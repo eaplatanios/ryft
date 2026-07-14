@@ -4,8 +4,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::benchmarking::{
-    BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
-    summarize_program,
+    BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
 use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -13,8 +12,8 @@ use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, Rever
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
-use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
-use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use crate::experimental::ops::{XlaConstant, XlaProgram};
+use crate::experimental::shard_map::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {
@@ -98,21 +97,8 @@ fn matrix_type(rows: usize, cols: usize) -> ArrayType {
     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
 }
 
-/// Summarizes one erased nested shard-map body.
-///
-/// # Parameters
-///
-///   - `label`: Stable nested-region label.
-///   - `body`: Nested shard-map body to summarize.
-fn summarize_nested_body(
-    label: &'static str,
-    body: &FlatTracedShardMap,
-) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = body.program().simplified()?;
-    Ok(nested_region(label, summarize_xla_program(&program)?))
-}
-
-/// Summarizes one traced XLA program, including nested shard-map bodies.
+/// Summarizes one traced XLA program; attached nested regions (including shard-map bodies) are covered by the
+/// generic region-arena walk in [`summarize_program`].
 ///
 /// # Parameters
 ///
@@ -120,13 +106,7 @@ fn summarize_nested_body(
 fn summarize_xla_program<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
     program: &XlaProgram<Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
-    summarize_program(program, |op| {
-        if let XlaOperation::ShardMap(shard_map_op) = op {
-            return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
-        }
-
-        Ok(Vec::new())
-    })
+    summarize_program(program)
 }
 
 /// Builds the program and MLIR records for one traced XLA program.
@@ -189,7 +169,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
         },
         TestArray::scalar(1.0),
     )?;
-    let summary = summarize_program(&closed_pushforward, |_| Ok(Vec::new()))?;
+    let summary = summarize_program(&closed_pushforward)?;
     let mlir = to_mlir_module_for_plain_program(&closed_pushforward, "main")
         .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     Ok(vec![record("scalar_quartic_plus_sin_linearize_pushforward", "scalar", "linearize_pushforward", mlir, summary)])

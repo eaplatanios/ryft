@@ -24,16 +24,17 @@
 //!
 //! Nested `while`s fall out of the recursion: an inner `while` is just an instruction encountered while recursively
 //! rewriting the outer body, so it is unrolled by the same pass. This is why the body is rewritten recursively rather
-//! than copied with [`add_program`](crate::ProgramBuilder::add_program), which would relocate a nested `while`
+//! than copied with [`splice_program`](crate::ProgramBuilder::splice_program), which would relocate a nested `while`
 //! verbatim and leave it un-unrolled.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::BooleanLike;
-use crate::operations::control_flow::{MaybeWhile, WhileParts};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
+use crate::operations::control_flow::WhileOperation;
+use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, RegionRef};
 
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.
@@ -77,7 +78,8 @@ where
     C: Context,
     <C as Domain>::Value: BooleanLike,
     <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>,
+    <C as Domain>::Operation: Clone,
+    for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     if !context.is_eager() {
         return Ok(program);
@@ -90,7 +92,7 @@ where
     // A `RefCell` lets the borrow-checker accept the two interpretation closures, which never run concurrently, each
     // taking a short-lived mutable borrow of the builder.
     let builder = RefCell::new(builder);
-    let output_pairs = rewrite_program_into(context, &builder, program, input_pairs)?;
+    let output_pairs = rewrite_program_into(context, &builder, program.entry_region_ref(), input_pairs)?;
 
     // The rewritten program keeps `program`'s flat input and output parameter structures: it has the same inputs, and
     // one output per source output.
@@ -114,30 +116,42 @@ where
 fn rewrite_program_into<C>(
     context: &C,
     builder: &RefCell<ProgramBuilder<<C as Domain>::Constant, <C as Domain>::Operation>>,
-    program: &Program<
-        <C as Domain>::Constant,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Constant>,
-        Vec<<C as Domain>::Constant>,
-    >,
+    program: RegionRef<'_, <C as Domain>::Constant, <C as Domain>::Operation>,
     input_pairs: Vec<(<C as Domain>::Value, AtomId)>,
 ) -> Result<Vec<(<C as Domain>::Value, AtomId)>, ProgramError>
 where
     C: Context,
     <C as Domain>::Value: BooleanLike,
     <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>,
+    <C as Domain>::Operation: Clone,
+    for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
+    let mut region_remapping = HashMap::new();
     program.interpret_with::<(<C as Domain>::Value, AtomId), ProgramError, _, _>(
         input_pairs,
         // Lift each live program constant once: materialize its concrete value and emit a matching constant atom.
         |_, constant| Ok((context.lift(constant.clone())?, builder.borrow_mut().add_constant(constant.clone()))),
         |instruction, input_pairs| {
             let operation = instruction.operation();
-            if let Some(parts) = operation.as_while()
-                && let Some(outputs) = unroll_while_into(context, builder, &parts, input_pairs.to_vec())?
-            {
-                return Ok(outputs);
+            if let Ok(while_operation) = <&WhileOperation>::try_from(operation) {
+                let [condition_region, body_region] = instruction.regions() else {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "while instruction must carry 2 attached regions but carries {}",
+                        instruction.regions().len(),
+                    )));
+                };
+                let condition = program.region_ref(*condition_region)?;
+                let body = program.region_ref(*body_region)?;
+                if let Some(outputs) = unroll_while_into(
+                    context,
+                    builder,
+                    while_operation.iteration_bound(),
+                    condition,
+                    body,
+                    input_pairs.to_vec(),
+                )? {
+                    return Ok(outputs);
+                }
             }
 
             // Non-`while` instruction: emit it verbatim over the operands' new atoms and interpret it concretely over
@@ -148,8 +162,23 @@ where
                 input_values.push(value.clone());
                 input_atoms.push(*atom);
             }
-            let output_atoms = builder.borrow_mut().add_instruction(operation.clone(), input_atoms)?.to_vec();
-            let output_values = context.bind(operation.clone(), &[], &[], &input_values)?;
+            let instruction_regions = instruction
+                .regions()
+                .iter()
+                .map(|id| program.region_ref(*id))
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let region_ids = instruction_regions
+                .iter()
+                .map(|region| builder.borrow_mut().import_region_with_remapping(*region, &mut region_remapping))
+                .collect();
+            let output_atoms =
+                builder.borrow_mut().add_instruction(operation.clone(), input_atoms, region_ids)?.to_vec();
+            let output_values = context.bind(
+                operation.clone(),
+                instruction_regions.into_iter().map(RegionRef::into_program).collect(),
+                &[],
+                &input_values,
+            )?;
             check_count!("output", output_values, output_atoms.len(), ProgramError);
             Ok(output_values.into_iter().zip(output_atoms).collect())
         },
@@ -170,30 +199,35 @@ where
 ///
 ///   - `context`: Eager context supplying the concrete value semantics.
 ///   - `builder`: Builder accumulating the straight-line program.
-///   - `parts`: Borrowed condition program, body program, and iteration bound of the `while` loop being unrolled.
+///   - `iteration_bound`: Semantic iteration bound of the `while` loop being unrolled, if any.
+///   - `condition`: Borrowed condition region of the `while` loop being unrolled.
+///   - `body`: Borrowed body region of the `while` loop being unrolled.
 ///   - `carry`: `(value, atom)` pairs for the loop's initial state, aligned with the condition and body input atoms.
 fn unroll_while_into<C>(
     context: &C,
     builder: &RefCell<ProgramBuilder<<C as Domain>::Constant, <C as Domain>::Operation>>,
-    parts: &WhileParts<'_, <C as Domain>::Constant, <C as Domain>::Operation>,
+    iteration_bound: Option<usize>,
+    condition: RegionRef<'_, <C as Domain>::Constant, <C as Domain>::Operation>,
+    body: RegionRef<'_, <C as Domain>::Constant, <C as Domain>::Operation>,
     mut carry: Vec<(<C as Domain>::Value, AtomId)>,
 ) -> Result<Option<Vec<(<C as Domain>::Value, AtomId)>>, ProgramError>
 where
     C: Context,
     <C as Domain>::Value: BooleanLike,
     <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>,
+    <C as Domain>::Operation: Clone,
+    for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     let mut completed_iterations = 0;
     loop {
-        let truncated = parts.iteration_bound.is_some_and(|bound| completed_iterations >= bound);
+        let truncated = iteration_bound.is_some_and(|bound| completed_iterations >= bound);
         if truncated {
             return Ok(Some(carry));
         }
 
         // Concretize the condition on the current concrete carry to decide whether another iteration runs.
         let condition_values = carry.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
-        let condition_outputs = parts.condition.interpret_in_context(context, condition_values)?;
+        let condition_outputs = condition.interpret_in_context(context, condition_values)?;
         check_count!("output", condition_outputs, 1, ProgramError);
         let predicate = match condition_outputs[0].boolean() {
             Ok(predicate) => predicate,
@@ -211,7 +245,7 @@ where
 
         // Run one body iteration: rewrite it into the builder over the carry atoms (unrolling any nested `while`) and
         // advance the carry to the body's outputs.
-        carry = rewrite_program_into(context, builder, parts.body, carry)?;
+        carry = rewrite_program_into(context, builder, body, carry)?;
         completed_iterations += 1;
     }
 }

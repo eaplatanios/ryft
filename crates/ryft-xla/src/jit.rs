@@ -2122,8 +2122,10 @@ mod tests {
             move |(primal_input, tangent_input)| {
                 let context = primal_input.context().clone();
                 let mut primal_outputs = context
-                    .stage_operation(
-                        XlaOperation::JitCall(Box::new(JitCallOperation::new(primal_half.clone()))),
+                    .stage_operation_with_callees(
+                        XlaOperation::JitCall(JitCallOperation::new()),
+                        Vec::new(),
+                        &[primal_half.clone()],
                         &[primal_input],
                     )
                     .expect("primal jit_call should stage");
@@ -2133,8 +2135,10 @@ mod tests {
                 let mut tangent_inputs = vec![tangent_input];
                 tangent_inputs.extend(residuals);
                 let tangent_output = context
-                    .stage_operation(
-                        XlaOperation::JitCall(Box::new(JitCallOperation::new(tangent_half.clone()))),
+                    .stage_operation_with_callees(
+                        XlaOperation::JitCall(JitCallOperation::new()),
+                        Vec::new(),
+                        &[tangent_half.clone()],
                         tangent_inputs.as_slice(),
                     )
                     .expect("tangent jit_call should stage")

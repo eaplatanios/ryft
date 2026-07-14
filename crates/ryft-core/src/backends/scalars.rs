@@ -26,9 +26,7 @@ use crate::operations::complex::{
 use crate::operations::constants::{
     ConstantOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{
-    MaybeWhile, Select, SelectCondition, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
-};
+use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation, WhilePredicate};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
@@ -46,7 +44,6 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
 use crate::tracing_v2::rematerialization::RematerializeOperation;
-use crate::tracing_v2::rematerialization::{ResidualProducers, ResidualProvenance};
 use crate::types::{DataType, TypeError, Typed};
 
 // TODO(eaplatanios): Review `ScalarOperation` and its implementations.
@@ -56,8 +53,8 @@ use crate::types::{DataType, TypeError, Typed};
 /// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar [`DataType`] metadata.
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum. Each variant simply wraps the same-named
-/// operation payload, and the program-valued payloads (e.g., `while` loops and the custom-derivative calls) are boxed
-/// because they are recursively parameterized by this enum itself.
+/// operation payload, and the program-valued payloads (e.g., the custom-derivative calls) are boxed because they are
+/// recursively parameterized by this enum itself.
 #[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {
@@ -88,33 +85,14 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Xor(XorOperation),
     Not(NotOperation),
     Select(SelectOperation),
-    While(Box<WhileOperation<V, Self>>),
+    While(WhileOperation),
     StopGradient(StopGradientOperation),
     Tag(TagOperation),
     Print(PrintOperation),
-    CustomJvp(Box<CustomJvpOperation<V, Self>>),
-    CustomVjp(Box<CustomVjpOperation<V, Self>>),
-    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
-    Rematerialize(Box<RematerializeOperation<V, Self>>),
-}
-
-/// [`ScalarOperation`] has no nested-program stacking operations (in particular, no `scan` variant), so every
-/// residual's producer is the operation itself.
-impl<V: Value<Type = DataType>> ResidualProvenance<V, ScalarOperation<V>> for ScalarOperation<V> {
-    #[inline]
-    fn residual_provenance(&self, _output_index: usize) -> ResidualProducers<'_, V, ScalarOperation<V>> {
-        ResidualProducers::Leaf
-    }
-}
-
-impl<V: Value<Type = DataType>> MaybeWhile<V, ScalarOperation<V>> for ScalarOperation<V> {
-    #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, V, ScalarOperation<V>>> {
-        match self {
-            Self::While(operation) => operation.as_while(),
-            _ => None,
-        }
-    }
+    CustomJvp(CustomJvpOperation),
+    CustomVjp(CustomVjpOperation),
+    CustomVjpTangent(CustomVjpTangentOperation),
+    Rematerialize(RematerializeOperation),
 }
 
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
@@ -1444,7 +1422,7 @@ impl Select for Scalar {
     type Condition = bool;
 
     /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the broadcasting
-    /// [`SelectOperation`](crate::operations::control_flow::SelectOperation) type-inference contract: the selected
+    /// [`SelectOperation`] type-inference contract: the selected
     /// branch is promoted to the promotion of the two branch data types, so `select(condition, f32, f64)` yields an
     /// `f64` like `jnp.where`. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before
     /// reaching here, so this only needs the resolved `bool`.
@@ -1475,11 +1453,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{Context, StagingContext};
-    use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::tracing::Trace;
     use crate::tracing_v2::ForwardModeDifferentiate;
+
+    use crate::programs::RegionInterface;
 
     use super::*;
 
@@ -1487,7 +1466,7 @@ mod tests {
     fn scalar_doubling_body() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1497,7 +1476,7 @@ mod tests {
         let carry = builder.add_input(DataType::F64);
         let eight = builder.add_constant(Scalar::from(8.0));
         let predicate = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight])
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight], Vec::new())
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1533,19 +1512,25 @@ mod tests {
 
     #[test]
     fn test_scalar_while() {
-        let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-            scalar_less_than_eight_condition(),
-            scalar_doubling_body(),
-        )
-        .unwrap();
+        let operation = WhileOperation::new();
+        let condition = scalar_less_than_eight_condition();
+        let body = scalar_doubling_body();
+        let interfaces = [
+            RegionInterface::new(condition.input_types(), condition.output_types(), condition.effects()),
+            RegionInterface::new(body.input_types(), body.output_types(), body.effects()),
+        ];
 
-        // Operation identity, type inference, and direct interpretation.
-        assert_eq!(operation.name(), crate::operations::control_flow::WHILE_OPERATION_NAME);
-        assert_eq!(operation.state_types(), vec![DataType::F64]);
+        // Operation identity, type inference, and eager binding through detached region access.
+        assert_eq!(Operation::<DataType>::name(&operation), crate::operations::control_flow::WHILE_OPERATION_NAME);
         assert_eq!(operation.iteration_bound(), None);
-        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(operation.infer_output_types(&[DataType::F64], &interfaces), Ok(vec![DataType::F64]));
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(1.0)]),
+            crate::EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
+                ScalarOperation::While(operation),
+                vec![condition.clone(), body.clone()],
+                &[],
+                &[Scalar::from(1.0)],
+            ),
             Ok(vec![Scalar::from(8.0)])
         );
 
@@ -1553,12 +1538,12 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |carry| {
-                let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-                    scalar_less_than_eight_condition(),
-                    scalar_doubling_body(),
-                )
-                .unwrap();
-                let mut outputs = carry.context().stage_operation(operation, &[&carry])?;
+                let operation = WhileOperation::new();
+                let mut outputs = carry.context().stage_operation(
+                    operation,
+                    vec![scalar_less_than_eight_condition(), scalar_doubling_body()],
+                    &[&carry],
+                )?;
                 Ok(outputs.remove(0))
             },
             DataType::F64,
@@ -1569,7 +1554,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = while [
+                let %1:f64 = while %0 [
                     condition={
                         lambda %0:f64 .
                         let %1:f64 = const
@@ -1581,7 +1566,7 @@ mod tests {
                         let %1:f64 = add %0 %0
                         in (%1)
                     },
-                ] %0
+                ]
                 in (%1)
             "}
             .trim_end(),
@@ -1592,12 +1577,9 @@ mod tests {
         let (primal, tangent): (Scalar, Scalar) = domain
             .jvp(
                 |carry| {
-                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-                        scalar_less_than_eight_condition(),
-                        scalar_doubling_body(),
-                    )
-                    .unwrap();
-                    Ok(carry.context().bind(operation, &[], &[], &[carry.clone()])?.remove(0))
+                    let operation = WhileOperation::new();
+                    let regions = vec![scalar_less_than_eight_condition(), scalar_doubling_body()];
+                    Ok(carry.context().bind(operation, regions, &[], &[carry.clone()])?.remove(0))
                 },
                 Scalar::from(1.0),
                 Scalar::from(1.0),
@@ -1609,9 +1591,10 @@ mod tests {
 
     #[test]
     fn test_scalar_while_rejects_non_boolean_condition() {
+        let body = scalar_doubling_body();
+        let interface = RegionInterface::new(body.input_types(), body.output_types(), body.effects());
         assert_eq!(
-            WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(scalar_doubling_body(), scalar_doubling_body())
-                .map(|_| ()),
+            WhileOperation::new().infer_output_types(&[DataType::F64], &[interface.clone(), interface]),
             Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
         );
     }
@@ -1744,7 +1727,7 @@ mod tests {
         assert_eq!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ZeroOperation::new(DataType::F64),
-                &[],
+                Vec::new(),
                 &[],
                 &[]
             ),
@@ -1753,7 +1736,7 @@ mod tests {
         assert_eq!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(
                 OneOperation::new(DataType::F64),
-                &[],
+                Vec::new(),
                 &[],
                 &[]
             ),
@@ -1923,7 +1906,7 @@ mod tests {
         assert_eq!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ZeroOperation::new(DataType::C64),
-                &[],
+                Vec::new(),
                 &[],
                 &[]
             ),
@@ -1948,7 +1931,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::C64);
         let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
-        let output = builder.add_instruction(crate::operations::math::MulOperation, vec![input, constant]).unwrap()[0];
+        let output = builder
+            .add_instruction(crate::operations::math::MulOperation, vec![input, constant], Vec::new())
+            .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();

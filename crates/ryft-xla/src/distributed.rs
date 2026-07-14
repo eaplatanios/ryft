@@ -297,7 +297,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
 ///
 /// Construct via [`Self::initialize`]. The handle owns:
 ///
-///   * a per-process [`DistributedRuntimeClient`] (wrapped in a [`DistributedKeyValueStore`]) that
+///   * a per-process [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient) (wrapped in a [`DistributedKeyValueStore`]) that
 ///     speaks to the coordinator service over the configured address, and
 ///   * on the coordinator node only, the [`DistributedRuntimeService`] that hosts the
 ///     coordination state for every participant.
@@ -315,7 +315,7 @@ impl DistributedRuntime {
     /// Every participating process in a job must call this with identical `coordinator_address`
     /// and `num_nodes`, and a unique `node_id` in `0..num_nodes`. Node 0 is the elected
     /// coordinator: it hosts the [`DistributedRuntimeService`] in addition to its own
-    /// [`DistributedRuntimeClient`]. The call blocks (subject to the configured
+    /// [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient). The call blocks (subject to the configured
     /// `initialization_timeout`) until all nodes have connected.
     ///
     /// # Parameters

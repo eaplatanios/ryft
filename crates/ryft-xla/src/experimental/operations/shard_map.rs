@@ -1,42 +1,44 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
+use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
-use ryft_core::effects::Effects;
-use ryft_core::interpretation::InterpretableOperation;
+use ryft_core::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
+};
 use ryft_core::macros::check_count;
-use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{Zero, ZeroOperation};
+use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
-    PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::{MaybeZero, ProgramError, Value};
+use ryft_core::programs::{MaybeZero, Program, ProgramError, RegionInterface, RegionRef, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
-use crate::experimental::ops::{XlaConstant, XlaOperation};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
 
-/// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
+/// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering. The local body
+/// program is not part of this payload: it is the operation's one attached `body` region, so this payload carries
+/// only the manual SPMD boundary metadata that the region program cannot represent.
 #[derive(Clone, Debug)]
 pub struct ShardMapOperation<V> {
-    /// Canonical erased shard-map body carried by this higher-order op.
-    body: FlatTracedShardMap,
+    /// Manual SPMD metadata (mesh, boundary shardings, and manual axes) governing the attached body region.
+    shard_map: ShardMap,
 
-    /// Global input types expected by the carried body.
+    /// Global input types declared at the shard-map boundary.
     input_types: Vec<ArrayType>,
 
-    /// Global output types produced by the carried body.
+    /// Global output types declared at the shard-map boundary.
     output_types: Vec<ArrayType>,
 
     /// Phantom marker tying the op to the traced leaf type it will replay with.
@@ -44,41 +46,59 @@ pub struct ShardMapOperation<V> {
 }
 
 impl<V> ShardMapOperation<V> {
-    /// Creates one ordinary staged shard-map op from its erased body payload.
+    /// Splits the provided erased shard-map body into a metadata-only operation and the local body program that the
+    /// caller attaches as the operation's `body` region (or interns as a shared callee).
     #[inline]
-    pub(crate) fn new(body: FlatTracedShardMap) -> Self {
-        Self {
-            input_types: body.global_input_types().to_vec(),
-            output_types: body.global_output_types().to_vec(),
-            body,
-            marker: PhantomData,
-        }
+    pub(crate) fn from_body(body: FlatTracedShardMap) -> (Self, XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>) {
+        let (shard_map, input_types, output_types, program) = body.into_operation_parts();
+        (Self { shard_map, input_types, output_types, marker: PhantomData }, program)
     }
 
-    /// Returns the erased shard-map body carried by this operation.
+    /// Returns the manual SPMD metadata governing the attached body region.
     #[inline]
-    pub(crate) fn body(&self) -> &FlatTracedShardMap {
-        &self.body
+    pub(crate) fn shard_map(&self) -> &ShardMap {
+        &self.shard_map
     }
-}
 
-impl<C> InterpretableOperation<ShardMapTracer, C> for ShardMapOperation<ShardMapTracer> {
-    /// Replays this traced-leaf shard-map op by staging it onto the trace its inputs already belong to: an input's
-    /// [`context`](Tracer::context) shares that trace's program builder, so
-    /// [`stage_operation`](StagingContext::stage_operation) on it appends to the same program. An empty-input body has
-    /// no such input, so its outputs are inferred directly and no operation is staged.
-    fn interpret(&self, _context: &C, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, ProgramError> {
-        match inputs.first() {
-            Some(first) => {
-                let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                self.infer_output_types(abstract_inputs.as_slice())?;
-                apply_flat_traced_shard_map(first, self.body.clone(), inputs).map_err(trace_error_from_shard_map)
-            }
-            None => {
-                self.infer_output_types(&[])?;
-                Ok(Vec::new())
-            }
+    /// Returns the global input types declared at the shard-map boundary.
+    #[inline]
+    pub(crate) fn global_input_types(&self) -> &[ArrayType] {
+        &self.input_types
+    }
+
+    /// Returns the global output types declared at the shard-map boundary.
+    #[inline]
+    pub(crate) fn global_output_types(&self) -> &[ArrayType] {
+        &self.output_types
+    }
+
+    /// Creates a metadata-only shard-map operation directly from its boundary parts. The local body program that
+    /// realizes this boundary is authored separately and attached as the operation's `body` region.
+    #[inline]
+    pub(crate) fn from_boundary(
+        shard_map: ShardMap,
+        input_types: Vec<ArrayType>,
+        output_types: Vec<ArrayType>,
+    ) -> Self {
+        Self { shard_map, input_types, output_types, marker: PhantomData }
+    }
+
+    /// Returns a copy of this operation whose global output types are replaced by `global_output_types`, keeping the
+    /// manual SPMD metadata and global input types unchanged. Forward-mode differentiation uses this to align a
+    /// tangent boundary's global output types with the staged primal `shard_map`'s adapted output types (see
+    /// `adapt_traced_shard_map_output_type`), so that the two `shard_map`s present matching output signatures.
+    pub(crate) fn with_global_output_types(
+        mut self,
+        global_output_types: Vec<ArrayType>,
+    ) -> Result<Self, ShardMapTraceError> {
+        if global_output_types.len() != self.output_types.len() {
+            return Err(ShardMapTraceError::OutputTypeCountMismatch {
+                expected: self.output_types.len(),
+                actual: global_output_types.len(),
+            });
         }
+        self.output_types = global_output_types;
+        Ok(self)
     }
 }
 
@@ -176,7 +196,11 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
         "shard_map"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         infer_shard_map_output_types(
             self.name(),
             self.input_types.as_slice(),
@@ -186,8 +210,8 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.body.program().effects()
+    fn region_names(&self) -> &'static [&'static str] {
+        &["body"]
     }
 }
 
@@ -202,6 +226,7 @@ where
     fn batch(
         &self,
         _context: &BatchingContext<C>,
+        _driver: &dyn BatchingDriver<C>,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
@@ -228,34 +253,44 @@ where
 /// the surviving unknown boundary inputs plus those residual edges and emitted into the residual program.
 impl<V, C> PartiallyEvaluatableOperation<C> for ShardMapOperation<V>
 where
-    V: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Operation = XlaOperation<V>>,
+    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
     ShardMapOperation<V>: Operation<ArrayType>,
 {
     fn partially_evaluate(
         &self,
         context: &PartialEvaluationContext<C>,
+        driver: &dyn PartialEvaluationDriver<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed boundary with at least one known-but-symbolic input; everything else keeps the default
         // fold-or-residualize behavior and therefore the original boundary.
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
-            return context.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(
+                XlaOperation::ShardMap(Box::new(self.clone())),
+                driver.regions()?.into_iter().map(|region| region.into_program()).collect(),
+                inputs,
+            );
         }
 
         // Split the local body through the shared online boundary machinery. The body's inputs are index-aligned
         // with the boundary inputs and carry the *local* types, so both split sides stay local programs.
+        let body_program = driver.region(0)?;
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-        let partition = self.body.program().partition(input_known.as_slice())?;
+        let partition = body_program.partition(input_known.as_slice())?;
         // A trivial partition — one whose known program contains no instructions — hoists no work (its known side
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(
+                XlaOperation::ShardMap(Box::new(self.clone())),
+                vec![body_program.into_program()],
+                inputs,
+            );
         }
 
         // Derive each residual edge's global boundary type and sharding from its local type.
-        let mesh = self.body.shard_map().mesh();
+        let mesh = self.shard_map.mesh();
         let residual_edge_boundaries = partition
             .residual_inputs()
             .iter()
@@ -269,12 +304,12 @@ where
         let known_global_input_types = partition
             .known_input_indices()
             .iter()
-            .map(|&index| self.body.global_input_types()[index].clone())
+            .map(|&index| self.input_types[index].clone())
             .collect::<Vec<_>>();
         let known_in_shardings = partition
             .known_input_indices()
             .iter()
-            .map(|&index| self.body.shard_map().in_shardings()[index].clone())
+            .map(|&index| self.shard_map.in_shardings()[index].clone())
             .collect::<Vec<_>>();
         let known_output_indices = partition
             .outputs()
@@ -282,13 +317,11 @@ where
             .enumerate()
             .filter_map(|(index, output)| output.is_known().then_some(index))
             .collect::<Vec<_>>();
-        let mut known_global_output_types = known_output_indices
-            .iter()
-            .map(|&index| self.body.global_output_types()[index].clone())
-            .collect::<Vec<_>>();
+        let mut known_global_output_types =
+            known_output_indices.iter().map(|&index| self.output_types[index].clone()).collect::<Vec<_>>();
         let mut known_out_shardings = known_output_indices
             .iter()
-            .map(|&index| self.body.shard_map().out_shardings()[index].clone())
+            .map(|&index| self.shard_map.out_shardings()[index].clone())
             .collect::<Vec<_>>();
         for (global_type, sharding) in residual_edge_boundaries.iter() {
             known_global_output_types.push(global_type.clone());
@@ -302,8 +335,8 @@ where
         for source in partition.residual_inputs().iter() {
             match source {
                 PartialEvaluationInput::Unknown(index) => {
-                    staged_global_input_types.push(self.body.global_input_types()[*index].clone());
-                    staged_in_shardings.push(self.body.shard_map().in_shardings()[*index].clone());
+                    staged_global_input_types.push(self.input_types[*index].clone());
+                    staged_in_shardings.push(self.shard_map.in_shardings()[*index].clone());
                 }
                 PartialEvaluationInput::Known(edge) => {
                     let (global_type, sharding) = &residual_edge_boundaries[*edge];
@@ -316,8 +349,8 @@ where
         let mut staged_out_shardings = Vec::new();
         for (index, output) in partition.outputs().iter().enumerate() {
             if output.is_unknown() {
-                staged_global_output_types.push(self.body.global_output_types()[index].clone());
-                staged_out_shardings.push(self.body.shard_map().out_shardings()[index].clone());
+                staged_global_output_types.push(self.output_types[index].clone());
+                staged_out_shardings.push(self.shard_map.out_shardings()[index].clone());
             }
         }
 
@@ -327,44 +360,34 @@ where
             partition,
             inputs,
             |known_program| {
-                let known_local_input_types = known_program.input_types();
-                let known_local_output_types = known_program.output_types();
                 let known_shard_map = ShardMap::from_shardings(
                     mesh.clone(),
                     known_in_shardings,
                     known_out_shardings,
-                    self.body.shard_map().manual_axes().to_vec(),
-                    self.body.shard_map().check_vma(),
+                    self.shard_map.manual_axes().to_vec(),
+                    self.shard_map.check_vma(),
                 );
-                let known_body = FlatTracedShardMap::from_parts(
+                let known_operation = ShardMapOperation::from_boundary(
                     known_shard_map,
                     known_global_input_types,
-                    known_local_input_types,
                     known_global_output_types,
-                    known_local_output_types,
-                    known_program,
                 );
-                XlaOperation::ShardMap(Box::new(ShardMapOperation::new(known_body)))
+                (XlaOperation::ShardMap(Box::new(known_operation)), vec![known_program])
             },
             |residual_program| {
-                let staged_local_input_types = residual_program.input_types();
-                let staged_local_output_types = residual_program.output_types();
                 let staged_shard_map = ShardMap::from_shardings(
                     mesh.clone(),
                     staged_in_shardings,
                     staged_out_shardings,
-                    self.body.shard_map().manual_axes().to_vec(),
-                    self.body.shard_map().check_vma(),
+                    self.shard_map.manual_axes().to_vec(),
+                    self.shard_map.check_vma(),
                 );
-                let staged_body = FlatTracedShardMap::from_parts(
+                let staged_operation = ShardMapOperation::from_boundary(
                     staged_shard_map,
                     staged_global_input_types,
-                    staged_local_input_types,
                     staged_global_output_types,
-                    staged_local_output_types,
-                    residual_program,
                 );
-                XlaOperation::ShardMap(Box::new(ShardMapOperation::new(staged_body)))
+                (XlaOperation::ShardMap(Box::new(staged_operation)), vec![residual_program])
             },
         )
     }
@@ -427,27 +450,36 @@ fn residual_boundary(local_type: &ArrayType, mesh: &LogicalMesh) -> Result<(Arra
 /// Fuse-linearizes a shard-map body capture-free into a primal body and a tangent body that thread residuals as plain
 /// operand edges across the shard-map boundary.
 ///
-/// The body's flat program is fuse-linearized once through [`Program::linearize`](ryft_core::Program::linearize),
-/// yielding a primal sub-program
+/// The borrowed `body` region is fuse-linearized once, yielding a primal sub-program
 /// `local_inputs -> [local_outputs..., local_residuals...]` and a tangent sub-program
-/// `[local_input_tangents..., local_residuals...] -> [local_output_tangents...]` together with the residual count. Each
-/// sub-program is re-wrapped as its own [`FlatTracedShardMap`]: the primal body's boundary gains the residual edges as
-/// trailing outputs, the tangent body's boundary gains them as trailing inputs, and both use the replicated residual
+/// `[local_input_tangents..., local_residuals...] -> [local_output_tangents...]` together with the residual count.
+/// Each sub-program pairs with a fresh boundary [`ShardMapOperation`]: the primal boundary gains the residual edges
+/// as trailing outputs, the tangent boundary gains them as trailing inputs, and both use the replicated residual
 /// boundary from [`residual_boundary`]. This is the shard-map counterpart of the jitted-call rule, realizing
 /// `jvp(shard_map(f)) = shard_map(jvp f)` with no symbolic capture ever introduced.
 ///
 /// # Parameters
 ///
-///   - `body`: Erased primal shard-map body to linearize.
-fn shard_map_bodies(
-    body: &FlatTracedShardMap,
-) -> Result<(FlatTracedShardMap, FlatTracedShardMap, usize), ShardMapTraceError> {
-    let output_count = body.global_output_types().len();
+///   - `operation`: Boundary metadata of the primal shard-map being linearized.
+///   - `program`: Borrowed `body` region of that shard-map.
+#[allow(clippy::type_complexity)]
+fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + BooleanLike>(
+    operation: &ShardMapOperation<V>,
+    program: RegionRef<'_, V, XlaOperation<V>>,
+) -> Result<
+    (
+        (ShardMapOperation<V>, Program<V, XlaOperation<V>, Vec<V>, Vec<V>>),
+        (ShardMapOperation<V>, Program<V, XlaOperation<V>, Vec<V>, Vec<V>>),
+        usize,
+    ),
+    ShardMapTraceError,
+> {
+    let output_count = operation.global_output_types().len();
     let (primal_program, tangent_program, residual_count) =
-        body.program().linearize().map_err(ProgramError::from)?.into_parts();
+        program.linearize().map_err(ProgramError::from)?.into_parts();
 
-    let mesh = body.shard_map().mesh();
-    let manual_axes = body.shard_map().manual_axes();
+    let mesh = operation.shard_map().mesh();
+    let manual_axes = operation.shard_map().manual_axes();
 
     // The primal sub-program's trailing outputs beyond the original outputs are the residual edges; their local
     // types are authoritative and back the residual boundary on both bodies.
@@ -461,48 +493,42 @@ fn shard_map_bodies(
         residual_shardings.push(residual_sharding);
     }
 
-    let primal_body = {
+    let primal_operation = {
         let shard_map = ShardMap::from_shardings(
             mesh.clone(),
-            body.shard_map().in_shardings().to_vec(),
-            body.shard_map().out_shardings().iter().cloned().chain(residual_shardings.iter().cloned()).collect(),
+            operation.shard_map().in_shardings().to_vec(),
+            operation
+                .shard_map()
+                .out_shardings()
+                .iter()
+                .cloned()
+                .chain(residual_shardings.iter().cloned())
+                .collect(),
             manual_axes.to_vec(),
-            body.shard_map().check_vma(),
+            operation.shard_map().check_vma(),
         );
-        let global_output_types =
-            body.global_output_types().iter().cloned().chain(residual_global_types.iter().cloned()).collect();
-        FlatTracedShardMap::from_parts(
-            shard_map,
-            body.global_input_types().to_vec(),
-            primal_program.input_types(),
-            global_output_types,
-            primal_local_output_types,
-            primal_program,
-        )
+        let global_output_types = operation
+            .global_output_types()
+            .iter()
+            .cloned()
+            .chain(residual_global_types.iter().cloned())
+            .collect();
+        ShardMapOperation::from_boundary(shard_map, operation.global_input_types().to_vec(), global_output_types)
     };
 
-    let tangent_body = {
+    let tangent_operation = {
         let shard_map = ShardMap::from_shardings(
             mesh.clone(),
-            body.shard_map().in_shardings().iter().cloned().chain(residual_shardings).collect(),
-            body.shard_map().out_shardings().to_vec(),
+            operation.shard_map().in_shardings().iter().cloned().chain(residual_shardings).collect(),
+            operation.shard_map().out_shardings().to_vec(),
             manual_axes.to_vec(),
-            body.shard_map().check_vma(),
+            operation.shard_map().check_vma(),
         );
-        let global_input_types = body.global_input_types().iter().cloned().chain(residual_global_types).collect();
-        let tangent_local_input_types = tangent_program.input_types();
-        let tangent_local_output_types = tangent_program.output_types();
-        FlatTracedShardMap::from_parts(
-            shard_map,
-            global_input_types,
-            tangent_local_input_types,
-            body.global_output_types().to_vec(),
-            tangent_local_output_types,
-            tangent_program,
-        )
+        let global_input_types = operation.global_input_types().iter().cloned().chain(residual_global_types).collect();
+        ShardMapOperation::from_boundary(shard_map, global_input_types, operation.global_output_types().to_vec())
     };
 
-    Ok((primal_body, tangent_body, residual_count))
+    Ok(((primal_operation, primal_program), (tangent_operation, tangent_program), residual_count))
 }
 
 /// Capture-free forward-mode (JVP) rule for [`ShardMapOperation`], binding a primal `shard_map` and a tangent
@@ -522,26 +548,34 @@ fn shard_map_bodies(
 /// by those residual values (recovering one output tangent per primal output), and pairs each primal output with its
 /// tangent output. The body program is keyed on [`XlaConstant`] regardless of the enclosing value type `V`, so the
 /// sub-programs are valid for every `V`.
+///
+/// # Parameters
+///
+///   - `context`: Active evaluation or staging context used to bind the differentiated shard-map operations.
+///   - `driver`: Call-scoped access to the attached shard-map body region.
+///   - `inputs`: Primal and tangent values for the shard-map operands.
 impl<C, V> DifferentiableOperation<C> for ShardMapOperation<V>
 where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: Value<Type = ArrayType>,
+    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
 {
     fn jvp(
         &self,
         context: &C,
+        driver: &dyn DifferentiationDriver<C>,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types.len();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
 
-        let (primal_body, tangent_body, _residual_count) =
-            shard_map_bodies(&self.body).map_err(trace_error_from_shard_map)?;
+        let body_program = driver.region(0)?;
+        let ((primal_operation, primal_body_program), (tangent_operation, tangent_body_program), _residual_count) =
+            shard_map_bodies(self, body_program).map_err(trace_error_from_shard_map)?;
 
         // Bind the primal `shard_map`, recovering the primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(primal_body)));
-        let mut primal_outputs = context.bind(primal_operation, &[], &[], &primal_operands)?;
+        let primal_operation = XlaOperation::ShardMap(Box::new(primal_operation));
+        let mut primal_outputs = context.bind(primal_operation, vec![primal_body_program], &[], &primal_operands)?;
         if primal_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "shard_map primal body produced {} outputs which is fewer than its {output_count} primal \
@@ -558,8 +592,9 @@ where
         // trailing residual operands and so skips that adaptation; re-embed the tangent body's global output boundary
         // into the staged primal output types directly to keep the two output signatures aligned.
         let primal_output_types = primal_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-        let tangent_body =
-            tangent_body.with_global_output_types(primal_output_types).map_err(trace_error_from_shard_map)?;
+        let tangent_operation = tangent_operation
+            .with_global_output_types(primal_output_types)
+            .map_err(trace_error_from_shard_map)?;
 
         // Bind the tangent `shard_map` over the operand tangents followed by the residual values, recovering one
         // output tangent per primal output.
@@ -570,8 +605,8 @@ where
             .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
-        let tangent_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(tangent_body)));
-        let tangent_outputs = context.bind(tangent_operation, &[], &[], &tangent_operands)?;
+        let tangent_operation = XlaOperation::ShardMap(Box::new(tangent_operation));
+        let tangent_outputs = context.bind(tangent_operation, vec![tangent_body_program], &[], &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -592,9 +627,8 @@ where
 ///
 ///   1. Reads the runtime value of every known operand from `operand_values`, in body-input order, to feed the
 ///      transposed body's known inputs.
-///   2. Transposes the tangent body's flat program with
-///      [`transpose_with_respect_to`](ryft_core::Program::transpose_with_respect_to) with respect to the same
-///      linear operands,
+///   2. Transposes the tangent body's flat program with [`TranspositionDriver::transpose_program`] with respect
+///      to the same linear operands,
 ///      so the transposed body maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`,
 ///      in body-input order on each side. It re-wraps the transposed program in a fresh [`FlatTracedShardMap`] whose
 ///      boundary shardings are permuted to match — its inputs carry the original output shardings (for the cotangents)
@@ -605,13 +639,14 @@ where
 ///
 /// The returned cotangents place the transposed `shard_map`'s outputs at the linear-operand positions and a structural
 /// [`MaybeZero::Zero`] at the known positions. The body transposition happens through
-/// [`transpose_with_respect_to`](ryft_core::Program::transpose_with_respect_to) in this same operation family, so it is
-/// value-level and introduces no recursive transposition obligation on [`XlaOperation`].
+/// [`TranspositionDriver::transpose_program`] in this same operation family, so it is value-level and introduces
+/// no recursive transposition obligation on [`XlaOperation`].
 ///
 /// # Parameters
 ///
 ///   - `operation`: Primal tangent `shard_map` staged into the tangent program.
 ///   - `context`: Active transpose tracing context the pullback is staged into.
+///   - `driver`: Instruction-scoped access to the attached body region and its recursive transposition machinery.
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the body's global inputs one-to-one. The
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual tracers the pullback reads.
@@ -619,12 +654,12 @@ where
 pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>>(
     operation: &ShardMapOperation<V>,
     context: &mut TracingContext<V, XlaOperation<V>>,
+    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let body = operation.body();
-    check_count!("input", operand_linear, body.global_input_types().len(), ProgramError);
+    check_count!("input", operand_linear, operation.global_input_types().len(), ProgramError);
 
     // A shard_map with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -642,8 +677,9 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>>(
 
     // Transpose the tangent body's flat program under the same per-operand linearity mask. The transposed program maps
     // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in body-input order on each
-    // side; re-wrap it as a transposed shard-map body whose boundary shardings are permuted to match.
-    let transposed_body = transpose_shard_map_body(body, operand_linear.as_slice())?;
+    // side; re-wrap it as a transposed shard-map boundary whose shardings are permuted to match.
+    let (transposed_operation, transposed_body_program) =
+        transpose_shard_map_body(operation, driver, operand_linear.as_slice())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `shard_map` over the transposed body on `[outputs..., known_input_values...]`. Its outputs are the
@@ -655,8 +691,9 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>>(
         operands.push(materialize_cotangent(context, cotangent, output_type));
     }
     operands.extend(known_values);
-    let transposed_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(transposed_body)));
-    let input_cotangents = context.stage_operation(transposed_operation, operands.as_slice())?;
+    let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
+    let input_cotangents =
+        context.stage_operation(transposed_operation, vec![transposed_body_program], operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -683,39 +720,38 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for S
     fn transpose(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
+        driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-        transpose_primal_shard_map(self, context, inputs, outputs).map_err(DifferentiationError::from)
+        transpose_primal_shard_map(self, context, driver, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 
-/// Transposes one tangent shard-map body into the reverse body consumed by [`transpose_primal_shard_map`].
+/// Transposes one tangent shard-map body into the reverse boundary and body consumed by
+/// [`transpose_primal_shard_map`].
 ///
-/// The tangent body's flat program is transposed with [`transpose_with_respect_to`](ryft_core::Program::transpose_with_respect_to)
-/// under `input_linearity`, producing a program mapping `[outputs..., known_input_values...]` to
-/// `[linear_input_cotangents...]`. The transposed [`FlatTracedShardMap`] permutes the original boundary to match: its
-/// global inputs are the original global outputs (for the output cotangents) followed by the known operands' original
-/// global inputs, and its global outputs are the linear operands' original global inputs. Local types come straight
-/// from the transposed program, which is authoritative for the manual region.
+/// The tangent body's flat program is transposed with [`TranspositionDriver::transpose_program`] under
+/// `input_linearity`, producing a program mapping `[outputs..., known_input_values...]` to
+/// `[linear_input_cotangents...]`. The transposed boundary permutes the original one to match: its global inputs are
+/// the original global outputs (for the output cotangents) followed by the known operands' original global inputs,
+/// and its global outputs are the linear operands' original global inputs.
 ///
 /// # Parameters
 ///
-///   - `body`: Tangent shard-map body produced by [`shard_map_bodies`], whose global inputs are
-///     `[input_tangents..., residuals...]` and whose global outputs are `[output_tangents...]`.
-///   - `input_linearity`: Per-input linearity flags over the tangent body's global inputs.
-fn transpose_shard_map_body(
-    body: &FlatTracedShardMap,
+///   - `operation`: Boundary metadata of the tangent `shard_map` produced by [`shard_map_bodies`], whose global
+///     inputs are `[input_tangents..., residuals...]` and whose global outputs are `[output_tangents...]`.
+///   - `driver`: Instruction-scoped access to the attached body region and its recursive transposition machinery.
+///   - `input_linearity`: Per-input linearity flags over the tangent boundary's global inputs.
+#[allow(clippy::type_complexity)]
+fn transpose_shard_map_body<V: Value<Type = ArrayType>>(
+    operation: &ShardMapOperation<V>,
+    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
     input_linearity: &[bool],
-) -> Result<FlatTracedShardMap, ProgramError> {
-    let with_respect_to = input_linearity
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &linear)| linear.then_some(index))
-        .collect::<Vec<_>>();
-    let transposed_program = body.program().transpose_with_respect_to(with_respect_to.as_slice())?;
+) -> Result<(ShardMapOperation<V>, Program<V, XlaOperation<V>, Vec<V>, Vec<V>>), ProgramError> {
+    let transposed_program = driver.transpose_program(driver.region(0)?, input_linearity)?;
 
-    let in_shardings = body
+    let in_shardings = operation
         .shard_map()
         .out_shardings()
         .iter()
@@ -723,67 +759,49 @@ fn transpose_shard_map_body(
         .chain(
             input_linearity
                 .iter()
-                .zip(body.shard_map().in_shardings().iter())
+                .zip(operation.shard_map().in_shardings().iter())
                 .filter(|&(&linear, _)| !linear)
                 .map(|(_, sharding)| sharding.clone()),
         )
         .collect::<Vec<_>>();
     let out_shardings = input_linearity
         .iter()
-        .zip(body.shard_map().in_shardings().iter())
+        .zip(operation.shard_map().in_shardings().iter())
         .filter(|&(&linear, _)| linear)
         .map(|(_, sharding)| sharding.clone())
         .collect::<Vec<_>>();
     let shard_map = ShardMap::from_shardings(
-        body.shard_map().mesh().clone(),
+        operation.shard_map().mesh().clone(),
         in_shardings,
         out_shardings,
-        body.shard_map().manual_axes().to_vec(),
-        body.shard_map().check_vma(),
+        operation.shard_map().manual_axes().to_vec(),
+        operation.shard_map().check_vma(),
     );
 
-    let global_input_types = body
+    let global_input_types = operation
         .global_output_types()
         .iter()
         .cloned()
         .chain(
             input_linearity
                 .iter()
-                .zip(body.global_input_types().iter())
+                .zip(operation.global_input_types().iter())
                 .filter(|&(&linear, _)| !linear)
                 .map(|(_, global_type)| global_type.clone()),
         )
         .collect::<Vec<_>>();
     let global_output_types = input_linearity
         .iter()
-        .zip(body.global_input_types().iter())
+        .zip(operation.global_input_types().iter())
         .filter(|&(&linear, _)| linear)
         .map(|(_, global_type)| global_type.clone())
         .collect::<Vec<_>>();
 
-    Ok(FlatTracedShardMap::from_parts(
-        shard_map,
-        global_input_types,
-        transposed_program.input_types(),
-        global_output_types,
-        transposed_program.output_types(),
-        transposed_program,
-    ))
+    Ok((ShardMapOperation::from_boundary(shard_map, global_input_types, global_output_types), transposed_program))
 }
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> ProgramError {
     ProgramError::Type(TypeError { message: error.to_string() })
-}
-
-fn apply_flat_traced_shard_map(
-    first: &ShardMapTracer,
-    body: FlatTracedShardMap,
-    traced_inputs: &[ShardMapTracer],
-) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    first
-        .context()
-        .stage_operation(XlaOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))), traced_inputs)
-        .map_err(ShardMapTraceError::from)
 }
 
 fn trace_flat_shard_map<
@@ -827,15 +845,12 @@ fn apply_traced_shard_map<C, Output>(
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError>
 where
-    C: Context<Type = ArrayType, Operation = XlaOperation>,
+    C: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
     Output: Parameterized<C::Value>,
 {
-    let staged_outputs = context.bind(
-        XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
-        &[],
-        &[],
-        traced_inputs.as_slice(),
-    )?;
+    let (operation, body_program) = ShardMapOperation::from_body(traced);
+    let staged_outputs =
+        context.bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], &[], traced_inputs.as_slice())?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 
@@ -935,7 +950,7 @@ macro_rules! implement_shard_map_invocation_leaf {
         impl<$($parameters)*> ShardMapInvocationLeaf for $value
         where
             $value: Value<Type = ArrayType>,
-            <$value as Value>::DispatchDomain: Context<Type = ArrayType, Operation = XlaOperation>,
+            <$value as Value>::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
             $($bounds)*
         {
             implement_shard_map_invocation_leaf!(@body $value);
@@ -1012,13 +1027,12 @@ macro_rules! implement_shard_map_invocation_leaf {
     };
 }
 
-implement_shard_map_invocation_leaf!(Tracer<C>, [C], [C: ryft_core::StagingContext<Type = ArrayType, Operation = XlaOperation>]);
+implement_shard_map_invocation_leaf!(Tracer<C>, [C], [C: ryft_core::StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>]);
 implement_shard_map_invocation_leaf!(ryft_core::DifferentiationTracer<C>, [C], [C: Context]);
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::contexts::StagingContext;
-    use ryft_core::interpretation::InterpretableOperation;
+    use ryft_core::contexts::{Context, StagingContext};
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
@@ -1028,7 +1042,7 @@ mod tests {
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
-    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTracer};
+    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
 
     use super::ShardMapOperation;
 
@@ -1080,9 +1094,9 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
-        let doubled = builder.add_instruction(AddOperation, vec![known_input, known_input]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![known_input, runtime_input]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![runtime_input, known_input]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, vec![known_input, known_input], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![known_input, runtime_input], Vec::new()).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![runtime_input, known_input], Vec::new()).unwrap()[0];
         FlatTracedShardMap::from_parts(
             shard_map,
             vec![array_type.clone(), array_type.clone()],
@@ -1100,17 +1114,17 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_shard_map_interpret_composes_staging_onto_input_trace() {
+    fn test_traced_shard_map_binds_staging_onto_input_trace() {
         let body = single_input_traced_shard_map_body();
-        let operation = ShardMapOperation::<ShardMapTracer>::new(body);
 
-        // The input tracer already belongs to a trace; `interpret` must compose the shard_map staging onto that same
-        // trace via the input's own context rather than originating a fresh builder.
+        // The input tracer already belongs to a trace; binding the shard_map through that trace's context composes
+        // the staging onto the same builder, attaching the local body as the instruction's `body` region.
         let context = DomainTracingContext::<XlaDomain<'static>>::new();
         let input = context.input(test_array_type());
 
-        let outputs = operation
-            .interpret(&context, std::slice::from_ref(&input))
+        let (operation, body_program) = ShardMapOperation::from_body(body);
+        let outputs = context
+            .bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], &[], std::slice::from_ref(&input))
             .expect("traced shard_map staging should compose onto the input tracer's trace");
 
         assert_eq!(outputs.len(), 1);
@@ -1120,6 +1134,7 @@ mod tests {
         assert_eq!(builder.instructions().len(), 1);
         assert!(matches!(builder.instructions()[0].operation(), XlaOperation::ShardMap(_)));
         assert_eq!(builder.instructions()[0].inputs(), &[input.atom_id().unwrap()]);
+        assert_eq!(builder.instructions()[0].regions().len(), 1);
     }
 
     /// Online partial evaluation of a mixed `shard_map` against a live outer trace: the known half of the local body
@@ -1133,14 +1148,20 @@ mod tests {
         use ryft_core::tracing::TracingContext;
 
         let array_type = test_array_type();
-        let operation = ShardMapOperation::<XlaConstant>::new(mixed_known_unknown_traced_shard_map_body());
+        let (operation, body_program) =
+            ShardMapOperation::<XlaConstant>::from_body(mixed_known_unknown_traced_shard_map_body());
 
-        // Enclosing program staging one `shard_map` over `[a, x]`.
+        // Enclosing program staging one `shard_map` over `[a, x]`, with the local body attached as its region.
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
+        let body_region = builder.import_program(body_program);
         let outputs = builder
-            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![known_input, runtime_input])
+            .add_instruction(
+                XlaOperation::ShardMap(Box::new(operation)),
+                vec![known_input, runtime_input],
+                vec![body_region],
+            )
             .unwrap()
             .to_vec();
         let program = builder
@@ -1162,31 +1183,33 @@ mod tests {
         {
             let outer_builder = outer.builder().borrow();
             assert_eq!(outer_builder.instructions().len(), 1);
-            let XlaOperation::ShardMap(known_side) = outer_builder.instructions()[0].operation() else {
+            let known_instruction = &outer_builder.instructions()[0];
+            let XlaOperation::ShardMap(known_side) = known_instruction.operation() else {
                 panic!("expected the outer program to contain the known-side shard_map");
             };
-            let known_body = known_side.body();
-            assert_eq!(known_body.program().input_ids().len(), 1);
-            assert_eq!(known_body.program().output_ids().len(), 2);
-            assert_eq!(known_body.program().instructions().len(), 1);
-            assert_eq!(known_body.global_output_types().len(), 2);
-            assert_eq!(known_body.shard_map().in_shardings().len(), 1);
-            assert_eq!(known_body.shard_map().out_shardings().len(), 2);
+            let known_body = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().into_program();
+            assert_eq!(known_body.input_ids().len(), 1);
+            assert_eq!(known_body.output_ids().len(), 2);
+            assert_eq!(known_body.instructions().len(), 1);
+            assert_eq!(known_side.global_output_types().len(), 2);
+            assert_eq!(known_side.shard_map().in_shardings().len(), 1);
+            assert_eq!(known_side.shard_map().out_shardings().len(), 2);
         }
 
         // The unknown half stayed behind one residual `shard_map` over the unknown boundary input plus the residual
         // edge, with the shardings threaded per input.
         assert_eq!(evaluation.program().instructions().len(), 1);
-        let XlaOperation::ShardMap(residual_side) = evaluation.program().instructions()[0].operation() else {
+        let residual_instruction = &evaluation.program().instructions()[0];
+        let XlaOperation::ShardMap(residual_side) = residual_instruction.operation() else {
             panic!("expected the residual program to contain the residual shard_map");
         };
-        let residual_body = residual_side.body();
-        assert_eq!(residual_body.program().input_ids().len(), 2);
-        assert_eq!(residual_body.program().instructions().len(), 2);
-        assert_eq!(residual_body.global_input_types().len(), 2);
-        assert_eq!(residual_body.shard_map().in_shardings().len(), 2);
-        assert_eq!(residual_body.shard_map().out_shardings().len(), 2);
-        assert_eq!(residual_body.global_output_types().len(), 2);
+        let residual_body = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().into_program();
+        assert_eq!(residual_body.input_ids().len(), 2);
+        assert_eq!(residual_body.instructions().len(), 2);
+        assert_eq!(residual_side.global_input_types().len(), 2);
+        assert_eq!(residual_side.shard_map().in_shardings().len(), 2);
+        assert_eq!(residual_side.shard_map().out_shardings().len(), 2);
+        assert_eq!(residual_side.global_output_types().len(), 2);
 
         // The boundary descriptors: the unknown enclosing input feeds the residual side, the residual edge is a
         // known feeder naming the known-side call's staged output, and the outputs reassemble in original order.

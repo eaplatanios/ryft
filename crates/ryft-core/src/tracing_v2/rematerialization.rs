@@ -14,10 +14,12 @@
 //! [`RematerializeOperation`] as pure graph rewrites of the linearization's sub-programs:
 //!
 //!   1. **Classification** builds one [`RematerializationCandidate`] per classifiable instruction-produced residual —
-//!      looking through nested-program boundaries via [`ResidualProvenance`], so a policy such as [`DotsSaveable`]
-//!      sees a dot inside a scan body rather than the scan itself — and consults the policy exactly once for each such
-//!      residual, memoizing the returned [`RematerializationDecision`]s. Residuals whose recompute slice would reach a
-//!      non-pure instruction are force-saved in producer-topological order, so effects execute exactly once.
+//!      lazily following each producing operation's
+//!      [`output_region_provenance`](Operation::output_region_provenance) through its attached regions, so a policy
+//!      such as [`DotsSaveable`] sees dots inside scan bodies and condition branches rather than the outer
+//!      higher-order operations — and consults the policy exactly once for each such residual, memoizing the returned
+//!      [`RematerializationDecision`]s. Residuals whose recompute slice would reach a non-pure instruction are
+//!      force-saved in producer-topological order, so effects execute exactly once.
 //!   2. The **forward** program is the linearization primal with a rewritten output boundary: the body outputs, the
 //!      region inputs, and the policy-saved residuals (behind their staged [`ResidualStorage`] store operations for
 //!      stored payloads, e.g. an offloading memory transfer).
@@ -28,44 +30,46 @@
 //!
 //! The built-in policies mirror JAX's `jax.checkpoint_policies` (the name-based members classify residuals by the
 //! [`tag`](crate::operations::tag::Tag::tag) key carried by the producing
-//! [`TagOperation`]), and closure-backed custom policies wrap in [`PolicyFn`]
-//! with full access to the concrete producing operation. Policies are pure classifiers: they never stage operations
-//! or touch program builders, and reusable policies state their operation requirements as derive-generated
-//! variant-projection bounds (e.g., a dot policy requires `for<'a> &'a O: TryInto<&'a DotOperation>`), so
-//! configuring a policy whose operation capability is absent is a compile-time error at the configuration site.
+//! [`TagOperation`]), and closure-backed custom policies wrap in [`PolicyFn`] with full access to every operation that
+//! may have produced the boundary residual. Policies are pure classifiers: they never stage operations or touch
+//! program builders, and reusable policies state their operation requirements as derive-generated variant-projection
+//! bounds (e.g., a dot policy requires `for<'a> &'a O: TryInto<&'a DotOperation>`), so configuring a policy whose
+//! operation capability is absent is a compile-time error at the configuration site.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use thiserror::Error;
 
 use crate::batching::ArrayBatch;
-use crate::batching::BatchingContext;
+use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
-use crate::batching::{BatchableOperation, BatchableProgramOperation};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::DifferentiationDriver;
 use crate::differentiation::DifferentiationDual;
+use crate::differentiation::TranspositionDriver;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
-use crate::effects::Effects;
-use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
+use crate::interpretation::InterpretableOperation;
+use crate::interpretation::InterpretationDriver;
 use crate::macros::{check_count, check_types};
 use crate::operations::Operation;
-use crate::operations::constants::{Constant as ConstantCapability, Zero, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
 use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::payloads::Captured;
-use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, Value};
-use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
-use crate::tracing_v2::operations::custom_derivatives::{
-    CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
+use crate::programs::{
+    Atom, AtomId, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, RegionInterface,
+    Value, ValueId,
 };
+use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
+use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
 use crate::tracing_v2::operations::dot::DotOperation;
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
 use crate::types::{ArrayType, Memory, Type, TypeError, Typed};
@@ -81,56 +85,21 @@ use crate::types::{ArrayType, Memory, Type, TypeError, Typed};
 /// The `prevent_cse` flag is likewise rematerialization-specific. Backends may lower it as an optimization barrier
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
 /// requested memory/computation tradeoff.
-#[derive(Clone, Debug)]
-pub struct RematerializeOperation<V: Value, O> {
-    /// Program computing the primal outputs from the primal inputs.
-    primal: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Program computing `(outputs..., residuals...)` from the primal inputs.
-    forward: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
-    backward: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Program computing one output tangent per primal output from `(residuals..., input_tangents...)`.
-    tangent: Program<V, O, Vec<V>, Vec<V>>,
-
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RematerializeOperation {
     /// Backend lowering hint requesting an optimization barrier around rematerialized backward/tangent outputs.
     prevent_cse: bool,
 }
 
-impl<V: Value, O: Operation<V::Type>> RematerializeOperation<V, O> {
-    /// Creates a rematerialization operation after validating the forward, backward, and tangent program signatures.
-    pub fn new(
-        primal: Program<V, O, Vec<V>, Vec<V>>,
-        forward: Program<V, O, Vec<V>, Vec<V>>,
-        backward: Program<V, O, Vec<V>, Vec<V>>,
-        tangent: Program<V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        let input_types = primal.input_types();
-        let output_types = primal.output_types();
-        check_types!("rematerialize forward input", &input_types, &forward.input_types());
-        let forward_output_types = forward.output_types();
-        if forward_output_types.len() < output_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
-                    output_types.len(),
-                    forward_output_types.len(),
-                ),
-            });
-        }
-        check_types!("rematerialize forward output", &output_types, &forward_output_types[..output_types.len()]);
-        let residual_types = &forward_output_types[output_types.len()..];
-        let expected_backward_input_types: Vec<V::Type> =
-            residual_types.iter().chain(output_types.iter()).cloned().collect();
-        check_types!("rematerialize backward input", &expected_backward_input_types, &backward.input_types(),);
-        check_types!("rematerialize backward output", &input_types, &backward.output_types());
-        let expected_tangent_input_types: Vec<V::Type> =
-            residual_types.iter().chain(input_types.iter()).cloned().collect();
-        check_types!("rematerialize tangent input", &expected_tangent_input_types, &tangent.input_types());
-        check_types!("rematerialize tangent output", &output_types, &tangent.output_types());
-        Ok(Self { primal, forward, backward, tangent, prevent_cse: false })
+impl RematerializeOperation {
+    /// Creates a rematerialization operation. The primal, forward, backward, and tangent [`Program`]s are supplied
+    /// separately as the operation's attached regions (via the `regions` argument of
+    /// [`Context::bind`]) in the region order `["primal", "forward", "backward", "tangent"]`;
+    /// [`Operation::infer_output_types`] validates the forward, backward, and tangent interfaces against the
+    /// primal interface.
+    #[inline]
+    pub fn new() -> Self {
+        Self { prevent_cse: false }
     }
 
     /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
@@ -147,94 +116,98 @@ impl<V: Value, O: Operation<V::Type>> RematerializeOperation<V, O> {
     pub fn prevent_cse(&self) -> bool {
         self.prevent_cse
     }
+}
 
-    /// Returns the primal program.
+impl Default for RematerializeOperation {
     #[inline]
-    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.primal
-    }
-
-    /// Returns the forward (residual-producing) program.
-    #[inline]
-    pub fn forward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.forward
-    }
-
-    /// Returns the backward (cotangent-producing) program.
-    #[inline]
-    pub fn backward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.backward
-    }
-
-    /// Returns the tangent-producing program.
-    #[inline]
-    pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.tangent
-    }
-
-    /// Returns the primal input types.
-    #[inline]
-    pub fn input_types(&self) -> Vec<V::Type> {
-        self.primal.input_types()
-    }
-
-    /// Returns the primal output types.
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.primal.output_types()
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl<V: Value, O> Display for RematerializeOperation<V, O>
-where
-    Self: Operation<V::Type>,
-{
+impl Display for RematerializeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        formatter.write_str("rematerialize")
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for RematerializeOperation<V, O> {
+/// Validates the rematerialization contract over the four attached region interfaces
+/// (`["primal", "forward", "backward", "tangent"]` region order) and returns the primal interface; refer to the
+/// documentation of [`RematerializeOperation::new`] for the contract.
+fn validated_rematerialize_interfaces<'i, T: Type>(
+    region_interfaces: &'i [RegionInterface<T>],
+) -> Result<&'i RegionInterface<T>, TypeError> {
+    if region_interfaces.len() != 4 {
+        return Err(TypeError {
+            message: format!("rematerialize expects 4 attached regions but got {}", region_interfaces.len()),
+        });
+    }
+    let primal_interface = &region_interfaces[0];
+    let forward_interface = &region_interfaces[1];
+    let backward_interface = &region_interfaces[2];
+    let tangent_interface = &region_interfaces[3];
+    let input_types = primal_interface.input_types();
+    let output_types = primal_interface.output_types();
+    check_types!("rematerialize forward input", input_types, forward_interface.input_types());
+    let forward_output_types = forward_interface.output_types();
+    if forward_output_types.len() < output_types.len() {
+        return Err(TypeError {
+            message: format!(
+                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                output_types.len(),
+                forward_output_types.len(),
+            ),
+        });
+    }
+    check_types!("rematerialize forward output", output_types, &forward_output_types[..output_types.len()]);
+    let residual_types = &forward_output_types[output_types.len()..];
+    let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
+    check_types!("rematerialize backward input", &expected_backward_input_types, backward_interface.input_types());
+    check_types!("rematerialize backward output", input_types, backward_interface.output_types());
+    let expected_tangent_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
+    check_types!("rematerialize tangent input", &expected_tangent_input_types, tangent_interface.input_types());
+    check_types!("rematerialize tangent output", output_types, tangent_interface.output_types());
+    Ok(primal_interface)
+}
+
+impl<T: Type> Operation<T> for RematerializeOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "rematerialize"
     }
 
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        check_types!("rematerialize input", &self.input_types(), input_types);
-        Ok(self.output_types())
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        let primal_interface = validated_rematerialize_interfaces(region_interfaces)?;
+        check_types!("rematerialize input", primal_interface.input_types(), input_types);
+        Ok(primal_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        // The forward, backward, and tangent programs replay the primal, so the primal's summary covers them; the
-        // union guards derived programs that stage extra effectful work (none do today).
-        self.primal
-            .effects()
-            .union(self.forward.effects())
-            .union(self.backward.effects())
-            .union(self.tangent.effects())
+    fn region_names(&self) -> &'static [&'static str] {
+        &["primal", "forward", "backward", "tangent"]
     }
 }
 
-impl<Constant, O, V, C> InterpretableOperation<V, C> for RematerializeOperation<Constant, O>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    O: InterpretableProgramOperation<V, C, Constant>,
-{
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        O::interpret_program(context, &self.primal, inputs.to_vec())
+impl<V: Value, C> InterpretableOperation<V, C> for RematerializeOperation {
+    fn interpret(
+        &self,
+        context: &C,
+        driver: &dyn InterpretationDriver<V, C>,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<V: Value, O: Clone + Operation<V::Type>, C: Context<Type = V::Type>> PartiallyEvaluatableOperation<C>
-    for RematerializeOperation<V, O>
-where
-    C::Operation: From<RematerializeOperation<V, O>>,
+impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation where
+    C::Operation: From<RematerializeOperation>
 {
 }
 
@@ -256,12 +229,11 @@ where
 /// Because both spliced programs are straight-line primal-enum operations referencing the staged tracers directly,
 /// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
 /// operand edges structurally — so
-/// this is a leaf rule needing no [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation)
-/// or [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation)
-/// witness, and reverse mode transposes the spliced recompute-and-pushforward operations like any other straight-line
+/// this is a leaf rule needing no nested differentiation or linearization request, and reverse mode transposes the
+/// spliced recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation<C::Constant, C::Operation>
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation
 where
     C::Constant: Clone,
     C::Operation: Clone,
@@ -269,18 +241,24 @@ where
     fn jvp(
         &self,
         context: &C,
+        driver: &dyn DifferentiationDriver<C>,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let output_count = self.output_types().len();
-        check_count!("input", inputs, self.input_types().len(), ProgramError);
+        // The attached regions are `["primal", "forward", "backward", "tangent"]`; the primal interface provides
+        // the boundary types.
+        let primal_region = driver.region(0)?;
+        let forward_region = driver.region(1)?;
+        let tangent_region = driver.region(3)?;
+        let output_count = primal_region.output_types().len();
+        check_count!("input", inputs, primal_region.input_types().len(), ProgramError);
 
-        // Splice the forward program on the dual primals, recovering the primal outputs followed by the forward tail
-        // (region inputs plus policy-saved residuals) that the tangent program consumes.
+        // Splice the forward region on the dual primals, recovering the primal outputs followed by the forward tail
+        // (region inputs plus policy-saved residuals) that the tangent region consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = self.forward().interpret_in_context(context, primal_operands)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "rematerialize forward program produced {} outputs which is fewer than its {output_count} \
+                "rematerialize forward region produced {} outputs which is fewer than its {output_count} \
                  primal output(s)",
                 forward_outputs.len(),
             ))
@@ -289,14 +267,14 @@ where
         let forward_tail = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
 
-        // Splice the tangent program on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
+        // Splice the tangent region on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
         // output.
         let mut tangent_operands = forward_tail;
         // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros.
         for input in inputs {
             tangent_operands.push(input.tangent().clone().materialize(context)?);
         }
-        let tangent_outputs = self.tangent().interpret_in_context(context, tangent_operands)?;
+        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -311,21 +289,20 @@ where
 /// map, so a tangent program never contains it on a linear operand (linearization splices the derived forward and
 /// tangent programs instead) and the rule reports an
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V, O, W, OLinear> TransposableOperation<W, OLinear> for RematerializeOperation<V, O>
+impl<W, OLinear> TransposableOperation<W, OLinear> for RematerializeOperation
 where
-    V: Value,
-    W: Value<Type = V::Type>,
-    O: Operation<V::Type>,
-    OLinear: Operation<V::Type>,
+    W: Value,
+    OLinear: Operation<W::Type>,
 {
     fn transpose(
         &self,
         _context: &mut TracingContext<W, OLinear>,
+        _driver: &dyn TranspositionDriver<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+            message: "operation `rematerialize` has no partition-aware transpose rule".to_string(),
         }
         .into())
     }
@@ -334,7 +311,7 @@ where
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
 /// `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C> for RematerializeOperation<C::Constant, O>
+impl<C, O> BatchableOperation<C> for RematerializeOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
@@ -343,258 +320,26 @@ where
         + Operation<ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
-        + From<RematerializeOperation<C::Constant, O>>
-        + BatchableProgramOperation<C::Constant>,
+        + From<RematerializeOperation>,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
+        driver: &dyn BatchingDriver<C>,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
-            None => Ok(O::from(self.clone())),
-            Some(axis_size) => Ok(O::from(
-                RematerializeOperation::new(
-                    batch_rewrapped_program(&self.primal, axis_size)?,
-                    batch_rewrapped_program(&self.forward, axis_size)?,
-                    batch_rewrapped_program(&self.backward, axis_size)?,
-                    batch_rewrapped_program(&self.tangent, axis_size)?,
-                )?
-                .with_prevent_cse(self.prevent_cse),
+            None => Ok((O::from(*self), driver.regions()?.into_iter().map(|region| region.into_program()).collect())),
+            Some(_) => Ok((
+                O::from(RematerializeOperation::new().with_prevent_cse(self.prevent_cse)),
+                vec![
+                    batch_rewrapped_program(context, driver, 0)?,
+                    batch_rewrapped_program(context, driver, 1)?,
+                    batch_rewrapped_program(context, driver, 2)?,
+                    batch_rewrapped_program(context, driver, 3)?,
+                ],
             )),
         })
-    }
-}
-
-/// Linear operation staged by [`RematerializeOperation`]'s JVP rule.
-///
-/// Unlike [`CustomVjpCallOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpCallOperation),
-/// both directions are executable: the un-transposed form replays the derived tangent program, and the transposed
-/// form replays the derived pullback program. This is what lets rematerialized regions support forward mode while
-/// user-authored [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation)
-/// remains reverse-mode-only.
-#[derive(Clone, Debug)]
-pub struct RematerializeCallOperation<V: Value, O, F: Value<Type = V::Type>> {
-    /// Derived backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
-    backward: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Derived tangent program, mapping `(residuals..., input_tangents...)` to output tangents.
-    tangent: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Captured residual factors consumed by the tangent or backward program.
-    residuals: Vec<F>,
-
-    /// Whether this call has been transposed into its pullback form.
-    transposed: bool,
-
-    /// Backend lowering hint requesting an optimization barrier around the lowered program outputs.
-    prevent_cse: bool,
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O> RematerializeCallOperation<V, O, F> {
-    /// Creates a rematerialization call. Use `transposed = false` for the tangent form and `transposed = true` for
-    /// the pullback form.
-    pub fn new(
-        backward: Program<V, O, Vec<V>, Vec<V>>,
-        tangent: Program<V, O, Vec<V>, Vec<V>>,
-        residuals: Vec<F>,
-        transposed: bool,
-        prevent_cse: bool,
-    ) -> Self {
-        Self { backward, tangent, residuals, transposed, prevent_cse }
-    }
-
-    /// Returns the derived backward program.
-    #[inline]
-    pub fn backward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.backward
-    }
-
-    /// Returns the derived tangent program.
-    #[inline]
-    pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.tangent
-    }
-
-    /// Returns the captured residual factors.
-    #[inline]
-    pub fn residuals(&self) -> &[F] {
-        self.residuals.as_slice()
-    }
-
-    /// Returns whether this call is in its transposed (pullback) form.
-    #[inline]
-    pub fn transposed(&self) -> bool {
-        self.transposed
-    }
-
-    /// Returns whether backends should wrap this call's lowered program outputs in an optimization barrier.
-    #[inline]
-    pub fn prevent_cse(&self) -> bool {
-        self.prevent_cse
-    }
-
-    /// Maps the residual factor payloads with `map_factor`, preserving the captured programs and direction.
-    pub fn map_captures<MappedFactor: Value<Type = V::Type>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<RematerializeCallOperation<V, O, MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-        O: Clone,
-    {
-        Ok(RematerializeCallOperation {
-            backward: self.backward.clone(),
-            tangent: self.tangent.clone(),
-            residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
-            transposed: self.transposed,
-            prevent_cse: self.prevent_cse,
-        })
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O: Operation<V::Type>> RematerializeCallOperation<V, O, F> {
-    /// Returns the cotangent types flowing *into* the backward program (one per primal output).
-    fn cotangent_types(&self) -> Vec<V::Type> {
-        self.backward.input_types().split_off(self.residuals.len())
-    }
-
-    /// Returns the tangent types flowing *into* the tangent program (one per primal input).
-    fn tangent_input_types(&self) -> Vec<V::Type> {
-        self.tangent.input_types().split_off(self.residuals.len())
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O> Display for RematerializeCallOperation<V, O, F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.transposed {
-            formatter.write_str("rematerialize_backward")
-        } else {
-            formatter.write_str("rematerialize_tangent")
-        }
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O: Operation<V::Type>> Operation<V::Type>
-    for RematerializeCallOperation<V, O, F>
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        if self.transposed { "rematerialize_backward" } else { "rematerialize_tangent" }
-    }
-
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        if self.transposed {
-            check_types!("rematerialize backward cotangent", &self.cotangent_types(), input_types);
-            Ok(self.backward.output_types())
-        } else {
-            check_types!("rematerialize tangent", &self.tangent_input_types(), input_types);
-            Ok(self.tangent.output_types())
-        }
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
-        self.backward.effects().union(self.tangent.effects())
-    }
-}
-
-impl<Constant, O, F, V, C> InterpretableOperation<V, C> for RematerializeCallOperation<Constant, O, F>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    F: CustomVjpResidual<V>,
-    O: InterpretableOperation<V, C> + Operation<Constant::Type>,
-    C: ConstantCapability<V, Constant, Captured>,
-    Vec<Constant>: Parameterized<Constant, ParameterStructure: Debug + PartialEq>,
-{
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        let program = if self.transposed { &self.backward } else { &self.tangent };
-        let mut values =
-            self.residuals.iter().map(|residual| residual.residual_value()).collect::<Result<Vec<_>, _>>()?;
-        values.extend(inputs.iter().cloned());
-        program.interpret_with(
-            values,
-            |_, constant| context.constant(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(context, inputs),
-        )
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
-/// [`RematerializeCallOperation`]. The residual operation family `O` is independent of the call's primal operation
-/// family `CallOperation`, because partial evaluation never inlines a nested program here and so never builds a
-/// residual program of its own.
-impl<V, CallOperation, F, C> PartiallyEvaluatableOperation<C> for RematerializeCallOperation<V, CallOperation, F>
-where
-    V: Value,
-    CallOperation: Clone + Operation<V::Type>,
-    F: Value<Type = V::Type>,
-    C: Context<Type = V::Type>,
-    C::Operation: From<RematerializeCallOperation<V, CallOperation, F>>,
-{
-}
-
-/// Transpose rule for [`RematerializeCallOperation`]: stages the flipped-direction form of the call.
-impl<V, O, F, W, OLinear> TransposableOperation<W, OLinear> for RematerializeCallOperation<V, O, F>
-where
-    V: Value,
-    F: Value<Type = V::Type>,
-    W: Value<Type = V::Type>,
-    O: Clone + Operation<V::Type>,
-    OLinear: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<RematerializeCallOperation<V, O, F>>,
-{
-    fn transpose(
-        &self,
-        context: &mut TracingContext<W, OLinear>,
-        _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
-        let cotangent_types = if self.transposed { self.tangent_input_types() } else { self.cotangent_types() };
-        check_count!("output", outputs, cotangent_types.len(), ProgramError);
-        let cotangent_tracers = outputs
-            .iter()
-            .map(|cotangent| cotangent.clone().materialize(context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let call = OLinear::from(RematerializeCallOperation {
-            backward: self.backward.clone(),
-            tangent: self.tangent.clone(),
-            residuals: self.residuals.to_vec(),
-            transposed: !self.transposed,
-            prevent_cse: self.prevent_cse,
-        });
-        let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
-        Ok(outputs.into_iter().map(MaybeZero::Value).collect())
-    }
-}
-
-/// Batching rule for [`RematerializeCallOperation`]: replays the selected tangent or backward program through the
-/// per-operation batching rules with the captured residuals lifted through `context.parent()` (the identity under an
-/// eager parent, a lifted constant under a staging parent) as replicated values.
-impl<C, O, F> BatchableOperation<C> for RematerializeCallOperation<C::Constant, O, F>
-where
-    C: Context<Type = ArrayType>,
-    C::Constant: Value<Type = ArrayType>,
-    F: CustomVjpResidual<C::Constant>,
-    O: Operation<ArrayType> + BatchableOperation<C>,
-{
-    fn batch(
-        &self,
-        context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        let program = if self.transposed { &self.backward } else { &self.tangent };
-        let mut values = self
-            .residuals
-            .iter()
-            .map(|residual| Ok(ArrayBatch::replicated(context.parent().lift(residual.residual_value()?)?)))
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        values.extend(inputs.iter().cloned());
-        program.interpret_with(
-            values,
-            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
-            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-        )
     }
 }
 
@@ -610,12 +355,15 @@ where
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RematerializationError {
     /// A [`RematerializationPolicy`] rejected saving one residual, aborting the whole transformation. The engine
-    /// enriches the policy-supplied [`RematerializationRejection`] with the producing operation's name and the
-    /// rendered logical residual type.
-    #[error("policy rejected saving the residual of type {residual_type} produced by '{operation_name}': {rejection}")]
+    /// enriches the policy-supplied [`RematerializationRejection`] with the possible producing operation names and
+    /// the rendered logical residual type.
+    #[error(
+        "policy rejected saving the residual of type {residual_type} produced by one of {operation_names:?}: \
+         {rejection}"
+    )]
     Rejected {
-        /// Name of the operation that produced the rejected residual.
-        operation_name: String,
+        /// Names of the operations that may have produced the rejected residual, in semantic provenance order.
+        operation_names: Vec<String>,
 
         /// Rendered logical type of the rejected residual.
         residual_type: String,
@@ -632,8 +380,7 @@ pub enum RematerializationError {
         message: String,
     },
 
-    /// An operation reported invalid or unsupported residual provenance (currently, any nested-source cardinality
-    /// other than exactly one, or an invalid nested program output index).
+    /// An operation reported invalid residual provenance, such as an invalid attached-region or region-output index.
     #[error("unsupported residual provenance: {message}")]
     UnsupportedProvenance {
         /// Human-readable description of the unsupported provenance shape.
@@ -666,88 +413,14 @@ impl From<RematerializationError> for ProgramError {
     }
 }
 
-/// Where the value behind one output of an operation is actually produced, for residual classification. Returned by
-/// [`ResidualProvenance::residual_provenance`].
-#[non_exhaustive]
-pub enum ResidualProducers<'a, V: Value, O: Operation<V::Type>> {
-    /// The operation itself is the producer to classify.
-    Leaf,
-
-    /// No instruction producer exists behind this output (for example, it forwards a nested program input or
-    /// constant). Such residuals are never presented to policies and are always recomputed, matching the
-    /// pass-through contract for scan body outputs.
-    Absent,
-
-    /// The value is produced per iteration (or per branch) by zero or more nested program outputs, where
-    /// classification continues. Classification currently supports exactly one nested source; zero sources are
-    /// invalid, while several are reserved for future condition look-through. Either unsupported cardinality produces
-    /// a structured
-    /// [`UnsupportedProvenance`](RematerializationError::UnsupportedProvenance) error.
-    Nested(Vec<NestedResidualSource<'a, V, O>>),
-}
-
-/// One nested program output that residual classification continues from; see [`ResidualProducers::Nested`].
-pub struct NestedResidualSource<'a, V: Value, O: Operation<V::Type>> {
-    /// Nested program owning the producer.
-    program: &'a Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Index into [`Program::output_ids`] selecting the nested output aligned with the outer output being classified.
-    output_index: usize,
-}
-
-impl<'a, V: Value, O: Operation<V::Type>> NestedResidualSource<'a, V, O> {
-    /// Creates a new [`NestedResidualSource`] continuing classification at output `output_index` of `program`.
-    /// Classification validates the index before following it, so a source cannot accidentally pair a program with
-    /// an [`AtomId`] owned by another program.
-    #[inline]
-    pub fn new(program: &'a Program<V, O, Vec<V>, Vec<V>>, output_index: usize) -> Self {
-        Self { program, output_index }
-    }
-}
-
-/// Reports where the values behind an operation's outputs are actually produced, so that residual classification
-/// can look through nested-program boundaries to the instructions whose operations policies should classify.
+/// Describes one operation output that may have produced a rematerialization residual.
 ///
-/// This is the one provenance capability that every rematerializable operation family implements (replacing the
-/// former per-fact inspection traits): ordinary operations report
-/// [`Leaf`](ResidualProducers::Leaf) (the operation itself is the producer), while operations that stack or forward
-/// nested program outputs — canonically `scan`, whose outputs `[final_carries..., stacked...]` align index-wise with
-/// its body outputs `[next_carries..., slices...]` — report the aligned nested output so classification recurses
-/// into the body. Families without nested-program operations (for example, scalar families) implement this with an
-/// unconditional [`Leaf`](ResidualProducers::Leaf), which imposes no scan-related bounds anywhere.
-///
-/// The three built-in operation families implement this trait by hand. A derive opt-in was deliberately not added for
-/// this initial API because provenance is semantic rather than implied by recursive payload structure, and three small
-/// explicit implementations do not justify variant-level derive attributes and their macro surface.
-///
-/// Current look-through is intentionally limited to `scan`. A condition output can have one producer per branch, so
-/// condition look-through requires a multi-source classification rule and is deferred; condition operations therefore
-/// remain leaves today. [`ResidualProducers::Nested`] preserves the multi-source shape for that future extension while
-/// returning [`UnsupportedProvenance`](RematerializationError::UnsupportedProvenance) until its semantics are defined.
-///
-/// Provenance refines *classification only*: the value crossing the rematerialization boundary (and therefore the
-/// candidate's [`residual_type`](RematerializationCandidate::residual_type) that storage applies to) remains the
-/// outer output — for example, the stacked scan output — while the candidate's operation and application types
-/// describe the nested producer. Recomputing such a value still copies the whole outer producing instruction. Finer
-/// recomputation inside nested bodies is deferred because it requires threading policy decisions through the fused
-/// nested-program split entry points.
-pub trait ResidualProvenance<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
-    /// Returns where the value behind output `output_index` of this operation is actually produced.
-    fn residual_provenance(&self, output_index: usize) -> ResidualProducers<'_, V, O>;
-}
-
-/// Policy-facing description of one residual-producing operation output, passed to
-/// [`RematerializationPolicy::classify`].
-///
-/// The candidate exposes the complete concrete producing operation rather than a closed list of attributes selected
-/// by `ryft-core`, so custom policies can inspect backend-specific variants and attributes directly, while the
-/// built-in policies rely on the derive-generated variant projections (borrowed `TryFrom` conversions). When
-/// [`ResidualProvenance`] looks through a nested program (e.g., a scan body), the producing operation and its
-/// application types describe the *nested* producer, while [`residual_type`](Self::residual_type) always describes
-/// the value actually crossing the boundary (e.g., the stacked scan output), which is what storage applies to.
+/// Each producer exposes the complete concrete operation rather than a closed list of attributes selected by
+/// `ryft-core`, so custom policies can inspect backend-specific variants and attributes directly. The application
+/// types belong to this nested producer and may differ from the type of the outer residual boundary.
 #[derive(Debug)]
-pub struct RematerializationCandidate<'a, T: Type, O: Operation<T>> {
-    /// Complete operation that produced the residual (possibly inside a nested program).
+pub struct RematerializationProducer<'a, T: Type, O: Operation<T>> {
+    /// Complete operation that may have produced the residual.
     operation: &'a O,
 
     /// Index of the producing operation output represented by this candidate, local to that producer's own
@@ -759,13 +432,10 @@ pub struct RematerializationCandidate<'a, T: Type, O: Operation<T>> {
 
     /// Abstract result types at the producer's application site.
     output_types: Vec<T>,
-
-    /// Abstract type of the boundary residual itself (the stacked type when looking through a scan).
-    logical_residual_type: T,
 }
 
-impl<'a, T: Type, O: Operation<T>> RematerializationCandidate<'a, T, O> {
-    /// Returns the complete operation that produced the residual.
+impl<'a, T: Type, O: Operation<T>> RematerializationProducer<'a, T, O> {
+    /// Returns the complete operation that may have produced the residual.
     #[inline]
     pub fn operation(&self) -> &'a O {
         self.operation
@@ -789,21 +459,42 @@ impl<'a, T: Type, O: Operation<T>> RematerializationCandidate<'a, T, O> {
     pub fn output_types(&self) -> &[T] {
         self.output_types.as_slice()
     }
+}
 
-    /// Returns the abstract type of the boundary residual itself. When provenance looked through a nested program,
-    /// this is the outer boundary type (e.g., the stacked scan output type) rather than the nested producer's own
-    /// result type, which remains available as `output_types()[output_index()]`.
+/// Policy-facing description of one rematerialization residual, passed to [`RematerializationPolicy::classify`].
+///
+/// A candidate represents the single value crossing the rematerialization boundary and contains every operation
+/// output that may have produced it. Most candidates have one producer. A condition result may have one producer per
+/// branch, in semantic branch order. Policies inspect the complete producer set and return one placement decision
+/// for the boundary value; storage is never applied independently inside individual branches.
+#[derive(Debug)]
+pub struct RematerializationCandidate<'a, T: Type, O: Operation<T>> {
+    /// Operations that may have produced the residual, in stable semantic provenance order.
+    producers: Vec<RematerializationProducer<'a, T, O>>,
+
+    /// Abstract type of the value crossing the rematerialization boundary.
+    residual_type: T,
+}
+
+impl<'a, T: Type, O: Operation<T>> RematerializationCandidate<'a, T, O> {
+    /// Returns the operations that may have produced this residual, in stable semantic provenance order.
     #[inline]
-    pub fn residual_type(&self) -> &T {
-        &self.logical_residual_type
+    pub fn producers(&self) -> &[RematerializationProducer<'a, T, O>] {
+        self.producers.as_slice()
     }
 
-    /// Builds the classification candidate for the residual produced at `residual_atom` of `program` by finding the
-    /// instruction that defines it and following its [`ResidualProvenance`] through nested-program boundaries.
-    /// Returns `None` for residuals that are not produced by an instruction (region inputs, constants, and
-    /// [`Absent`](ResidualProducers::Absent) provenance), which policies never see; such residuals are always
-    /// recomputed. The candidate's `output_index` is recomputed at every nested level relative to the defining
-    /// instruction's own outputs.
+    /// Returns the abstract type of the boundary residual. This may differ from the nested producers' result types;
+    /// for example, a scan body producer may have a scalar result while the outer scan residual is stacked.
+    #[inline]
+    pub fn residual_type(&self) -> &T {
+        &self.residual_type
+    }
+
+    /// Builds the classification candidate for `residual_atom` by recursively following the producing operations'
+    /// [`output_region_provenance`](Operation::output_region_provenance) through `program`'s attached regions.
+    /// Returns `None` when every provenance path ends at a region input or constant, which policies never see and
+    /// which rematerialization always recomputes. Repeated leaf values are deduplicated while preserving their first
+    /// occurrence in semantic provenance order.
     ///
     /// # Parameters
     ///
@@ -817,57 +508,76 @@ impl<'a, T: Type, O: Operation<T>> RematerializationCandidate<'a, T, O> {
     ) -> Result<Option<Self>, RematerializationError>
     where
         V: Value<Type = T>,
-        O: ResidualProvenance<V, O>,
     {
-        let mut program = program;
-        let mut atom = residual_atom;
-        loop {
-            let Some(instruction) =
-                program.instructions().iter().rev().find(|instruction| instruction.outputs().contains(&atom))
-            else {
-                return Ok(None);
-            };
-            // The producer-local output index: the position of the followed atom among the defining instruction's
-            // own outputs, recomputed at every nested level (it is not the outer boundary output index).
-            let output_index = instruction.outputs().iter().position(|output| *output == atom).unwrap();
-            match instruction.operation().residual_provenance(output_index) {
-                ResidualProducers::Leaf => {
-                    let atom_type = |id: &AtomId| program.atoms()[id.index()].r#type().into_owned();
-                    return Ok(Some(Self {
-                        operation: instruction.operation(),
-                        output_index,
-                        input_types: instruction.inputs().iter().map(atom_type).collect(),
-                        output_types: instruction.outputs().iter().map(atom_type).collect(),
-                        logical_residual_type,
-                    }));
-                }
-                ResidualProducers::Absent => return Ok(None),
-                ResidualProducers::Nested(sources) => match sources.as_slice() {
-                    [source] => {
-                        program = source.program;
-                        atom = source.program.output_ids().get(source.output_index).copied().ok_or_else(|| {
-                            RematerializationError::UnsupportedProvenance {
-                                message: format!(
-                                    "nested residual source selected output index {} from a program with {} outputs",
-                                    source.output_index,
-                                    source.program.output_ids().len(),
-                                ),
-                            }
-                        })?;
-                    }
-                    _ => {
-                        return Err(RematerializationError::UnsupportedProvenance {
-                            message: format!(
-                                "operation '{}' reported {} nested residual sources but classification currently \
-                                 supports exactly one",
-                                instruction.operation().name(),
-                                sources.len(),
-                            ),
-                        });
-                    }
-                },
+        let mut producers = Vec::new();
+        let mut producer_values = HashSet::new();
+        Self::resolve_producers(
+            program,
+            ValueId::new(program.entry(), residual_atom),
+            &mut producer_values,
+            &mut producers,
+        )?;
+        Ok((!producers.is_empty()).then_some(Self { producers, residual_type: logical_residual_type }))
+    }
+
+    /// Appends the leaf producers reachable from `value` to `producers` in semantic provenance order.
+    fn resolve_producers<V>(
+        program: &'a Program<V, O, Vec<V>, Vec<V>>,
+        value: ValueId,
+        producer_values: &mut HashSet<ValueId>,
+        producers: &mut Vec<RematerializationProducer<'a, T, O>>,
+    ) -> Result<(), RematerializationError>
+    where
+        V: Value<Type = T>,
+    {
+        let Some(instruction_id) = program.producer(value)? else {
+            return Ok(());
+        };
+        let instruction = program.instruction(instruction_id)?;
+        let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
+        let provenance = instruction.operation().output_region_provenance(output_index);
+        if provenance.is_empty() {
+            if producer_values.insert(value) {
+                let region = program.region(value.region())?;
+                let atom_type = |id: &AtomId| region.atoms()[id.index()].r#type().into_owned();
+                producers.push(RematerializationProducer {
+                    operation: instruction.operation(),
+                    output_index,
+                    input_types: instruction.inputs().iter().map(atom_type).collect(),
+                    output_types: instruction.outputs().iter().map(atom_type).collect(),
+                });
             }
+            return Ok(());
         }
+
+        for origin in provenance {
+            let region_id = instruction.regions().get(origin.region_index).copied().ok_or_else(|| {
+                RematerializationError::UnsupportedProvenance {
+                    message: format!(
+                        "operation '{}' reported provenance into region index {} but the instruction carries {} \
+                         attached regions",
+                        instruction.operation().name(),
+                        origin.region_index,
+                        instruction.regions().len(),
+                    ),
+                }
+            })?;
+            let region = program
+                .region(region_id)
+                .map_err(|error| RematerializationError::UnsupportedProvenance { message: error.to_string() })?;
+            let atom = region.output_ids().get(origin.output_index).copied().ok_or_else(|| {
+                RematerializationError::UnsupportedProvenance {
+                    message: format!(
+                        "operation '{}' reported provenance selecting output {} from a region with {} outputs",
+                        instruction.operation().name(),
+                        origin.output_index,
+                        region.output_ids().len(),
+                    ),
+                }
+            })?;
+            Self::resolve_producers(program, ValueId::new(region_id, atom), producer_values, producers)?;
+        }
+        Ok(())
     }
 }
 
@@ -902,9 +612,9 @@ pub enum RematerializationRejectionKind {
 /// (including through combinators such as [`SaveFromBothPolicies`], via `?`).
 ///
 /// The rejection is deliberately not generic over the type system: the rematerialization engine enriches it with the
-/// producing operation's name and the rendered logical residual type when wrapping it into
-/// [`RematerializationError::Rejected`], which keeps backend-defined
-/// rejection reasons extensible without making the error surface generic.
+/// possible producing operation names and the rendered logical residual type when wrapping it into
+/// [`RematerializationError::Rejected`], which keeps backend-defined rejection reasons extensible without making the
+/// error surface generic.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RematerializationRejection {
     /// Kind of this rejection.
@@ -971,6 +681,11 @@ impl Display for RematerializationRejection {
 /// derivations are cached by input types, and a policy that answered differently across calls would silently disagree
 /// with its cached derivations.
 ///
+/// Each candidate describes one boundary residual and every operation that may have produced it. This collection has
+/// more than one entry for values produced by different condition branches. Built-in predicate policies save when any
+/// possible producer matches; custom policies receive the complete ordered collection and return one decision for the
+/// outer boundary value.
+///
 /// Reversible storage behavior (e.g., offloading a saved residual to pinned host memory) is described by the
 /// associated [`Storage`](Self::Storage) type and returned through
 /// [`SaveWith`](RematerializationDecision::SaveWith); the rematerialization engine stages the store and restore
@@ -982,7 +697,8 @@ pub trait RematerializationPolicy<T: Type, O: Operation<T>> {
     /// [`SaveWith`](RematerializationDecision::SaveWith).
     type Storage: ResidualStorage<T, O>;
 
-    /// Classifies one residual-producing operation output, or rejects the transformation.
+    /// Classifies one boundary residual from all of its possible producing operation outputs, or rejects the
+    /// transformation.
     fn classify(
         &self,
         candidate: &RematerializationCandidate<'_, T, O>,
@@ -1179,10 +895,16 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, ArrayType, O>,
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
-        Ok(match project::<O, DotOperation>(candidate.operation()).is_some() {
-            true => RematerializationDecision::Save,
-            false => RematerializationDecision::Recompute,
-        })
+        Ok(
+            match candidate
+                .producers()
+                .iter()
+                .any(|producer| project::<O, DotOperation>(producer.operation()).is_some())
+            {
+                true => RematerializationDecision::Save,
+                false => RematerializationDecision::Recompute,
+            },
+        )
     }
 }
 
@@ -1204,7 +926,7 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, ArrayType, O>,
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
-        Ok(match is_unbatched_dot(candidate.operation()) {
+        Ok(match candidate.producers().iter().any(|producer| is_unbatched_dot(producer.operation())) {
             true => RematerializationDecision::Save,
             false => RematerializationDecision::Recompute,
         })
@@ -1238,10 +960,15 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, T, O>,
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
-        Ok(match tag_key(candidate.operation()).is_some_and(|name| self.names.iter().any(|n| n == name)) {
-            true => RematerializationDecision::Save,
-            false => RematerializationDecision::Recompute,
-        })
+        Ok(
+            match candidate.producers().iter().any(|producer| {
+                tag_key(producer.operation())
+                    .is_some_and(|name| self.names.iter().any(|configured_name| configured_name == name))
+            }) {
+                true => RematerializationDecision::Save,
+                false => RematerializationDecision::Recompute,
+            },
+        )
     }
 }
 
@@ -1272,10 +999,15 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, T, O>,
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
-        Ok(match tag_key(candidate.operation()).is_some_and(|name| !self.names.iter().any(|n| n == name)) {
-            true => RematerializationDecision::Save,
-            false => RematerializationDecision::Recompute,
-        })
+        Ok(
+            match candidate.producers().iter().any(|producer| {
+                tag_key(producer.operation())
+                    .is_some_and(|name| !self.names.iter().any(|configured_name| configured_name == name))
+            }) {
+                true => RematerializationDecision::Save,
+                false => RematerializationDecision::Recompute,
+            },
+        )
     }
 }
 
@@ -1306,10 +1038,15 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, T, O>,
     ) -> Result<RematerializationDecision<NoStorage>, RematerializationRejection> {
-        Ok(match tag_key(candidate.operation()).is_some_and(|name| self.names.iter().any(|n| n == name)) {
-            true => RematerializationDecision::Recompute,
-            false => RematerializationDecision::Save,
-        })
+        Ok(
+            match candidate.producers().iter().any(|producer| {
+                !tag_key(producer.operation())
+                    .is_some_and(|name| self.names.iter().any(|configured_name| configured_name == name))
+            }) {
+                true => RematerializationDecision::Save,
+                false => RematerializationDecision::Recompute,
+            },
+        )
     }
 }
 
@@ -1412,13 +1149,19 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, ArrayType, O>,
     ) -> Result<RematerializationDecision<MemoryTransferStorage>, RematerializationRejection> {
-        Ok(match tag_key(candidate.operation()) {
-            Some(name) if self.saveable.iter().any(|n| n == name) => RematerializationDecision::Save,
-            Some(name) if self.offloadable.iter().any(|n| n == name) => {
-                RematerializationDecision::SaveWith(MemoryTransferStorage::new(self.destination))
-            }
-            _ => RematerializationDecision::Recompute,
-        })
+        if candidate.producers().iter().any(|producer| {
+            tag_key(producer.operation())
+                .is_some_and(|name| self.saveable.iter().any(|configured_name| configured_name == name))
+        }) {
+            Ok(RematerializationDecision::Save)
+        } else if candidate.producers().iter().any(|producer| {
+            tag_key(producer.operation())
+                .is_some_and(|name| self.offloadable.iter().any(|configured_name| configured_name == name))
+        }) {
+            Ok(RematerializationDecision::SaveWith(MemoryTransferStorage::new(self.destination)))
+        } else {
+            Ok(RematerializationDecision::Recompute)
+        }
     }
 }
 
@@ -1450,7 +1193,7 @@ where
         &self,
         candidate: &RematerializationCandidate<'_, ArrayType, O>,
     ) -> Result<RematerializationDecision<MemoryTransferStorage>, RematerializationRejection> {
-        Ok(match is_unbatched_dot(candidate.operation()) {
+        Ok(match candidate.producers().iter().any(|producer| is_unbatched_dot(producer.operation())) {
             true => RematerializationDecision::SaveWith(MemoryTransferStorage::new(self.destination)),
             false => RematerializationDecision::Recompute,
         })
@@ -1518,7 +1261,7 @@ fn validate_storage_operation<T: Type, O: Operation<T>>(
             message: format!("storage operation '{operation_name}' must be pure but declares effects"),
         });
     }
-    let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type)).map_err(|error| {
+    let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[]).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
             message: format!(
                 "storage operation '{operation_name}' rejected its single input of type {input_type}: {error}",
@@ -1546,7 +1289,7 @@ fn stage_storage_operation<V: Value, O: Operation<V::Type>>(
     let input_type = builder.atoms()[input.index()].r#type().into_owned();
     validate_storage_operation(&operation, &input_type)?;
     let operation_name = operation.name();
-    let outputs = builder.add_instruction(operation, vec![input]).map_err(|error| {
+    let outputs = builder.add_instruction(operation, vec![input], Vec::new()).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
             message: format!("storage operation '{operation_name}' could not be staged: {error}"),
         }
@@ -1600,7 +1343,11 @@ fn residual_slice_is_pure<V: Value, O: Operation<V::Type>>(
             None => {}
             Some(instruction_index) => {
                 let instruction = &primal.instructions()[instruction_index];
-                if !instruction.operation().effects().is_pure() {
+                // Instruction-level effects include the recursively derived effects of attached regions, so an
+                // effect inside a nested body (e.g., a print in a scan body) also forces the save.
+                let effects =
+                    primal.instruction_effects(InstructionId::new(primal.entry(), instruction_index)).unwrap();
+                if !effects.is_pure() {
                     return false;
                 }
                 stack.extend(instruction.inputs().iter().map(|input| input.index()));
@@ -1635,6 +1382,9 @@ struct PrimalSliceResolver<'p, V: Value, O> {
 
     /// Replay-output map from primal atom index to the destination atom produced by its copied instruction.
     replayed: Vec<Option<AtomId>>,
+
+    /// Mapping preserving attached-region sharing across every producer instruction copied from the primal.
+    region_remapping: HashMap<RegionId, RegionId>,
 }
 
 impl<'p, V: Value, O: Clone + Operation<V::Type>> PrimalSliceResolver<'p, V, O> {
@@ -1649,6 +1399,7 @@ impl<'p, V: Value, O: Clone + Operation<V::Type>> PrimalSliceResolver<'p, V, O> 
             instruction_by_output: primal.instruction_by_output(),
             cuts,
             replayed: vec![None; primal.atoms().len()],
+            region_remapping: HashMap::new(),
         }
     }
 
@@ -1702,9 +1453,11 @@ impl<'p, V: Value, O: Clone + Operation<V::Type>> PrimalSliceResolver<'p, V, O> 
         }
         for instruction_index in needed {
             let instruction = &self.primal.instructions()[instruction_index];
-            // The classification pass force-saves residual roots whose slices reach non-pure instructions, so a
-            // recompute slice can never legitimately copy one.
-            if !instruction.operation().effects().is_pure() {
+            // The classification pass force-saves residual roots whose slices reach non-pure instructions
+            // (including effects inside attached regions), so a recompute slice can never legitimately copy one.
+            let effects =
+                self.primal.instruction_effects(InstructionId::new(self.primal.entry(), instruction_index)).unwrap();
+            if !effects.is_pure() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "rematerialization attempted to recompute the non-pure operation '{}'",
                     instruction.operation().name(),
@@ -1712,7 +1465,15 @@ impl<'p, V: Value, O: Clone + Operation<V::Type>> PrimalSliceResolver<'p, V, O> 
             }
             let inputs =
                 instruction.inputs().iter().map(|input| self.leaf(*input, builder)).collect::<Result<Vec<_>, _>>()?;
-            let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+            let regions = instruction
+                .regions()
+                .iter()
+                .map(|region| {
+                    Ok(builder
+                        .import_region_with_remapping(self.primal.region_ref(*region)?, &mut self.region_remapping))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let outputs = builder.add_instruction(instruction.operation().clone(), inputs, regions)?.to_vec();
             for (source_output, destination_output) in instruction.outputs().iter().zip(outputs) {
                 // The replayed sibling of a saved output is recorded here, but `cuts` win at resolution, so
                 // dependencies on the saved output keep resolving to the restored saved input.
@@ -1782,6 +1543,17 @@ where
         source_input_positions[input.index()] = Some(position);
     }
     let mut relocation: Vec<Option<AtomId>> = vec![None; source.atoms().len()];
+    let source_region_ids = source
+        .instructions()
+        .iter()
+        .flat_map(|instruction| instruction.regions().iter().copied())
+        .collect::<Vec<_>>();
+    let source_regions = source_region_ids
+        .iter()
+        .map(|region| source.region_ref(*region))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    let relocated_regions = builder.import_regions(source_regions.as_slice())?;
+    let region_relocation = source_region_ids.into_iter().zip(relocated_regions).collect::<HashMap<_, _>>();
     let lookup = |atom: AtomId,
                   relocation: &mut Vec<Option<AtomId>>,
                   resolver: &mut PrimalSliceResolver<'_, V, O>,
@@ -1807,7 +1579,16 @@ where
             .iter()
             .map(|input| lookup(*input, &mut relocation, &mut resolver, &mut builder))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+        let regions = instruction
+            .regions()
+            .iter()
+            .map(|region| {
+                region_relocation.get(region).copied().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!("region {region} was not imported during relocation"))
+                })
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let outputs = builder.add_instruction(instruction.operation().clone(), inputs, regions)?.to_vec();
         for (source_output, destination_output) in instruction.outputs().iter().zip(outputs) {
             relocation[source_output.index()] = Some(destination_output);
         }
@@ -1878,10 +1659,19 @@ where
 }
 
 /// One [`Rematerialize`] cache entry: the flat input types a derivation was specialized to, the derived
-/// rematerialization operation, and the structure of the body's output tree.
+/// rematerialization operation together with its four region programs (in
+/// `["primal", "forward", "backward", "tangent"]` region order), and the structure of the body's output tree.
 type CachedDerivation<D, OT> = (
     Vec<<D as Domain>::Type>,
-    RematerializeOperation<<D as Domain>::Constant, <D as Domain>::Operation>,
+    RematerializeOperation,
+    Vec<
+        Program<
+            <D as Domain>::Constant,
+            <D as Domain>::Operation,
+            Vec<<D as Domain>::Constant>,
+            Vec<<D as Domain>::Constant>,
+        >,
+    >,
     <OT as Parameterized<DomainTracer<D>>>::ParameterStructure,
 );
 
@@ -1975,8 +1765,7 @@ where
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
     <D as Domain>::Operation: Clone
-        + ResidualProvenance<<D as Domain>::Constant, <D as Domain>::Operation>
-        + From<RematerializeOperation<<D as Domain>::Constant, <D as Domain>::Operation>>
+        + From<RematerializeOperation>
         + From<ZeroOperation<D::Type>>
         + From<AddOperation>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
@@ -1984,6 +1773,7 @@ where
         + DifferentiableOperation<
             PartialEvaluationContext<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
         > + PartiallyEvaluatableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
+    <D as Domain>::Type: DifferentiableType,
     Vec<<D as Domain>::Constant>: Parameterized<<D as Domain>::Constant, ParameterStructure = Vec<Placeholder>>,
 {
     /// Stages this rematerialized function on the provided tracer inputs and returns its outputs, deriving the
@@ -2018,16 +1808,16 @@ where
         let input_types = structured_input_types.parameters().cloned().collect::<Vec<_>>();
 
         // Stage a previously cached derivation when one exists for these input types, without re-tracing anything.
-        let cached = self
-            .cache
-            .borrow()
-            .iter()
-            .find(|(cached_input_types, ..)| *cached_input_types == input_types)
-            .map(|(_, operation, output_structure)| (operation.clone(), output_structure.clone()));
-        if let Some((operation, output_structure)) = cached {
+        let cached =
+            self.cache.borrow().iter().find(|(cached_input_types, ..)| *cached_input_types == input_types).map(
+                |(_, operation, operation_regions, output_structure)| {
+                    (*operation, operation_regions.clone(), output_structure.clone())
+                },
+            );
+        if let Some((operation, operation_regions, output_structure)) = cached {
             let operation = <D as Domain>::Operation::from(operation);
             let context = first.dispatch_domain();
-            let outputs = context.bind(operation, &[], &[], &input_tracers)?;
+            let outputs = context.bind(operation, operation_regions, &[], &input_tracers)?;
             return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
 
@@ -2064,7 +1854,11 @@ where
                 None => RematerializationDecision::Recompute,
                 Some(candidate) => self.policy.classify(&candidate).map_err(|rejection| {
                     ProgramError::from(RematerializationError::Rejected {
-                        operation_name: candidate.operation().name().to_string(),
+                        operation_names: candidate
+                            .producers()
+                            .iter()
+                            .map(|producer| producer.operation().name().to_string())
+                            .collect(),
                         residual_type: candidate.residual_type().to_string(),
                         rejection,
                     })
@@ -2147,11 +1941,17 @@ where
                 }
             }
             let output_structure = vec![Placeholder; output_ids.len()];
+            // The rewritten boundary replaces only the entry region; the attached regions of copied instructions
+            // stay valid because the rest of the arena is carried over verbatim (the entry region's identifier is
+            // assigned last, so the copied instructions' region ids are unchanged).
+            let mut regions = source.regions().to_vec();
+            regions[source.entry().index()] =
+                Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions };
             let forward = Program {
                 input_structure: vec![Placeholder; input_count],
                 output_structure,
-                regions: vec![Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions }],
-                entry: RegionId::new(0),
+                regions,
+                entry: source.entry(),
                 marker: PhantomData,
             };
             (forward.into_simplified()?, saved_types)
@@ -2189,12 +1989,15 @@ where
             saved_indices.as_slice(),
         )?;
 
-        let operation =
-            RematerializeOperation::new(primal, forward, backward, tangent)?.with_prevent_cse(self.prevent_cse);
+        let operation = RematerializeOperation::new().with_prevent_cse(self.prevent_cse);
+        let operation_regions = vec![primal, forward, backward, tangent];
         let output_structure = structured_output_types.parameter_structure();
-        self.cache.borrow_mut().push((input_types, operation.clone(), output_structure.clone()));
+        self.cache
+            .borrow_mut()
+            .push((input_types, operation, operation_regions.clone(), output_structure.clone()));
         let context = first.dispatch_domain();
-        let outputs = context.bind(<D as Domain>::Operation::from(operation), &[], &[], &input_tracers)?;
+        let outputs =
+            context.bind(<D as Domain>::Operation::from(operation), operation_regions, &[], &input_tracers)?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -2210,6 +2013,7 @@ mod tests {
     use crate::backends::scalars::ScalarOperation;
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
+    use crate::contexts::StagingContext;
     use crate::operations::math::{Cos, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -2223,7 +2027,29 @@ mod tests {
 
     impl<P: RematerializationPolicy<ArrayType, ArrayOperation<TestArray>> + Clone + Debug> TestPolicy for P {}
 
-    /// Traces `function.call` over one `input_type` input and returns the staged [`RematerializeOperation`].
+    /// One staged [`RematerializeOperation`] together with its materialized region programs (in
+    /// `["primal", "forward", "backward", "tangent"]` region order), exposing the same accessors the payload-owned
+    /// operation used to so the structural assertions below stay readable.
+    struct StagedRematerialization {
+        regions: Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>,
+    }
+
+    impl StagedRematerialization {
+        fn forward(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+            &self.regions[1]
+        }
+
+        fn backward(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+            &self.regions[2]
+        }
+
+        fn tangent(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+            &self.regions[3]
+        }
+    }
+
+    /// Traces `function.call` over one `input_type` input and returns the staged [`RematerializeOperation`]
+    /// together with its materialized region programs.
     fn staged_operation<B, P>(
         function: &Rematerialize<
             EagerContext<TestArray, ArrayOperation<TestArray>>,
@@ -2233,7 +2059,7 @@ mod tests {
             P,
         >,
         input_type: ArrayType,
-    ) -> RematerializeOperation<TestArray, ArrayOperation<TestArray>>
+    ) -> StagedRematerialization
     where
         B: Fn(
             DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
@@ -2243,10 +2069,14 @@ mod tests {
         let (_, program) =
             EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), input_type).unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a rematerialize call");
-        };
-        (**operation).clone()
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let regions = instruction
+            .regions()
+            .iter()
+            .map(|region| program.region_ref(*region).unwrap().into_program())
+            .collect::<Vec<_>>();
+        StagedRematerialization { regions }
     }
 
     use super::*;
@@ -2328,9 +2158,12 @@ mod tests {
                 .add_instruction(
                     crate::tracing_v2::operations::DotOperation::new(DotDimensionNumbers::inner_product()),
                     vec![row, row],
+                    Vec::new(),
                 )
                 .unwrap()[0];
-            let next = builder.add_instruction(crate::operations::math::MulOperation, vec![carry, dot]).unwrap()[0];
+            let next = builder
+                .add_instruction(crate::operations::math::MulOperation, vec![carry, dot], Vec::new())
+                .unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
                 .unwrap()
@@ -2342,8 +2175,9 @@ mod tests {
         let scan_body = |carry: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
             let context = carry.context().clone();
             let xs = StagingContext::constant(&context, stacked.clone());
-            let scan = ScanOperation::new(body.clone(), 1, 3)?;
-            let outputs = context.stage_operation(ArrayOperation::Scan(Box::new(scan)), &[carry, xs])?;
+            let scan = ScanOperation::new(1, 3);
+            let outputs =
+                context.stage_operation(ArrayOperation::Scan(scan), vec![body.clone()], &[carry, xs])?;
             Ok(outputs.into_iter().next().unwrap())
         };
 
@@ -2376,23 +2210,31 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_outputs_remain_leaf_producers_until_multi_source_look_through_is_supported() {
+    fn test_condition_outputs_expose_all_possible_branch_producers() {
         use crate::operations::control_flow::ConditionOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::operations::dot::DotOperation;
 
         let vector_type = vector_type(2);
-        let branch = || {
+        let branch = |tag_output| {
             let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
             let lhs = builder.add_input(vector_type.clone());
             let rhs = builder.add_input(vector_type.clone());
-            let output = builder
+            let dot = builder
                 .add_instruction(
                     ArrayOperation::Dot(DotOperation::new(DotDimensionNumbers::inner_product())),
                     vec![lhs, rhs],
+                    Vec::new(),
                 )
                 .unwrap()[0];
+            let output = if tag_output {
+                builder
+                    .add_instruction(crate::operations::tag::TagOperation::new("false"), vec![dot], Vec::new())
+                    .unwrap()[0]
+            } else {
+                dot
+            };
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -2401,9 +2243,14 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let lhs = builder.add_input(vector_type.clone());
         let rhs = builder.add_input(vector_type.clone());
-        let condition = ConditionOperation::new(branch(), branch()).unwrap();
+        let condition_regions = vec![branch(false), branch(true)];
+        let condition = ConditionOperation::new();
+        let regions = condition_regions
+            .iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
         let output = builder
-            .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, lhs, rhs])
+            .add_instruction(ArrayOperation::Condition(condition), vec![predicate, lhs, rhs], regions)
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
@@ -2413,10 +2260,178 @@ mod tests {
             RematerializationCandidate::from_program_residual(&program, output, ArrayType::scalar(DataType::F64))
                 .unwrap()
                 .unwrap();
-        assert!(
-            matches!(candidate.operation(), ArrayOperation::Condition(_)),
-            "dot producers inside condition branches remain intentionally opaque until multi-source provenance is supported",
+        assert_eq!(candidate.producers().len(), 2);
+        assert!(matches!(candidate.producers()[0].operation(), ArrayOperation::Dot(_)));
+        assert!(matches!(candidate.producers()[1].operation(), ArrayOperation::Tag(_)));
+        assert_eq!(
+            candidate.producers().iter().map(|producer| producer.output_index()).collect::<Vec<_>>(),
+            vec![0, 0],
         );
+
+        let policy_calls = Rc::new(RefCell::new(0));
+        let recorded_names = Rc::new(RefCell::new(Vec::new()));
+        let recorded_calls = policy_calls.clone();
+        let recorded_producers = recorded_names.clone();
+        let policy =
+            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+                *recorded_calls.borrow_mut() += 1;
+                recorded_producers
+                    .borrow_mut()
+                    .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
+                Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Save)
+            });
+        assert_eq!(policy.classify(&candidate), Ok(RematerializationDecision::Save));
+        assert_eq!(*policy_calls.borrow(), 1, "one boundary residual receives one policy decision");
+        assert_eq!(recorded_names.borrow().as_slice(), &["dot", "tag"]);
+
+        let storage_policy = SaveAndOffloadOnlyTheseNames::new(["false"], ["false"], PINNED_HOST);
+        assert_eq!(
+            storage_policy.classify(&candidate),
+            Ok(RematerializationDecision::Save),
+            "candidate-wide in-place saving takes precedence over offloading",
+        );
+
+        // Reusing one attached region in both condition slots reaches the same program-local value twice. The
+        // resolver retains its first semantic occurrence and does not expose duplicate producers to policies.
+        let mut shared_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let shared_region = shared_builder.import_region(condition_regions[0].entry_region_ref());
+        let shared_predicate = shared_builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let shared_lhs = shared_builder.add_input(vector_type.clone());
+        let shared_rhs = shared_builder.add_input(vector_type.clone());
+        let shared_output = shared_builder
+            .add_instruction(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![shared_predicate, shared_lhs, shared_rhs],
+                vec![shared_region, shared_region],
+            )
+            .unwrap()[0];
+        let shared_program = shared_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![shared_output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let shared_candidate = RematerializationCandidate::from_program_residual(
+            &shared_program,
+            shared_output,
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shared_candidate.producers().len(), 1);
+
+        // A constant-producing branch contributes no instruction producer, while the other branch's dot remains
+        // visible. The boundary is classifiable whenever at least one possible path has an instruction producer.
+        let constant_branch = {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            builder.add_input(vector_type.clone());
+            builder.add_input(vector_type.clone());
+            let output = builder.add_constant(TestArray::scalar(0.0));
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut mixed_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let dot_region = mixed_builder.import_region(condition_regions[0].entry_region_ref());
+        let constant_region = mixed_builder.import_region(constant_branch.entry_region_ref());
+        let mixed_predicate = mixed_builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let mixed_lhs = mixed_builder.add_input(vector_type.clone());
+        let mixed_rhs = mixed_builder.add_input(vector_type);
+        let mixed_output = mixed_builder
+            .add_instruction(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![mixed_predicate, mixed_lhs, mixed_rhs],
+                vec![dot_region, constant_region],
+            )
+            .unwrap()[0];
+        let mixed_program = mixed_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![mixed_output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mixed_candidate = RematerializationCandidate::from_program_residual(
+            &mixed_program,
+            mixed_output,
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mixed_candidate.producers().len(), 1);
+        assert!(matches!(mixed_candidate.producers()[0].operation(), ArrayOperation::Dot(_)));
+    }
+
+    #[test]
+    fn test_dots_saveable_saves_conditional_dot_residuals_for_both_predicates() {
+        use crate::operations::control_flow::ConditionOperation;
+        use crate::operations::math::{CosOperation, MulOperation, SinOperation};
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+
+        /// Builds `x -> (x · x) * trig(x · x)` for one condition branch.
+        fn branch(cosine: bool) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let input = builder.add_input(vector_type(2));
+            let dot = builder
+                .add_instruction(
+                    DotOperation::new(DotDimensionNumbers::inner_product()),
+                    vec![input, input],
+                    Vec::new(),
+                )
+                .unwrap()[0];
+            let trigonometric = if cosine {
+                builder.add_instruction(CosOperation, vec![dot], Vec::new()).unwrap()[0]
+            } else {
+                builder.add_instruction(SinOperation, vec![dot], Vec::new()).unwrap()[0]
+            };
+            let output = builder.add_instruction(MulOperation, vec![dot, trigonometric], Vec::new()).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        }
+
+        /// Derives and executes a rematerialized constant-predicate condition under `policy`.
+        fn check(policy: impl TestPolicy, predicate: bool) -> (usize, f64, Vec<f64>) {
+            let true_branch = branch(false);
+            let false_branch = branch(true);
+            let body = move |input: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                let context = input.dispatch_domain();
+                let predicate =
+                    context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]))?;
+                let mut outputs = context.bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![true_branch.clone(), false_branch.clone()],
+                    &[],
+                    &[predicate, input],
+                )?;
+                Ok(outputs.remove(0))
+            };
+            let function =
+                rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body).with_policy(policy);
+            let forward_output_count = staged_operation(&function, vector_type(2)).forward().output_types().len();
+            let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .value_and_gradient(
+                    |input| function.call(input).unwrap(),
+                    TestArray::new(vector_type(2), vec![0.5, 1.5]),
+                )
+                .unwrap();
+            (forward_output_count, value.values[0], gradient.values)
+        }
+
+        let input = [0.5, 1.5];
+        let dot = input.iter().map(|value| value * value).sum::<f64>();
+        let true_derivative = dot.sin() + dot * dot.cos();
+        let false_derivative = dot.cos() - dot * dot.sin();
+
+        let (true_baseline, true_value, true_gradient) = check(NothingSaveable, true);
+        let (true_saved, _, _) = check(DotsSaveable, true);
+        assert_eq!(true_saved, true_baseline + 1, "the condition residual is one outer boundary value");
+        assert_abs_diff_eq!(true_value, dot * dot.sin(), epsilon = 1e-9);
+        for (index, value) in input.iter().enumerate() {
+            assert_abs_diff_eq!(true_gradient[index], true_derivative * 2.0 * value, epsilon = 1e-9);
+        }
+
+        let (false_baseline, false_value, false_gradient) = check(NothingSaveable, false);
+        let (false_saved, _, _) = check(DotsSaveable, false);
+        assert_eq!(false_saved, false_baseline + 1, "the condition residual is one outer boundary value");
+        assert_abs_diff_eq!(false_value, dot * dot.cos(), epsilon = 1e-9);
+        for (index, value) in input.iter().enumerate() {
+            assert_abs_diff_eq!(false_gradient[index], false_derivative * 2.0 * value, epsilon = 1e-9);
+        }
     }
 
     #[test]
@@ -2567,18 +2582,18 @@ mod tests {
         let (_, program) =
             EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), scalar_type).unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a rematerialize call");
-        };
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let primal = program.region_ref(instruction.regions()[0]).unwrap();
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
         assert!(
-            operation
-                .primal()
+            primal
                 .instructions()
                 .iter()
                 .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomVjp(_))),
             "the rematerialized primal program should preserve the custom_vjp call",
         );
-        assert_eq!(operation.forward().output_types().len(), 3);
+        assert_eq!(forward.output_types().len(), 3);
     }
 
     #[test]
@@ -2631,7 +2646,6 @@ mod tests {
     /// `.tasks/plan_partition_policies.md`).
     #[test]
     fn test_rematerialize_remains_opaque_to_partial_evaluation_under_staging() {
-        use crate::contexts::StagingContext;
         use crate::partial::PartialEvaluationInput;
         use crate::tracing::TracingContext;
 
@@ -2707,13 +2721,13 @@ mod tests {
         let (_, program) =
             EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| outer.call(x), vector_type(2)).unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("nested rematerialization should stage a rematerialize call");
-        };
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let primal = program.region_ref(instruction.regions()[0]).unwrap();
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
         // The outer primal program preserves the inner rematerialized call instead of inlining its body.
         assert!(
-            operation
-                .primal()
+            primal
                 .instructions()
                 .iter()
                 .any(|instruction| matches!(instruction.operation(), ArrayOperation::Rematerialize(_))),
@@ -2721,7 +2735,7 @@ mod tests {
         );
         // `NothingSaveable` everywhere: the outer forward program outputs only the body output plus the region
         // input, storing no interior residuals — in particular nothing produced inside the inner region.
-        assert_eq!(operation.forward().output_types().len(), 2);
+        assert_eq!(forward.output_types().len(), 2);
     }
 
     #[test]
@@ -2794,10 +2808,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(program.instructions().len(), 1, "unexpected batched program shape for policy {policy:?}");
-            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-                panic!("batching a rematerialized call should re-wrap the staged rematerialize call");
-            };
-            let forward_output_types = operation.forward().output_types();
+            let instruction = &program.instructions()[0];
+            assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+            let forward = program.region_ref(instruction.regions()[1]).unwrap();
+            let forward_output_types = forward.output_types();
             assert_eq!(
                 forward_output_types.len(),
                 expected_forward_outputs,
@@ -2977,11 +2991,11 @@ mod tests {
         let dot_or_named =
             PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
                 assert!(candidate.residual_type().shape().dimensions().is_empty());
-                let saves = match candidate.operation() {
+                let saves = candidate.producers().iter().any(|producer| match producer.operation() {
                     ArrayOperation::Dot(_) => true,
                     ArrayOperation::Tag(operation) => operation.key() == "s",
                     _ => false,
-                };
+                });
                 Ok::<_, RematerializationRejection>(match saves {
                     true => RematerializationDecision::<NoStorage>::Save,
                     false => RematerializationDecision::Recompute,
@@ -2989,10 +3003,12 @@ mod tests {
             });
         let cosines_only =
             PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                Ok::<_, RematerializationRejection>(match candidate.operation().name() == "cos" {
-                    true => RematerializationDecision::<NoStorage>::Save,
-                    false => RematerializationDecision::Recompute,
-                })
+                Ok::<_, RematerializationRejection>(
+                    match candidate.producers().iter().any(|producer| producer.operation().name() == "cos") {
+                        true => RematerializationDecision::<NoStorage>::Save,
+                        false => RematerializationDecision::Recompute,
+                    },
+                )
             });
         let expected_gradient = {
             // f(x) = u sin(u) with u = x · x, so ∇f(x) = (sin(u) + u cos(u)) · 2x.
@@ -3192,10 +3208,10 @@ mod tests {
             .with_policy(OffloadDotsWithNoBatchDims::new(PINNED_HOST));
         let (_, program) =
             EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a rematerialize call");
-        };
-        let forward_output_types = operation.forward().output_types();
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
+        let forward_output_types = forward.output_types();
         assert_eq!(forward_output_types.len(), 3);
         assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
 
@@ -3224,7 +3240,7 @@ mod tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let policy =
             PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                let key = match candidate.operation() {
+                let key = match candidate.producers()[0].operation() {
                     ArrayOperation::Tag(operation) => Some(operation.key()),
                     _ => None,
                 };
@@ -3238,10 +3254,10 @@ mod tests {
             rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body).with_policy(policy);
         let (_, program) =
             EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a rematerialize call");
-        };
-        let forward_output_types = operation.forward().output_types();
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
+        let forward_output_types = forward.output_types();
         assert_eq!(forward_output_types.len(), 4);
         // The two saved residuals are `u` (saved in place, device-resident) and `v` (offloaded to pinned host);
         // their relative order follows the linearization's residual enumeration, which the test does not pin.
@@ -3283,10 +3299,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("batching a rematerialized call should re-wrap the staged rematerialize call");
-        };
-        let forward_output_types = operation.forward().output_types();
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
+        let forward_output_types = forward.output_types();
         assert_eq!(forward_output_types.len(), 3);
         let saved_type = &forward_output_types[2];
         assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Size::Static(2)));
@@ -3326,9 +3342,13 @@ mod tests {
         // rejection with the producing operation's name and the rendered logical residual type.
         let policy =
             PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                match candidate.operation() {
-                    ArrayOperation::Cos(_) => Err(RematerializationRejection::other("cosines are not allowed here")),
-                    _ => Ok(RematerializationDecision::<NoStorage>::Recompute),
+                match candidate
+                    .producers()
+                    .iter()
+                    .any(|producer| matches!(producer.operation(), ArrayOperation::Cos(_)))
+                {
+                    true => Err(RematerializationRejection::other("cosines are not allowed here")),
+                    false => Ok(RematerializationDecision::<NoStorage>::Recompute),
                 }
             });
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
@@ -3339,7 +3359,7 @@ mod tests {
         assert_eq!(
             rematerialization,
             Some(RematerializationError::Rejected {
-                operation_name: "cos".to_string(),
+                operation_names: vec!["cos".to_string()],
                 residual_type: "f64[]".to_string(),
                 rejection: RematerializationRejection::other("cosines are not allowed here"),
             }),
@@ -3366,9 +3386,12 @@ mod tests {
                 .add_instruction(
                     crate::tracing_v2::operations::DotOperation::new(DotDimensionNumbers::inner_product()),
                     vec![row, row],
+                    Vec::new(),
                 )
                 .unwrap()[0];
-            let next = builder.add_instruction(crate::operations::math::MulOperation, vec![carry, dot]).unwrap()[0];
+            let next = builder
+                .add_instruction(crate::operations::math::MulOperation, vec![carry, dot], Vec::new())
+                .unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -3378,9 +3401,12 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(scalar_type);
         let rows = builder.add_input(stacked_rows_type);
-        let scan = ScanOperation::new(body, 1, 3).unwrap();
-        let scan_outputs =
-            builder.add_instruction(ArrayOperation::Scan(Box::new(scan)), vec![carry, rows]).unwrap().to_vec();
+        let scan = ScanOperation::new(1, 3);
+        let body_region = builder.import_region(body.entry_region_ref());
+        let scan_outputs = builder
+            .add_instruction(ArrayOperation::Scan(scan), vec![carry, rows], vec![body_region])
+            .unwrap()
+            .to_vec();
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(scan_outputs.clone(), vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -3389,10 +3415,12 @@ mod tests {
             RematerializationCandidate::from_program_residual(&program, scan_outputs[1], stacked_type.clone())
                 .unwrap()
                 .unwrap();
-        assert!(matches!(candidate.operation(), ArrayOperation::Dot(_)));
-        assert_eq!(candidate.output_index(), 0, "the output index must be local to the nested dot instruction");
+        assert_eq!(candidate.producers().len(), 1);
+        let producer = &candidate.producers()[0];
+        assert!(matches!(producer.operation(), ArrayOperation::Dot(_)));
+        assert_eq!(producer.output_index(), 0, "the output index must be local to the nested dot instruction");
         assert_eq!(candidate.residual_type(), &stacked_type, "the residual type must stay the outer stacked type");
-        assert_eq!(candidate.output_types()[candidate.output_index()], ArrayType::scalar(DataType::F64));
+        assert_eq!(producer.output_types()[producer.output_index()], ArrayType::scalar(DataType::F64));
     }
 
     #[test]
@@ -3418,7 +3446,11 @@ mod tests {
                 "split"
             }
 
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone(), input_types[0].clone()])
             }
@@ -3428,7 +3460,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<TestArray, SplitOperation>::new();
         let input = builder.add_input(scalar_type.clone());
-        let split_outputs = builder.add_instruction(SplitOperation, vec![input]).unwrap().to_vec();
+        let split_outputs = builder.add_instruction(SplitOperation, vec![input], Vec::new()).unwrap().to_vec();
         let primal = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(split_outputs.clone(), vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -3457,230 +3489,155 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_source_residual_provenance_is_rejected() {
+    fn test_invalid_output_region_provenance_is_rejected() {
         use std::fmt::Display;
 
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
-        /// Test-only operation family whose single operation reports *two* nested residual sources, which
-        /// classification does not support.
-        #[derive(Clone, Debug)]
-        struct PairProvenanceOperation {
-            /// Nested program providing both reported sources.
-            body: Program<TestArray, PairProvenanceOperation, Vec<TestArray>, Vec<TestArray>>,
+        /// Test-only operation that returns caller-selected output-region provenance.
+        #[derive(Copy, Clone, Debug)]
+        struct InvalidOriginOperation {
+            provenance: crate::operations::OutputRegionProvenance,
         }
 
-        impl Display for PairProvenanceOperation {
+        impl Display for InvalidOriginOperation {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.render(formatter, 0)
             }
         }
 
-        impl Operation<ArrayType> for PairProvenanceOperation {
+        impl Operation<ArrayType> for InvalidOriginOperation {
             fn name(&self) -> &'static str {
-                "pair_provenance"
+                "invalid_origin"
             }
 
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
             }
-        }
 
-        impl ResidualProvenance<TestArray, PairProvenanceOperation> for PairProvenanceOperation {
-            fn residual_provenance(
-                &self,
-                _output_index: usize,
-            ) -> ResidualProducers<'_, TestArray, PairProvenanceOperation> {
-                ResidualProducers::Nested(vec![
-                    NestedResidualSource::new(&self.body, 0),
-                    NestedResidualSource::new(&self.body, 0),
-                ])
+            fn region_names(&self) -> &'static [&'static str] {
+                &["body"]
+            }
+
+            fn output_region_provenance(&self, _output_index: usize) -> Vec<crate::operations::OutputRegionProvenance> {
+                vec![self.provenance]
             }
         }
 
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut body_builder = ProgramBuilder::<TestArray, PairProvenanceOperation>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
         let body_input = body_builder.add_input(scalar_type.clone());
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::<TestArray, PairProvenanceOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
-        let output = builder.add_instruction(PairProvenanceOperation { body }, vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                InvalidOriginOperation {
+                    provenance: crate::operations::OutputRegionProvenance { region_index: 0, output_index: 1 },
+                },
+                vec![input],
+                vec![body_region],
+            )
+            .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let error = RematerializationCandidate::from_program_residual(&program, output, scalar_type).unwrap_err();
         assert!(matches!(
-            error,
-            RematerializationError::UnsupportedProvenance { message }
-                if message.contains("2 nested residual sources"),
+            RematerializationCandidate::from_program_residual(&program, output, scalar_type.clone()),
+            Err(RematerializationError::UnsupportedProvenance { message })
+                if message.contains("selecting output 1"),
         ));
-    }
 
-    #[test]
-    fn test_zero_source_residual_provenance_is_rejected() {
-        use std::fmt::Display;
-
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
-        /// Test-only operation reporting no nested source for an instruction-produced output.
-        #[derive(Clone, Debug)]
-        struct ZeroSourceProvenanceOperation;
-
-        impl Display for ZeroSourceProvenanceOperation {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.render(formatter, 0)
-            }
-        }
-
-        impl Operation<ArrayType> for ZeroSourceProvenanceOperation {
-            fn name(&self) -> &'static str {
-                "zero_source_provenance"
-            }
-
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone()])
-            }
-        }
-
-        impl ResidualProvenance<TestArray, ZeroSourceProvenanceOperation> for ZeroSourceProvenanceOperation {
-            fn residual_provenance(
-                &self,
-                _output_index: usize,
-            ) -> ResidualProducers<'_, TestArray, ZeroSourceProvenanceOperation> {
-                ResidualProducers::Nested(Vec::new())
-            }
-        }
-
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, ZeroSourceProvenanceOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
-        let output = builder.add_instruction(ZeroSourceProvenanceOperation, vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                InvalidOriginOperation {
+                    provenance: crate::operations::OutputRegionProvenance { region_index: 1, output_index: 0 },
+                },
+                vec![input],
+                vec![body_region],
+            )
+            .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-
         assert!(matches!(
             RematerializationCandidate::from_program_residual(&program, output, scalar_type),
             Err(RematerializationError::UnsupportedProvenance { message })
-                if message.contains("0 nested residual sources"),
+                if message.contains("region index 1"),
         ));
     }
 
     #[test]
-    fn test_invalid_nested_output_index_is_rejected() {
+    fn test_origin_landing_on_a_region_input_skips_classification() {
         use std::fmt::Display;
 
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
-        /// Test-only operation that reports an out-of-range output of its nested program.
+        /// Test-only operation whose provenance forwards its attached region's pass-through output, so the walk
+        /// lands on a region input rather than a producing instruction.
         #[derive(Clone, Debug)]
-        struct InvalidProvenanceOperation {
-            /// Nested program whose only output has index zero.
-            body: Program<TestArray, InvalidProvenanceOperation, Vec<TestArray>, Vec<TestArray>>,
-        }
+        struct PassThroughOriginOperation;
 
-        impl Display for InvalidProvenanceOperation {
+        impl Display for PassThroughOriginOperation {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.render(formatter, 0)
             }
         }
 
-        impl Operation<ArrayType> for InvalidProvenanceOperation {
+        impl Operation<ArrayType> for PassThroughOriginOperation {
             fn name(&self) -> &'static str {
-                "invalid_provenance"
+                "pass_through_origin"
             }
 
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
             }
-        }
 
-        impl ResidualProvenance<TestArray, InvalidProvenanceOperation> for InvalidProvenanceOperation {
-            fn residual_provenance(
-                &self,
-                _output_index: usize,
-            ) -> ResidualProducers<'_, TestArray, InvalidProvenanceOperation> {
-                ResidualProducers::Nested(vec![NestedResidualSource::new(&self.body, 1)])
+            fn region_names(&self) -> &'static [&'static str] {
+                &["body"]
+            }
+
+            fn output_region_provenance(&self, output_index: usize) -> Vec<crate::operations::OutputRegionProvenance> {
+                vec![crate::operations::OutputRegionProvenance { region_index: 0, output_index }]
             }
         }
 
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut body_builder = ProgramBuilder::<TestArray, InvalidProvenanceOperation>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, PassThroughOriginOperation>::new();
         let body_input = body_builder.add_input(scalar_type.clone());
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::<TestArray, InvalidProvenanceOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, PassThroughOriginOperation>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
-        let output = builder.add_instruction(InvalidProvenanceOperation { body }, vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        assert!(matches!(
-            RematerializationCandidate::from_program_residual(&program, output, scalar_type),
-            Err(RematerializationError::UnsupportedProvenance { message })
-                if message == "nested residual source selected output index 1 from a program with 1 outputs",
-        ));
-    }
-
-    #[test]
-    fn test_absent_residual_provenance_skips_classification() {
-        use std::fmt::Display;
-
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
-        /// Test-only operation whose output represents a forwarded nested input or constant.
-        #[derive(Clone, Debug)]
-        struct AbsentProvenanceOperation;
-
-        impl Display for AbsentProvenanceOperation {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.render(formatter, 0)
-            }
-        }
-
-        impl Operation<ArrayType> for AbsentProvenanceOperation {
-            fn name(&self) -> &'static str {
-                "absent_provenance"
-            }
-
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone()])
-            }
-        }
-
-        impl ResidualProvenance<TestArray, AbsentProvenanceOperation> for AbsentProvenanceOperation {
-            fn residual_provenance(
-                &self,
-                _output_index: usize,
-            ) -> ResidualProducers<'_, TestArray, AbsentProvenanceOperation> {
-                ResidualProducers::Absent
-            }
-        }
-
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, AbsentProvenanceOperation>::new();
-        let input = builder.add_input(scalar_type.clone());
-        let output = builder.add_instruction(AbsentProvenanceOperation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(PassThroughOriginOperation, vec![input], vec![body_region]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         assert!(
             RematerializationCandidate::from_program_residual(&program, output, scalar_type).unwrap().is_none(),
-            "absent provenance must not produce a policy candidate",
+            "an origin landing on a region input must not produce a policy candidate",
         );
     }
 
@@ -3722,7 +3679,11 @@ mod tests {
                 }
             }
 
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
                 if matches!(self, Self::RejectsInput) {
                     return Err(TypeError { message: "unsupported storage input".to_string() });
                 }
@@ -3881,7 +3842,9 @@ mod tests {
         let recorded = names.clone();
         let policy =
             PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                recorded.borrow_mut().push(candidate.operation().name().to_string());
+                recorded
+                    .borrow_mut()
+                    .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
                 Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Recompute)
             });
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
@@ -3915,6 +3878,7 @@ mod tests {
                 .add_instruction(
                     crate::operations::compare::CompareOperation::new(ComparisonDirection::LessThan),
                     vec![state, bound],
+                    Vec::new(),
                 )
                 .unwrap()[0];
             builder.build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -3923,8 +3887,9 @@ mod tests {
         let body = {
             let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
             let state = builder.add_input(scalar_type.clone());
-            let doubled =
-                builder.add_instruction(crate::operations::math::MulOperation, vec![state, state]).unwrap()[0];
+            let doubled = builder
+                .add_instruction(crate::operations::math::MulOperation, vec![state, state], Vec::new())
+                .unwrap()[0];
             builder.build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
@@ -3932,7 +3897,9 @@ mod tests {
         let recorded = names.clone();
         let policy =
             PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                recorded.borrow_mut().push(candidate.operation().name().to_string());
+                recorded
+                    .borrow_mut()
+                    .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
                 Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Recompute)
             });
         let remat_condition = condition.clone();
@@ -3940,9 +3907,12 @@ mod tests {
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
             move |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                 let context = x.context().clone();
-                let operation =
-                    WhileOperation::new(remat_condition.clone(), remat_body.clone())?.with_iteration_bound(3)?;
-                let outputs = context.stage_operation(ArrayOperation::While(Box::new(operation)), &[x])?;
+                let operation = WhileOperation::new().with_iteration_bound(3)?;
+                let outputs = context.stage_operation(
+                    ArrayOperation::While(operation),
+                    vec![remat_condition.clone(), remat_body.clone()],
+                    &[x],
+                )?;
                 Ok(outputs.into_iter().next().unwrap())
             },
         )
@@ -3956,9 +3926,10 @@ mod tests {
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    let operation =
-                        WhileOperation::new(condition.clone(), body.clone()).unwrap().with_iteration_bound(3).unwrap();
-                    let outputs = context.bind(ArrayOperation::While(Box::new(operation)), &[], &[], &[x]).unwrap();
+                    let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
+                    let outputs = context
+                        .bind(ArrayOperation::While(operation), vec![condition.clone(), body.clone()], &[], &[x])
+                        .unwrap();
                     outputs.into_iter().next().unwrap()
                 },
                 TestArray::scalar(1.1),
@@ -3971,13 +3942,13 @@ mod tests {
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
-        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a rematerialize call");
-        };
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
+        let forward = program.region_ref(instruction.regions()[1]).unwrap();
         // Pinned boundary behavior: a bounded while keeps its residual stacks internal to the staged loop, so no
         // while-produced residuals cross the rematerialization boundary and the policy is never consulted for them.
         // The forward program stores only the body output and the region input.
         assert!(names.borrow().is_empty(), "bounded-while loops contribute no residual candidates");
-        assert_eq!(operation.forward().output_types().len(), 2);
+        assert_eq!(forward.output_types().len(), 2);
     }
 }

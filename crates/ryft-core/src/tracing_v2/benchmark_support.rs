@@ -36,7 +36,7 @@ fn summarize_tracing_program<
 >(
     program: &Program<V, O, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
-    summarize_program(program, |_| Ok(Vec::new()))
+    summarize_program(program)
 }
 
 /// Builds one tracing benchmark record from a staged program.

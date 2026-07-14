@@ -11,7 +11,7 @@ use crate::operations::constants::{
     ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{
-    ConditionOperation, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
+    ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation, WhilePredicate,
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
@@ -36,9 +36,7 @@ use crate::tracing_v2::operations::custom_derivatives::{
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
 use crate::tracing_v2::operations::{DotOperation, Reduce};
-use crate::tracing_v2::rematerialization::{
-    NestedResidualSource, RematerializeOperation, ResidualProducers, ResidualProvenance,
-};
+use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::ArrayType;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -111,43 +109,11 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Collective(CollectiveOperation),
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
-    Condition(Box<ConditionOperation<V, Self>>),
-    While(Box<WhileOperation<V, Self>>),
-    Scan(Box<ScanOperation<V, Self>>),
-    CustomJvp(Box<CustomJvpOperation<V, Self>>),
-    CustomVjp(Box<CustomVjpOperation<V, Self>>),
-    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
-    Rematerialize(Box<RematerializeOperation<V, Self>>),
-}
-
-/// Residual provenance for [`ArrayOperation`]: `scan` outputs `[final_carries..., stacked...]` align index-wise with
-/// the body outputs `[next_carries..., slices...]`, so a stacked residual is produced per iteration by the body
-/// instruction defining the same-index body output; every other operation is its own producer.
-impl<V> ResidualProvenance<V, ArrayOperation<V>> for ArrayOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    fn residual_provenance(&self, output_index: usize) -> ResidualProducers<'_, V, ArrayOperation<V>> {
-        match self {
-            Self::Scan(operation) => {
-                let body = operation.body();
-                ResidualProducers::Nested(vec![NestedResidualSource::new(body, output_index)])
-            }
-            _ => ResidualProducers::Leaf,
-        }
-    }
-}
-
-// TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeWhile<V, ArrayOperation<V>> for ArrayOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, V, ArrayOperation<V>>> {
-        match self {
-            Self::While(operation) => operation.as_while(),
-            _ => None,
-        }
-    }
+    Condition(ConditionOperation<V>),
+    While(WhileOperation),
+    Scan(ScanOperation<V>),
+    CustomJvp(CustomJvpOperation),
+    CustomVjp(CustomVjpOperation),
+    CustomVjpTangent(CustomVjpTangentOperation),
+    Rematerialize(RematerializeOperation),
 }

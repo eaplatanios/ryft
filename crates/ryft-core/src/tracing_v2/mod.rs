@@ -40,10 +40,10 @@ pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::transpose_primal_scan;
 pub use operations::{ArrayOperation, RecomputeOperation};
 pub use rematerialization::{
-    DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage,
-    NestedResidualSource, NoStorage, NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate,
-    RematerializationDecision, RematerializationError, RematerializationPolicy, RematerializationRejection,
-    RematerializationRejectionKind, Rematerialize, RematerializeCallOperation, RematerializeOperation,
-    ResidualProducers, ResidualProvenance, ResidualStorage, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, rematerialize,
+    DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
+    NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,
+    RematerializationError, RematerializationPolicy, RematerializationProducer, RematerializationRejection,
+    RematerializationRejectionKind, Rematerialize, RematerializeOperation, ResidualStorage,
+    SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies,
+    SaveOnlyTheseNames, rematerialize,
 };

@@ -30,7 +30,7 @@ fn bind_single_output<'o, P: Into<XlaOperation>>(
     inputs: &[Array<'o>],
 ) -> Result<Array<'o>, ProgramError> {
     let domain = inputs.first().unwrap().execution_domain();
-    let mut outputs = domain.bind(operation, &[], &[], inputs)?;
+    let mut outputs = domain.bind(operation, Vec::new(), &[], inputs)?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }

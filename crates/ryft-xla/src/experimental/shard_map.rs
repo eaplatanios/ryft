@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
 #[cfg(test)]
@@ -216,17 +216,37 @@ impl From<ShardMapError> for ShardMapTraceError {
 /// Default static tracer alias used by public XLA tracing helpers.
 pub(crate) type ShardMapTracer = XlaTracer<'static>;
 
-/// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API.
-fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
-    atoms: Vec<Atom<XlaConstant>>,
-    input_ids: Vec<AtomId>,
+/// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API, retyping the
+/// source program's input/output parameter structures while preserving its atoms, instructions, and attached
+/// instruction regions. The rebuilt program exposes the provided `output_ids` (in the source program's atom-id
+/// space), which lets callers project the output boundary while copying everything else verbatim.
+fn rebuild_xla_program_with_builder<Input, Output, SourceInput, SourceOutput>(
+    source: &XlaProgram<SourceInput, SourceOutput>,
     output_ids: Vec<AtomId>,
-    instructions: Vec<Instruction<XlaOperation>>,
     input_structure: Input::ParameterStructure,
     output_structure: Output::ParameterStructure,
-) -> Result<XlaProgram<Input, Output>, ProgramError> {
+) -> Result<XlaProgram<Input, Output>, ProgramError>
+where
+    Input: Parameterized<XlaConstant>,
+    Output: Parameterized<XlaConstant>,
+    SourceInput: Parameterized<XlaConstant>,
+    SourceOutput: Parameterized<XlaConstant>,
+{
+    let atoms = source.atoms().to_vec();
+    let input_ids = source.input_ids().to_vec();
+    let instructions = source.instructions().to_vec();
     let mut builder = XlaProgramBuilder::new();
     let mut atom_id_mapping = vec![None; atoms.len()];
+    let source_region_ids = instructions
+        .iter()
+        .flat_map(|instruction| instruction.regions().iter().copied())
+        .collect::<Vec<_>>();
+    let source_regions = source_region_ids
+        .iter()
+        .map(|region| source.region_ref(*region))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    let imported_regions = builder.import_regions(source_regions.as_slice())?;
+    let region_id_mapping = source_region_ids.into_iter().zip(imported_regions).collect::<HashMap<_, _>>();
 
     for input_id in input_ids {
         let input_atom = atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
@@ -268,12 +288,17 @@ fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: P
             .copied()
             .map(|output| remap_atom_id(atom_id_mapping.as_slice(), output))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_instruction_unchecked(Instruction::new(
-            instruction.operation().clone(),
-            inputs,
-            outputs,
-            Vec::new(),
-        ));
+        // Re-attach the instruction's regions through the batch import above so shared descendants stay shared.
+        let regions = instruction
+            .regions()
+            .iter()
+            .map(|region| {
+                region_id_mapping.get(region).copied().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!("region {region} was not imported during rebuilding"))
+                })
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        builder.add_instruction_unchecked(Instruction::new(instruction.operation().clone(), inputs, outputs, regions));
     }
 
     let output_ids = output_ids
@@ -314,6 +339,24 @@ where
     let live_atoms = live_atoms.atoms();
     let mut builder = XlaProgramBuilder::new();
     let mut atom_id_mapping = vec![None; program.atoms().len()];
+    let source_region_ids = program
+        .instructions()
+        .iter()
+        .filter(|instruction| {
+            let has_dead_output =
+                instruction.outputs().iter().any(|output| !live_atoms.get(output.index()).copied().unwrap_or(false));
+            let has_live_output =
+                instruction.outputs().iter().any(|output| live_atoms.get(output.index()).copied().unwrap_or(false));
+            !matches!(instruction.operation(), XlaOperation::ShardMap(_) if has_dead_output && has_live_output)
+        })
+        .flat_map(|instruction| instruction.regions().iter().copied())
+        .collect::<Vec<_>>();
+    let source_regions = source_region_ids
+        .iter()
+        .map(|region| program.region_ref(*region))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    let imported_regions = builder.import_regions(source_regions.as_slice())?;
+    let region_id_mapping = source_region_ids.into_iter().zip(imported_regions).collect::<HashMap<_, _>>();
 
     for input_id in program.input_ids().iter().copied() {
         let Atom::Variable(input_type) = &program.atoms()[input_id.index()] else {
@@ -343,17 +386,41 @@ where
             .map(|output| live_atoms.get(output.index()).copied().unwrap_or(false))
             .collect::<Vec<_>>();
         // Project a `shard_map` body only when some outputs are live and some are dead. A fully dead `shard_map` is left
-        // intact for the subsequent `simplified` to drop wholesale, and a fully live one is copied verbatim.
+        // intact for the subsequent `simplified` to drop wholesale, and a fully live one is copied verbatim. Every
+        // other instruction re-attaches its regions through one batch import, preserving source sharing.
         let has_dead_output = live_outputs.iter().any(|&live| !live);
         let has_live_output = live_outputs.iter().any(|&live| live);
-        let operation = match instruction.operation() {
+        let (operation, region_ids) = match instruction.operation() {
             XlaOperation::ShardMap(shard_map_op) if has_dead_output && has_live_output => {
-                let projected = shard_map_op.body().with_live_outputs(live_outputs.as_slice())?;
-                XlaOperation::ShardMap(Box::new(ShardMapOperation::new(projected)))
+                let body_program = program.region_ref(instruction.regions()[0])?.into_program();
+                let body = FlatTracedShardMap::from_parts(
+                    shard_map_op.shard_map().clone(),
+                    shard_map_op.global_input_types().to_vec(),
+                    body_program.input_types(),
+                    shard_map_op.global_output_types().to_vec(),
+                    body_program.output_types(),
+                    body_program,
+                );
+                let projected = body.with_live_outputs(live_outputs.as_slice())?;
+                let (projected_operation, projected_body) = ShardMapOperation::from_body(projected);
+                (XlaOperation::ShardMap(Box::new(projected_operation)), vec![builder.import_program(projected_body)])
             }
-            operation => operation.clone(),
+            operation => {
+                let region_ids = instruction
+                    .regions()
+                    .iter()
+                    .map(|region| {
+                        region_id_mapping.get(region).copied().ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "region {region} was not imported during shard-map pruning",
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                (operation.clone(), region_ids)
+            }
         };
-        let new_outputs = builder.add_instruction(operation, inputs)?.to_vec();
+        let new_outputs = builder.add_instruction(operation, inputs, region_ids)?.to_vec();
         let mut next_new_output = new_outputs.into_iter();
         for (output, live) in instruction.outputs().iter().copied().zip(live_outputs) {
             if live {
@@ -493,7 +560,7 @@ where
         }
         let context = input.context().clone();
         Ok(context
-            .stage_operation(make_operation(sharding), &[&input])?
+            .stage_operation(make_operation(sharding), Vec::new(), &[&input])?
             .into_iter()
             .next()
             .expect("a sharding-control operation produces one output per input leaf"))
@@ -1114,10 +1181,15 @@ impl FlatTracedShardMap {
         Self::new(shard_map, global_input_types, local_input_types, global_output_types, local_output_types, program)
     }
 
-    /// Returns the manual SPMD metadata carried by this erased shard-map body.
+    /// Splits this erased body into the boundary metadata consumed by
+    /// [`ShardMapOperation`](crate::experimental::operations::shard_map::ShardMapOperation) — the manual SPMD
+    /// metadata plus the global boundary types — and the local body program that rides as the operation's attached
+    /// `body` region. The local boundary types are dropped: the region program is authoritative for them.
     #[inline]
-    pub(crate) fn shard_map(&self) -> &ShardMap {
-        &self.shard_map
+    pub(crate) fn into_operation_parts(
+        self,
+    ) -> (ShardMap, Vec<ArrayType>, Vec<ArrayType>, XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>) {
+        (self.shard_map, self.global_input_types, self.global_output_types, self.program)
     }
 
     /// Returns the global input types corresponding to the erased body inputs.
@@ -1165,10 +1237,8 @@ impl FlatTracedShardMap {
         let input_count = traced.program.input_ids().len();
         let output_count = traced.program.output_ids().len();
         let program = rebuild_xla_program_with_builder(
-            traced.program.atoms().to_vec(),
-            traced.program.input_ids().to_vec(),
+            &traced.program,
             traced.program.output_ids().to_vec(),
-            traced.program.instructions().to_vec(),
             vec![Placeholder; input_count],
             vec![Placeholder; output_count],
         )
@@ -1181,37 +1251,6 @@ impl FlatTracedShardMap {
             local_output_types,
             program,
         )
-    }
-
-    /// Returns a copy of this erased shard-map body whose global output types are replaced by `global_output_types`,
-    /// keeping the manual SPMD metadata, local types, and program unchanged.
-    ///
-    /// Forward-mode differentiation uses this to align a tangent body's global output boundary with the staged
-    /// primal `shard_map`'s adapted output types (see `adapt_traced_shard_map_output_type`), so that the two
-    /// `shard_map`s present matching output signatures. Only the global output array types carried at the boundary
-    /// change; the per-instance output shardings rendered into the `sdy.manual_computation` attributes are unaffected.
-    ///
-    /// # Parameters
-    ///
-    ///   - `global_output_types`: New global output types, one per existing body output.
-    pub(crate) fn with_global_output_types(
-        &self,
-        global_output_types: Vec<ArrayType>,
-    ) -> Result<Self, ShardMapTraceError> {
-        if global_output_types.len() != self.global_output_types.len() {
-            return Err(ShardMapTraceError::OutputTypeCountMismatch {
-                expected: self.global_output_types.len(),
-                actual: global_output_types.len(),
-            });
-        }
-        Ok(Self::from_parts(
-            self.shard_map.clone(),
-            self.global_input_types.clone(),
-            self.local_input_types.clone(),
-            global_output_types,
-            self.local_output_types.clone(),
-            self.program.clone(),
-        ))
     }
 
     /// Returns a copy of this erased shard-map body restricted to the outputs selected by `live_outputs`, dropping the
@@ -1245,11 +1284,9 @@ impl FlatTracedShardMap {
             .filter_map(|(output_id, live)| live.then_some(output_id))
             .collect::<Vec<_>>();
         let live_output_count = live_output_ids.len();
-        let program = rebuild_xla_program_with_builder::<Vec<XlaConstant>, Vec<XlaConstant>>(
-            self.program.atoms().to_vec(),
-            self.program.input_ids().to_vec(),
+        let program = rebuild_xla_program_with_builder::<Vec<XlaConstant>, Vec<XlaConstant>, _, _>(
+            &self.program,
             live_output_ids,
-            self.program.instructions().to_vec(),
             vec![Placeholder; self.program.input_ids().len()],
             vec![Placeholder; live_output_count],
         )?
@@ -1284,18 +1321,6 @@ impl FlatTracedShardMap {
             retain(&self.global_output_types),
             retain(&self.local_output_types),
             program,
-        ))
-    }
-
-    /// Returns a copy of this erased shard-map body with dead staged work removed.
-    pub(crate) fn simplified(&self) -> Result<Self, ShardMapTraceError> {
-        Ok(Self::from_parts(
-            self.shard_map.clone(),
-            self.global_input_types.clone(),
-            self.local_input_types.clone(),
-            self.global_output_types.clone(),
-            self.local_output_types.clone(),
-            self.program.simplified()?,
         ))
     }
 }
@@ -3606,6 +3631,7 @@ mod tests {
                                     .add_instruction(
                                         CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
                                         vec![input],
+                                        Vec::new(),
                                     )
                                     .unwrap()[0];
                                 builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -3615,14 +3641,17 @@ mod tests {
                                 let input = builder.add_input(local_type);
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
-                            let condition = ConditionOperation::new(psum_branch, identity_branch).unwrap();
                             let predicate = local_x
                                 .compare(&local_x, ComparisonDirection::Equal)
                                 .unwrap()
                                 .reduce(&[0], ReductionKind::Any);
                             let context = local_x.context().clone();
                             let mut outputs = context
-                                .stage_operation(XlaOperation::Condition(Box::new(condition)), &[predicate, local_x])
+                                .stage_operation(
+                                    XlaOperation::Condition(ConditionOperation::new()),
+                                    vec![psum_branch, identity_branch],
+                                    &[predicate, local_x],
+                                )
                                 .unwrap();
                             outputs.remove(0)
                         },

@@ -7,7 +7,7 @@ use crate::differentiation::DifferentiationError;
 use crate::operations::Operation;
 use crate::operations::math::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
-use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
+use crate::programs::{Atom, AtomId, Program, ProgramError, RegionRef, Value};
 use crate::types::Type;
 
 /// Error type returned by the IR benchmark tooling.
@@ -423,16 +423,16 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
     }
 }
 
-/// Summarizes one staged program and its immediate nested regions.
+/// Summarizes one [`Program`], including every attached nested region: each region-carrying instruction contributes
+/// one nested-region summary per attached region (recursively), labeled `"{operation}.{region_name}"` per the
+/// operation's declared [`region_names`](Operation::region_names) (or the slot index when the operation declares
+/// fewer names than attached regions).
 ///
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
-///     staged op.
-pub fn summarize_program<T, V, Input, Output, O, F>(
+pub fn summarize_program<T, V, Input, Output, O>(
     program: &Program<V, O, Input, Output>,
-    nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     T: Type,
@@ -440,7 +440,16 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Operation<T>,
-    F: Fn(&O) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
+{
+    summarize_region(program.entry_region_ref())
+}
+
+/// Summarizes one borrowed region and its reachable nested regions.
+fn summarize_region<T, V, O>(program: RegionRef<'_, V, O>) -> Result<IrBenchmarkSummary, BenchmarkError>
+where
+    T: Type,
+    V: Value<Type = T>,
+    O: Operation<T>,
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();
@@ -467,7 +476,14 @@ where
             depth_by_atom[output.index()] = input_depth + 1;
         }
 
-        nested_regions.extend(nested_regions_for_op(instruction.operation())?);
+        let region_names = instruction.operation().region_names();
+        for (slot, region) in instruction.regions().iter().copied().enumerate() {
+            let label = match region_names.get(slot) {
+                Some(name) => format!("{}.{name}", instruction.operation().name()),
+                None => format!("{}.{slot}", instruction.operation().name()),
+            };
+            nested_regions.push(nested_region(label, summarize_region(program.region_ref(region)?)?));
+        }
     }
 
     let nested_region_count = nested_regions.len()
@@ -496,7 +512,7 @@ where
 ///
 ///   - `label`: Stable nested-region label.
 ///   - `summary`: Child program summary.
-pub fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
+pub fn nested_region(label: impl Into<String>, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
     IrNestedRegionSummary::new(
         label,
         summary.input_leaf_count,
@@ -541,7 +557,7 @@ mod tests {
             )
             .unwrap();
 
-        let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
+        let summary = summarize_program(&compiled).unwrap();
         assert_eq!(
             summary,
             IrBenchmarkSummary {

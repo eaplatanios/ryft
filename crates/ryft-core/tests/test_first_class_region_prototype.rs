@@ -4,21 +4,20 @@
 //! migration, that the post-migration design is solver-sound and borrow-sound:
 //!
 //!   1. An operation enum whose higher-order variant carries NO nested program (regions are instruction
-//!      attachments) compiles with ordinary direct per-variant bounds — no `*ProgramOperation` witness, no
-//!      recursive-variant where-clause filtering — for interpretation, partial evaluation, batching, fused JVP,
+//!      attachments) compiles with ordinary direct per-variant bounds and no recursive-variant where-clause filtering
+//!      for interpretation, partial evaluation, batching, fused JVP,
 //!      split linearization, and transposition, including the fresh-context driver stacks that diverge today
 //!      (`BatchingContext<TracingContext<..>>`, `DifferentiationContext<PartialEvaluationContext<TracingContext<..>>>`).
-//!   2. Region access is a driver-passed, call-scoped, sealed argument (`*Regions<'_, ..>` below): public methods,
-//!      private fields, crate-private construction. Rules never see a recursive bound; the driver constructs the
-//!      nested-work callback where the family bound is already established. Interpretation's context parameter `C`
-//!      stays deliberately unbounded.
+//!   2. Region access is a separate, mandatory, call-scoped driver argument. Rules never see a recursive bound; the
+//!      driver constructs the nested-work callback where the family bound is already established. Interpretation's
+//!      context parameter `C` stays deliberately unbounded.
 //!   3. Immutable instruction/region views coexist with recursive driver work and with a `&mut` destination
 //!      context (transposition) without cloning programs.
 //!   4. The region-carrying `Context::bind` protocol covers freshly authored regional
 //!      operations in eager and staging contexts, delegating to `bind` when attachment-free.
 //!   5. Builder imports copy the complete reachable closure with sharing preserved, and callee imports intern by
 //!      live `Rc` identity.
-//!   6. Lazy residual-origin resolution (`ResultOriginRule`) recovers producers through region-attached
+//!   6. Lazy residual-origin resolution (`OutputRegionProvenance`) recovers producers through region-attached
 //!      instructions with first-occurrence deduplication, empty origins for inputs/constants, and errors for
 //!      malformed rules.
 //!
@@ -32,9 +31,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Everything inside `model` plays the role of `ryft-core` internals; the `#[test]` functions at the bottom play
-/// the role of downstream user code. Sealing is expressed with module privacy: the `*Regions` types have private
-/// fields and no public constructors, so tests (and, in production, users) can call their methods but can never
-/// construct or forge them.
+/// the role of downstream user code. Concrete drivers remain module-private, while operation rules depend only on
+/// the public driver contracts.
 mod model {
     use super::*;
 
@@ -93,16 +91,31 @@ mod model {
         pub entry: RegionId,
     }
 
+    /// Borrowed view of one region in a [`Program`].
+    pub struct RegionRef<'a, C, O> {
+        /// Program that owns the region arena.
+        program: &'a Program<C, O>,
+
+        /// Identifier of the viewed region in `program`.
+        id: RegionId,
+    }
+
     impl<C: Clone, O: Clone> Program<C, O> {
         pub fn entry_region(&self) -> &Region<C, O> {
             &self.regions[self.entry.0]
         }
 
-        /// Materializes one region (and its reachable closure) as a standalone program, so drivers can recurse
-        /// into attachments with the same whole-program machinery.
-        pub fn region_as_program(&self, region: RegionId) -> Program<C, O> {
+        /// Returns a borrowed view of `region`.
+        pub fn region_ref(&self, region: RegionId) -> RegionRef<'_, C, O> {
+            RegionRef { program: self, id: region }
+        }
+    }
+
+    impl<C: Clone, O: Clone> RegionRef<'_, C, O> {
+        /// Materializes this region and its reachable closure as a standalone program.
+        pub fn into_program(self) -> Program<C, O> {
             let mut builder = ProgramBuilder::new();
-            let entry = builder.add_region_closure(self, region, &mut HashMap::new());
+            let entry = builder.add_region_closure(self.program, self.id, &mut HashMap::new());
             builder.build(entry)
         }
     }
@@ -219,12 +232,12 @@ mod model {
         }
 
         /// Imports a whole program as an owned lexical subtree (never interned: two imports = two subtrees).
-        pub fn add_region(&mut self, source: &Program<C, O>) -> RegionId {
+        pub fn import_region(&mut self, source: &Program<C, O>) -> RegionId {
             self.add_region_closure(source, source.entry, &mut HashMap::new())
         }
 
         /// Imports a program as a shareable callee root, interning by live `Rc` identity within this builder.
-        pub fn add_callee(&mut self, source: &Rc<Program<C, O>>) -> RegionId {
+        pub fn intern_callee(&mut self, source: &Rc<Program<C, O>>) -> RegionId {
             let key = Rc::as_ptr(source) as *const ();
             if let Some(id) = self.interned_callees.get(&key) {
                 return *id;
@@ -241,21 +254,21 @@ mod model {
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Operations: non-recursive payloads, origin rules.
+    // Operations: non-recursive payloads and region provenance.
     // ------------------------------------------------------------------------------------------------------------
 
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum ResultOriginRule {
-        Opaque,
-        Transparent(Vec<(usize, usize)>),
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct OutputRegionProvenance {
+        pub region_index: usize,
+        pub output_index: usize,
     }
 
     pub trait Operation: Clone + 'static {
         fn name(&self) -> &'static str;
         fn output_count(&self) -> usize;
-        fn result_origin_rule(&self, result_index: usize) -> ResultOriginRule {
-            let _ = result_index;
-            ResultOriginRule::Opaque
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            let _ = output_index;
+            Vec::new()
         }
     }
 
@@ -267,7 +280,7 @@ mod model {
     }
 
     /// The higher-order stand-in. CRUCIALLY it owns no program and does not mention the operation enum: two
-    /// lexical region slots (`true`, `false`) live on the instruction. Payload is metadata only.
+    /// lexical regions (`true`, `false`) live on the instruction. Payload is metadata only.
     #[derive(Copy, Clone, Debug, PartialEq)]
     pub struct Cond;
 
@@ -297,8 +310,11 @@ mod model {
         fn output_count(&self) -> usize {
             1
         }
-        fn result_origin_rule(&self, result_index: usize) -> ResultOriginRule {
-            ResultOriginRule::Transparent(vec![(0, result_index), (1, result_index)])
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            vec![
+                OutputRegionProvenance { region_index: 0, output_index },
+                OutputRegionProvenance { region_index: 1, output_index },
+            ]
         }
     }
 
@@ -315,10 +331,10 @@ mod model {
                 Op::Cond(operation) => operation.output_count(),
             }
         }
-        fn result_origin_rule(&self, result_index: usize) -> ResultOriginRule {
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
             match self {
-                Op::Prim(operation) => operation.result_origin_rule(result_index),
-                Op::Cond(operation) => operation.result_origin_rule(result_index),
+                Op::Prim(operation) => operation.output_region_provenance(output_index),
+                Op::Cond(operation) => operation.output_region_provenance(output_index),
             }
         }
     }
@@ -382,14 +398,10 @@ mod model {
             callees: &[Rc<Program<Stored, Op>>],
             inputs: &[f64],
         ) -> R<Vec<f64>> {
-            // Eager contexts interpret freshly authored nested computations through the detached access path;
-            // region-free operations receive empty access.
-            if regions.is_empty() && callees.is_empty() {
-                operation.interpret(self, InterpretRegions::empty(), inputs)
-            } else {
-                let detached = DetachedInterpret { context: self, regions, callees };
-                operation.interpret(self, InterpretRegions { nested: Some(&detached) }, inputs)
-            }
+            // Eager contexts interpret freshly authored nested computations through the detached access path. The
+            // same empty detached driver serves region-free applications, whose rules simply do not invoke it.
+            let detached = DetachedInterpret { context: self, regions, callees };
+            operation.interpret(self, &detached, inputs)
         }
     }
 
@@ -432,43 +444,20 @@ mod model {
         ) -> R<Vec<usize>> {
             // Staging contexts add the nested computations to the destination program and attach their ids. Owned
             // regions import through the copying policy and callees through the interning policy, but the resulting
-            // instruction carries one slot-ordered region list (owned slots first, callee slots after).
+            // instruction carries one ordered region list (owned regions first, callee regions after).
             let mut program = self.program.borrow_mut();
-            let mut attached = regions.iter().map(|region| program.add_region(region)).collect::<Vec<_>>();
-            attached.extend(callees.iter().map(|callee| program.add_callee(callee)));
+            let mut attached = regions.iter().map(|region| program.import_region(region)).collect::<Vec<_>>();
+            attached.extend(callees.iter().map(|callee| program.intern_callee(callee)));
             let count = operation.output_count();
             Ok(self.builder.borrow_mut().add_instruction(operation, inputs.to_vec(), count, attached))
         }
     }
     // ------------------------------------------------------------------------------------------------------------
-    // Sealed call-scoped region access (invariant 3): public types, private fields, model-private construction and
-    // model-private nested-work traits. Rules can call methods; they can never construct, implement, or forge one.
+    // Call-scoped region drivers (invariant 3): public contracts and model-private concrete implementations.
     // ------------------------------------------------------------------------------------------------------------
 
-    trait NestedInterpret<V> {
-        fn slot_count(&self) -> usize;
-        fn interpret_slot(&self, slot: usize, inputs: Vec<V>) -> R<Vec<V>>;
-    }
-
-    pub struct InterpretRegions<'a, V> {
-        nested: Option<&'a dyn NestedInterpret<V>>,
-    }
-
-    impl<'a, V> InterpretRegions<'a, V> {
-        fn empty() -> Self {
-            Self { nested: None }
-        }
-
-        pub fn slot_count(&self) -> usize {
-            self.nested.map_or(0, |nested| nested.slot_count())
-        }
-
-        pub fn interpret_slot(&self, slot: usize, inputs: Vec<V>) -> R<Vec<V>> {
-            match self.nested {
-                Some(nested) => nested.interpret_slot(slot, inputs),
-                None => Err("operation has no attached regions".to_string()),
-            }
-        }
+    pub trait InterpretationDriver<V> {
+        fn interpret_region(&self, index: usize, inputs: Vec<V>) -> R<Vec<V>>;
     }
 
     /// Detached access to freshly authored nested computations, used by [`EagerContext::bind`].
@@ -478,19 +467,21 @@ mod model {
         callees: &'a [Rc<Program<Stored, Op>>],
     }
 
-    impl NestedInterpret<f64> for DetachedInterpret<'_> {
-        fn slot_count(&self) -> usize {
-            self.regions.len() + self.callees.len()
-        }
-
-        fn interpret_slot(&self, slot: usize, inputs: Vec<f64>) -> R<Vec<f64>> {
-            let program =
-                if slot < self.regions.len() { &self.regions[slot] } else { &*self.callees[slot - self.regions.len()] };
+    impl InterpretationDriver<f64> for DetachedInterpret<'_> {
+        fn interpret_region(&self, index: usize, inputs: Vec<f64>) -> R<Vec<f64>> {
+            let program = if let Some(region) = self.regions.get(index) {
+                region
+            } else {
+                self.callees
+                    .get(index - self.regions.len())
+                    .map(Rc::as_ref)
+                    .ok_or_else(|| "operation has no attached regions".to_string())?
+            };
             program.interpret_in_context(self.context, &|constant| self.context.lift(constant), inputs)
         }
     }
 
-    /// Replay access: resolves the active instruction's region slots against the source arena and recurses through
+    /// Replay access: resolves the active instruction's regions against the source arena and recurses through
     /// the driver. Constructed only by [`Program::interpret_in_context`], where the family bound already holds.
     struct ReplayInterpret<'a, C, V, Ctx, O> {
         program: &'a Program<C, O>,
@@ -499,30 +490,26 @@ mod model {
         lift: &'a dyn Fn(&C) -> R<V>,
     }
 
-    impl<C: Clone, V: Clone, Ctx, O> NestedInterpret<V> for ReplayInterpret<'_, C, V, Ctx, O>
+    impl<C: Clone, V: Clone, Ctx, O> InterpretationDriver<V> for ReplayInterpret<'_, C, V, Ctx, O>
     where
         O: InterpretableOperation<V, Ctx>,
     {
-        fn slot_count(&self) -> usize {
-            self.instruction.regions.len()
-        }
-
-        fn interpret_slot(&self, slot: usize, inputs: Vec<V>) -> R<Vec<V>> {
-            let region = self.instruction.regions[slot];
+        fn interpret_region(&self, index: usize, inputs: Vec<V>) -> R<Vec<V>> {
+            let region = self.instruction.regions[index];
             self.program.interpret_region_in_context(region, self.context, self.lift, inputs)
         }
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Interpretation: single `interpret` method, deliberately UNBOUNDED `C`, direct per-variant bounds, no witness.
+    // Interpretation: single `interpret` method, deliberately unbounded `C`, and direct per-variant bounds.
     // ------------------------------------------------------------------------------------------------------------
 
     pub trait InterpretableOperation<V, C>: Operation {
-        fn interpret(&self, context: &C, regions: InterpretRegions<'_, V>, inputs: &[V]) -> R<Vec<V>>;
+        fn interpret(&self, context: &C, driver: &dyn InterpretationDriver<V>, inputs: &[V]) -> R<Vec<V>>;
     }
 
     impl<C> InterpretableOperation<f64, C> for Prim {
-        fn interpret(&self, _context: &C, _regions: InterpretRegions<'_, f64>, inputs: &[f64]) -> R<Vec<f64>> {
+        fn interpret(&self, _context: &C, _driver: &dyn InterpretationDriver<f64>, inputs: &[f64]) -> R<Vec<f64>> {
             match self {
                 Prim::Add => Ok(vec![inputs[0] + inputs[1]]),
                 Prim::Mul => Ok(vec![inputs[0] * inputs[1]]),
@@ -531,24 +518,23 @@ mod model {
     }
 
     impl<C> InterpretableOperation<f64, C> for Cond {
-        fn interpret(&self, _context: &C, regions: InterpretRegions<'_, f64>, inputs: &[f64]) -> R<Vec<f64>> {
-            // Predicate first, branch operands after; nonzero selects the `true` slot.
-            let slot = if inputs[0] != 0.0 { 0 } else { 1 };
-            regions.interpret_slot(slot, inputs[1..].to_vec())
+        fn interpret(&self, _context: &C, driver: &dyn InterpretationDriver<f64>, inputs: &[f64]) -> R<Vec<f64>> {
+            // Predicate first, branch operands after; nonzero selects the `true` region.
+            let index = if inputs[0] != 0.0 { 0 } else { 1 };
+            driver.interpret_region(index, inputs[1..].to_vec())
         }
     }
 
-    /// The enum dispatch that today requires witness filtering: here the per-variant bounds are DIRECT and finite
-    /// because no variant payload mentions `Op`.
+    /// The enum dispatch uses direct, finite per-variant bounds because no variant payload mentions `Op`.
     impl<V, C> InterpretableOperation<V, C> for Op
     where
         Prim: InterpretableOperation<V, C>,
         Cond: InterpretableOperation<V, C>,
     {
-        fn interpret(&self, context: &C, regions: InterpretRegions<'_, V>, inputs: &[V]) -> R<Vec<V>> {
+        fn interpret(&self, context: &C, driver: &dyn InterpretationDriver<V>, inputs: &[V]) -> R<Vec<V>> {
             match self {
-                Op::Prim(operation) => operation.interpret(context, regions, inputs),
-                Op::Cond(operation) => operation.interpret(context, regions, inputs),
+                Op::Prim(operation) => operation.interpret(context, driver, inputs),
+                Op::Cond(operation) => operation.interpret(context, driver, inputs),
             }
         }
     }
@@ -593,8 +579,7 @@ mod model {
                     .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayInterpret { program: self, instruction, context, lift };
-                let outputs =
-                    instruction.operation.interpret(context, InterpretRegions { nested: Some(&replay) }, &operands)?;
+                let outputs = instruction.operation.interpret(context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -608,8 +593,7 @@ mod model {
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Partial evaluation: fixed known-side context `C` (the property that makes today's PE witness blanket-able),
-    // single method, sealed access, no witness.
+    // Partial evaluation: fixed known-side context `C`, one semantic method, and direct driver access.
     // ------------------------------------------------------------------------------------------------------------
 
     #[derive(Clone, Debug)]
@@ -627,28 +611,15 @@ mod model {
         }
     }
 
-    trait NestedPartialEvaluate<V> {
-        fn partially_evaluate_slot(&self, slot: usize, inputs: Vec<PartialValue<V>>) -> R<Vec<PartialValue<V>>>;
-    }
-
-    pub struct PartialRegions<'a, V> {
-        nested: Option<&'a dyn NestedPartialEvaluate<V>>,
-    }
-
-    impl<'a, V> PartialRegions<'a, V> {
-        pub fn partially_evaluate_slot(&self, slot: usize, inputs: Vec<PartialValue<V>>) -> R<Vec<PartialValue<V>>> {
-            match self.nested {
-                Some(nested) => nested.partially_evaluate_slot(slot, inputs),
-                None => Err("operation has no attached regions".to_string()),
-            }
-        }
+    pub trait PartialEvaluationDriver<V> {
+        fn partially_evaluate_region(&self, index: usize, inputs: Vec<PartialValue<V>>) -> R<Vec<PartialValue<V>>>;
     }
 
     pub trait PartiallyEvaluatableOperation<C: Context>: Operation {
         fn partially_evaluate(
             &self,
             context: &C,
-            regions: PartialRegions<'_, C::Value>,
+            driver: &dyn PartialEvaluationDriver<C::Value>,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>>;
     }
@@ -657,7 +628,7 @@ mod model {
         fn partially_evaluate(
             &self,
             context: &C,
-            _regions: PartialRegions<'_, C::Value>,
+            _driver: &dyn PartialEvaluationDriver<C::Value>,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
@@ -673,14 +644,14 @@ mod model {
         fn partially_evaluate(
             &self,
             _context: &C,
-            regions: PartialRegions<'_, C::Value>,
+            driver: &dyn PartialEvaluationDriver<C::Value>,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
-            // Semantics stub: production selects the slot from the known predicate value and residualizes the
+            // Semantics stub: production selects the region from the known predicate value and residualizes the
             // application (with transformed attachments) when the predicate is unknown. The solver-relevant part is
             // the region re-entry below with no bound on `Op`.
             if inputs[0].known().is_some() {
-                regions.partially_evaluate_slot(0, inputs[1..].to_vec())
+                driver.partially_evaluate_region(0, inputs[1..].to_vec())
             } else {
                 Ok(vec![PartialValue::Unknown; self.output_count()])
             }
@@ -691,12 +662,12 @@ mod model {
         fn partially_evaluate(
             &self,
             context: &C,
-            regions: PartialRegions<'_, C::Value>,
+            driver: &dyn PartialEvaluationDriver<C::Value>,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             match self {
-                Op::Prim(operation) => operation.partially_evaluate(context, regions, inputs),
-                Op::Cond(operation) => operation.partially_evaluate(context, regions, inputs),
+                Op::Prim(operation) => operation.partially_evaluate(context, driver, inputs),
+                Op::Cond(operation) => operation.partially_evaluate(context, driver, inputs),
             }
         }
     }
@@ -708,16 +679,16 @@ mod model {
         lift: &'a dyn Fn(&C) -> R<Ctx::Value>,
     }
 
-    impl<C: Clone, Ctx: Context, O> NestedPartialEvaluate<Ctx::Value> for ReplayPartial<'_, C, Ctx, O>
+    impl<C: Clone, Ctx: Context, O> PartialEvaluationDriver<Ctx::Value> for ReplayPartial<'_, C, Ctx, O>
     where
         O: PartiallyEvaluatableOperation<Ctx>,
     {
-        fn partially_evaluate_slot(
+        fn partially_evaluate_region(
             &self,
-            slot: usize,
+            index: usize,
             inputs: Vec<PartialValue<Ctx::Value>>,
         ) -> R<Vec<PartialValue<Ctx::Value>>> {
-            let region = self.instruction.regions[slot];
+            let region = self.instruction.regions[index];
             self.program.partially_evaluate_region_in_context(region, self.context, self.lift, inputs)
         }
     }
@@ -762,11 +733,7 @@ mod model {
                     .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayPartial { program: self, instruction, context, lift };
-                let outputs = instruction.operation.partially_evaluate(
-                    context,
-                    PartialRegions { nested: Some(&replay) },
-                    &operands,
-                )?;
+                let outputs = instruction.operation.partially_evaluate(context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -851,28 +818,22 @@ mod model {
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Batching: fresh `BatchingContext<TracingContext>` driver stack, sealed region access, no witness.
+    // Batching: fresh `BatchingContext<TracingContext>` stack and instruction-scoped region access.
     // ------------------------------------------------------------------------------------------------------------
 
-    trait NestedBatch<O> {
-        fn batch_slot(&self, slot: usize) -> R<Program<Stored, O>>;
-    }
+    pub trait BatchingDriver<O> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, O>>;
 
-    pub struct BatchRegions<'a, O> {
-        nested: Option<&'a dyn NestedBatch<O>>,
-    }
-
-    impl<'a, O> BatchRegions<'a, O> {
-        pub fn batch_slot(&self, slot: usize) -> R<Program<Stored, O>> {
-            match self.nested {
-                Some(nested) => nested.batch_slot(slot),
-                None => Err("operation has no attached regions".to_string()),
-            }
-        }
+        fn batch_program(&self, region: RegionRef<'_, Stored, O>) -> R<Program<Stored, O>>;
     }
 
     pub trait BatchableOperation<C: Context>: Operation {
-        fn batch(&self, context: &C, regions: BatchRegions<'_, C::Operation>, inputs: &[C::Value]) -> R<Vec<C::Value>>;
+        fn batch(
+            &self,
+            context: &C,
+            driver: &dyn BatchingDriver<C::Operation>,
+            inputs: &[C::Value],
+        ) -> R<Vec<C::Value>>;
     }
 
     impl<C: Context> BatchableOperation<C> for Prim
@@ -882,7 +843,7 @@ mod model {
         fn batch(
             &self,
             context: &C,
-            _regions: BatchRegions<'_, C::Operation>,
+            _driver: &dyn BatchingDriver<C::Operation>,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>> {
             context.bind((*self).into(), &[], &[], inputs)
@@ -893,11 +854,16 @@ mod model {
     where
         C::Operation: From<Cond>,
     {
-        fn batch(&self, context: &C, regions: BatchRegions<'_, C::Operation>, inputs: &[C::Value]) -> R<Vec<C::Value>> {
-            // The higher-order rule requests transformed regions through its sealed access and emits one
+        fn batch(
+            &self,
+            context: &C,
+            driver: &dyn BatchingDriver<C::Operation>,
+            inputs: &[C::Value],
+        ) -> R<Vec<C::Value>> {
+            // The higher-order rule requests transformed regions through its driver and emits one
             // destination application with attachments; it never restates a bound on the operation enum.
-            let true_region = regions.batch_slot(0)?;
-            let false_region = regions.batch_slot(1)?;
+            let true_region = driver.batch_program(driver.region(0)?)?;
+            let false_region = driver.batch_program(driver.region(1)?)?;
             context.bind((*self).into(), &[true_region, false_region], &[], inputs)
         }
     }
@@ -907,10 +873,15 @@ mod model {
         Prim: BatchableOperation<C>,
         Cond: BatchableOperation<C>,
     {
-        fn batch(&self, context: &C, regions: BatchRegions<'_, C::Operation>, inputs: &[C::Value]) -> R<Vec<C::Value>> {
+        fn batch(
+            &self,
+            context: &C,
+            driver: &dyn BatchingDriver<C::Operation>,
+            inputs: &[C::Value],
+        ) -> R<Vec<C::Value>> {
             match self {
-                Op::Prim(operation) => operation.batch(context, regions, inputs),
-                Op::Cond(operation) => operation.batch(context, regions, inputs),
+                Op::Prim(operation) => operation.batch(context, driver, inputs),
+                Op::Cond(operation) => operation.batch(context, driver, inputs),
             }
         }
     }
@@ -920,11 +891,15 @@ mod model {
         instruction: &'a Instruction<Op>,
     }
 
-    impl NestedBatch<Op> for ReplayBatch<'_> {
-        fn batch_slot(&self, slot: usize) -> R<Program<Stored, Op>> {
+    impl BatchingDriver<Op> for ReplayBatch<'_> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, Op>> {
+            Ok(self.program.region_ref(self.instruction.regions[index]))
+        }
+
+        fn batch_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
             // Runtime recursion through the driver: the bound is re-established here by the concrete entry point,
             // never by the rule that asked.
-            self.program.region_as_program(self.instruction.regions[slot]).batched()
+            region.into_program().batched()
         }
     }
 
@@ -964,8 +939,7 @@ mod model {
                     .map(|input| values[*input].ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayBatch { program: self, instruction };
-                let outputs =
-                    instruction.operation.batch(context, BatchRegions { nested: Some(&replay) }, &operands)?;
+                let outputs = instruction.operation.batch(context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -989,28 +963,17 @@ mod model {
         pub tangent: V,
     }
 
-    trait NestedJvp<O> {
-        fn jvp_slot(&self, slot: usize) -> R<Program<Stored, O>>;
-    }
+    pub trait DifferentiationDriver<O> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, O>>;
 
-    pub struct JvpRegions<'a, O> {
-        nested: Option<&'a dyn NestedJvp<O>>,
-    }
-
-    impl<'a, O> JvpRegions<'a, O> {
-        pub fn jvp_slot(&self, slot: usize) -> R<Program<Stored, O>> {
-            match self.nested {
-                Some(nested) => nested.jvp_slot(slot),
-                None => Err("operation has no attached regions".to_string()),
-            }
-        }
+        fn jvp_program(&self, region: RegionRef<'_, Stored, O>) -> R<Program<Stored, O>>;
     }
 
     pub trait DifferentiableOperation<C: Context>: Operation {
         fn jvp(
             &self,
             context: &C,
-            regions: JvpRegions<'_, C::Operation>,
+            driver: &dyn DifferentiationDriver<C::Operation>,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>>;
     }
@@ -1022,7 +985,7 @@ mod model {
         fn jvp(
             &self,
             context: &C,
-            _regions: JvpRegions<'_, C::Operation>,
+            _driver: &dyn DifferentiationDriver<C::Operation>,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             let primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -1051,14 +1014,14 @@ mod model {
         fn jvp(
             &self,
             context: &C,
-            regions: JvpRegions<'_, C::Operation>,
+            driver: &dyn DifferentiationDriver<C::Operation>,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             // Semantics stub: production emits one primal condition and one tangent condition over the jvp'd
-            // branches with proper operand wiring. The solver-relevant parts are the sealed region re-entry and the
+            // branches with proper operand wiring. The solver-relevant parts are the driver-based region re-entry and
             // attachment-aware emission with no bound on the operation enum.
-            let true_region = regions.jvp_slot(0)?;
-            let false_region = regions.jvp_slot(1)?;
+            let true_region = driver.jvp_program(driver.region(0)?)?;
+            let false_region = driver.jvp_program(driver.region(1)?)?;
             let primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
             let tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
             let primal =
@@ -1076,12 +1039,12 @@ mod model {
         fn jvp(
             &self,
             context: &C,
-            regions: JvpRegions<'_, C::Operation>,
+            driver: &dyn DifferentiationDriver<C::Operation>,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             match self {
-                Op::Prim(operation) => operation.jvp(context, regions, inputs),
-                Op::Cond(operation) => operation.jvp(context, regions, inputs),
+                Op::Prim(operation) => operation.jvp(context, driver, inputs),
+                Op::Cond(operation) => operation.jvp(context, driver, inputs),
             }
         }
     }
@@ -1091,9 +1054,13 @@ mod model {
         instruction: &'a Instruction<Op>,
     }
 
-    impl NestedJvp<Op> for ReplayJvp<'_> {
-        fn jvp_slot(&self, slot: usize) -> R<Program<Stored, Op>> {
-            self.program.region_as_program(self.instruction.regions[slot]).jvp()
+    impl DifferentiationDriver<Op> for ReplayJvp<'_> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, Op>> {
+            Ok(self.program.region_ref(self.instruction.regions[index]))
+        }
+
+        fn jvp_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
+            region.into_program().jvp()
         }
     }
 
@@ -1102,11 +1069,15 @@ mod model {
         instruction: &'a Instruction<Op>,
     }
 
-    impl NestedJvp<Op> for ReplayLinearize<'_> {
-        fn jvp_slot(&self, slot: usize) -> R<Program<Stored, Op>> {
-            // The linearize driver hands rules linearized regions through the SAME sealed access type: which
-            // transform runs is the driver's choice, invisible to the rule.
-            Ok(self.program.region_as_program(self.instruction.regions[slot]).linearize()?.0)
+    impl DifferentiationDriver<Op> for ReplayLinearize<'_> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, Op>> {
+            Ok(self.program.region_ref(self.instruction.regions[index]))
+        }
+
+        fn jvp_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
+            // The linearize driver hands rules linearized regions through the same driver contract: which transform
+            // runs is the driver's choice, invisible to the rule.
+            Ok(region.into_program().linearize()?.0)
         }
     }
 
@@ -1159,7 +1130,7 @@ mod model {
                     .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayJvp { program: self, instruction };
-                let outputs = instruction.operation.jvp(context, JvpRegions { nested: Some(&replay) }, &operands)?;
+                let outputs = instruction.operation.jvp(context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1219,7 +1190,7 @@ mod model {
                     .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayLinearize { program: self, instruction };
-                let outputs = instruction.operation.jvp(context, JvpRegions { nested: Some(&replay) }, &operands)?;
+                let outputs = instruction.operation.jvp(context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1233,33 +1204,22 @@ mod model {
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Transposition: `&mut` destination context coexisting with sealed source-region access.
+    // Transposition: `&mut` destination context coexisting with borrowed source-region access.
     // ------------------------------------------------------------------------------------------------------------
 
-    trait NestedTranspose<O> {
-        fn transpose_slot(&self, slot: usize) -> R<Program<Stored, O>>;
-    }
+    pub trait TranspositionDriver<O> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, O>>;
 
-    pub struct TransposeRegions<'a, O> {
-        nested: Option<&'a dyn NestedTranspose<O>>,
-    }
-
-    impl<'a, O> TransposeRegions<'a, O> {
-        pub fn transpose_slot(&self, slot: usize) -> R<Program<Stored, O>> {
-            match self.nested {
-                Some(nested) => nested.transpose_slot(slot),
-                None => Err("operation has no attached regions".to_string()),
-            }
-        }
+        fn transpose_program(&self, region: RegionRef<'_, Stored, O>) -> R<Program<Stored, O>>;
     }
 
     pub trait TransposableOperation: Operation {
-        /// Mirrors the production `&mut TracingContext` destination: the sealed access borrows the SOURCE program
+        /// Mirrors the production `&mut TracingContext` destination: the driver borrows the source program
         /// immutably while the rule stages into the mutable destination, with no aliasing between them.
         fn transpose(
             &self,
             context: &mut TracingContext,
-            regions: TransposeRegions<'_, Op>,
+            driver: &dyn TranspositionDriver<Op>,
             cotangents: &[usize],
         ) -> R<Vec<usize>>;
     }
@@ -1268,7 +1228,7 @@ mod model {
         fn transpose(
             &self,
             context: &mut TracingContext,
-            _regions: TransposeRegions<'_, Op>,
+            _driver: &dyn TranspositionDriver<Op>,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             // Semantics stub: re-stage the operation on the cotangents.
@@ -1280,11 +1240,11 @@ mod model {
         fn transpose(
             &self,
             context: &mut TracingContext,
-            regions: TransposeRegions<'_, Op>,
+            driver: &dyn TranspositionDriver<Op>,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
-            let true_region = regions.transpose_slot(0)?;
-            let false_region = regions.transpose_slot(1)?;
+            let true_region = driver.transpose_program(driver.region(0)?)?;
+            let false_region = driver.transpose_program(driver.region(1)?)?;
             context.bind(Op::Cond(*self), &[true_region, false_region], &[], cotangents)
         }
     }
@@ -1293,12 +1253,12 @@ mod model {
         fn transpose(
             &self,
             context: &mut TracingContext,
-            regions: TransposeRegions<'_, Op>,
+            driver: &dyn TranspositionDriver<Op>,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             match self {
-                Op::Prim(operation) => operation.transpose(context, regions, cotangents),
-                Op::Cond(operation) => operation.transpose(context, regions, cotangents),
+                Op::Prim(operation) => operation.transpose(context, driver, cotangents),
+                Op::Cond(operation) => operation.transpose(context, driver, cotangents),
             }
         }
     }
@@ -1308,15 +1268,19 @@ mod model {
         instruction: &'a Instruction<Op>,
     }
 
-    impl NestedTranspose<Op> for ReplayTranspose<'_> {
-        fn transpose_slot(&self, slot: usize) -> R<Program<Stored, Op>> {
-            self.program.region_as_program(self.instruction.regions[slot]).transposed()
+    impl TranspositionDriver<Op> for ReplayTranspose<'_> {
+        fn region(&self, index: usize) -> R<RegionRef<'_, Stored, Op>> {
+            Ok(self.program.region_ref(self.instruction.regions[index]))
+        }
+
+        fn transpose_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
+            region.into_program().transposed()
         }
     }
 
     impl Program<Stored, Op> {
         /// Semantics stub of `Program::transpose_with_respect_to`: forward replay standing in for the reverse walk;
-        /// the borrow shape (`&mut` destination + immutable source views + sealed access) is the gate item.
+        /// the borrow shape (`&mut` destination + immutable source views + a borrowed driver) is the gate item.
         pub fn transposed(&self) -> R<Program<Stored, Op>> {
             let mut context = TracingContext::new();
             let entry = self.entry_region();
@@ -1337,11 +1301,7 @@ mod model {
                     .map(|input| values[*input].ok_or_else(|| "unbound operand".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayTranspose { program: self, instruction };
-                let outputs = instruction.operation.transpose(
-                    &mut context,
-                    TransposeRegions { nested: Some(&replay) },
-                    &operands,
-                )?;
+                let outputs = instruction.operation.transpose(&mut context, &replay, &operands)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1361,8 +1321,8 @@ mod model {
 
     impl<C: Clone, O: Operation> Program<C, O> {
         /// Resolves the semantic origins of one value against this frozen program: empty for inputs/constants
-        /// (including synthetic padding, whose producer is a constant), the value itself for opaque producers, and
-        /// the transitive region-output origins for transparent producers, deduplicated by first occurrence.
+        /// (including synthetic padding, whose producer is a constant), the value itself when its provenance is
+        /// empty, and the transitive region-output origins otherwise, deduplicated by first occurrence.
         pub fn resolve_origins(&self, value: ValueId) -> R<Vec<ValueId>> {
             let mut origins = Vec::new();
             self.resolve_origins_into(value, &mut origins)?;
@@ -1388,31 +1348,27 @@ mod model {
             }) else {
                 return Ok(());
             };
-            match instruction.operation.result_origin_rule(local_index) {
-                ResultOriginRule::Opaque => {
-                    if !origins.contains(&value) {
-                        origins.push(value);
-                    }
-                    Ok(())
+            let provenance = instruction.operation.output_region_provenance(local_index);
+            if provenance.is_empty() {
+                if !origins.contains(&value) {
+                    origins.push(value);
                 }
-                ResultOriginRule::Transparent(entries) => {
-                    for (slot, output_index) in entries {
-                        let target = instruction
-                            .regions
-                            .get(slot)
-                            .copied()
-                            .ok_or_else(|| "origin rule references a region slot out of range".to_string())?;
-                        let target_region =
-                            self.regions.get(target.0).ok_or_else(|| "region out of range".to_string())?;
-                        let atom = *target_region
-                            .outputs
-                            .get(output_index)
-                            .ok_or_else(|| "origin rule references a region output out of range".to_string())?;
-                        self.resolve_origins_into(ValueId { region: target, atom }, origins)?;
-                    }
-                    Ok(())
-                }
+                return Ok(());
             }
+            for origin in provenance {
+                let target = instruction
+                    .regions
+                    .get(origin.region_index)
+                    .copied()
+                    .ok_or_else(|| "output provenance references a region index out of range".to_string())?;
+                let target_region = self.regions.get(target.0).ok_or_else(|| "region out of range".to_string())?;
+                let atom = *target_region
+                    .outputs
+                    .get(origin.output_index)
+                    .ok_or_else(|| "output provenance references a region output out of range".to_string())?;
+                self.resolve_origins_into(ValueId { region: target, atom }, origins)?;
+            }
+            Ok(())
         }
     }
 }
@@ -1421,8 +1377,7 @@ pub use model::*;
 
 /// Builds a program whose entry is `cond(p, x)` with `depth` further conditions nested inside successive `true`
 /// branches. The innermost `true` branch computes `x + capture#0`; every `false` branch computes `x * x`. Depth is
-/// runtime data: the SAME `Op` type serves every level, which is exactly what recursive payloads make impossible to
-/// prove today without witnesses.
+/// runtime data: the same `Op` type serves every level, demonstrating that deeper nesting adds no trait obligations.
 fn nested_condition_program(depth: usize) -> Program<Stored, Op> {
     fn branches(builder: &mut ProgramBuilder<Stored, Op>, depth: usize) -> (RegionId, RegionId) {
         let mut false_branch = RegionBuilder::new();
@@ -1468,7 +1423,7 @@ fn single_region_program(body: impl FnOnce(&mut RegionBuilder<Stored, Op>, usize
 }
 
 #[test]
-fn test_witness_free_nested_interpretation_substitutes_captures() {
+fn test_direct_driver_nested_interpretation_substitutes_captures() {
     // Interpretation with distinct stored-constant (`Stored`) and runtime (`f64`) types, capture substitution
     // through three nesting levels, and the deliberately unbounded interpretation context parameter.
     let program = nested_condition_program(2);
@@ -1495,6 +1450,10 @@ fn test_attachment_aware_hook_binds_fresh_regional_operations() {
 
     // Eager contexts interpret freshly authored nested computations through the detached access path.
     let context = EagerContext { captures: Rc::new(Vec::new()) };
+    assert_eq!(
+        context.bind(Op::Cond(Cond), &[], &[], &[1.0, 3.0]),
+        Err("operation has no attached regions".to_string()),
+    );
     assert_eq!(
         context.bind(Op::Cond(Cond), &[true_program.clone(), false_program.clone()], &[], &[1.0, 3.0]),
         Ok(vec![4.0]),
@@ -1525,11 +1484,11 @@ fn test_attachment_aware_hook_binds_fresh_regional_operations() {
 }
 
 #[test]
-fn test_fresh_stack_transform_drivers_run_without_witnesses() {
+fn test_fresh_stack_transform_drivers_use_direct_bounds() {
     // The load-bearing assertion in this test is that it COMPILES: proving `Op: BatchableOperation<BatchingContext<
     // TracingContext>>`, `Op: DifferentiableOperation<DifferentiationContext<TracingContext>>`, the composed
     // linearize stack, and transposition for a region-attached higher-order variant, with direct per-variant bounds
-    // and no `*ProgramOperation` witness. Depth is runtime data, so arbitrarily deep nesting adds no obligations.
+    // with direct per-variant bounds. Depth is runtime data, so arbitrarily deep nesting adds no obligations.
     let program = nested_condition_program(2);
     let context = EagerContext { captures: Rc::new(vec![10.0]) };
     let lift = |constant: &Stored| context.lift(constant);
@@ -1548,12 +1507,12 @@ fn test_fresh_stack_transform_drivers_run_without_witnesses() {
     assert_eq!(residual_count, 0);
     assert_eq!(primal.interpret_in_context(&context, &lift, vec![1.0, 2.0]), Ok(vec![12.0]));
 
-    // Transposition is a semantic identity stub; the `&mut` destination context coexisting with sealed source
-    // access is the gate item.
+    // Transposition is a semantic identity stub; the `&mut` destination context coexisting with a driver that
+    // borrows the source is the gate item.
     let transposed = program.transposed().unwrap();
     assert_eq!(transposed.interpret_in_context(&context, &lift, vec![1.0, 2.0]), Ok(vec![12.0]));
 
-    // Partial evaluation against a FIXED user context (the property that makes today's PE witness blanket-able).
+    // Partial evaluation against a fixed user context.
     let known = program
         .partially_evaluate_in_context(
             &context,
@@ -1586,16 +1545,16 @@ fn test_callee_interning_and_full_closure_import() {
 
     // Interning: one live `Rc` imports once; a structurally equal but distinct program stays distinct.
     let mut builder = ProgramBuilder::<Stored, Op>::new();
-    let first = builder.add_callee(&callee);
-    let second = builder.add_callee(&callee);
-    let third = builder.add_callee(&equal_but_distinct);
+    let first = builder.intern_callee(&callee);
+    let second = builder.intern_callee(&callee);
+    let third = builder.intern_callee(&equal_but_distinct);
     assert_eq!(first, second);
     assert_ne!(first, third);
 
     // Full-closure import with sharing preserved: a source program whose entry references the same callee root
     // from two instructions imports that callee exactly once.
     let mut source_builder = ProgramBuilder::<Stored, Op>::new();
-    let callee_root = source_builder.add_callee(&callee);
+    let callee_root = source_builder.intern_callee(&callee);
     let mut entry = RegionBuilder::new();
     let x = entry.add_input();
     // The mini-model does not validate operation-declared attachment counts, so a primitive carrying a callee edge
@@ -1608,7 +1567,7 @@ fn test_callee_interning_and_full_closure_import() {
     assert_eq!(source.regions.len(), 2);
 
     let mut destination = ProgramBuilder::<Stored, Op>::new();
-    let imported_entry = destination.add_region(&source);
+    let imported_entry = destination.import_region(&source);
     let imported = destination.build(imported_entry);
     assert_eq!(imported.regions.len(), 2);
     let imported_instructions = &imported.entry_region().instructions;
@@ -1616,8 +1575,8 @@ fn test_callee_interning_and_full_closure_import() {
 
     // Two lexical imports of one program produce two owned subtrees.
     let mut duplicating = ProgramBuilder::<Stored, Op>::new();
-    let first_subtree = duplicating.add_region(&callee);
-    let second_subtree = duplicating.add_region(&callee);
+    let first_subtree = duplicating.import_region(&callee);
+    let second_subtree = duplicating.import_region(&callee);
     assert_ne!(first_subtree, second_subtree);
 }
 
@@ -1644,8 +1603,8 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let entry_id = builder.seal(entry);
     let program = builder.build(entry_id);
 
-    // Transparent resolution: the true branch contributes its mul result; the false branch's constant contributes
-    // nothing (padding never surfaces a producer).
+    // Region-provenance resolution: the true branch contributes its mul result; the false branch's constant
+    // contributes nothing (padding never surfaces a producer).
     let boundary = ValueId { region: entry_id, atom: output };
     assert_eq!(program.resolve_origins(boundary), Ok(vec![ValueId { region: true_id, atom: product }]));
 
@@ -1654,7 +1613,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let mul_result = ValueId { region: true_id, atom: product };
     assert_eq!(program.resolve_origins(mul_result), Ok(vec![mul_result]));
 
-    // First-occurrence deduplication: both condition slots referencing one region resolve that region's producer
+    // First-occurrence deduplication: both condition regions referencing one region resolve that region's producer
     // once. (The mini-model does not enforce unique lexical ownership, which production validation does.)
     let mut shared_builder = ProgramBuilder::<Stored, Op>::new();
     let mut shared = RegionBuilder::new();
@@ -1674,7 +1633,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
         Ok(vec![ValueId { region: shared_id, atom: doubled }]),
     );
 
-    // Malformed transparent rules error instead of resolving: a condition instruction with no attached regions.
+    // Malformed output provenance errors instead of resolving: a condition instruction with no attached regions.
     let mut malformed_builder = ProgramBuilder::<Stored, Op>::new();
     let mut malformed_entry = RegionBuilder::new();
     let predicate = malformed_entry.add_input();
@@ -1685,7 +1644,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let malformed = malformed_builder.build(malformed_id);
     assert_eq!(
         malformed.resolve_origins(ValueId { region: malformed_id, atom: output }),
-        Err("origin rule references a region slot out of range".to_string()),
+        Err("output provenance references a region index out of range".to_string()),
     );
 }
 

@@ -6,15 +6,15 @@ use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, Transp
 use ryft_core::batching::ArrayBatch;
 use ryft_core::batching::BatchAxis;
 use ryft_core::batching::BatchableOperation;
-use ryft_core::batching::BatchingContext;
 use ryft_core::batching::BatchingError;
 use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
+use ryft_core::batching::{BatchingContext, BatchingDriver};
 use ryft_core::captures::CaptureReference;
-use ryft_core::compilation::function::CompiledProgramOperation;
+use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
-use ryft_core::effects::Effects;
-use ryft_core::interpretation::InterpretableOperation;
+use ryft_core::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
+};
 use ryft_core::macros::check_count;
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
@@ -23,7 +23,7 @@ use ryft_core::operations::constants::{
     ZeroOperation,
 };
 use ryft_core::operations::control_flow::{
-    ConditionOperation, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
+    ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation, WhilePredicate,
 };
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
@@ -38,11 +38,12 @@ use ryft_core::operations::math::{
 };
 use ryft_core::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
+use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::partial::{
-    PartialEvaluationContext, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, RegionInterface, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::backends::scalars::Scalar;
@@ -66,8 +67,9 @@ pub type XlaConstant = CaptureReference<ArrayType>;
 /// Ordinary staged-operation universe owned by the XLA backend.
 ///
 /// This enum flattens the core array operation payloads directly into the backend-owned operation family. Higher-order
-/// operations that own nested programs use XLA-owned bodies so those programs can contain backend-specific operations
-/// such as [`jit_call`](JitCallOperation) and [`shard_map`](ShardMapOperation).
+/// instructions attach their nested computations as regions of the containing XLA program, so those regions can
+/// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
+/// [`shard_map`](ShardMapOperation).
 #[derive(Clone, Debug, Operation, TransposableOperation, DifferentiableOperation, BatchableOperation)]
 #[ryft(crate = "ryft_core")]
 #[ryft(bounds(
@@ -130,42 +132,33 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Collective(CollectiveOperation),
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
-    /// Backend-owned condition whose branch bodies can contain XLA operations.
-    Condition(Box<ConditionOperation<V, Self>>),
+    /// Backend-owned condition whose attached branch regions can contain XLA operations.
+    Condition(ConditionOperation<V>),
 
-    /// Backend-owned loop whose condition and body programs can contain XLA operations.
-    While(Box<WhileOperation<V, Self>>),
+    /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
+    While(WhileOperation),
 
-    /// Backend-owned scan whose body program can contain XLA operations.
-    Scan(Box<ScanOperation<V, Self>>),
+    /// Backend-owned scan whose attached body region can contain XLA operations.
+    Scan(ScanOperation<V>),
 
-    /// Backend-owned custom JVP call whose nested programs can contain XLA operations.
-    CustomJvp(Box<CustomJvpOperation<V, Self>>),
+    /// Backend-owned custom JVP call whose attached regions can contain XLA operations.
+    CustomJvp(CustomJvpOperation),
 
-    /// Backend-owned custom VJP call whose nested programs can contain XLA operations.
-    CustomVjp(Box<CustomVjpOperation<V, Self>>),
+    /// Backend-owned custom VJP call whose attached regions can contain XLA operations.
+    CustomVjp(CustomVjpOperation),
 
     /// Backend-owned opaque custom-VJP tangent carrier, staged by the capture-free forward of a
-    /// [`CustomVjp`](Self::CustomVjp) call. Its nested backward program can contain XLA operations.
-    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
+    /// [`CustomVjp`](Self::CustomVjp) call. Its attached backward region can contain XLA operations.
+    CustomVjpTangent(CustomVjpTangentOperation),
 
-    /// Backend-owned rematerialized call whose nested programs can contain XLA operations.
-    Rematerialize(Box<RematerializeOperation<V, Self>>),
+    /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
+    Rematerialize(RematerializeOperation),
 
     /// Call to a flat jitted XLA sub-program.
-    JitCall(Box<JitCallOperation>),
+    JitCall(JitCallOperation),
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<V>>),
-}
-
-fn map_core_xla_program<V>(
-    program: &Program<V, ArrayOperation<V>, Vec<V>, Vec<V>>,
-) -> Program<V, XlaOperation<V>, Vec<V>, Vec<V>>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    program.map_operations(|operation| Ok(XlaOperation::from(operation.clone()))).unwrap()
 }
 
 impl<V> From<ArrayOperation<V>> for XlaOperation<V>
@@ -224,178 +217,14 @@ where
             ArrayOperation::Collective(operation) => Self::Collective(operation),
             ArrayOperation::AxisIndex(operation) => Self::AxisIndex(operation),
             ArrayOperation::Select(operation) => Self::Select(operation),
-            ArrayOperation::Condition(operation) => XlaOperation::from(*operation),
-            ArrayOperation::While(operation) => XlaOperation::from(*operation),
-            ArrayOperation::Scan(operation) => XlaOperation::from(*operation),
-            ArrayOperation::CustomJvp(operation) => XlaOperation::from(*operation),
-            ArrayOperation::CustomVjp(operation) => XlaOperation::from(*operation),
-            ArrayOperation::CustomVjpTangent(operation) => XlaOperation::from(*operation),
-            ArrayOperation::Rematerialize(operation) => XlaOperation::from(*operation),
+            ArrayOperation::Condition(operation) => XlaOperation::from(operation),
+            ArrayOperation::While(operation) => Self::While(operation),
+            ArrayOperation::Scan(operation) => Self::Scan(operation),
+            ArrayOperation::CustomJvp(operation) => Self::CustomJvp(operation),
+            ArrayOperation::CustomVjp(operation) => Self::CustomVjp(operation),
+            ArrayOperation::CustomVjpTangent(operation) => Self::CustomVjpTangent(operation),
+            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation),
         }
-    }
-}
-
-impl<V> From<ConditionOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: ConditionOperation<V, ArrayOperation<V>>) -> Self {
-        Self::Condition(Box::new(
-            ConditionOperation::new(
-                map_core_xla_program(operation.true_branch()),
-                map_core_xla_program(operation.false_branch()),
-            )
-            .unwrap(),
-        ))
-    }
-}
-
-impl<V> From<WhileOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: WhileOperation<V, ArrayOperation<V>>) -> Self {
-        Self::While(Box::new(
-            WhileOperation::new(map_core_xla_program(operation.condition()), map_core_xla_program(operation.body()))
-                .unwrap()
-                .with_iteration_bound(operation.iteration_bound())
-                .unwrap(),
-        ))
-    }
-}
-
-impl<V> From<ScanOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: ScanOperation<V, ArrayOperation<V>>) -> Self {
-        Self::Scan(Box::new(
-            ScanOperation::new(map_core_xla_program(operation.body()), operation.carry_count(), operation.length())
-                .unwrap()
-                .with_reverse(operation.reverse())
-                .with_unroll(operation.unroll())
-                .unwrap()
-                .with_captures(operation.captures().to_vec()),
-        ))
-    }
-}
-
-impl<V> From<CustomJvpOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: CustomJvpOperation<V, ArrayOperation<V>>) -> Self {
-        Self::CustomJvp(Box::new(
-            CustomJvpOperation::new(
-                map_core_xla_program(operation.primal()),
-                map_core_xla_program(operation.jvp_program()),
-            )
-            .unwrap(),
-        ))
-    }
-}
-
-impl<V> From<CustomVjpOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: CustomVjpOperation<V, ArrayOperation<V>>) -> Self {
-        Self::CustomVjp(Box::new(
-            CustomVjpOperation::new(
-                map_core_xla_program(operation.primal()),
-                map_core_xla_program(operation.forward()),
-                map_core_xla_program(operation.backward()),
-            )
-            .unwrap(),
-        ))
-    }
-}
-
-impl<V> From<CustomVjpTangentOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: CustomVjpTangentOperation<V, ArrayOperation<V>>) -> Self {
-        Self::CustomVjpTangent(Box::new(CustomVjpTangentOperation::new(
-            map_core_xla_program(operation.backward()),
-            operation.residual_count(),
-            operation.transposed(),
-        )))
-    }
-}
-
-impl<V> From<RematerializeOperation<V, ArrayOperation<V>>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-{
-    fn from(operation: RematerializeOperation<V, ArrayOperation<V>>) -> Self {
-        Self::Rematerialize(Box::new(
-            RematerializeOperation::new(
-                map_core_xla_program(operation.primal()),
-                map_core_xla_program(operation.forward()),
-                map_core_xla_program(operation.backward()),
-                map_core_xla_program(operation.tangent()),
-            )
-            .unwrap()
-            .with_prevent_cse(operation.prevent_cse()),
-        ))
-    }
-}
-
-/// Residual provenance for [`XlaOperation`]: `scan` outputs align index-wise with the body outputs, so a stacked
-/// residual is produced per iteration by the body instruction defining the same-index body output; every other
-/// operation is its own producer.
-impl<V> ryft_core::tracing_v2::rematerialization::ResidualProvenance<V, XlaOperation<V>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    fn residual_provenance(
-        &self,
-        output_index: usize,
-    ) -> ryft_core::tracing_v2::rematerialization::ResidualProducers<'_, V, XlaOperation<V>> {
-        use ryft_core::tracing_v2::rematerialization::{NestedResidualSource, ResidualProducers};
-        match self {
-            Self::Scan(operation) => {
-                let body = operation.body();
-                ResidualProducers::Nested(vec![NestedResidualSource::new(body, output_index)])
-            }
-            _ => ResidualProducers::Leaf,
-        }
-    }
-}
-
-impl<V> MaybeWhile<V, XlaOperation<V>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, V, XlaOperation<V>>> {
-        match self {
-            Self::While(operation) => operation.as_while(),
-            _ => None,
-        }
-    }
-}
-
-/// Staged replay of a jitted call over tracers stages the call operation whole onto the trace the context owns,
-/// preserving the compilation boundary instead of inlining the callee.
-impl<C> InterpretableOperation<Tracer<C>, C> for JitCallOperation
-where
-    C: StagingContext<Type = ArrayType, Operation: From<JitCallOperation>>,
-{
-    fn interpret(&self, context: &C, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
-        context.stage_operation(self.clone(), inputs)
-    }
-}
-
-/// Staged replay of a captured-body shard map over tracers stages the operation whole onto the trace the context
-/// owns, preserving the sharding boundary instead of inlining the local body.
-impl<C> InterpretableOperation<Tracer<C>, C> for ShardMapOperation<CaptureReference<ArrayType>>
-where
-    C: StagingContext<Type = ArrayType, Operation: From<ShardMapOperation<CaptureReference<ArrayType>>>>,
-{
-    fn interpret(&self, context: &C, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
-        context.stage_operation(self.clone(), inputs)
     }
 }
 
@@ -405,41 +234,31 @@ pub type XlaProgram<Input, Output> = Program<XlaConstant, XlaOperation, Input, O
 /// Program builder specialized to the backend-owned XLA op universe.
 pub type XlaProgramBuilder = ProgramBuilder<XlaConstant, XlaOperation>;
 
-/// Flat XLA program payload used by staged call operations.
+/// Flat XLA program over the backend-owned op universe — the shape of materialized regions and of the callees
+/// handed to [`Context::bind`]'s `callees` argument.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
-/// Staged call to a flat jitted XLA program.
-#[derive(Clone, Debug)]
-pub struct JitCallOperation {
-    /// Flat callee program called by this operation. Shared via [`Rc`] so repeated calls staged from the same
-    /// function handle carry one program and remain identity-comparable for call-site deduplication at lowering.
-    program: Rc<FlatXlaProgram>,
-}
+/// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
+/// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
+/// operation (the single `["callee"]` slot), interned by [`Rc`] identity when the call is staged through the
+/// `callees` argument of [`Context::bind`], so repeated calls staged from one function handle share one callee
+/// root and remain identity-comparable for call-site deduplication at lowering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct JitCallOperation;
 
 impl JitCallOperation {
-    /// Creates a staged jitted-call operation for `program`.
+    /// Creates a staged jitted-call operation. The flat callee program is supplied separately through the
+    /// `callees` argument of [`Context::bind`].
     #[inline]
-    pub(crate) fn new(program: Rc<FlatXlaProgram>) -> Self {
-        Self { program }
-    }
-
-    /// Returns the flat callee program.
-    #[inline]
-    pub(crate) fn program(&self) -> &FlatXlaProgram {
-        self.program.as_ref()
-    }
-
-    /// Returns the shared handle to the flat callee program, used for call-site deduplication at lowering.
-    #[inline]
-    pub(crate) fn program_rc(&self) -> &Rc<FlatXlaProgram> {
-        &self.program
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
-impl CompiledProgramOperation<XlaConstant> for XlaOperation {
+impl CompiledCallOperation<XlaConstant> for XlaOperation {
     #[inline]
-    fn compiled_call(program: Rc<FlatXlaProgram>) -> Self {
-        Self::JitCall(Box::new(JitCallOperation::new(program)))
+    fn compiled_call() -> Self {
+        Self::JitCall(JitCallOperation::new())
     }
 }
 
@@ -480,41 +299,30 @@ fn ensure_call_input_types(
     Ok(())
 }
 
-fn build_batched_call_program(
-    program: &FlatXlaProgram,
-    batch_axes: &[Option<usize>],
-    axis_size: usize,
-) -> Result<(FlatXlaProgram, Vec<Option<usize>>), ProgramError> {
-    // Delegate to the core program-batching pass, which replays `program` through a `BatchingContext` over a fresh
-    // trace and packages the batched program with its natural (rule-produced) output axes.
-    let input_batch_axes = batch_axes.iter().copied().map(batch_axis_from_position).collect::<Vec<_>>();
-    let (batched_program, output_axes) =
-        program.batched(axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
-    let output_axes = output_axes.iter().map(batch_axis_position).collect();
-    Ok((batched_program.into_simplified()?, output_axes))
-}
-
 impl Operation<ArrayType> for JitCallOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "jit_call"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ensure_call_input_types(self.name(), self.program.input_types().as_slice(), input_types)?;
-        Ok(self.program.output_types())
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError {
+                message: format!("jit_call expects 1 attached callee region but got {}", region_interfaces.len()),
+            });
+        }
+        let callee_interface = &region_interfaces[0];
+        ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
+        Ok(callee_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.program.effects()
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("inputs", self.program.input_ids().len())?;
-            operation.field("outputs", self.program.output_ids().len())
-        })
+    fn region_names(&self) -> &'static [&'static str] {
+        &["callee"]
     }
 }
 
@@ -534,60 +342,49 @@ impl Operation<ArrayType> for JitCallOperation {
 /// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation
 where
-    V: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType, Operation = XlaOperation<V>>,
+    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate(
         &self,
         context: &PartialEvaluationContext<C>,
+        driver: &dyn PartialEvaluationDriver<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed call with at least one known-but-symbolic input; everything else keeps the default
         // fold-or-residualize behavior and therefore the original boundary.
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
-            return context.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(
+                XlaOperation::JitCall(*self),
+                driver.regions()?.into_iter().map(|region| region.into_program()).collect(),
+                inputs,
+            );
         }
 
         // Split the callee through the shared online boundary machinery, bind the known side into the enclosing
         // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
         // side as the residual `jit_call`, and reassemble the original output order.
+        let callee = driver.region(0)?;
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-        let partition = self.program.partition(input_known.as_slice())?;
+        let partition = callee.partition(input_known.as_slice())?;
         // A trivial partition — one whose known program contains no instructions — hoists no work (its known side
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.into_program()], inputs);
         }
         context.inline_partitioned_program(
             partition,
             inputs,
-            |known_program| XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(known_program)))),
-            |residual_program| XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(residual_program)))),
+            |known_program| (XlaOperation::JitCall(JitCallOperation::new()), vec![known_program]),
+            |residual_program| (XlaOperation::JitCall(JitCallOperation::new()), vec![residual_program]),
         )
     }
 }
 
-impl JitCallOperation {
-    /// Returns the call operation and output-axis metadata for batching this call.
-    fn batched_call_operation<V: Value<Type = ArrayType>>(
-        &self,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        match ArrayBatch::common_batch_size(inputs)? {
-            Some(axis_size) => {
-                let (batched_program, output_axes) =
-                    build_batched_call_program(&self.program, batch_axes.as_slice(), axis_size)?;
-                Ok((JitCallOperation::new(Rc::new(batched_program)), output_axes))
-            }
-            None => Ok((self.clone(), vec![None; self.program.output_types().len()])),
-        }
-    }
-}
-
-/// Batching rule for [`JitCallOperation`]: the callee program is rebatched over the mapped input axes (via
-/// [`JitCallOperation::batched_call_operation`]) and the batched call is bound through `context.parent()`. An eager
+/// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
+/// [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
+/// batched callee re-attached. An eager
 /// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
 /// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
 /// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
@@ -598,11 +395,34 @@ where
     fn batch(
         &self,
         context: &BatchingContext<C>,
+        driver: &dyn BatchingDriver<C>,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.parent().bind(operation, &[], &[], &physical_inputs)?;
+        // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
+        // all-replicated call binds its original callee unchanged.
+        let (batched_callee, output_axes) = match ArrayBatch::common_batch_size(inputs)? {
+            Some(_) => {
+                let input_batch_axes = inputs
+                    .iter()
+                    .map(|input| batch_axis_from_position(input.batch_axis_position()))
+                    .collect::<Vec<_>>();
+                let (batched_callee, output_axes) = driver.batch_program(
+                    context,
+                    driver.region(0)?,
+                    input_batch_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?;
+                let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
+                (batched_callee.into_simplified()?, output_axes)
+            }
+            None => {
+                let callee = driver.region(0)?;
+                let output_axes = vec![None; callee.output_types().len()];
+                (callee.into_program(), output_axes)
+            }
+        };
+        let outputs = context.parent().bind(*self, Vec::new(), &[Rc::new(batched_callee)], &physical_inputs)?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -633,33 +453,42 @@ where
 ///      residual values, recovering one output tangent per primal output.
 ///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
 ///
-/// The callee program is concretely keyed on [`XlaConstant`] (it is a [`FlatXlaProgram`]) regardless of the enclosing
-/// value type `V`, so the split halves are themselves [`FlatXlaProgram`]s and the rule is valid for every `V`.
-/// Preserving both `jit_call` boundaries keeps the callee body out of the caller's program, so forward mode over a
-/// jitted call stays compiled rather than inlined.
+/// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
+/// (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
+/// as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
+/// so forward mode over a jitted call stays compiled rather than inlined.
+///
+/// # Parameters
+///
+///   - `context`: Active evaluation or staging context used to bind the differentiated calls.
+///   - `driver`: Call-scoped access to the attached callee region.
+///   - `inputs`: Primal and tangent values for the call operands.
 impl<C, V> DifferentiableOperation<C> for JitCallOperation
 where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: Value<Type = ArrayType>,
+    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
 {
     fn jvp(
         &self,
         context: &C,
+        driver: &dyn DifferentiationDriver<C>,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let output_count = self.program().output_types().len();
-        check_count!("input", inputs, self.program().input_types().len(), ProgramError);
+        let callee = driver.region(0)?;
+        let output_count = callee.output_types().len();
+        check_count!("input", inputs, callee.input_types().len(), ProgramError);
 
         // Linearize the callee capture-free. The primal sub-program produces `[outputs..., residuals...]` and the
         // tangent sub-program consumes `[input_tangents..., residuals...]`; the residual count is the number of
         // trailing outputs of the primal sub-program beyond the original callee outputs.
-        let (primal_program, tangent_program, _) = self.program().linearize()?.into_parts();
+        let (primal_program, tangent_program, _) = callee.linearize()?.into_parts();
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(primal_program))));
-        let mut primal_call_outputs = context.bind(primal_call, &[], &[], &primal_operands)?;
+        let primal_call = XlaOperation::JitCall(JitCallOperation::new());
+        let mut primal_call_outputs =
+            context.bind(primal_call, Vec::new(), &[Rc::new(primal_program)], &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -680,8 +509,8 @@ where
             .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
-        let tangent_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(tangent_program))));
-        let tangent_outputs = context.bind(tangent_call, &[], &[], &tangent_operands)?;
+        let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
+        let tangent_outputs = context.bind(tangent_call, Vec::new(), &[Rc::new(tangent_program)], &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -693,7 +522,9 @@ where
 }
 
 /// Partition-aware transpose rule for a *primal* tangent [`JitCallOperation`], the jitted-call counterpart of
-/// [`transpose_primal_condition`], [`transpose_primal_scan`], and [`transpose_primal_custom_vjp`]. It is used when the
+/// [`transpose_primal_condition`](ryft_core::tracing_v2::transpose_primal_condition),
+/// [`transpose_primal_scan`](ryft_core::tracing_v2::transpose_primal_scan), and
+/// [`transpose_primal_custom_vjp`](ryft_core::tracing_v2::transpose_primal_custom_vjp). It is used when the
 /// direct reverse transposes a tangent program in the primal [`XlaOperation`] family rather than re-keying it
 /// into a linear operation family.
 ///
@@ -707,8 +538,8 @@ where
 ///
 ///   1. Reads the runtime value of every known operand from `operand_values`, in callee-input order, to feed the
 ///      transposed callee's known inputs.
-///   2. Transposes the callee program with [`Program::transpose_with_respect_to`](ryft_core::Program::transpose_with_respect_to)
-///      under the same per-operand linearity mask, so the callee's own linear and known inputs match the operands. The
+///   2. Transposes the callee program with [`TranspositionDriver::transpose_program`] under the same per-operand
+///      linearity mask, so the callee's own linear and known inputs match the operands. The
 ///      transposed callee maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in
 ///      callee-input order on each side.
 ///   3. Re-wraps the transposed callee in a fresh [`JitCallOperation`] and stages it over
@@ -718,20 +549,22 @@ where
 ///
 /// The returned cotangents place the transposed call's outputs at the linear-operand positions and a structural
 /// [`MaybeZero::Zero`] at the known positions, which carry no cotangent. The callee transposition happens through
-/// [`Program::transpose_with_respect_to`](ryft_core::Program::transpose_with_respect_to) in the same operation family, so it is
-/// value-level and introduces no recursive transposition obligation on [`XlaOperation`].
+/// [`TranspositionDriver::transpose_program`] in the same operation family, so it is value-level and introduces
+/// no recursive transposition obligation on [`XlaOperation`].
 ///
 /// # Parameters
 ///
 ///   - `operation`: Primal tangent `jit_call` staged into the tangent program.
 ///   - `context`: Active transpose tracing context the pullback is staged into.
+///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the callee's inputs one-to-one. The
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
 pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
-    operation: &JitCallOperation,
+    _operation: &JitCallOperation,
     context: &mut TracingContext<V, XlaOperation<V>>,
+    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
@@ -745,7 +578,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
     // prefix as known leading operands. The dispatch guarantees a `Known` operand carries its pullback value, so each
     // known tracer is read directly in callee-input order.
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let callee = operation.program();
+    let callee = driver.region(0)?;
     check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
     let known_values = inputs
         .iter()
@@ -755,12 +588,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
 
     // Transpose the callee with respect to its linear inputs. The transposed callee maps
     // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in callee-input order.
-    let with_respect_to = operand_linear
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &linear)| linear.then_some(index))
-        .collect::<Vec<_>>();
-    let transposed_callee = callee.transpose_with_respect_to(with_respect_to.as_slice())?;
+    let transposed_callee = driver.transpose_program(callee, operand_linear.as_slice())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., known_input_values...]`. Its outputs are the
@@ -779,8 +607,9 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
         }
     }
     operands.extend(known_values);
-    let transposed_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(transposed_callee))));
-    let input_cotangents = context.stage_operation(transposed_call, operands.as_slice())?;
+    let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
+    let input_cotangents =
+        context.bind(transposed_call, Vec::new(), &[Rc::new(transposed_callee)], operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -807,10 +636,11 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
     fn transpose(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
+        driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-        transpose_primal_jit_call(self, context, inputs, outputs).map_err(DifferentiationError::from)
+        transpose_primal_jit_call(self, context, driver, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 
@@ -849,9 +679,9 @@ mod tests {
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
-            let shifted = builder.add_instruction(AddOperation, vec![known_input, literal]).unwrap()[0];
-            let scaled = builder.add_instruction(MulOperation, vec![runtime_input, literal]).unwrap()[0];
-            let product = builder.add_instruction(MulOperation, vec![shifted, runtime_input]).unwrap()[0];
+            let shifted = builder.add_instruction(AddOperation, vec![known_input, literal], Vec::new()).unwrap()[0];
+            let scaled = builder.add_instruction(MulOperation, vec![runtime_input, literal], Vec::new()).unwrap()[0];
+            let product = builder.add_instruction(MulOperation, vec![shifted, runtime_input], Vec::new()).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![shifted, scaled, product],
@@ -865,8 +695,12 @@ mod tests {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
-        let call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(callee))));
-        let outputs = builder.add_instruction(call, vec![known_input, runtime_input]).unwrap().to_vec();
+        let callee_region = builder.intern_callee(&Rc::new(callee));
+        let call = XlaOperation::JitCall(JitCallOperation::new());
+        let outputs = builder
+            .add_instruction(call, vec![known_input, runtime_input], vec![callee_region])
+            .unwrap()
+            .to_vec();
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
             .unwrap();
@@ -882,25 +716,32 @@ mod tests {
         {
             let outer_builder = outer.builder().borrow();
             assert_eq!(outer_builder.instructions().len(), 1);
-            let XlaOperation::JitCall(known_call) = outer_builder.instructions()[0].operation() else {
-                panic!("expected the outer program to contain the known-side jit_call");
-            };
-            assert_eq!(known_call.program().input_ids().len(), 1);
-            assert_eq!(known_call.program().output_ids().len(), 2);
-            assert_eq!(known_call.program().instructions().len(), 1);
-            assert!(matches!(known_call.program().instructions()[0].operation(), XlaOperation::Add(_)));
-            assert!(known_call.program().atoms().iter().any(|atom| atom.is_constant()));
+            let known_instruction = &outer_builder.instructions()[0];
+            assert!(
+                matches!(known_instruction.operation(), XlaOperation::JitCall(_)),
+                "expected the outer program to contain the known-side jit_call",
+            );
+            let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().into_program();
+            assert_eq!(known_callee.input_ids().len(), 1);
+            assert_eq!(known_callee.output_ids().len(), 2);
+            assert_eq!(known_callee.instructions().len(), 1);
+            assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Add(_)));
+            assert!(known_callee.atoms().iter().any(|atom| atom.is_constant()));
         }
 
         // The unknown half stayed behind one residual `jit_call` over the unknown input plus the residual edge, with
         // the literal rebuilt inline from its original payload.
         assert_eq!(evaluation.program().instructions().len(), 1);
-        let XlaOperation::JitCall(residual_call) = evaluation.program().instructions()[0].operation() else {
-            panic!("expected the residual program to contain the residual jit_call");
-        };
-        assert_eq!(residual_call.program().input_ids().len(), 2);
-        assert_eq!(residual_call.program().instructions().len(), 2);
-        assert!(residual_call.program().atoms().iter().any(|atom| atom.is_constant()));
+        let residual_instruction = &evaluation.program().instructions()[0];
+        assert!(
+            matches!(residual_instruction.operation(), XlaOperation::JitCall(_)),
+            "expected the residual program to contain the residual jit_call",
+        );
+        let residual_callee =
+            evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().into_program();
+        assert_eq!(residual_callee.input_ids().len(), 2);
+        assert_eq!(residual_callee.instructions().len(), 2);
+        assert!(residual_callee.atoms().iter().any(|atom| atom.is_constant()));
 
         // The boundary descriptors: the unknown enclosing input feeds the residual call, the residual edge is a
         // known feeder naming the known-side call's staged output, and the outputs reassemble in original order.

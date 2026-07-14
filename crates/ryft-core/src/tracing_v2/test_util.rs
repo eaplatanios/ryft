@@ -13,7 +13,7 @@ pub(crate) fn scalar_scale_branch(
     let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
     let input = builder.add_input(ArrayType::scalar(DataType::F64));
     let factor = builder.add_constant(TestArray::scalar(factor));
-    let output = builder.add_instruction(MulOperation, vec![input, factor]).unwrap()[0];
+    let output = builder.add_instruction(MulOperation, vec![input, factor], Vec::new()).unwrap()[0];
     builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
 }
 
@@ -25,7 +25,7 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
-    use crate::batching::BatchingContext;
+    use crate::batching::{BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::CompareOperation;
@@ -57,7 +57,11 @@ mod tests {
         let rhs = ArrayBatch::replicated(TestArray::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
         let outputs = DotOperation::new(dimensions)
-            .batch(&BatchingContext::new(EagerContext::<TestArray>::new(), 2, None), &[lhs, rhs])
+            .batch(
+                &BatchingContext::new(EagerContext::<TestArray>::new(), 2, None),
+                &crate::RegionlessDriver,
+                &[lhs, rhs],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -76,7 +80,7 @@ mod tests {
 
         // Primal: reduce(x, [0], Sum) on `TestArray` directly.
         let primal_output = operation
-            .interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&primal))
+            .interpret(&EagerContext::<TestArray>::new(), &crate::RegionlessDriver, std::slice::from_ref(&primal))
             .unwrap()
             .into_iter()
             .next()
@@ -86,7 +90,11 @@ mod tests {
         // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the
         // reduce of the tangent.
         let tangent_outputs = operation
-            .interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&tangent_value))
+            .interpret(
+                &EagerContext::<TestArray>::new(),
+                &crate::RegionlessDriver,
+                std::slice::from_ref(&tangent_value),
+            )
             .unwrap();
         let tangent_output = tangent_outputs.into_iter().next().unwrap();
         assert_eq!(tangent_output.values(), &[2.0]);
@@ -108,9 +116,13 @@ mod tests {
         // Condition program: state -> (state > 0). Returns a scalar Boolean.
         let mut condition_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let cond_input = condition_builder.add_input(scalar_f64.clone());
-        let cond_zero = condition_builder.add_instruction(ZeroLikeOperation, vec![cond_input]).unwrap()[0];
+        let cond_zero = condition_builder.add_instruction(ZeroLikeOperation, vec![cond_input], Vec::new()).unwrap()[0];
         let cond_output = condition_builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![cond_input, cond_zero])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                vec![cond_input, cond_zero],
+                Vec::new(),
+            )
             .unwrap()[0];
         let condition: Program<TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
@@ -119,13 +131,14 @@ mod tests {
         // Body program: state -> state - 1.
         let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let body_input = body_builder.add_input(scalar_f64);
-        let body_one = body_builder.add_instruction(OneLikeOperation, vec![body_input]).unwrap()[0];
-        let body_output = body_builder.add_instruction(SubOperation, vec![body_input, body_one]).unwrap()[0];
+        let body_one = body_builder.add_instruction(OneLikeOperation, vec![body_input], Vec::new()).unwrap()[0];
+        let body_output =
+            body_builder.add_instruction(SubOperation, vec![body_input, body_one], Vec::new()).unwrap()[0];
         let body: Program<TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let while_op = WhileOperation::<TestArray, TestOp>::new(condition, body).unwrap();
+        let while_op = WhileOperation::new();
         let context = BatchingContext::new(EagerContext::<TestArray, TestOp>::new(), 3, None);
 
         let initial_state = {
@@ -133,7 +146,13 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = while_op.batch(&context, &[initial_state]).unwrap();
+        let inputs = [BatchingTracer::new(context.clone(), initial_state)];
+        let outputs = context
+            .bind(while_op, vec![condition.clone(), body.clone()], &[], &inputs)
+            .unwrap()
+            .into_iter()
+            .map(BatchingTracer::into_batch)
+            .collect::<Vec<_>>();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         // Each batch item terminates when its value reaches 0; inactive batch items retain their last value.
@@ -148,12 +167,24 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = bounded_while_op.batch(&context, &[initial_state]).unwrap();
+        let inputs = [BatchingTracer::new(context.clone(), initial_state)];
+        let outputs = context
+            .bind(bounded_while_op, vec![condition.clone(), body.clone()], &[], &inputs)
+            .unwrap()
+            .into_iter()
+            .map(BatchingTracer::into_batch)
+            .collect::<Vec<_>>();
         assert_eq!(outputs[0].value().values(), &[1.0, 0.0, 0.0]);
 
         // The replicated batched loop respects the bound as well: an unbatched initial state of 5.0 stops at 3.0.
         let initial_state = ArrayBatch::replicated(TestArray::scalar(5.0));
-        let outputs = bounded_while_op.batch(&context, &[initial_state]).unwrap();
+        let inputs = [BatchingTracer::new(context.clone(), initial_state)];
+        let outputs = context
+            .bind(bounded_while_op, vec![condition, body], &[], &inputs)
+            .unwrap()
+            .into_iter()
+            .map(BatchingTracer::into_batch)
+            .collect::<Vec<_>>();
         assert_eq!(outputs[0].value().values(), &[3.0]);
     }
 
@@ -312,12 +343,13 @@ mod tests {
     fn test_condition_batches_replicated_true_predicate_over_array_batches() {
         use crate::batching::ArrayBatch;
         use crate::batching::BatchAxis;
-        use crate::batching::BatchableOperation;
+        use crate::batching::BatchingTracer;
 
         // A replicated `true` predicate selects scalar_scale_branch(2.0). Pass a 3-item batched operand and
         // verify each batch item is independently scaled by 2.
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
+        let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let condition = ConditionOperation::new();
+        let operation = ArrayOperation::Condition(condition);
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
 
         let batched_input = {
@@ -325,9 +357,19 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = operation.batch(&context, &[replicated_predicate(true), batched_input]).unwrap();
+        let outputs = context
+            .bind(
+                operation,
+                condition_regions,
+                &[],
+                &[
+                    BatchingTracer::new(context.clone(), replicated_predicate(true)),
+                    BatchingTracer::new(context.clone(), batched_input),
+                ],
+            )
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        let output_batch = &outputs[0];
+        let output_batch = outputs[0].batch();
         assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
         assert_eq!(output_batch.value().values, vec![2.0, 8.0, 18.0]);
     }
@@ -336,10 +378,11 @@ mod tests {
     fn test_condition_batches_false_branch_when_replicated_predicate_is_false() {
         use crate::batching::ArrayBatch;
         use crate::batching::BatchAxis;
-        use crate::batching::BatchableOperation;
+        use crate::batching::BatchingTracer;
 
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
+        let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let condition = ConditionOperation::new();
+        let operation = ArrayOperation::Condition(condition);
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
 
         let batched_input = {
@@ -347,9 +390,19 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = operation.batch(&context, &[replicated_predicate(false), batched_input]).unwrap();
+        let outputs = context
+            .bind(
+                operation,
+                condition_regions,
+                &[],
+                &[
+                    BatchingTracer::new(context.clone(), replicated_predicate(false)),
+                    BatchingTracer::new(context.clone(), batched_input),
+                ],
+            )
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        let output_batch = &outputs[0];
+        let output_batch = outputs[0].batch();
         assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
         assert_eq!(output_batch.value().values, vec![3.0, 12.0, 27.0]);
     }
@@ -449,11 +502,13 @@ mod tests {
 
     #[test]
     fn test_batching_batch_varying_condition_selects_per_item() {
+        use crate::batching::BatchingTracer;
         // Per-item scalar branches: on_true scales by 2.0, on_false scales by 3.0. Operand is a
         // [4]-vector; predicate is a [4]-vector with values [1.0, 0.0, 1.0, 0.0]. Expected per-item
         // output: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
+        let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let condition = ConditionOperation::new();
+        let operation = ArrayOperation::Condition(condition);
 
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
@@ -464,10 +519,20 @@ mod tests {
             ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4, None);
-        let outputs = operation.batch(&context, &[predicate_batch, operand_batch]).unwrap();
+        let outputs = context
+            .bind(
+                operation,
+                condition_regions,
+                &[],
+                &[
+                    BatchingTracer::new(context.clone(), predicate_batch),
+                    BatchingTracer::new(context.clone(), operand_batch),
+                ],
+            )
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![2.0, 6.0, 6.0, 12.0]);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].batch().value().values, vec![2.0, 6.0, 6.0, 12.0]);
     }
 
     #[test]
@@ -530,6 +595,7 @@ mod tests {
         let outputs = SelectOperation
             .batch(
                 &BatchingContext::new(EagerContext::<TestArray>::new(), 3, None),
+                &crate::RegionlessDriver,
                 &[pred_batch, on_true_batch, on_false_batch],
             )
             .unwrap();
@@ -553,6 +619,7 @@ mod tests {
                     2,
                     None,
                 ),
+                &crate::RegionlessDriver,
                 &[],
             )
             .unwrap();
@@ -575,6 +642,7 @@ mod tests {
                     2,
                     None,
                 ),
+                &crate::RegionlessDriver,
                 &[],
             )
             .unwrap();
@@ -594,7 +662,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
 
         let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
-        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &crate::RegionlessDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![0.0]);
@@ -603,7 +671,7 @@ mod tests {
             scalar,
             crate::backends::scalars::Scalar::from(7.5),
         ));
-        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &crate::RegionlessDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![7.5]);
@@ -649,11 +717,13 @@ mod tests {
         V::DispatchDomain:
             crate::contexts::Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
     {
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
+        let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let condition = ConditionOperation::new();
         let context = x.dispatch_domain();
         let predicate = context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
-        let mut outputs =
-            context.bind(ArrayOperation::Condition(Box::new(condition)), &[], &[], &[predicate, x]).unwrap();
+        let mut outputs = context
+            .bind(ArrayOperation::Condition(condition), condition_regions.clone(), &[], &[predicate, x])
+            .unwrap();
         outputs.remove(0)
     }
 
@@ -675,9 +745,12 @@ mod tests {
         assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
     }
 
-    /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests.
-    fn doubling_while_operation()
-    -> crate::operations::control_flow::WhileOperation<TestArray, ArrayOperation<TestArray>> {
+    /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests,
+    /// returning the payload-free operation together with its condition and body region programs (in region order).
+    fn doubling_while_operation() -> (
+        crate::operations::control_flow::WhileOperation,
+        Vec<crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>,
+    ) {
         use crate::operations::compare::ComparisonDirection;
         type TestOp = ArrayOperation<TestArray>;
 
@@ -686,7 +759,11 @@ mod tests {
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
         let predicate = condition_builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![condition_state, threshold])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                vec![condition_state, threshold],
+                Vec::new(),
+            )
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -694,12 +771,12 @@ mod tests {
 
         let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let body_state = body_builder.add_input(scalar_f64);
-        let doubled = body_builder.add_instruction(AddOperation, vec![body_state, body_state]).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, vec![body_state, body_state], Vec::new()).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        crate::operations::control_flow::WhileOperation::new(condition, body).unwrap()
+        (crate::operations::control_flow::WhileOperation::new(), vec![condition, body])
     }
 
     #[test]
@@ -707,12 +784,16 @@ mod tests {
         // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
         // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain:
         // the rule stages the doubled-state linear loop, which direct JVP execution interprets immediately.
-        let while_operation = doubling_while_operation();
+        let (while_operation, while_regions) = doubling_while_operation();
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        ArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -729,12 +810,16 @@ mod tests {
         // the batched basis tangents through it: the pushforward is instantiated into a direct linear program and
         // interpreted over the batching rules with concrete values, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
-        let while_operation = doubling_while_operation();
+        let (while_operation, while_regions) = doubling_while_operation();
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        ArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -749,13 +834,14 @@ mod tests {
         // runs three iterations, below the bound of 5, so the eager hybrid rule unrolls the loop in full (the bound
         // only truncates once it is reached). The straight-line pushforward transposes, and locally `f(x) = 8 x`, so
         // the value is 8 and the gradient is 8.
-        let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
+        let (while_operation, while_regions) = doubling_while_operation();
+        let while_operation = while_operation.with_iteration_bound(5).unwrap();
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[], &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -772,13 +858,13 @@ mod tests {
         // `x = 1` (three iterations), so the pushforward is a straight-line linear program that transposes. Locally
         // `f(x) = 8 x`, so the value is 8 and the gradient is 8. JAX cannot do this even under eager execution,
         // because it always traces `while_loop`.
-        let while_operation = doubling_while_operation();
+        let (while_operation, while_regions) = doubling_while_operation();
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[], &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -795,12 +881,17 @@ mod tests {
         // three iterations, below the bound of 5, so the eager hybrid rule unrolls the loop in full and transposes the
         // straight-line pushforward into a reusable pullback (no `while` remains). The loop is locally `f(x) = 8 x`,
         // so every output cotangent is scaled by 8.
-        let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
+        let (while_operation, while_regions) = doubling_while_operation();
+        let while_operation = while_operation.with_iteration_bound(5).unwrap();
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        ArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -832,12 +923,16 @@ mod tests {
     fn test_while_vjp_computes_cotangents_through_unrolled_loop() {
         // Eager `vjp` transposes the unrolled straight-line pushforward of an *unbounded* loop into a reusable
         // pullback: the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
-        let while_operation = doubling_while_operation();
+        let (while_operation, while_regions) = doubling_while_operation();
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        ArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -868,12 +963,15 @@ mod tests {
     /// used by the scan differentiation tests, optionally visiting the iterations in reverse order.
     fn product_scan_operation(
         reverse: bool,
-    ) -> crate::operations::control_flow::ScanOperation<TestArray, ArrayOperation<TestArray>> {
+    ) -> (
+        crate::operations::control_flow::ScanOperation<TestArray>,
+        crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+    ) {
         type TestOp = ArrayOperation<TestArray>;
         let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let carry = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let x = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = body_builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![product, product],
@@ -881,9 +979,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        crate::operations::control_flow::ScanOperation::<TestArray, ArrayOperation<TestArray>>::new(body, 1, 3)
-            .unwrap()
-            .with_reverse(reverse)
+        (crate::operations::control_flow::ScanOperation::<TestArray>::new(1, 3).with_reverse(reverse), body)
     }
 
     #[test]
@@ -893,13 +989,13 @@ mod tests {
         // gradient `24` w.r.t. `init` and `[12, 8, 6]` w.r.t. `xs`. The pullback runs the transposed linear scan
         // (same residual stacks, `reverse` flipped) — the static trip count is what makes this total, where the
         // staged linear `while` rejects transposition.
-        let scan = product_scan_operation(false);
+        let (scan, scan_body) = product_scan_operation(false);
         let (value, (init_gradient, xs_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |(init, xs)| {
                     let mut outputs = init
                         .context()
-                        .bind(ArrayOperation::Scan(Box::new(scan)), &[], &[], &[init.clone(), xs.clone()])
+                        .bind(ArrayOperation::Scan(scan), vec![scan_body.clone()], &[], &[init.clone(), xs.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -916,13 +1012,13 @@ mod tests {
         // `vjp` through the cumulative-product scan produces a reusable pullback containing the transposed linear
         // scan: the same residual stacks with `reverse` flipped to `true`. Each cotangent seed scales the
         // hand-computed gradients `(24, [12, 8, 6])`.
-        let scan = product_scan_operation(false);
+        let (scan, scan_body) = product_scan_operation(false);
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        ArrayOperation::Scan(Box::new(scan)),
-                        &[],
+                        ArrayOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[],
                         &[init.clone(), xs.clone()],
                     )?;
@@ -956,13 +1052,13 @@ mod tests {
         // residual iteration `i` is consumed exactly when tangent iteration `i` is processed. The reversed cumulative
         // product has `ys = [x0 x1 x2, x1 x2, x2] = [24, 12, 4]`, so a unit tangent on `x1` gives
         // `dys = [x0 x2, x2, 0] = [8, 4, 0]`.
-        let scan = product_scan_operation(true);
+        let (scan, scan_body) = product_scan_operation(true);
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        ArrayOperation::Scan(Box::new(scan)),
-                        &[],
+                        ArrayOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[],
                         &[init.clone(), xs.clone()],
                     )?;
@@ -980,13 +1076,13 @@ mod tests {
 
         // Reverse mode through the reversed scan flips `reverse` back to `false` in the pullback and produces the
         // same product-rule gradients (multiplication commutes across the visit order).
-        let scan = product_scan_operation(true);
+        let (scan, scan_body) = product_scan_operation(true);
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        ArrayOperation::Scan(Box::new(scan)),
-                        &[],
+                        ArrayOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[],
                         &[init.clone(), xs.clone()],
                     )?;
@@ -1008,13 +1104,14 @@ mod tests {
 
     #[test]
     fn test_array_operation_condition_interprets_runtime_predicate() {
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let operation = ArrayOperation::Condition(Box::new(condition));
+        let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+        let condition = ConditionOperation::new();
+        let operation = ArrayOperation::Condition(condition);
 
         let predicate = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         assert_eq!(
-            operation
-                .interpret(&EagerContext::<TestArray>::new(), &[predicate, TestArray::scalar(4.0)])
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .bind(operation, condition_regions, &[], &[predicate, TestArray::scalar(4.0)])
                 .map(|outputs| outputs[0].values[0]),
             Ok(12.0),
         );
@@ -1029,10 +1126,11 @@ mod tests {
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
-                    let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
+                    let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+                    let condition = ConditionOperation::new();
                     let mut outputs = predicate.context().bind(
-                        ArrayOperation::Condition(Box::new(condition)),
-                        &[],
+                        ArrayOperation::Condition(condition),
+                        condition_regions.clone(),
                         &[],
                         &[predicate.clone(), operand.clone()],
                     )?;
@@ -1052,10 +1150,11 @@ mod tests {
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
-                    let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
+                    let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+                    let condition = ConditionOperation::new();
                     let mut outputs = predicate.context().bind(
-                        ArrayOperation::Condition(Box::new(condition)),
-                        &[],
+                        ArrayOperation::Condition(condition),
+                        condition_regions.clone(),
                         &[],
                         &[predicate.clone(), operand.clone()],
                     )?;

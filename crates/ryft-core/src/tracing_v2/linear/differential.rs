@@ -14,6 +14,7 @@ use crate::differentiation::{DifferentiableOperation, DifferentiationError, Tran
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::BooleanLike;
+use crate::operations::RegionlessDriver;
 use crate::operations::constants::{FillOperation, OneOperation, ZeroLikeOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::operations::math::AddOperation;
@@ -118,7 +119,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: Clone
             + InterpretableOperation<DomainValue<Self>, Self>
-            + PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<Self> + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + From<ZeroOperation<ArrayType>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
             + BatchableOperation<Self>,
@@ -721,12 +722,12 @@ where
         // A zero-input operation has no operand batch axis to lift through and is replicated by construction, so
         // interpret it once over the per-item value type and surface the result as a replicated value.
         return operation
-            .interpret(context.parent(), &[])?
+            .interpret(&context.parent().clone(), &RegionlessDriver, &[])?
             .into_iter()
             .map(|value| Ok(ArrayBatch::replicated(value)))
             .collect();
     }
-    operation.batch(context, inputs)
+    operation.batch(context, &RegionlessDriver, inputs)
 }
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.
@@ -767,6 +768,7 @@ where
         + BatchableOperation<C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>
         + DifferentiableOperation<PartialEvaluationContext<C>>,
