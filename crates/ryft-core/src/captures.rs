@@ -18,10 +18,11 @@ use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::constants::Zero;
+use crate::operations::constants::ZeroOperation;
+use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Region, Value};
+use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -105,33 +106,14 @@ impl<T: Type> Value for CaptureReference<T> {
 /// enabling executable reuse across captured values, retaining device buffers on-device, and keeping the IR compact.
 pub trait CapturingContext: Context {
     /// Concrete runtime value type that this [`CapturingContext`] registers in its capture table. This is deliberately
-    /// distinct from both [`Context::Value`] (i.e., the value type flowing through the context, which is typically
-    /// a [`Tracer`](crate::Tracer) while capturing) and [`Context::Constant`] (i.e., the staged payload that
-    /// [`capture`](Self::capture) returns).
+    /// distinct from both [`Value`](crate::Domain::Value) (i.e., the value type flowing through the context, which is
+    /// typically a [`Tracer`](crate::Tracer) while capturing) and [`Constant`](crate::Domain::Constant) (i.e., the
+    /// staged payload that [`capture`](Self::capture) returns).
     type Capture: Value<Type = Self::Type>;
 
     /// Appends `value` to the current captures table of this [`CapturingContext`] and returns the constant payload
     /// that refers to it.
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError>;
-
-    // TODO(eaplatanios): Delete this method (together with its overrides, the `TracingContext` nested-capture flag
-    //  and its `note_nested_capture`/`has_nested_captures` accessors,
-    //  and the pruning skip in `compilation/function.rs`) once the operation-family migrations in phases 4-6 make
-    //  capture discovery recursively region-aware, at which point nested-only capture references become visible to
-    //  pruning and the conservative guard is no longer needed.
-    /// Registers `value` like [`capture`](Self::capture) for a registration that originates inside a nested trace,
-    /// whose builder is where the returned reference constant will be staged. The reference then lives only inside a
-    /// nested payload program that top-level-only capture pruning cannot see, so the capture-reference root context
-    /// overrides this to additionally record that pruning would be unsafe, while stackable transform contexts
-    /// forward it to their parent like [`capture`](Self::capture). The default forwards to [`capture`](Self::capture)
-    /// directly, which also makes nested-in-nested registration chain correctly through [`NestedTracingContext`]'s
-    /// delegating [`capture`](Self::capture). This is part of the temporary conservative capture-pruning guard for the
-    /// first-class-program-regions migration and is deleted once capture discovery is recursively region-aware for
-    /// every operation family.
-    #[inline]
-    fn capture_in_nested_trace(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.capture(value)
-    }
 }
 
 impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext for TracingContext<CaptureReference<T>, O, C> {
@@ -144,12 +126,6 @@ impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext for TracingC
         captures.push(value);
         Ok(constant)
     }
-
-    #[inline]
-    fn capture_in_nested_trace(&self, value: C) -> Result<Self::Constant, ProgramError> {
-        self.note_nested_capture();
-        self.capture(value)
-    }
 }
 
 impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
@@ -157,14 +133,16 @@ impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
 
     #[inline]
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        // The returned reference constant is staged into this nested trace's builder, so the registration takes the
-        // nested-flavored path. Top-level-only capture pruning cannot see the nested reference.
-        self.parent().capture_in_nested_trace(value)
+        self.parent().capture(value)
     }
 }
 
-impl<C: CapturingContext<Operation: PartiallyEvaluatableOperation<C>>> CapturingContext
-    for PartialEvaluationContext<C>
+impl<
+    C: CapturingContext<
+        Operation: PartiallyEvaluatableOperation<C>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    >,
+> CapturingContext for PartialEvaluationContext<C>
 {
     type Capture = C::Capture;
 
@@ -172,29 +150,17 @@ impl<C: CapturingContext<Operation: PartiallyEvaluatableOperation<C>>> Capturing
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
-
-    #[inline]
-    fn capture_in_nested_trace(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent().capture_in_nested_trace(value)
-    }
 }
 
-impl<C: CapturingContext<Type = ArrayType, Operation: BatchableOperation<C>>> CapturingContext for BatchingContext<C> {
-    type Capture = C::Capture;
-
-    #[inline]
-    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent().capture(value)
-    }
-
-    #[inline]
-    fn capture_in_nested_trace(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent().capture_in_nested_trace(value)
-    }
-}
-
-impl<C: CapturingContext<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> CapturingContext
-    for DifferentiationContext<C>
+impl<
+    C: CapturingContext<
+            Type = ArrayType,
+            Operation: BatchableOperation<C>
+                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<TransposeOperation>
+                           + From<BroadcastOperation>,
+        >,
+> CapturingContext for BatchingContext<C>
 {
     type Capture = C::Capture;
 
@@ -202,10 +168,23 @@ impl<C: CapturingContext<Operation: Clone + DifferentiableOperation<C>> + Zero<C
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
+}
+
+impl<
+    C: CapturingContext<
+        Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                       + DifferentiableOperation<C>
+                       + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+                       + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+                       + From<ZeroOperation<C::Type>>,
+    >,
+> CapturingContext for DifferentiationContext<C>
+{
+    type Capture = C::Capture;
 
     #[inline]
-    fn capture_in_nested_trace(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent().capture_in_nested_trace(value)
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
+        self.parent().capture(value)
     }
 }
 
@@ -292,21 +271,16 @@ impl<
     /// rebuilt program instead of being cloned.
     pub fn without_unused_captures(self) -> Result<Self, ProgramError> {
         let Self { program, captures } = self;
-        // TODO(eaplatanios): Fix this as part of later phase of the first-class program regions plan.
-        if program.regions().len() != 1 {
-            return Err(ProgramError::MalformedProgram(
-                "multi-region programs are not yet supported by this transformation".to_string(),
-            ));
-        }
-        let Program { regions, input_structure, output_structure, .. } = program;
-        let Region { atoms, input_ids, output_ids, instructions } = regions.into_iter().next().unwrap();
 
-        // Mark the captures that at least one constant atom references. Indexing into `is_referenced`
-        // cannot fail because `new` validated every capture reference at construction time.
+        // Mark the captures that at least one constant atom references. Every region participates in the program's
+        // single capture scope, so the marking pass walks all of them. Indexing into `is_referenced` cannot fail
+        // because `new` validated every capture reference at construction time.
         let mut is_referenced = vec![false; captures.len()];
-        for atom in &atoms {
-            if let Atom::Constant(capture_reference) = atom {
-                is_referenced[capture_reference.index()] = true;
+        for region in program.regions() {
+            for atom in region.atoms() {
+                if let Atom::Constant(capture_reference) = atom {
+                    is_referenced[capture_reference.index()] = true;
+                }
             }
         }
 
@@ -321,97 +295,19 @@ impl<
             }
         }
 
-        /// Materializes the rebuilt atom identifiers for `atom_ids` in `builder`, memoizing the results in
-        /// `mapped_atoms` and lazily re-adding referenced capture constants with their re-indexed references.
-        /// The `capture_index_map` slot lookups cannot fail because the marking pass in
-        /// [`ClosedProgram::without_unused_captures`] assigns a slot to every capture
-        /// referenced by any constant atom.
-        fn map_atoms<T: Type, O: Operation<T>>(
-            atoms: &[Atom<CaptureReference<T>>],
-            capture_index_map: &[Option<usize>],
-            builder: &mut ProgramBuilder<CaptureReference<T>, O>,
-            mapped_atoms: &mut [Option<AtomId>],
-            atom_ids: Vec<AtomId>,
-        ) -> Result<Vec<AtomId>, ProgramError> {
-            atom_ids
-                .into_iter()
-                .map(|atom_id| {
-                    if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
-                        return Ok(mapped);
-                    }
-                    match atoms.get(atom_id.index()) {
-                        Some(Atom::Constant(capture_reference)) => {
-                            let index = capture_index_map[capture_reference.index()].unwrap();
-                            let mapped = builder
-                                .add_constant(CaptureReference::new(index, capture_reference.r#type().into_owned()));
-                            mapped_atoms[atom_id.index()] = Some(mapped);
-                            Ok(mapped)
-                        }
-                        Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
-                            "variable atom {atom_id} has no mapped input or instruction output",
-                        ))),
-                        None => Err(ProgramError::UnboundAtomId { id: atom_id }),
-                    }
-                })
-                .collect()
-        }
-
-        // Rebuild the underlying program with the same structure, rewriting only the constant atoms. `mapped_atoms`
-        // tracks the rebuilt `AtomId` of every source atom so that an atom shared across instructions maps to a single
-        // rebuilt atom instead of being duplicated.
-        let mut builder = ProgramBuilder::new();
-        let mut mapped_atoms = vec![None; atoms.len()];
-
-        // Program inputs must be re-added before any instruction is replayed so that instruction operands referencing
-        // them resolve through `mapped_atoms` instead of being treated as unmapped atoms.
-        for input_id in input_ids {
-            let input_index = input_id.index();
-            let input = atoms.get(input_index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(input_type) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-            };
-            mapped_atoms[input_index] = Some(builder.add_input(input_type.clone()));
-        }
-
-        // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
-        // instructions (and the program outputs) can resolve them. The operations are moved into the rebuilt program.
-        for instruction in instructions {
-            let (operation, instruction_inputs, instruction_outputs, regions) = instruction.into_parts();
-            if !regions.is_empty() {
-                // TODO(eaplatanios): Fix this as part of later phase of the first-class program regions plan.
-                // This is unreachable by construction. The single-region check above already rejected multi-region
-                // programs and a single-region program has no sealed regions for an instruction to attach.
-                return Err(ProgramError::MalformedProgram(
-                    "multi-region programs are not yet supported by this transformation".to_string(),
-                ));
-            }
-            let inputs = map_atoms(
-                atoms.as_slice(),
-                capture_index_map.as_slice(),
-                &mut builder,
-                mapped_atoms.as_mut_slice(),
-                instruction_inputs,
-            )?;
-            let outputs = builder.add_instruction(operation, inputs)?.to_vec();
-            check_count!("output", outputs, instruction_outputs.len(), ProgramError);
-            for (output, rebuilt_output) in instruction_outputs.into_iter().zip(outputs) {
-                let mapped_atom =
-                    mapped_atoms.get_mut(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
-                *mapped_atom = Some(rebuilt_output);
+        // Rewrite every constant atom in place, across every region, to carry its capture's new index. The program
+        // structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved exactly. The
+        // `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every capture
+        // referenced by any constant atom.
+        let mut program = program;
+        for region in &mut program.regions {
+            for atom in &mut region.atoms {
+                if let Atom::Constant(capture_reference) = atom {
+                    let index = capture_index_map[capture_reference.index()].unwrap();
+                    *capture_reference = CaptureReference::new(index, capture_reference.r#type().into_owned());
+                }
             }
         }
-
-        // Program outputs may be inputs, instruction outputs, or captured constants, and so they are resolved
-        // through the same atom mapping as instruction operands.
-        let output_ids = map_atoms(
-            atoms.as_slice(),
-            capture_index_map.as_slice(),
-            &mut builder,
-            mapped_atoms.as_mut_slice(),
-            output_ids,
-        )?;
-
-        let program = builder.build(output_ids, input_structure, output_structure)?;
 
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
@@ -425,10 +321,7 @@ impl<
     ) -> Result<
         Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
         ProgramError,
-    >
-    where
-        O: Clone,
-    {
+    > {
         /// Materializes the rebuilt atom identifiers for `atom_ids`, resolving each atom either through `mapped_atoms`
         /// (which memoizes the rebuilt identifiers of program inputs and instruction outputs) or, for a captured
         /// constant, to the leading capture input that `capture_inputs` records for the capture the constant
@@ -460,9 +353,14 @@ impl<
 
         // Add one leading input per capture, in capture-table order and unconditionally (a capture that no atom
         // references still occupies its input slot), because execution supplies arguments positionally in
-        // `[captures..., public inputs...]` order. A constant atom referencing capture `k` resolves to
-        // `capture_inputs[k]` during the replay below.
+        // `[captures..., public inputs...]` order. Entry-region constant atoms referencing capture `k` resolve
+        // to `capture_inputs[k]` during the replay below. Constants inside attached regions are preserved as
+        // `CaptureReference`s (backend-specific lowering like XLA lowering will resolve them against the same
+        // hidden capture argument prefix while lowering those regions). Nested regions are imported verbatim ahead
+        // of the replay. Their identifiers are arena indices assigned in order, so copying them in order preserves
+        // every entry-instruction region reference.
         let mut builder = ProgramBuilder::new();
+        builder.regions = self.program.regions()[..self.program.entry().index()].to_vec();
         let capture_inputs = self
             .captures
             .iter()
@@ -485,7 +383,8 @@ impl<
 
         // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
         // instructions (and the program outputs) can resolve them. This borrows `self`, and so the operations are
-        // cloned into the rebuilt program (cheaply, since operations share their nested programs).
+        // cloned into the rebuilt program (cheaply, since nested regions are copied by arena splicing with sharing
+        // preserved).
         for instruction in self.program.instructions() {
             let inputs = map_atoms(
                 self.program.atoms(),
@@ -493,7 +392,9 @@ impl<
                 capture_inputs.as_slice(),
                 instruction.inputs(),
             )?;
-            let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+            let outputs = builder
+                .add_instruction(instruction.operation().clone(), inputs, instruction.regions().to_vec())?
+                .to_vec();
             check_count!("output", outputs, instruction.outputs().len(), ProgramError);
             for (source_output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
                 let mapped = mapped_atoms
@@ -553,14 +454,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
+    use crate::operations::RegionlessDriver;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::programs::{ProgramBuilder, ProgramError, RegionId};
+    use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
     use crate::types::DataType;
 
@@ -606,7 +508,7 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
-        let output = builder.add_instruction(AddOperation, vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, capture], Vec::new()).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
                 vec![output],
@@ -647,11 +549,61 @@ mod tests {
                 vec![Scalar::from(2.0)],
                 |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()]),
                 |instruction, inputs| {
-                    instruction.operation().interpret(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), inputs)
+                    instruction.operation().interpret(
+                        &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                        &RegionlessDriver,
+                        inputs,
+                    )
                 },
             )
             .unwrap();
         assert_eq!(output, vec![Scalar::from(101.0)]);
+    }
+
+    #[test]
+    fn test_closed_program_without_unused_captures_with_attached_regions() {
+        // Captures referenced only inside an attached region survive pruning, and reference indices rewrite in every
+        // region. Capture #0 is unused (dropped), #1 is referenced only by the nested region (kept, becomes #0), and
+        // #2 is referenced only by the entry region (kept, becomes #1).
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let nested_capture = region_builder.add_constant(CaptureReference::new(1, DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![nested_capture],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let entry_capture = builder.add_constant(CaptureReference::new(2, DataType::F64));
+        let output = builder
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![entry_capture], vec![sealed])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![output],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let program =
+            ClosedProgram::new(program, vec![Scalar::from(1.0), Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
+        let pruned = program.without_unused_captures().unwrap();
+        assert_eq!(pruned.captures(), &[Scalar::from(2.0), Scalar::from(3.0)]);
+        let nested_indices = pruned.program().regions()[0]
+            .atoms()
+            .iter()
+            .filter_map(|atom| atom.as_constant().map(CaptureReference::index))
+            .collect::<Vec<_>>();
+        assert_eq!(nested_indices, vec![0]);
+        let entry_indices = pruned
+            .program()
+            .atoms()
+            .iter()
+            .filter_map(|atom| atom.as_constant().map(CaptureReference::index))
+            .collect::<Vec<_>>();
+        assert_eq!(entry_indices, vec![1]);
     }
 
     #[test]
@@ -661,8 +613,8 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
-        let sum = builder.add_instruction(AddOperation, vec![input, capture]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, vec![sum, capture]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![input, capture], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![sum, capture], Vec::new()).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
                 vec![output],
@@ -699,21 +651,84 @@ mod tests {
                 vec![Scalar::from(3.0), Scalar::from(7.0), Scalar::from(2.0)],
                 |_, _| unreachable!("the lifted program contains no captured-constant atoms"),
                 |instruction, inputs| {
-                    instruction.operation().interpret(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), inputs)
+                    instruction.operation().interpret(
+                        &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                        &RegionlessDriver,
+                        inputs,
+                    )
                 },
             )
             .unwrap();
         assert_eq!(output, vec![Scalar::from(8.0)]);
     }
 
-    // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_capturing_context_capture_in_nested_trace_marks_the_root_context_and_preserves_nested_only_captures() {
-        // Phase 1 guard pin for the first-class-program-regions plan: a capture registered through a nested trace
-        // is referenced only by a constant inside a nested payload program, which top-level-only pruning cannot
-        // see. The nested delegation marks the root context, and pruning is skipped for such traces (mirroring the
-        // jit staging path), so the capture and its indices survive intact. The unguarded pruning behavior is also
-        // pinned below to document why the guard exists until capture discovery becomes recursively region-aware.
+    fn test_closed_program_to_program_with_lifted_captures_with_attached_regions() {
+        // Lifting supports capture-free attached regions (imported verbatim ahead of the entry replay) and rejects
+        // nested-region capture references until region boundaries can thread them.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![region_input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let entry_capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let output = builder
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![entry_capture], vec![sealed])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![output],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let program = ClosedProgram::new(program, vec![Scalar::from(1.0)]).unwrap();
+        let lifted = program.to_program_with_lifted_captures().unwrap();
+        assert_eq!(lifted.regions().len(), 2);
+        assert_eq!(lifted.input_ids().len(), 1);
+        assert_eq!(lifted.instructions()[0].regions(), &[RegionId::new(0)]);
+
+        // A nested region that references a capture keeps that reference for backends that resolve nested constants
+        // against the lifted capture prefix while lowering attached regions.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let mut region_builder = ProgramBuilder::<CaptureReference<DataType>, TestRegionOperation>::new();
+        let nested_capture = region_builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![nested_capture],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let sealed = builder.import_region(region_program.entry_region_ref());
+        let entry_input = builder.add_input(DataType::F64);
+        let output = builder
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![entry_input], vec![sealed])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let program = ClosedProgram::new(program, vec![Scalar::from(1.0)]).unwrap();
+        let lifted = program.to_program_with_lifted_captures().unwrap();
+        assert_eq!(lifted.input_ids().len(), 2);
+        assert_eq!(lifted.instructions()[0].regions(), &[RegionId::new(0)]);
+        assert_eq!(lifted.regions()[0].atoms()[0].as_constant().map(CaptureReference::index), Some(0));
+    }
+
+    #[test]
+    fn test_capturing_context_nested_trace_preserves_nested_only_captures() {
+        // A capture registered through a nested trace is referenced only by a constant inside an attached region.
+        // Region-aware capture discovery must still keep it when pruning unused captures.
         let root =
             TracingContext::<CaptureReference<DataType>, ScalarOperation<CaptureReference<DataType>>, Scalar>::new();
         let state = root.input(DataType::F64);
@@ -724,7 +739,7 @@ mod tests {
             |inputs: Vec<Tracer<_>>| {
                 inputs[0].context().bind(
                     CompareOperation::new(ComparisonDirection::LessThan),
-                    &[],
+                    Vec::new(),
                     &[],
                     &[inputs[0].clone(), inputs[0].clone()],
                 )
@@ -741,18 +756,15 @@ mod tests {
                 let context = inputs[0].context().clone();
                 let reference = context.capture(Scalar::from(3.0))?;
                 let captured = StagingContext::constant(&context, reference);
-                context.bind(AddOperation, &[], &[], &[inputs[0].clone(), captured])
+                context.bind(AddOperation, Vec::new(), &[], &[inputs[0].clone(), captured])
             },
             vec![DataType::F64],
         )
         .unwrap();
-        let operation = WhileOperation::new(condition, body).unwrap();
+        let operation = WhileOperation::new();
         let outputs = root
-            .bind(ScalarOperation::While(Box::new(operation)), &[], &[], std::slice::from_ref(&state))
+            .bind(ScalarOperation::While(operation), vec![condition, body], &[], std::slice::from_ref(&state))
             .unwrap();
-
-        // The nested registration marked the root context through the delegation chain.
-        assert!(root.has_nested_captures());
 
         // The top-level program holds no capture-reference atoms. The only reference lives in the while body.
         let output_ids = outputs.iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>().unwrap();
@@ -769,11 +781,9 @@ mod tests {
         assert!(closed.program().atoms().iter().all(|atom| !atom.is_constant()));
         assert_eq!(closed.captures(), &[Scalar::from(3.0)]);
 
-        // Unguarded pruning would silently drop the nested-only capture (the bug the guard prevents).
-        // The guarded path keeps the closed program untouched instead.
+        // The while body is an attached region, so capture-use discovery walks into it and pruning keeps the
+        // nested-only capture.
         let pruned = closed.clone().without_unused_captures().unwrap();
-        assert_eq!(pruned.captures(), &[] as &[Scalar]);
-        let guarded = if root.has_nested_captures() { closed } else { closed.without_unused_captures().unwrap() };
-        assert_eq!(guarded.captures(), &[Scalar::from(3.0)]);
+        assert_eq!(pruned.captures(), &[Scalar::from(3.0)]);
     }
 }
