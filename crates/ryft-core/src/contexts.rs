@@ -25,11 +25,11 @@
 //!
 //! # Entry Points
 //!
-//! Use the free [`trace`](crate::trace) function for ordinary symbolic tracing (or [`Trace::trace`](Trace::trace) to
-//! name a domain explicitly) and [`infer_output_type`](crate::tracing::infer_output_type) when only abstract outputs
-//! are needed. Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to replay through a
-//! chosen context. Most transform modules also expose a free value-level entry point and a context capability built
-//! on this same bind protocol.
+//! Use the free [`trace`](crate::trace) function for ordinary symbolic tracing (or [`Trace::trace`] to name a domain
+//! explicitly) and [`infer_output_type`](crate::tracing::infer_output_type) when only abstract outputs are needed.
+//! Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to replay through a chosen context.
+//! Most transform modules also expose a free value-level entry point and a context capability built on this same bind
+//! protocol.
 //!
 //! # Domains versus Contexts
 //!
@@ -106,16 +106,17 @@
 //! context capabilities to the parent where appropriate.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, RegionId, RegionInterface, Value};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -171,20 +172,32 @@ pub trait Context: Domain + Clone {
     /// [`Tracer`]s.
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError>;
 
-    /// Binds the provided [`Operation`] to the provided input [`Value`]s in this [`Context`] and returns the resulting
-    /// output values. Eager contexts bind by interpreting the operation over concrete values. [`StagingContext`]s bind
-    /// by recording an [`Instruction`](crate::Instruction) in their underling [`ProgramBuilder`]. Operations that carry
-    /// nested computations additionally provide them at construction time as the freshly authored lexically owned
-    /// computations (via the `regions` argument) and shareable callee computations (via the `callees` argument), each
-    /// in the operation-defined order. Once an operation family stores its nested computations as instruction
-    /// [`Region`](crate::Region)s instead of payload fields, this is how a freshly authored application reaches a
-    /// context: eager contexts interpret the provided computations, staging contexts add them to the destination
-    /// program and attach them to the staged instruction, and transform contexts transform them before emitting the
-    /// destination application.
-    fn bind<O: Into<Self::Operation>>(
+    /// Applies an [`Operation`] in this [`Context`] and returns its output values. The context determines what applying
+    /// the operation means: [`EagerContext`]s interpret it over concrete values, [`StagingContext`]s record an
+    /// [`Instruction`](crate::Instruction) in their [`ProgramBuilder`], and transform contexts apply the corresponding
+    /// transformation rule before forwarding rewritten operations to a parent context.
+    ///
+    /// Nested computations belong to an operation application rather than to the operation payload itself. They are
+    /// therefore supplied alongside the operation and its inputs. Freshly authored, lexically owned computations are
+    /// passed as `regions`, while independently shared computations are passed as `callees`. Both are exposed to the
+    /// operation in one ordered [`Region`](crate::Region) namespace, with the owned regions preceding the callees.
+    /// Eager and transform contexts make those regions available to the operation's application-scoped driver. Staging
+    /// contexts import them into the destination program and attach their [`RegionId`]s to the recorded instruction.
+    /// The combined `regions` and `callees` sequence must match the number and order of slots returned by
+    /// [`Operation::region_names`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: [`Operation`] being applied.
+    ///   - `regions`: Nested computations owned by this operation application. They occupy the first attached region
+    ///     slots. Binding consumes these programs because staging may import them into the destination program.
+    ///   - `callees`: Shared nested computations referenced by this application. They follow `regions` in the
+    ///     attached region namespace and retain shared ownership so staging can intern repeated references.
+    ///   - `inputs`: Input values supplied as the operation's operands, in operation-defined order.
+    fn bind<O: Into<Self::Operation>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: O,
-        regions: &[FlatProgram<Self>],
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
@@ -232,10 +245,7 @@ pub trait Context: Domain + Clone {
             Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
-    >
-    where
-        Self::Operation: Clone,
-    {
+    > {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
@@ -327,33 +337,18 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
     }
 
     #[inline]
-    fn bind<P: Into<O>>(
+    fn bind<P: Into<O>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: P,
-        regions: &[FlatProgram<Self>],
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
+        // Eager context binds interpret their owned nested programs through detached access. Shared callee programs
+        // slot in after the owned regions, mirroring the staged region ordering.
         let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard: no operation family stages region-carrying binds yet,
-        //  and so every `Context::bind` implementation rejects non-empty `regions`/`callees` instead of silently
-        //  dropping them. Each guard is replaced by real region-binding behavior as its context migrates in phases
-        //  2-6 of `.tasks/plan_first_class_program_regions.md` (eager contexts interpret the nested programs, staging
-        //  contexts import them and attach destination region ids, and transform contexts transform them before
-        //  emitting the destination instruction). Deletion inventory: `EagerContext` (here), `TracingContext` and
-        //  `NestedTracingContext` in `tracing.rs`, `BatchingContext` in `batching.rs`, `DifferentiationContext` in
-        //  `differentiation/forward.rs`, `PartialEvaluationContext` in `partial.rs`,
-        //  `StagedDispatchTestArrayDomain` in `tracing_v2/operations/control_flow.rs`, and `XlaDomain` in
-        //  `ryft-xla`'s `experimental/domains.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
-        operation.interpret(self, inputs)
+        let driver = EagerInterpretationDriver { regions: regions.as_ref(), callees };
+        operation.interpret(self, &driver, inputs)
     }
 
     #[inline]
@@ -364,6 +359,51 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
     #[inline]
     fn resolve(&self, value: &V) -> ValueResolution<V> {
         ValueResolution::Concrete(value.clone())
+    }
+}
+
+/// [`InterpretationDriver`] that is used for eager interpretation of nested programs (i.e., that is used for
+/// interpretation by [`EagerContext`]s). [`EagerInterpretationDriver::interpret_region`] replays programs through
+/// the [`EagerContext`] itself, and so region-carrying operations interpret their branches without owning them.
+struct EagerInterpretationDriver<'r, V: Value, O: Operation<V::Type>> {
+    /// Owned nested [`Program`]s, in the operation-defined region order.
+    regions: &'r [FlatProgram<EagerContext<V, O>>],
+
+    /// Shared callee [`Program`]s, ordered after [`Self::regions`].
+    callees: &'r [Rc<FlatProgram<EagerContext<V, O>>>],
+}
+
+impl<V: Value, O: Operation<V::Type>> EagerInterpretationDriver<'_, V, O> {
+    /// Returns the `index`-th [`Program`] in the concatenated owned-region and shared-callee program list.
+    fn program(&self, index: usize) -> Option<&FlatProgram<EagerContext<V, O>>> {
+        self.regions
+            .get(index)
+            .or_else(|| index.checked_sub(self.regions.len()).and_then(|index| self.callees.get(index)).map(Rc::as_ref))
+    }
+}
+
+impl<V: Value, O: InterpretableOperation<V, EagerContext<V, O>>> InterpretationDriver<V, EagerContext<V, O>>
+    for EagerInterpretationDriver<'_, V, O>
+{
+    #[inline]
+    fn region_interface(&self, index: usize) -> Result<RegionInterface<V::Type>, ProgramError> {
+        let program = self
+            .program(index)
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("region index {index} is out of range")))?;
+        Ok(program.interface())
+    }
+
+    #[inline]
+    fn interpret_region(
+        &self,
+        context: &EagerContext<V, O>,
+        index: usize,
+        inputs: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError> {
+        let program = self
+            .program(index)
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("region index {index} is out of range")))?;
+        program.interpret_in_context(context, inputs)
     }
 }
 
@@ -424,13 +464,21 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         &self,
         operation: O,
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        self.stage_operation::<O, Self::Value>(operation, &[])
+        self.stage_operation::<O, _, Self::Value>(operation, [], &[], &[])
     }
 
-    /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
-    fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Self::Value>>(
+    /// Stages an application of the provided [`Operation`] in this [`StagingContext`], importing owned nested `regions`
+    /// and interning shared `callees` by [`Rc`] identity through [`ProgramBuilder::intern_callee`]. This is the staging
+    /// channel used by [`Context::bind`], including callee-carrying applications such as JIT-compiled function calls.
+    fn stage_operation<
+        O: Into<Self::Operation>,
+        R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>,
+        I: std::borrow::Borrow<Self::Value>,
+    >(
         &self,
         operation: O,
+        regions: R,
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[I],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
@@ -438,7 +486,13 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             .map_err(|error| self.error(error))?;
         if self.builder().borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice())?;
+            let region_interfaces = regions
+                .as_ref()
+                .iter()
+                .map(Program::interface)
+                .chain(callees.iter().map(|callee| callee.interface()))
+                .collect::<Vec<_>>();
+            let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
             Ok(output_types
                 .into_iter()
                 .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
@@ -450,7 +504,10 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             };
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, inputs) {
+                let mut region_ids = Vec::with_capacity(regions.as_ref().len() + callees.len());
+                region_ids.extend(regions.into_iter().map(|region| builder.import_program(region)));
+                region_ids.extend(callees.iter().map(|callee| builder.intern_callee(callee)));
+                match builder.add_instruction(operation, inputs, region_ids) {
                     Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
@@ -479,12 +536,35 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
     ) -> Result<Vec<Self::Value>, ProgramError>
     where
         Self::Constant: Clone,
-        Self::Operation: Clone,
     {
-        program.interpret_with(
+        // TODO(eaplatanios): Fix this.
+        let mut region_programs = HashMap::<RegionId, Rc<FlatProgram<Self>>>::new();
+        let entry_region = program.entry_region_ref();
+        entry_region.interpret_with(
             inputs,
             |_, value| Ok::<_, ProgramError>(self.constant(value.clone())),
-            |instruction, inputs| self.stage_operation(instruction.operation().clone(), inputs),
+            |instruction, inputs| {
+                if instruction.regions().is_empty() {
+                    self.stage_operation(instruction.operation().clone(), Vec::new(), &[], inputs)
+                } else {
+                    // Replayed attached regions are materialized once per source region id and fed through the
+                    // callee-interning path, so a source region referenced by several instructions remains one
+                    // destination region.
+                    let callees = instruction
+                        .regions()
+                        .iter()
+                        .map(|id| {
+                            if let Some(program) = region_programs.get(id) {
+                                return Ok::<_, ProgramError>(program.clone());
+                            }
+                            let program = Rc::new(entry_region.region_ref(*id)?.into_program());
+                            region_programs.insert(*id, program.clone());
+                            Ok::<_, ProgramError>(program)
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+                    self.stage_operation(instruction.operation().clone(), Vec::new(), callees.as_slice(), inputs)
+                }
+            },
         )
     }
 }
@@ -535,7 +615,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
+    use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
@@ -549,14 +631,26 @@ mod tests {
         // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is an eager `Context` over the self-describing [`Scalar`] value type, so binding a nullary
         // zero/one `Operation` interprets it directly to the [`Scalar`] variant matching the requested [`DataType`].
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::BF16), &[], &[], &[]), Ok(vec![Scalar::BF16(bf16::ZERO)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::BF16), &[], &[], &[]), Ok(vec![Scalar::BF16(bf16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F16), &[], &[], &[]), Ok(vec![Scalar::F16(f16::ZERO)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F16), &[], &[], &[]), Ok(vec![Scalar::F16(f16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F32), &[], &[], &[]), Ok(vec![Scalar::F32(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F32), &[], &[], &[]), Ok(vec![Scalar::F32(1.0)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::F64(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::F64(1.0)]));
+        assert_eq!(
+            domain.bind(ZeroOperation::new(DataType::BF16), Vec::new(), &[], &[]),
+            Ok(vec![Scalar::BF16(bf16::ZERO)])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(DataType::BF16), Vec::new(), &[], &[]),
+            Ok(vec![Scalar::BF16(bf16::ONE)])
+        );
+        assert_eq!(
+            domain.bind(ZeroOperation::new(DataType::F16), Vec::new(), &[], &[]),
+            Ok(vec![Scalar::F16(f16::ZERO)])
+        );
+        assert_eq!(
+            domain.bind(OneOperation::new(DataType::F16), Vec::new(), &[], &[]),
+            Ok(vec![Scalar::F16(f16::ONE)])
+        );
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::F32), Vec::new(), &[], &[]), Ok(vec![Scalar::F32(0.0)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::F32), Vec::new(), &[], &[]), Ok(vec![Scalar::F32(1.0)]));
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::F64), Vec::new(), &[], &[]), Ok(vec![Scalar::F64(0.0)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::F64), Vec::new(), &[], &[]), Ok(vec![Scalar::F64(1.0)]));
     }
 
     #[test]
@@ -570,10 +664,10 @@ mod tests {
         assert_eq!(format!("{default_context:?}"), "EagerContext");
         assert_eq!(format!("{cloned_context:?}"), "EagerContext");
         assert_eq!(context.lift(Scalar::from(2.5)), Ok(Scalar::from(2.5)));
-        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::from(0.0)]));
-        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), [], &[], &[]), Ok(vec![Scalar::from(0.0)]));
+        assert_eq!(context.bind(OneOperation::new(DataType::F64), Vec::new(), &[], &[]), Ok(vec![Scalar::from(1.0)]));
         assert_eq!(
-            context.bind(AddOperation, &[], &[], &[Scalar::from(2.0), Scalar::from(3.5)]),
+            context.bind(AddOperation, Vec::new(), &[], &[Scalar::from(2.0), Scalar::from(3.5)]),
             Ok(vec![Scalar::from(5.5)]),
         );
     }
@@ -615,7 +709,7 @@ mod tests {
 
         let lhs = context.input(DataType::F64);
         let rhs = context.input(DataType::F64);
-        let mut add_outputs = context.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
+        let mut add_outputs = context.stage_operation(AddOperation, [], &[], &[&lhs, &rhs]).unwrap();
         assert_eq!(add_outputs.len(), 1);
         let sum = add_outputs.remove(0);
         assert_eq!(sum.atom_id(), Ok(AtomId::new(3)));
@@ -651,7 +745,7 @@ mod tests {
         assert_eq!(context.error(second_error.clone()), second_error);
         assert_eq!(builder.borrow().error().cloned(), Some(first_error.clone()));
 
-        let mut outputs = context.stage_operation(NegOperation, &[&input]).unwrap();
+        let mut outputs = context.stage_operation(NegOperation, Vec::new(), &[], &[&input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output = outputs.remove(0);
         assert_eq!(output.state(), &TracerState::Poison);
@@ -665,7 +759,7 @@ mod tests {
         let foreign_input = foreign_context.input(DataType::F64);
 
         assert!(matches!(
-            context.stage_operation(AddOperation, &[&input, &foreign_input]),
+            context.stage_operation(AddOperation, Vec::new(), &[], &[&input, &foreign_input]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -676,8 +770,9 @@ mod tests {
         let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let source_input = source_builder.add_input(DataType::F64);
         let source_constant = source_builder.add_constant(Scalar::from(4.0));
-        let source_output =
-            source_builder.add_instruction(AddOperation, vec![source_input, source_constant]).unwrap()[0];
+        let source_output = source_builder
+            .add_instruction(AddOperation, vec![source_input, source_constant], Vec::new())
+            .unwrap()[0];
         let source_program =
             source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
 
@@ -713,7 +808,7 @@ mod tests {
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let input = context.input(DataType::F64);
         let constant = context.constant(Scalar::from(2.5));
-        let mut add_outputs = context.stage_operation(AddOperation, &[&input, &constant]).unwrap();
+        let mut add_outputs = context.stage_operation(AddOperation, Vec::new(), &[], &[&input, &constant]).unwrap();
         let sum = add_outputs.remove(0);
 
         // Literal-backed tracers resolve to their concrete constant payload, while inputs and operation outputs
@@ -731,33 +826,48 @@ mod tests {
         // Poisoned tracers are opaque even in their own context.
         let poisoning_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         assert_eq!(foreign_context.error(poisoning_error.clone()), poisoning_error);
-        let mut poisoned_outputs = foreign_context.stage_operation(NegOperation, &[&foreign_input]).unwrap();
+        let mut poisoned_outputs =
+            foreign_context.stage_operation(NegOperation, Vec::new(), &[], &[&foreign_input]).unwrap();
         let poisoned = poisoned_outputs.remove(0);
         assert_eq!(poisoned.state(), &TracerState::Poison);
         assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);
     }
 
-    // TODO(eaplatanios): Review this test.
+    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_bind_rejects_nested_regions() {
-        // Phase 1 pin for the first-class-program-regions plan: the region-aware binding hook is the extension
-        // point through which freshly authored regional operations will reach contexts; until contexts become
-        // region-aware (with the operation families' migrations), the default delegates region-free calls to `bind`
-        // and rejects nested regions explicitly.
+    fn test_bind_interprets_shared_callee_programs() {
+        // Shared callee programs bind through the same detached-interpretation channel as freshly authored owned
+        // regions, slotted in after the owned regions: the while below receives its condition and body as interned
+        // shared callees and still runs the loop to completion.
+
+        let condition = {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let carry = builder.add_input(DataType::F64);
+            let eight = builder.add_constant(Scalar::from(8.0));
+            let predicate = builder
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight], Vec::new())
+                .unwrap()[0];
+            builder
+                .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let carry = builder.add_input(DataType::F64);
+            let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+            builder
+                .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
-            context.bind(AddOperation, &[], &[], &[Scalar::from(2.0), Scalar::from(3.0)]),
-            Ok(vec![Scalar::from(5.0)]),
+            context.bind(
+                ScalarOperation::While(WhileOperation::new()),
+                Vec::new(),
+                &[Rc::new(condition), Rc::new(body)],
+                &[Scalar::from(1.0)],
+            ),
+            Ok(vec![Scalar::from(8.0)]),
         );
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let region = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            context.bind(AddOperation, &[region], &[], &[Scalar::from(2.0), Scalar::from(3.0)]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "operation `add` carries nested regions which this context cannot bind yet",
-        ));
     }
 }
