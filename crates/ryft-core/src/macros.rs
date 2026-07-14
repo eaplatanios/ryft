@@ -163,6 +163,7 @@ macro_rules! define_elementwise_operation {
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::DataType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
@@ -179,6 +180,7 @@ macro_rules! define_elementwise_operation {
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::ArrayType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
@@ -191,13 +193,18 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<V: ::std::clone::Clone + $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
+        impl<V: $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
             for $operation
         where
             Self: $crate::Operation<V::Type>,
         {
             #[inline]
-            fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, $crate::ProgramError> {
+            fn interpret<D: $crate::InterpretationDriver<V, C>>(
+                &self,
+                _context: &C,
+                _driver: &D,
+                inputs: &[V],
+            ) -> Result<Vec<V>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].$method()?])
             }
@@ -224,7 +231,7 @@ macro_rules! define_elementwise_operation {
                 // Fully qualified calls are required here because the `Value` and `Context` traits are not
                 // necessarily imported at the macro expansion site.
                 let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, &[], &[], &[self.clone()])?.remove(0))
+                Ok($crate::Context::bind(&domain, $operation, Vec::new(), &[], &[self.clone()])?.remove(0))
             }
         }
     };
@@ -253,6 +260,7 @@ macro_rules! define_elementwise_operation {
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::DataType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 // The fully qualified call is required here because the `Broadcastable` trait is not necessarily
@@ -275,6 +283,7 @@ macro_rules! define_elementwise_operation {
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::ArrayType],
+                _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
@@ -287,13 +296,18 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<V: ::std::clone::Clone + $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
+        impl<V: $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
             for $operation
         where
             Self: $crate::Operation<V::Type>,
         {
             #[inline]
-            fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, $crate::ProgramError> {
+            fn interpret<D: $crate::InterpretationDriver<V, C>>(
+                &self,
+                _context: &C,
+                _driver: &D,
+                inputs: &[V],
+            ) -> Result<Vec<V>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].$method(&inputs[1])?])
             }
@@ -320,7 +334,7 @@ macro_rules! define_elementwise_operation {
                 // Fully qualified calls are required here because the `Value` and `Context` traits are not
                 // necessarily imported at the macro expansion site.
                 let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, &[], &[], &[self.clone(), rhs.clone()])?.remove(0))
+                Ok($crate::Context::bind(&domain, $operation, Vec::new(), &[], &[self.clone(), rhs.clone()])?.remove(0))
             }
         }
     };
@@ -372,7 +386,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -387,7 +401,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -402,7 +416,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -427,7 +441,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -442,7 +456,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -457,7 +471,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }

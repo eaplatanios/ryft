@@ -2378,7 +2378,7 @@ mod linearization_tests {
             move |inputs| {
                 let operation = WhileOperation::new();
                 let mut outputs =
-                    inputs[0].context().stage_operation(operation, vec![condition, body], &[inputs[0].clone()])?;
+                    inputs[0].context().stage_operation(operation, vec![condition, body], &[], &[inputs[0].clone()])?;
                 Ok(vec![outputs.remove(0)])
             },
             vec![DataType::F64],
@@ -2838,6 +2838,7 @@ mod linearization_tests {
         inputs[0].context().stage_operation(
             ScalarOperation::Rematerialize(*operation),
             operation_regions,
+            &[],
             &[&inputs[0]],
         )
     }
@@ -2999,11 +3000,12 @@ mod linearization_tests {
                 .unwrap();
 
             let operation = CustomVjpOperation::new();
-            let a = inputs[0].context().stage_operation(SinOperation, Vec::new(), &[&inputs[0]])?.remove(0);
-            let b = inputs[0].context().stage_operation(CosOperation, Vec::new(), &[&inputs[0]])?.remove(0);
+            let a = inputs[0].context().stage_operation(SinOperation, Vec::new(), &[], &[&inputs[0]])?.remove(0);
+            let b = inputs[0].context().stage_operation(CosOperation, Vec::new(), &[], &[&inputs[0]])?.remove(0);
             inputs[0].context().stage_operation(
                 ScalarOperation::CustomVjp(operation),
                 vec![primal, forward, backward],
+                &[],
                 &[&a, &b],
             )
         }
@@ -4331,8 +4333,7 @@ mod array_linearization_tests {
 
         fn assert_program_bounds<V: Value, O>()
         where
-            O: Clone
-                + Operation<V::Type>
+            O: Operation<V::Type>
                 + From<ZeroOperation<V::Type>>
                 + DifferentiableOperation<TracingContext<V, O>>
                 + PartiallyEvaluatableOperation<TracingContext<V, O>>
@@ -4480,6 +4481,7 @@ mod array_linearization_tests {
                 inputs[0].context().stage_operation(
                     ArrayOperation::While(while_operation),
                     vec![condition.clone(), body.clone()],
+                    &[],
                     &[&inputs[0]],
                 )
             },
@@ -4624,9 +4626,12 @@ mod array_linearization_tests {
             .iter()
             .map(|region| program.region_ref(*region).map(|region| region.into_program()))
             .collect::<Result<Vec<_>, _>>()?;
-        inputs[0]
-            .context()
-            .stage_operation(ArrayOperation::Rematerialize(*operation), operation_regions, &[&inputs[0]])
+        inputs[0].context().stage_operation(
+            ArrayOperation::Rematerialize(*operation),
+            operation_regions,
+            &[],
+            &[&inputs[0]],
+        )
     }
 
     #[test]

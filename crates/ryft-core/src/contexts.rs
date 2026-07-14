@@ -177,13 +177,12 @@ pub trait Context: Domain + Clone {
     /// transformation rule before forwarding rewritten operations to a parent context.
     ///
     /// Nested computations belong to an operation application rather than to the operation payload itself. They are
-    /// therefore supplied alongside the operation and its inputs. Freshly authored, lexically owned computations are
-    /// passed as `regions`, while independently shared computations are passed as `callees`. Both are exposed to the
-    /// operation in one ordered [`Region`](crate::Region) namespace, with the owned regions preceding the callees.
-    /// Eager and transform contexts make those regions available to the operation's application-scoped driver. Staging
-    /// contexts import them into the destination program and attach their [`RegionId`]s to the recorded instruction.
-    /// The combined `regions` and `callees` sequence must match the number and order of slots returned by
-    /// [`Operation::region_names`].
+    /// therefore supplied alongside the operation and its inputs. Owned nested computations are passed as `regions`,
+    /// while independently shared computations are passed as `callees`. Both are exposed to the operation in one
+    /// ordered [`Region`](crate::Region) namespace, with the owned regions preceding the callees. Eager and transform
+    /// contexts make those regions available to the operation's application-scoped driver. Staging contexts import them
+    /// into the destination program and attach their [`RegionId`]s to the recorded instruction. The combined `regions`
+    /// and `callees` sequence must match the number and order of slots returned by [`Operation::region_names`].
     ///
     /// # Parameters
     ///
