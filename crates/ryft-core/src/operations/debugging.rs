@@ -1,22 +1,24 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::effects::{Effect, Effects};
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, ProgramError, RegionInterface, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`PrintOperation`].
-pub const PRINT_OPERATION_NAME: &'static str = "print";
+pub const PRINT_OPERATION_NAME: &str = "print";
 
 /// [`Operation`] that returns its input unchanged while printing it to standard error with a label — the analogue of
 /// [`jax.debug.print`](https://docs.jax.dev/en/latest/debugging/print_breakpoint.html). Refer to the documentation of
@@ -67,7 +69,11 @@ impl<T: Type> Operation<T> for PrintOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
@@ -90,8 +96,13 @@ impl ElementwiseOperation for PrintOperation {
     }
 }
 
-impl<V: Clone + Value, C> InterpretableOperation<V, C> for PrintOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain> InterpretableOperation<C> for PrintOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         eprintln!("{}: {}", self.label, inputs[0]);
         Ok(vec![inputs[0].clone()])
@@ -124,26 +135,32 @@ where
     #[inline]
     fn print(self, label: &str) -> Self {
         self.dispatch_domain()
-            .bind(PrintOperation::new(label), &[], &[], std::slice::from_ref(&self))
+            .bind(PrintOperation::new(label), Vec::new(), &[], std::slice::from_ref(&self))
             .expect("`print` operation failed")
             .remove(0)
     }
 }
 
-impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOperation>>> DifferentiableOperation<C>
-    for PrintOperation
+impl<C: Context> DifferentiableOperation<C> for PrintOperation
+where
+    C::Operation: From<ZeroOperation<C::Type>> + From<PrintOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // We re-print the input primal so the effect survives differentiation, while letting the input tangent pass
         // through unchanged (printing tangents would change the observable output of the differentiated program).
         // The print binds through the context so the rule works uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let mut primal =
-            context.bind(PrintOperation::new(self.label()), &[], &[], std::slice::from_ref(inputs[0].primal()))?;
+        let mut primal = context.bind(
+            PrintOperation::new(self.label()),
+            Vec::new(),
+            &[],
+            std::slice::from_ref(inputs[0].primal()),
+        )?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }
@@ -151,9 +168,10 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOper
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOperation {
     #[inline]
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -194,7 +212,7 @@ mod tests {
         assert_eq!(Operation::<ArrayType>::name(&operation), PRINT_OPERATION_NAME);
         assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type.clone()]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type.clone()], &[]),
             Ok(vec![scalar_type])
         );
         assert_eq!(operation.to_string(), "print [label=x]");
@@ -204,7 +222,9 @@ mod tests {
     fn test_print_interprets_as_the_identity() {
         let context = EagerContext::<TestArray>::new();
         let input = TestArray::scalar(3.0);
-        let outputs = PrintOperation::new("x").interpret(&context, &[input.clone()]).unwrap();
+        let outputs = PrintOperation::new("x")
+            .interpret(&context.clone(), &crate::RegionlessDriver, &[input.clone()])
+            .unwrap();
         assert_eq!(outputs, vec![input]);
     }
 

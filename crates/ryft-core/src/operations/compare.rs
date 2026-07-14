@@ -1,16 +1,16 @@
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{BooleanLike, ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`CompareOperation`].
-pub const COMPARE_OPERATION_NAME: &'static str = "compare";
+pub const COMPARE_OPERATION_NAME: &str = "compare";
 
 /// Direction of the pairwise comparison performed by a [`CompareOperation`]. Each direction corresponds to one
 /// comparison predicate.
@@ -71,7 +71,11 @@ impl<T: Type + Broadcastable + BooleanLike> Operation<T> for CompareOperation {
         COMPARE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
 
         // Complex operands are unordered, so only the equality comparison directions are defined for them.
@@ -105,15 +109,21 @@ impl ElementwiseOperation for CompareOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Value + Compare<Output = V>, C> InterpretableOperation<V, C> for CompareOperation
+impl<C: Domain> InterpretableOperation<C> for CompareOperation
 where
-    Self: Operation<V::Type>,
+    C::Value: Compare<Output = C::Value>,
+    C::Type: Broadcastable + BooleanLike,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].compare(&inputs[1], self.direction)?])
     }
@@ -185,7 +195,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(CompareOperation::new(direction), &[], &[], &[self.clone(), rhs.clone()])?
+            .bind(CompareOperation::new(direction), Vec::new(), &[], &[self.clone(), rhs.clone()])?
             .remove(0))
     }
 }
@@ -210,6 +220,7 @@ mod tests {
         let outputs = Operation::<ArrayType>::infer_output_types(
             &CompareOperation::new(ComparisonDirection::LessThan),
             &[lhs, rhs],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -224,6 +235,7 @@ mod tests {
         let outputs = Operation::<ArrayType>::infer_output_types(
             &CompareOperation::new(ComparisonDirection::LessThan),
             &[lhs, rhs],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -235,22 +247,22 @@ mod tests {
         // non-promotable ones error.
         let operation = CompareOperation::new(ComparisonDirection::LessThan);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64], &[]),
             Ok(vec![DataType::Boolean]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
             Ok(vec![DataType::Boolean]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
             Err(TypeError { message: "comparison input types are not broadcast-compatible".to_string() }),
         );
 
         // Complex operands are unordered: ordered directions are rejected while the equality directions stay
         // supported (at both the data-type and array-type levels).
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
             Err(TypeError {
                 message: "cannot apply an ordered comparison to unordered complex operands of types c64 and c64"
                     .to_string(),
@@ -260,12 +272,14 @@ mod tests {
             Operation::<DataType>::infer_output_types(
                 &CompareOperation::new(ComparisonDirection::Equal),
                 &[DataType::C64, DataType::C64],
+                &[],
             ),
             Ok(vec![DataType::Boolean]),
         );
         let complex_array = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]));
         assert!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex_array.clone(), complex_array]).is_err(),
+            Operation::<ArrayType>::infer_output_types(&operation, &[complex_array.clone(), complex_array], &[])
+                .is_err(),
         );
 
         // Test that `as_boolean` on type metadata produces Boolean counterparts while `boolean` errors because
@@ -280,9 +294,10 @@ mod tests {
         assert_eq!(Scalar::from(2.0).less_than(&Scalar::from(3.0)).unwrap(), Scalar::from(true));
         assert_eq!(Scalar::from(2.0f32).greater_than(&Scalar::from(3.0f32)).unwrap(), Scalar::from(false));
         assert_eq!(
-            <CompareOperation as InterpretableOperation<Scalar, EagerContext<Scalar>>>::interpret(
+            <CompareOperation as InterpretableOperation<EagerContext<Scalar>>>::interpret(
                 &operation,
                 &EagerContext::<Scalar>::new(),
+                &crate::RegionlessDriver,
                 &[Scalar::from(2.0), Scalar::from(3.0)],
             ),
             Ok(vec![Scalar::from(true)])
@@ -292,7 +307,7 @@ mod tests {
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
         let outputs = CompareOperation::new(ComparisonDirection::LessThan)
-            .interpret(&EagerContext::<TestArray>::new(), &[lhs, rhs])
+            .interpret(&EagerContext::<TestArray>::new(), &crate::RegionlessDriver, &[lhs, rhs])
             .unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 

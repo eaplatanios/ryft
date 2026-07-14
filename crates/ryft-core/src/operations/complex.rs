@@ -1,26 +1,26 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::types::{ArrayType, DataType, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ComplexOperation`].
-pub const COMPLEX_OPERATION_NAME: &'static str = "complex";
+pub const COMPLEX_OPERATION_NAME: &str = "complex";
 
 /// Canonical operation name for [`ConjugateOperation`].
-pub const CONJUGATE_OPERATION_NAME: &'static str = "conjugate";
+pub const CONJUGATE_OPERATION_NAME: &str = "conjugate";
 
 /// Canonical operation name for [`RealOperation`].
-pub const REAL_OPERATION_NAME: &'static str = "real";
+pub const REAL_OPERATION_NAME: &str = "real";
 
 /// Canonical operation name for [`ImaginaryOperation`].
-pub const IMAGINARY_OPERATION_NAME: &'static str = "imaginary";
+pub const IMAGINARY_OPERATION_NAME: &str = "imaginary";
 
 /// Maps a real part element [`DataType`] to the complex [`DataType`] it constructs (i.e., `f32 → c64` and
 /// `f64 → c128`), reporting a [`TypeError`] under `op`'s name for any other part data type.
@@ -65,7 +65,11 @@ impl Operation<DataType> for ComplexOperation {
         COMPLEX_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         if input_types[0] != input_types[1] {
             return Err(TypeError {
@@ -85,7 +89,11 @@ impl Operation<ArrayType> for ComplexOperation {
         COMPLEX_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         if input_types[0] != input_types[1] {
             return Err(TypeError {
@@ -108,16 +116,21 @@ impl ElementwiseOperation for ComplexOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Clone + Value + Complex, C> InterpretableOperation<V, C> for ComplexOperation
+impl<C: Domain<Value: Complex>> InterpretableOperation<C> for ComplexOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].complex(&inputs[1])?])
     }
@@ -139,7 +152,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<ComplexOperation>>>> Compl
     fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(ComplexOperation, &[], &[], &[self.clone(), imaginary.clone()])?
+            .bind(ComplexOperation, Vec::new(), &[], &[self.clone(), imaginary.clone()])?
             .remove(0))
     }
 }
@@ -165,7 +178,11 @@ impl Operation<DataType> for ConjugateOperation {
         CONJUGATE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         complex_to_part_data_type(input_types[0].clone(), CONJUGATE_OPERATION_NAME)?;
         Ok(vec![input_types[0].clone()])
@@ -178,7 +195,11 @@ impl Operation<ArrayType> for ConjugateOperation {
         CONJUGATE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         complex_to_part_data_type(input_types[0].data_type(), CONJUGATE_OPERATION_NAME)?;
         Ok(vec![input_types[0].clone()])
@@ -193,16 +214,21 @@ impl ElementwiseOperation for ConjugateOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Clone + Value + Conjugate, C> InterpretableOperation<V, C> for ConjugateOperation
+impl<C: Domain<Value: Conjugate>> InterpretableOperation<C> for ConjugateOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].conjugate()?])
     }
@@ -221,7 +247,7 @@ pub trait Conjugate: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ConjugateOperation>>>> Conjugate for V {
     #[inline]
     fn conjugate(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ConjugateOperation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ConjugateOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -246,7 +272,11 @@ impl Operation<DataType> for RealOperation {
         REAL_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![complex_to_part_data_type(input_types[0].clone(), REAL_OPERATION_NAME)?])
     }
@@ -258,7 +288,11 @@ impl Operation<ArrayType> for RealOperation {
         REAL_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         let data_type = complex_to_part_data_type(input_types[0].data_type(), REAL_OPERATION_NAME)?;
         Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
@@ -273,16 +307,21 @@ impl ElementwiseOperation for RealOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Clone + Value + Real, C> InterpretableOperation<V, C> for RealOperation
+impl<C: Domain<Value: Real>> InterpretableOperation<C> for RealOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].real()?])
     }
@@ -301,7 +340,7 @@ pub trait Real: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<RealOperation>>>> Real for V {
     #[inline]
     fn real(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(RealOperation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(RealOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -326,7 +365,11 @@ impl Operation<DataType> for ImaginaryOperation {
         IMAGINARY_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![complex_to_part_data_type(input_types[0].clone(), IMAGINARY_OPERATION_NAME)?])
     }
@@ -338,7 +381,11 @@ impl Operation<ArrayType> for ImaginaryOperation {
         IMAGINARY_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         let data_type = complex_to_part_data_type(input_types[0].data_type(), IMAGINARY_OPERATION_NAME)?;
         Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
@@ -353,16 +400,21 @@ impl ElementwiseOperation for ImaginaryOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Clone + Value + Imaginary, C> InterpretableOperation<V, C> for ImaginaryOperation
+impl<C: Domain<Value: Imaginary>> InterpretableOperation<C> for ImaginaryOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].imaginary()?])
     }
@@ -381,7 +433,7 @@ pub trait Imaginary: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ImaginaryOperation>>>> Imaginary for V {
     #[inline]
     fn imaginary(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ImaginaryOperation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ImaginaryOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -406,42 +458,44 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), COMPLEX_OPERATION_NAME);
         assert_eq!(format!("{operation}"), COMPLEX_OPERATION_NAME);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32], &[]),
             Ok(vec![DataType::C64]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64], &[]),
             Ok(vec![DataType::C128]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
             Err(TypeError { message: "'complex' requires identical part types but got f32 and f64".to_string() }),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::I32, DataType::I32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::I32, DataType::I32], &[]),
             Err(TypeError { message: "'complex' requires f32 or f64 parts but got i32".to_string() }),
         );
 
         // Array type inference swaps the element data type and keeps the shape.
         let part = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[part.clone(), part]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[part.clone(), part], &[]),
             Ok(vec![ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]))]),
         );
 
         // Concrete interpretation constructs the complex scalar, and `TestArray` (real-only storage) rejects it.
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &crate::RegionlessDriver,
                 &[Scalar::from(1.5f32), Scalar::from(-2.0f32)],
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f32, -2.0f32))]),
         );
         assert!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &crate::RegionlessDriver,
                 &[TestArray::scalar(1.5), TestArray::scalar(-2.0)],
             )
             .is_err()
@@ -454,17 +508,21 @@ mod tests {
 
         // Type inference preserves the complex operand type and rejects real operands.
         assert_eq!(Operation::<DataType>::name(&operation), CONJUGATE_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C64]), Ok(vec![DataType::C64]),);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Ok(vec![DataType::C64]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
             Err(TypeError { message: "'conjugate' requires a complex operand but got f64".to_string() }),
         );
 
         // Concrete interpretation negates the imaginary part.
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &crate::RegionlessDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f64, 2.0f64))]),
@@ -477,23 +535,30 @@ mod tests {
 
         // Type inference maps the complex operand to its part data type and rejects real operands.
         assert_eq!(Operation::<DataType>::name(&operation), REAL_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C64]), Ok(vec![DataType::F32]));
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C128]), Ok(vec![DataType::F64]));
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Ok(vec![DataType::F32])
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C128], &[]),
+            Ok(vec![DataType::F64])
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
             Err(TypeError { message: "'real' requires a complex operand but got f32".to_string() }),
         );
         let complex = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[complex], &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))]),
         );
 
         // Concrete interpretation extracts the real part.
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &crate::RegionlessDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(1.5f64)]),
@@ -506,17 +571,21 @@ mod tests {
 
         // Type inference maps the complex operand to its part data type and rejects real operands.
         assert_eq!(Operation::<DataType>::name(&operation), IMAGINARY_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C64]), Ok(vec![DataType::F32]));
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Ok(vec![DataType::F32])
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean], &[]),
             Err(TypeError { message: "'imaginary' requires a complex operand but got bool".to_string() }),
         );
 
         // Concrete interpretation extracts the imaginary part.
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &crate::RegionlessDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(-2.0f64)]),

@@ -32,7 +32,7 @@ fn summarize_tracing_program<
     V: Value<Type = T>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + crate::operations::Operation<T>,
+    O: crate::operations::Operation<T>,
 >(
     program: &Program<V, O, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
@@ -58,7 +58,7 @@ fn tracing_record<
         + crate::operations::constants::OneLike,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + crate::operations::Operation<T>,
+    O: crate::operations::Operation<T>,
 >(
     case_id: &'static str,
     surface: &'static str,

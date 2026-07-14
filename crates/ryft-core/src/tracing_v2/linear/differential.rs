@@ -4,20 +4,17 @@ use std::marker::PhantomData;
 use ryft_macros::Parameter;
 
 use crate::backends::scalars::Scalar;
-use crate::batching::ArrayBatch;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::LinearizationTracer;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationError, LinearizationTracer, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::BooleanLike;
-use crate::operations::RegionlessDriver;
 use crate::operations::constants::{FillOperation, OneOperation, ZeroLikeOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::operations::math::AddOperation;
+use crate::operations::{BooleanLike, RegionlessDriver};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
@@ -84,42 +81,26 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
     ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, ProgramError>
     where
         Self: CoordinateBasis<DomainValue<Self>>,
-        DomainValue<Self>: Value<Type = ArrayType> + BooleanLike + Broadcast + Reshape + Slice + Transpose + 'domain,
-        Input: Parameterized<
-                DomainValue<Self>,
-                To<DomainValue<Self>> = Input,
-                ParameterStructure: Debug + PartialEq,
-            >,
+        DomainValue<Self>: BooleanLike + Broadcast + Reshape + Slice + Transpose + 'domain,
+        Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input>,
         TracedOutput: Parameterized<LinearizationTracer<Self>, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<LinearizationTracer<Self>>
-            + ParameterizedFamily<DifferentialBlock<DomainValue<Self>>>,
+        Input::Family:
+            ParameterizedFamily<LinearizationTracer<Self>> + ParameterizedFamily<DifferentialBlock<DomainValue<Self>>>,
+        Input::ParameterStructure: Debug + PartialEq,
         TracedOutput::Family: ParameterizedFamily<DomainValue<Self>>
             + ParameterizedFamily<LinearizationTracer<Self>>
-            + ParameterizedFamily<
-                DifferentialRow<
-                    Input::To<DifferentialBlock<DomainValue<Self>>>,
-                    DomainValue<Self>,
-                >,
-            >,
+            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<DomainValue<Self>>>, DomainValue<Self>>>,
         TracedOutput::To<DomainValue<Self>>: Parameterized<
-                DomainValue<Self>,
-                To<DomainValue<Self>> = TracedOutput::To<DomainValue<Self>>,
-                To<
-                    DifferentialRow<
-                        Input::To<DifferentialBlock<DomainValue<Self>>>,
-                        DomainValue<Self>,
-                    >,
-                > = TracedOutput::To<
-                    DifferentialRow<
-                        Input::To<DifferentialBlock<DomainValue<Self>>>,
-                        DomainValue<Self>,
-                    >,
-                >,
+            DomainValue<Self>,
+            To<DomainValue<Self>> = TracedOutput::To<DomainValue<Self>>,
+            To<DifferentialRow<Input::To<DifferentialBlock<DomainValue<Self>>>, DomainValue<Self>>> = TracedOutput::To<
+                DifferentialRow<Input::To<DifferentialBlock<DomainValue<Self>>>, DomainValue<Self>>,
+            >,
         >,
         F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<TracedOutput, ProgramError>,
-        <Self as Domain>::Operation: Clone
-            + InterpretableOperation<DomainValue<Self>, Self>
-            + PartiallyEvaluatableOperation<Self> + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
+        <Self as Domain>::Operation: InterpretableOperation<Self>
+            + PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + From<ZeroOperation<ArrayType>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
             + BatchableOperation<Self>,
@@ -158,13 +139,14 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
         Self: CoordinateBasis<DomainValue<Self>>,
-        DomainValue<Self>: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose + 'domain,
-        Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
+        DomainValue<Self>: Broadcast + Reshape + Slice + Transpose + 'domain,
+        Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input>,
         Input::Family: ParameterizedFamily<LinearizationTracer<DomainTracingContext<Self>>>
             + ParameterizedFamily<Tracer<DomainTracingContext<Self>>>
             + ParameterizedFamily<<Self as Domain>::Constant>
             + ParameterizedFamily<DifferentialBlock<DomainValue<Self>>>
             + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<DomainValue<Self>>>, DomainValue<Self>>>,
+        Input::ParameterStructure: Debug + PartialEq,
         Input::To<Tracer<DomainTracingContext<Self>>>: Parameterized<
                 Tracer<DomainTracingContext<Self>>,
                 To<Tracer<DomainTracingContext<Self>>> = Input::To<Tracer<DomainTracingContext<Self>>>,
@@ -178,8 +160,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         F: FnOnce(
             Input::To<LinearizationTracer<DomainTracingContext<Self>>>,
         ) -> LinearizationTracer<DomainTracingContext<Self>>,
-        <Self as Domain>::Operation: Clone
-            + InterpretableOperation<DomainValue<Self>, Self>
+        <Self as Domain>::Operation: InterpretableOperation<Self>
             + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
             + DifferentiableOperation<
@@ -191,7 +172,6 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             + From<OneOperation<ArrayType>>
             + From<ZeroLikeOperation>
             + From<AddOperation>,
-        <Self as Domain>::Constant: Value<Type = ArrayType>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -484,7 +464,7 @@ where
         Output::Family: ParameterizedFamily<DifferentialRow<Partials, V>>,
         Partials: Parameterized<DifferentialBlock<V>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, V>, ParameterStructure = Output::ParameterStructure>,
-        <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<C>,
+        <C as Domain>::Operation: InterpretableOperation<C> + BatchableOperation<C>,
     {
         let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
         let input_shapes = input_types
@@ -708,15 +688,13 @@ where
 /// family's batching dispatcher is implemented at — so backend domains whose nullary constructions need runtime state
 /// (for example a PJRT client) participate in the dense-Jacobian replay through the batching context's parent instead
 /// of a fresh constant-only [`EagerContext`](crate::contexts::EagerContext).
-fn batch_linear_program_instruction<C, V>(
+fn batch_linear_program_instruction<C: Context<Type = ArrayType>>(
     context: &BatchingContext<C>,
-    operation: &<C as Domain>::Operation,
-    inputs: &[ArrayBatch<V>],
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
+    operation: &C::Operation,
+    inputs: &[ArrayBatch<C::Value>],
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType, Value = V>,
-    V: Value<Type = ArrayType>,
-    <C as Domain>::Operation: BatchableOperation<C> + InterpretableOperation<V, C>,
+    C::Operation: BatchableOperation<C> + InterpretableOperation<C>,
 {
     if inputs.is_empty() {
         // A zero-input operation has no operand batch axis to lift through and is replicated by construction, so
@@ -742,17 +720,18 @@ pub fn jacrev<C, F, Input, TracedOutput>(
 ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<C>>, DomainValue<C>>, ProgramError>
 where
     C: Context<Type = ArrayType> + CoordinateBasis<DomainValue<C>>,
-    DomainValue<C>: Value<Type = ArrayType> + BooleanLike + Broadcast + Reshape + Slice + Transpose,
-    <C as Domain>::Constant: Value<Type = ArrayType>,
-    Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input, ParameterStructure: Debug + PartialEq>,
-    TracedOutput: Parameterized<LinearizationTracer<C>, ParameterStructure: Debug + PartialEq>,
+    DomainValue<C>: BooleanLike + Broadcast + Reshape + Slice + Transpose,
+    Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input>,
+    TracedOutput: Parameterized<LinearizationTracer<C>>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<LinearizationTracer<C>>
         + ParameterizedFamily<DifferentialBlock<DomainValue<C>>>,
+    Input::ParameterStructure: Debug + PartialEq,
     TracedOutput::Family: ParameterizedFamily<DomainValue<C>>
         + ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<LinearizationTracer<C>>
         + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<DomainValue<C>>>, DomainValue<C>>>,
+    TracedOutput::ParameterStructure: Debug + PartialEq,
     TracedOutput::To<DomainValue<C>>: Parameterized<
             DomainValue<C>,
             To<DomainValue<C>> = TracedOutput::To<DomainValue<C>>,
@@ -763,8 +742,7 @@ where
             ParameterStructure: Debug + PartialEq,
         >,
     F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<TracedOutput, ProgramError>,
-    <C as Domain>::Operation: Clone
-        + InterpretableOperation<DomainValue<C>, C>
+    <C as Domain>::Operation: InterpretableOperation<C>
         + BatchableOperation<C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + PartiallyEvaluatableOperation<C>

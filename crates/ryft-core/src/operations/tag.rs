@@ -1,14 +1,16 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, ProgramError, RegionInterface, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{Type, TypeError};
 
@@ -56,7 +58,11 @@ impl<T: Type> Operation<T> for TagOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
@@ -69,9 +75,14 @@ impl ElementwiseOperation for TagOperation {
     }
 }
 
-impl<V: Clone + Value, C> InterpretableOperation<V, C> for TagOperation {
+impl<C: Domain> InterpretableOperation<C> for TagOperation {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
@@ -93,18 +104,20 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
     #[inline]
     fn tag(self, key: &str) -> Self {
         self.dispatch_domain()
-            .bind(TagOperation::new(key), &[], &[], std::slice::from_ref(&self))
+            .bind(TagOperation::new(key), Vec::new(), &[], std::slice::from_ref(&self))
             .expect("`tag` operation failed")
             .remove(0)
     }
 }
 
-impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperation>>> DifferentiableOperation<C>
-    for TagOperation
+impl<C: Context> DifferentiableOperation<C> for TagOperation
+where
+    C::Operation: From<ZeroOperation<C::Type>> + From<TagOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // We re-tag the input primal for downstream classification while letting the input tangent pass through
@@ -112,7 +125,7 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperat
         // uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
         let mut primal =
-            context.bind(TagOperation::new(self.key()), &[], &[], std::slice::from_ref(inputs[0].primal()))?;
+            context.bind(TagOperation::new(self.key()), Vec::new(), &[], std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }
@@ -120,9 +133,10 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperat
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for TagOperation {
     #[inline]
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {

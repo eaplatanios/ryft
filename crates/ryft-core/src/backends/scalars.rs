@@ -1458,8 +1458,6 @@ mod tests {
     use crate::tracing::Trace;
     use crate::tracing_v2::ForwardModeDifferentiate;
 
-    use crate::programs::RegionInterface;
-
     use super::*;
 
     /// Builds a carry-only scalar body program that maps `[carry]` to `[carry + carry]`.
@@ -1515,10 +1513,7 @@ mod tests {
         let operation = WhileOperation::new();
         let condition = scalar_less_than_eight_condition();
         let body = scalar_doubling_body();
-        let interfaces = [
-            RegionInterface::new(condition.input_types(), condition.output_types(), condition.effects()),
-            RegionInterface::new(body.input_types(), body.output_types(), body.effects()),
-        ];
+        let interfaces = [condition.interface(), body.interface()];
 
         // Operation identity, type inference, and eager binding through detached region access.
         assert_eq!(Operation::<DataType>::name(&operation), crate::operations::control_flow::WHILE_OPERATION_NAME);
@@ -1542,6 +1537,7 @@ mod tests {
                 let mut outputs = carry.context().stage_operation(
                     operation,
                     vec![scalar_less_than_eight_condition(), scalar_doubling_body()],
+                    &[],
                     &[&carry],
                 )?;
                 Ok(outputs.remove(0))
@@ -1592,7 +1588,7 @@ mod tests {
     #[test]
     fn test_scalar_while_rejects_non_boolean_condition() {
         let body = scalar_doubling_body();
-        let interface = RegionInterface::new(body.input_types(), body.output_types(), body.effects());
+        let interface = body.interface();
         assert_eq!(
             WhileOperation::new().infer_output_types(&[DataType::F64], &[interface.clone(), interface]),
             Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),

@@ -43,19 +43,13 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingError;
-use crate::batching::{BatchingContext, BatchingDriver};
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationDriver;
-use crate::differentiation::DifferentiationDual;
-use crate::differentiation::TranspositionDriver;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
-use crate::interpretation::InterpretableOperation;
-use crate::interpretation::InterpretationDriver;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -192,13 +186,13 @@ impl<T: Type> Operation<T> for RematerializeOperation {
     }
 }
 
-impl<V: Value, C> InterpretableOperation<V, C> for RematerializeOperation {
-    fn interpret(
+impl<C: Domain> InterpretableOperation<C> for RematerializeOperation {
+    fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
-        driver: &dyn InterpretationDriver<V, C>,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
@@ -211,8 +205,8 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation whe
 {
 }
 
-/// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: splices the derived forward and tangent
-/// programs directly into the shared builder.
+/// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
+/// programs through the active context, staging their operations in the shared builder.
 ///
 /// Both derived programs are ordinary primal-enum programs, so the rule replays them through
 /// [`Program::interpret_in_context`](crate::Program::interpret_in_context):
@@ -222,26 +216,22 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation whe
 ///      forward tail; the tail is split off after the primal outputs.
 ///   2. The tangent program maps `(forward_tail..., input_tangents...) -> output_tangents`, exactly the forward tail
 ///      followed by the input tangents (per [`RematerializeOperation::new`]'s signature validation), so the tail is
-///      spliced verbatim ahead of the dual tangents and replayed to produce the output tangents. The tangent program
+///      passed ahead of the dual tangents and replayed to produce the output tangents. The tangent program
 ///      recomputes any unsaved residuals from the tail internally, so no residual reconstruction is needed here.
 ///   3. Each primal output is paired with its staged output tangent into a [`DifferentiationDual`].
 ///
-/// Because both spliced programs are straight-line primal-enum operations referencing the staged tracers directly,
+/// Because both replayed programs are straight-line primal-enum operations referencing the staged tracers directly,
 /// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
 /// operand edges structurally — so
 /// this is a leaf rule needing no nested differentiation or linearization request, and reverse mode transposes the
-/// spliced recompute-and-pushforward operations like any other straight-line
+/// replayed recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation
-where
-    C::Constant: Clone,
-    C::Operation: Clone,
-{
-    fn jvp(
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation {
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
-        driver: &dyn DifferentiationDriver<C>,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The attached regions are `["primal", "forward", "backward", "tangent"]`; the primal interface provides
@@ -252,7 +242,7 @@ where
         let output_count = primal_region.output_types().len();
         check_count!("input", inputs, primal_region.input_types().len(), ProgramError);
 
-        // Splice the forward region on the dual primals, recovering the primal outputs followed by the forward tail
+        // Replay the forward region on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent region consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
@@ -267,7 +257,7 @@ where
         let forward_tail = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
 
-        // Splice the tangent region on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
+        // Replay the tangent region on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
         // output.
         let mut tangent_operands = forward_tail;
         // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros.
@@ -286,7 +276,7 @@ where
 }
 
 /// Transpose rule for [`RematerializeOperation`]: the call is a higher-order primal boundary rather than a linear
-/// map, so a tangent program never contains it on a linear operand (linearization splices the derived forward and
+/// map, so a tangent program never contains it on a linear operand (linearization replays the derived forward and
 /// tangent programs instead) and the rule reports an
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
 impl<W, OLinear> TransposableOperation<W, OLinear> for RematerializeOperation
@@ -294,10 +284,10 @@ where
     W: Value,
     OLinear: Operation<W::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<W, OLinear>>(
         &self,
         _context: &mut TracingContext<W, OLinear>,
-        _driver: &dyn TranspositionDriver<W, OLinear>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
@@ -314,22 +304,17 @@ where
 impl<C, O> BatchableOperation<C> for RematerializeOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: Broadcast + Transpose,
-    O: Clone
-        + Operation<ArrayType>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>
-        + From<RematerializeOperation>,
+    O: Operation<ArrayType> + From<TransposeOperation> + From<BroadcastOperation> + From<RematerializeOperation>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
-        driver: &dyn BatchingDriver<C>,
+        driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
-            None => Ok((O::from(*self), driver.regions()?.into_iter().map(|region| region.into_program()).collect())),
+            None => Ok((O::from(*self), driver.regions().map(|region| region.into_program()).collect())),
             Some(_) => Ok((
                 O::from(RematerializeOperation::new().with_prevent_cse(self.prevent_cse)),
                 vec![
@@ -1387,7 +1372,7 @@ struct PrimalSliceResolver<'p, V: Value, O> {
     region_remapping: HashMap<RegionId, RegionId>,
 }
 
-impl<'p, V: Value, O: Clone + Operation<V::Type>> PrimalSliceResolver<'p, V, O> {
+impl<'p, V: Value, O: Operation<V::Type>> PrimalSliceResolver<'p, V, O> {
     /// Creates a resolver over `primal` whose region inputs resolve to `region_inputs` in the destination program.
     fn new(primal: &'p Program<V, O, Vec<V>, Vec<V>>, region_inputs: &[AtomId]) -> Self {
         let mut cuts = vec![None; primal.atoms().len()];
@@ -1505,7 +1490,7 @@ fn assemble_reconstruction_program<V, O, S>(
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
-    O: Clone + Operation<V::Type>,
+    O: Operation<V::Type>,
     S: ResidualStorage<V::Type, O>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
 {
@@ -1635,7 +1620,6 @@ where
 /// plain rematerialization.
 pub struct Rematerialize<D: Domain, B, IT, OT, P = NothingSaveable>
 where
-    D::Type: PartialEq,
     OT: Parameterized<DomainTracer<D>>,
 {
     /// Closure computing the region output tree from the region input tree.
@@ -1680,7 +1664,7 @@ type CachedDerivation<D, OT> = (
 /// documentation of [`Rematerialize`] for the derivation and rematerialization semantics.
 pub fn rematerialize<D, B, IT, OT>(body: B) -> Rematerialize<D, B, IT, OT>
 where
-    D: Domain<Type: PartialEq>,
+    D: Domain,
     B: Fn(IT) -> Result<OT, ProgramError>,
     OT: Parameterized<DomainTracer<D>>,
 {
@@ -1695,7 +1679,7 @@ where
 
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: Domain<Type: PartialEq>,
+    D: Domain,
     OT: Parameterized<DomainTracer<D>>,
 {
     /// Replaces this rematerialization's policy, re-typing the wrapper to the new policy type — any
@@ -1739,17 +1723,13 @@ where
 
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: Context<Type: PartialEq>,
+    D: Context,
     B: Fn(IT) -> Result<OT, ProgramError>,
     P: RematerializationPolicy<D::Type, <D as Domain>::Operation>,
-    IT: Parameterized<
-            DomainTracer<D>,
-            Family: ParameterizedFamily<D::Type> + ParameterizedFamily<<D as Domain>::Constant>,
-        >,
-    OT: Parameterized<
-            DomainTracer<D>,
-            Family: ParameterizedFamily<D::Type> + ParameterizedFamily<<D as Domain>::Constant>,
-        >,
+    IT: Parameterized<DomainTracer<D>>,
+    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<<D as Domain>::Constant>,
+    OT: Parameterized<DomainTracer<D>>,
+    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<<D as Domain>::Constant>,
     IT::To<D::Type>: Clone
         + Parameterized<
             D::Type,
@@ -1764,8 +1744,7 @@ where
             To<DomainTracer<D>> = OT,
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
-    <D as Domain>::Operation: Clone
-        + From<RematerializeOperation>
+    <D as Domain>::Operation: From<RematerializeOperation>
         + From<ZeroOperation<D::Type>>
         + From<AddOperation>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
@@ -2009,11 +1988,9 @@ mod tests {
     use std::fmt::Debug;
     use std::rc::Rc;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::BatchAxis;
-    use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{Cos, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -2177,7 +2154,7 @@ mod tests {
             let xs = StagingContext::constant(&context, stacked.clone());
             let scan = ScanOperation::new(1, 3);
             let outputs =
-                context.stage_operation(ArrayOperation::Scan(scan), vec![body.clone()], &[carry, xs])?;
+                context.stage_operation(ArrayOperation::Scan(scan), vec![body.clone()], &[], &[carry, xs])?;
             Ok(outputs.into_iter().next().unwrap())
         };
 
@@ -3827,11 +3804,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_residual_candidates_expose_the_spliced_forward_producer() {
+    fn test_custom_vjp_residual_candidates_expose_the_replayed_forward_producer() {
         use crate::tracing_v2::operations::custom_derivatives::custom_vjp;
 
-        // Phase 0 boundary pin: the custom-VJP *forward* program is spliced through the linearization, so the
-        // declared residual's producing instruction is the spliced internal `cos` — not the opaque call — while the
+        // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
+        // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the
         // user-owned backward program contributes no candidates at all.
         let custom = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
@@ -3911,6 +3888,7 @@ mod tests {
                 let outputs = context.stage_operation(
                     ArrayOperation::While(operation),
                     vec![remat_condition.clone(), remat_body.clone()],
+                    &[],
                     &[x],
                 )?;
                 Ok(outputs.into_iter().next().unwrap())

@@ -171,7 +171,7 @@ where
                 builder.borrow_mut().add_instruction(operation.clone(), input_atoms, region_ids)?.to_vec();
             let output_values = context.bind(
                 operation.clone(),
-                instruction_regions.into_iter().map(RegionRef::into_program).collect(),
+                instruction_regions.into_iter().map(RegionRef::into_program).collect::<Vec<_>>(),
                 &[],
                 &input_values,
             )?;
