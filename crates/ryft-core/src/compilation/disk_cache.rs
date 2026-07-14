@@ -129,11 +129,11 @@ impl DiskCache {
     }
 
     /// Environment variable that [`Self::from_env`] reads for the cache directory.
-    pub const ENV_VAR: &'static str = "RYFT_COMPILATION_CACHE_DIR";
+    pub const ENV_VAR: &str = "RYFT_COMPILATION_CACHE_DIR";
 
     /// Environment variable that [`Self::from_env`] reads for the optional on-disk byte cap.
     /// Parsed as an unsigned 64-bit integer. Unparseable or absent values disable eviction.
-    pub const MAX_BYTES_ENV_VAR: &'static str = "RYFT_COMPILATION_CACHE_MAX_BYTES";
+    pub const MAX_BYTES_ENV_VAR: &str = "RYFT_COMPILATION_CACHE_MAX_BYTES";
 
     fn open_inner(directory: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let directory = directory.into();

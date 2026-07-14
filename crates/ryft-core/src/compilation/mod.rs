@@ -92,7 +92,7 @@
 //!
 //! [`CapturingContext`](crate::captures::CapturingContext) lets ordinary and transform contexts register captures
 //! through their parent. To embed a
-//! staged function in a larger trace, an operation family implements [`CompiledProgramOperation`]; that operation
+//! staged function in a larger trace, an operation family implements [`CompiledCallOperation`]; that operation
 //! then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation, and
 //! interpretation.
 //!
@@ -144,7 +144,7 @@
 //! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity
 //! from the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional
 //! hooks add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or
-//! memory analysis without recompilation, and implement [`CompiledProgramOperation`] on the operation family when
+//! memory analysis without recompilation, and implement [`CompiledCallOperation`] on the operation family when
 //! staged functions must compose inside other traces.
 //!
 //! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
@@ -177,8 +177,8 @@ pub use contexts::{
 pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
-    CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledFunction,
-    CompiledProgramOperation, ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics,
+    CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
+    CompiledFunction, ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics,
     JittedFunction, LoweredFunction, LoweringRequest, Specialization, StageRequest, StagedFunction, call_function, jit,
     jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacities,
     try_jit_with_options_and_capacity,

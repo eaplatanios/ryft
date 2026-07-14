@@ -556,7 +556,7 @@ where
         }
         let context = input.context().clone();
         Ok(context
-            .stage_operation(make_operation(sharding), Vec::new(), &[&input])?
+            .stage_operation(make_operation(sharding), Vec::new(), &[], &[&input])?
             .into_iter()
             .next()
             .expect("a sharding-control operation produces one output per input leaf"))
@@ -3637,6 +3637,7 @@ mod tests {
                                 .stage_operation(
                                     XlaOperation::Condition(ConditionOperation::new()),
                                     vec![psum_branch, identity_branch],
+                                    &[],
                                     &[predicate, local_x],
                                 )
                                 .unwrap();

@@ -4,7 +4,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::benchmarking::{
-    BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
+    record, summarize_program, BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
 use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -13,7 +13,7 @@ use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
-use crate::experimental::shard_map::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use crate::experimental::shard_map::{shard_map, trace, ShardMapTracer, TracedXlaProgram};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {
@@ -115,18 +115,15 @@ fn summarize_xla_program<Input: Parameterized<XlaConstant>, Output: Parameterize
 ///
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
-fn traced_xla_records<
-    Input: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Output: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<ShardMapTracer>,
-        >,
->(
+fn traced_xla_records<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
-) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>
+where
+    <Input as Parameterized<ArrayType>>::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    <Output as Parameterized<ArrayType>>::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
+{
     let program = traced.program().simplified()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(

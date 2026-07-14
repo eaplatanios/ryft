@@ -60,7 +60,6 @@ pub trait CompilationDomain: Domain<Constant = CaptureReference<<Self as Domain>
     ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
     where
         Self: Sized,
-        Self::Operation: Clone,
         Request: StageRequest<Self>;
 
     /// Performs the complete backend-specific lowering transition.

@@ -356,7 +356,7 @@ where
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(
                 XlaOperation::JitCall(*self),
-                driver.regions()?.into_iter().map(|region| region.into_program()).collect(),
+                driver.regions().map(|region| region.into_program()).collect(),
                 inputs,
             );
         }
@@ -390,7 +390,8 @@ where
 /// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
 impl<C> BatchableOperation<C> for JitCallOperation
 where
-    C: Context<Type = ArrayType, Operation: From<JitCallOperation>>,
+    C: Context<Type = ArrayType>,
+    C::Operation: From<JitCallOperation>,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -621,7 +622,11 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
         .zip(inputs)
         .map(
             |(&linear, input)| {
-                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().into_owned()) }
+                if linear {
+                    input_cotangents.next().unwrap()
+                } else {
+                    MaybeZero::Zero(input.r#type().into_owned())
+                }
             },
         )
         .collect();

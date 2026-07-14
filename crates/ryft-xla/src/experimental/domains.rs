@@ -360,13 +360,16 @@ impl<'c> Context for XlaDomain<'c> {
     /// compiled through this domain's compile cache, and executed on this domain's PJRT client via
     /// the crate-private `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the
     /// constant directly through the runtime client without compiling a program.
-    fn bind<P: Into<Self::Operation>>(
+    fn bind<P, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: P,
-        regions: Vec<FlatProgram<Self>>,
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
+    ) -> Result<Vec<Self::Value>, ProgramError>
+    where
+        P: Into<Self::Operation>,
+    {
         let operation = operation.into();
         let name = operation.name();
         if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
@@ -578,8 +581,8 @@ impl<'c> Constant<Array<'c>, XlaConstant> for XlaDomain<'c> {
 /// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
 /// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 /// through this same domain.
-impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for JitCallOperation {
-    fn interpret<D: InterpretationDriver<Array<'c>, XlaDomain<'c>>>(
+impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation {
+    fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
         context: &XlaDomain<'c>,
         driver: &D,
@@ -599,8 +602,8 @@ impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for JitCallOperation {
 //  `shard_map` through this rule, extend `InterpretationDriver` with a whole-rebind request instead of
 //  interpreting the local body over global values (phase 7 or later of
 //  `.tasks/plan_first_class_program_regions.md`).
-impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for ShardMapOperation<XlaConstant> {
-    fn interpret<D: InterpretationDriver<Array<'c>, XlaDomain<'c>>>(
+impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant> {
+    fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
         _context: &XlaDomain<'c>,
         _driver: &D,
@@ -651,13 +654,13 @@ impl<'c> XlaDomain<'c> {
     /// (shardings included), compiled through this domain's compile cache, and executed on this domain's PJRT client.
     /// The cache key contains the complete lowered computation, its effective compilation options, and the derived
     /// mesh, so repeated eager binds of the same lowering reuse one compiled executable without conflating distinct
-    /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) carry their
-    /// nested programs as payloads and flow through this same path — the compiler handles the control flow, so no host
-    /// interpreter loops are needed.
-    fn eager_bind(
+    /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their
+    /// nested programs as attached regions and flow through this same path — the compiler handles the control flow, so
+    /// no host interpreter loops are needed.
+    fn eager_bind<R: AsRef<[FlatXlaProgram]> + IntoIterator<Item = FlatXlaProgram>>(
         &self,
         operation: XlaOperation,
-        regions: Vec<FlatXlaProgram>,
+        regions: R,
         callees: &[Rc<FlatXlaProgram>],
         inputs: &[Array<'c>],
     ) -> Result<Vec<Array<'c>>, ProgramError> {
@@ -675,7 +678,8 @@ impl<'c> XlaDomain<'c> {
         // provided region bodies to that instruction.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let mut builder = XlaProgramBuilder::new();
-        let mut region_ids = regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>();
+        let mut region_ids = Vec::with_capacity(regions.as_ref().len() + callees.len());
+        region_ids.extend(regions.into_iter().map(|region| builder.import_program(region)));
         region_ids.extend(callees.iter().map(|callee| builder.intern_callee(callee)));
         let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let output_atoms = builder.add_instruction(operation, input_atoms, region_ids)?.to_vec();
@@ -3307,7 +3311,7 @@ mod tests {
         let true_outputs = domain
             .bind(
                 operation.clone(),
-                vec![doubled.clone(), squared.clone()],
+                [doubled.clone(), squared.clone()],
                 &[],
                 &[boolean_scalar(&client, &mesh, true), input.clone()],
             )
@@ -3315,7 +3319,7 @@ mod tests {
         assert_eq!(read_f32s(&client, &true_outputs[0]), vec![2.0, 4.0, 6.0, 8.0]);
 
         let false_outputs = domain
-            .bind(operation, vec![doubled, squared], &[], &[boolean_scalar(&client, &mesh, false), input])
+            .bind(operation, [doubled, squared], &[], &[boolean_scalar(&client, &mesh, false), input])
             .unwrap();
         assert_eq!(read_f32s(&client, &false_outputs[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "both predicate values must share one compiled executable");
@@ -3428,8 +3432,7 @@ mod tests {
         };
         let scan = ScanOperation::<XlaConstant>::new(1, 4);
 
-        let outputs =
-            domain.bind(XlaOperation::Scan(scan), vec![body], &[], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
+        let outputs = domain.bind(XlaOperation::Scan(scan), [body], &[], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![4.0]);
         assert_eq!(outputs[1].shape(), StaticShape::new(vec![4]));

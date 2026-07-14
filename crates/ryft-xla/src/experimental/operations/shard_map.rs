@@ -264,7 +264,7 @@ where
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(
                 XlaOperation::ShardMap(Box::new(self.clone())),
-                driver.regions()?.into_iter().map(|region| region.into_program()).collect(),
+                driver.regions().map(|region| region.into_program()).collect(),
                 inputs,
             );
         }
@@ -689,7 +689,7 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
     let input_cotangents =
-        context.stage_operation(transposed_operation, vec![transposed_body_program], operands.as_slice())?;
+        context.stage_operation(transposed_operation, vec![transposed_body_program], &[], operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 

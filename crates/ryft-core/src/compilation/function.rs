@@ -13,8 +13,8 @@ use lru::LruCache;
 use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
-use crate::operations::Operation;
 use crate::operations::constants::Constant;
+use crate::operations::Operation;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer};
@@ -22,7 +22,8 @@ use crate::types::Typed;
 
 use super::contexts::CompilationDomain;
 
-/// Flat source-program representation stored by nested compiled-call operations.
+/// Flat source-program representation of a compiled call's callee, supplied to [`Context::bind`]'s `callees`
+/// argument and interned as a shared callee root region on the staged instruction.
 pub type FlatCompilationProgram<D> = Program<
     <D as Domain>::Constant,
     <D as Domain>::Operation,
@@ -65,18 +66,21 @@ impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Inp
 /// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
 pub trait StageRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
-    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>;
+    type Input: Parameterized<
+        D::Type,
+        Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    >;
 
     /// Structured abstract output type.
     type Output: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-            To<CompilationTracer<D>>: Parameterized<
-                CompilationTracer<D>,
-                To<D::Type> = Self::Output,
-                To<D::Constant> = <Self::Output as Parameterized<D::Type>>::To<D::Constant>,
-            >,
-        >;
+        D::Type,
+        Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+        To<CompilationTracer<D>>: Parameterized<
+            CompilationTracer<D>,
+            To<D::Type> = Self::Output,
+            To<D::Constant> = <Self::Output as Parameterized<D::Type>>::To<D::Constant>,
+        >,
+    >;
 
     /// Returns the structured abstract input signature.
     fn input_types(&self) -> &Self::Input;
@@ -93,7 +97,6 @@ pub trait StageRequest<D: CompilationDomain>: Sized {
         normalize_output_types: NormalizeOutput,
     ) -> Result<StagedFunction<D, Self::Input, Self::Output>, D::Error>
     where
-        D::Operation: Clone,
         NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>;
 }
 
@@ -109,9 +112,7 @@ pub trait LoweringRequest<D: CompilationDomain>: Sized {
     fn staged(&self) -> &StagedFunction<D, Self::Input, Self::Output>;
 
     /// Opens runtime captures as leading flat inputs.
-    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
-    where
-        D::Operation: Clone;
+    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>;
 
     /// Assembles the backend-established lowering.
     fn into_lowered(
@@ -191,22 +192,18 @@ pub trait CallRequest<D: CompilationDomain>: Sized {
 
 impl<D, F, Input, Output> StageRequest<D> for CompilationStagingRequest<D, F, Input, Output>
 where
-    D: CompilationDomain<Operation: Clone>,
+    D: CompilationDomain,
     F: FnOnce(
         Vec<D::Constant>,
         Vec<CompilationTracer<D>>,
         Input::To<CompilationTracer<D>>,
     ) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
-    Output: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-            To<CompilationTracer<D>>: Parameterized<
-                CompilationTracer<D>,
-                To<D::Type> = Output,
-                To<D::Constant> = Output::To<D::Constant>,
-            >,
-        >,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output::To<CompilationTracer<D>>:
+        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
 {
     type Input = Input;
     type Output = Output;
@@ -395,13 +392,16 @@ impl Default for JitCacheCapacities {
 
 /// Operation-family capability for representing a call to a staged program.
 ///
-/// The payload owns a flat program whose captures have been lifted into leading inputs. The concrete operation family
-/// decides how that boundary lowers and how batching, differentiation, partial evaluation, and other transforms rewrite
-/// it. This keeps higher-order call semantics with the operation that owns them while allowing the lifecycle and
-/// capture plumbing to remain backend-neutral.
-pub trait CompiledProgramOperation<Constant: Value>: Operation<Constant::Type> + Sized {
-    /// Constructs a call operation for `program`.
-    fn compiled_call(program: Rc<Program<Constant, Self, Vec<Constant>, Vec<Constant>>>) -> Self;
+/// The call operation is metadata-only: the callee is a flat program (whose captures have been lifted into leading
+/// inputs) supplied separately through the `callees` argument of [`Context::bind`], which
+/// interns it as a shared callee root region by [`Rc`] identity. The concrete operation family decides how that
+/// boundary lowers and how batching, differentiation, partial evaluation, and other transforms rewrite it. This
+/// keeps higher-order call semantics with the operation that owns them while allowing the lifecycle and capture
+/// plumbing to remain backend-neutral.
+pub trait CompiledCallOperation<Constant: Value>: Operation<Constant::Type> + Sized {
+    /// Constructs a call operation. The callee program rides through the `callees` argument of the accompanying
+    /// [`Context::bind`].
+    fn compiled_call() -> Self;
 }
 
 /// Staged, unlowered form of one compiled function.
@@ -442,22 +442,26 @@ struct StagedFunctionState<
     lifted_program: std::cell::OnceCell<Rc<FlatCompilationProgram<D>>>,
 }
 
-impl<
+impl<D, Input, Output> Clone for StagedFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> Clone for StagedFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn clone(&self) -> Self {
         Self { state: self.state.clone() }
     }
 }
 
-impl<
+impl<D, Input, Output> StagedFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> StagedFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     /// Returns the source program and its runtime captures.
     #[inline]
@@ -508,7 +512,7 @@ impl<
     /// active context.
     pub fn call<V>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        D::Operation: Clone + CompiledProgramOperation<D::Constant>,
+        D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
         V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>
             + CapturingContext<Capture = D::Value>
@@ -529,7 +533,7 @@ impl<
     /// Stages a call to this function through an explicitly supplied active `context`.
     pub fn call_in_context<C, V>(&self, context: &C, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        D::Operation: Clone + CompiledProgramOperation<D::Constant>,
+        D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
         C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
             + CapturingContext<Capture = D::Value>
@@ -552,8 +556,12 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
-        let outputs =
-            context.bind(D::Operation::compiled_call(self.lifted_program()?), &[], &[], flat_inputs.as_slice())?;
+        let outputs = context.bind(
+            D::Operation::compiled_call(),
+            Vec::new(),
+            &[self.lifted_program()?],
+            flat_inputs.as_slice(),
+        )?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -564,7 +572,7 @@ impl<
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        D::Operation: Clone + CompiledProgramOperation<D::Constant>,
+        D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
         V::DispatchDomain:
             Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation> + Constant<V, D::Constant>,
@@ -587,7 +595,7 @@ impl<
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        D::Operation: Clone + CompiledProgramOperation<D::Constant>,
+        D::Operation: CompiledCallOperation<D::Constant>,
         V: Value<Type = D::Type>,
         C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
             + Constant<V, D::Constant>,
@@ -613,15 +621,12 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(D::Operation::compiled_call(self.lifted_program()?), &[], &[], flat_inputs.as_slice())
+        context.bind(D::Operation::compiled_call(), Vec::new(), &[self.lifted_program()?], flat_inputs.as_slice())
     }
 
     /// Returns the source program with runtime captures lifted into leading flat inputs.
     #[doc(hidden)]
-    pub fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
-    where
-        D::Operation: Clone,
-    {
+    pub fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError> {
         if let Some(program) = self.state.lifted_program.get() {
             return Ok(program.clone());
         }
@@ -630,11 +635,13 @@ impl<
     }
 }
 
-impl<
+impl<D, Input, Output> LoweringRequest<D> for StagedFunction<D, Input, Output>
+where
     D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> LoweringRequest<D> for StagedFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     type Input = Input;
     type Output = Output;
@@ -643,10 +650,7 @@ impl<
         self
     }
 
-    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
-    where
-        D::Operation: Clone,
-    {
+    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError> {
         StagedFunction::lifted_program(self)
     }
 
@@ -671,22 +675,26 @@ pub struct LoweredFunction<
     output_types: Vec<D::Type>,
 }
 
-impl<
+impl<D, Input, Output> Clone for LoweredFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> Clone for LoweredFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), staged: self.staged.clone(), output_types: self.output_types.clone() }
     }
 }
 
-impl<
+impl<D, Input, Output> LoweredFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> LoweredFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     /// Assembles a lowering whose output signature has already been established by its backend.
     #[doc(hidden)]
@@ -723,11 +731,13 @@ impl<
     }
 }
 
-impl<
+impl<D, Input, Output> CompileRequest<D> for LoweredFunction<D, Input, Output>
+where
     D: CompilationDomain,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> CompileRequest<D> for LoweredFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     type Input = Input;
     type Output = Output;
@@ -913,22 +923,26 @@ pub struct CompiledFunction<
     lowered: LoweredFunction<D, Input, Output>,
 }
 
-impl<
+impl<D, Input, Output> Clone for CompiledFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> Clone for CompiledFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn clone(&self) -> Self {
         Self { executable_program: self.executable_program.clone(), lowered: self.lowered.clone() }
     }
 }
 
-impl<
+impl<D, Input, Output> CompiledFunction<D, Input, Output>
+where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> CompiledFunction<D, Input, Output>
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     /// Assembles a compiled function from backend-validated parts.
     #[doc(hidden)]
@@ -1045,16 +1059,14 @@ struct JittedFunctionState<
     statistics: JitCacheStatisticsState,
 }
 
-impl<
-    D,
-    F,
-    Static: Specialization,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> Clone for JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Specialization, Input, Output> Clone for JittedFunction<D, F, Static, Input, Output>
 where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
     D::Type: Eq + Hash,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn clone(&self) -> Self {
         Self { state: self.state.clone() }
@@ -1080,16 +1092,14 @@ impl<Key: Eq + Hash> Drop for JitProducerGuard<'_, Key> {
     }
 }
 
-impl<
-    D,
-    F,
-    Static: Specialization,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Specialization, Input, Output> JittedFunction<D, F, Static, Input, Output>
 where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
     D::Type: Eq + Hash,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn new(domain: &D, function: F, options: D::Options, capacities: JitCacheCapacities) -> Self {
         let trace_capacity =
@@ -1197,16 +1207,15 @@ where
     /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
     pub fn call(&self, static_parameters: Static, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
     where
-        D::Operation: Clone,
         D::Options: Clone,
         F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
         Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
         Input::To<D::Value>: Parameterized<
-                D::Value,
-                Family = Input::Family,
-                ParameterStructure = Input::ParameterStructure,
-                To<D::Type> = Input,
-            >,
+            D::Value,
+            Family = Input::Family,
+            ParameterStructure = Input::ParameterStructure,
+            To<D::Type> = Input,
+        >,
         Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
         Output::To<D::Value>:
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
@@ -1390,9 +1399,10 @@ where
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
     Static: Specialization,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
-    Output:
-        Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
 {
     try_jit_with_options(domain, move |static_parameters, inputs| Ok(function(static_parameters, inputs)), options)
 }
@@ -1414,9 +1424,10 @@ where
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
     Static: Specialization,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
-    Output:
-        Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
 {
     jit_with_options(domain, function, D::Options::default())
 }
@@ -1429,18 +1440,14 @@ pub fn stage_function<D, F, Input, Output>(
     options: D::Options,
 ) -> Result<StagedFunction<D, Input, Output>, D::Error>
 where
-    D: CompilationDomain<Operation: Clone>,
+    D: CompilationDomain,
     F: FnOnce(Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
-    Output: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-            To<CompilationTracer<D>>: Parameterized<
-                CompilationTracer<D>,
-                To<D::Type> = Output,
-                To<D::Constant> = Output::To<D::Constant>,
-            >,
-        >,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output::To<CompilationTracer<D>>:
+        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
 {
     domain.stage(CompilationStagingRequest::new(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, options))
 }
@@ -1471,22 +1478,18 @@ pub(crate) fn trace_with_capture_references<D, F, Input, Output, NormalizeOutput
     normalize_output_types: NormalizeOutput,
 ) -> Result<StagedFunction<D, Input, Output>, D::Error>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>, Operation: Clone>,
+    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
     F: FnOnce(
         Vec<D::Constant>,
         Vec<CompilationTracer<D>>,
         Input::To<CompilationTracer<D>>,
     ) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
-    Output: Parameterized<
-            D::Type,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-            To<CompilationTracer<D>>: Parameterized<
-                CompilationTracer<D>,
-                To<D::Type> = Output,
-                To<D::Constant> = Output::To<D::Constant>,
-            >,
-        >,
+    Input: Parameterized<D::Type>,
+    Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output: Parameterized<D::Type>,
+    Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Output::To<CompilationTracer<D>>:
+        Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
     NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>,
 {
     let context = DomainTracingContext::<D, D::Value>::new();
@@ -1512,18 +1515,12 @@ where
     let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
     let output_types = normalize_output_types(&options, output_types)?;
     drop(outputs);
-    // Temporary conservative capture-pruning guard for the first-class-program-regions migration: a capture
-    // registered through a nested trace is referenced only inside a nested payload program, which top-level-only
-    // pruning cannot see, so pruning (and its index renumbering) is skipped entirely for such traces.
-    // TODO(eaplatanios): [regions] Delete this skip together with `CapturingContext::capture_in_nested_trace` once
-    //  the phase 4-6 operation-family migrations make capture discovery recursively region-aware.
-    let has_nested_captures = context.has_nested_captures();
     drop(context);
     let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
     let source_program = ClosedProgram::new(program, captures)?;
-    let source_program = if has_nested_captures { source_program } else { source_program.without_unused_captures()? };
+    let source_program = source_program.without_unused_captures()?;
     Ok(StagedFunction {
         state: Rc::new(StagedFunctionState {
             source_program,
@@ -1538,6 +1535,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::programs::RegionInterface;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1558,7 +1556,11 @@ mod tests {
             "test_negate"
         }
 
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        fn infer_output_types(
+            &self,
+            input_types: &[DataType],
+            _region_interfaces: &[RegionInterface<DataType>],
+        ) -> Result<Vec<DataType>, TypeError> {
             if input_types.len() != 1 {
                 return Err(TypeError {
                     message: format!("test_negate expects 1 input but got {}", input_types.len()),
@@ -1948,7 +1950,11 @@ mod tests {
         let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate {
+                    input.unary(NegateOperation)
+                } else {
+                    input
+                }
             },
         );
 
@@ -1995,7 +2001,11 @@ mod tests {
         let function: JittedFunction<TestDomain, _, CollidingStatic, DataType, DataType> = jit(
             &domain,
             |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
-                if static_parameters.0 { input.unary(NegateOperation) } else { input }
+                if static_parameters.0 {
+                    input.unary(NegateOperation)
+                } else {
+                    input
+                }
             },
         );
 
@@ -2024,7 +2034,11 @@ mod tests {
         let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate { input.unary(NegateOperation) } else { input }
+                if negate {
+                    input.unary(NegateOperation)
+                } else {
+                    input
+                }
             },
         );
         function.call(true, Scalar::from(2.0)).unwrap();

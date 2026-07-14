@@ -9,15 +9,12 @@
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
-use ryft_core::Batch;
-use ryft_core::LinearizationTracer;
-use ryft_core::Typed;
 use ryft_core::batching::BatchAxis;
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
+    call_function, jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
     CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram,
-    JittedFunction as CoreJittedFunction, Specialization, StagedFunction, call_function,
-    jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
+    JittedFunction as CoreJittedFunction, Specialization, StagedFunction,
 };
 use ryft_core::contexts::Context;
 use ryft_core::differentiation::DifferentiationError;
@@ -28,12 +25,15 @@ use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::ArrayType;
+use ryft_core::Batch;
+use ryft_core::LinearizationTracer;
+use ryft_core::Typed;
 use ryft_pjrt::Execution;
 
-use crate::Array;
 use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::profile_guided::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction};
+use crate::Array;
 
 /// Tracer leaf used while tracing an XLA compilation.
 pub type XlaCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
@@ -54,8 +54,10 @@ pub fn try_jitted_with_options<'c, F, Static, In, Out>(
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
     Static: Specialization,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    In: Parameterized<ArrayType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out: Parameterized<ArrayType>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     core_try_jit_with_options(domain, function, options)
 }
@@ -75,8 +77,10 @@ pub fn jitted_with_options<'c, F, Static, In, Out>(
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     Static: Specialization,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    In: Parameterized<ArrayType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out: Parameterized<ArrayType>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     core_jit_with_options(domain, function, options)
 }
@@ -97,8 +101,10 @@ pub fn jitted<'c, F, Static, In, Out>(
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
     Static: Specialization,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    In: Parameterized<ArrayType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out: Parameterized<ArrayType>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     jitted_with_options(function, domain, XlaOptions::new(mesh))
 }
@@ -120,31 +126,29 @@ type XlaCompileLinearizationTracer<'c> = LinearizationTracer<DomainTracingContex
 /// [`CompiledXlaFunction`] when an executable is actually needed. Executable cache identity is derived from the
 /// complete lowered computation and compile-relevant backend state, so equivalent lowerings can share an executable
 /// even when they were produced at different Rust call sites.
-pub struct StagedXlaFunction<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> {
+pub struct StagedXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+{
     /// Backend-neutral staged function carrying the source program, captures, structures, and retained options.
     function: StagedFunction<XlaDomain<'c>, In, Out>,
 }
 
-impl<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> Clone for StagedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for StagedXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
     }
 }
 
-impl<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> StagedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> StagedXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns the staged source [`Program`](ryft_core::Program) together with its captured runtime values. Useful for
     /// outer transforms (`grad` / `jvp` / `vjp` / `batch`), staged `jit_call` payloads, and diagnostics (printing the
@@ -171,19 +175,21 @@ impl<
         V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        In: Parameterized<ArrayType>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>,
+        Out: Parameterized<ArrayType>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>,
         Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.function.call(inputs)
     }
 }
 
-impl<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> From<StagedFunction<XlaDomain<'c>, In, Out>> for StagedXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> From<StagedFunction<XlaDomain<'c>, In, Out>>
+    for StagedXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     #[inline]
     fn from(function: StagedFunction<XlaDomain<'c>, In, Out>) -> Self {
@@ -228,8 +234,10 @@ impl<'c> XlaDomain<'c> {
         staged: StagedXlaFunction<'c, In, Out>,
     ) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
     where
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+        In: Parameterized<ArrayType>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+        Out: Parameterized<ArrayType>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     {
         let lowered = self.lower(staged.function)?;
         let function = self.compile(lowered)?;
@@ -308,8 +316,10 @@ impl<'c> XlaDomain<'c> {
         options: AdaptiveProfileGuidedOptions,
     ) -> Result<AdaptiveProfileGuidedXlaFunction<'c, In, Out>, XlaDomainError>
     where
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
+        In: Parameterized<ArrayType>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+        Out: Parameterized<ArrayType>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     {
         AdaptiveProfileGuidedXlaFunction::new(
             self.clone(),
@@ -332,32 +342,30 @@ impl<'c> XlaDomain<'c> {
 /// compiled into, exposed via [`Self::source_program`]. Useful for diagnostics (printing the traced IR, instruction
 /// counts, graph rendering), for outer transforms, and for inner staging via [`Self::call`] with trace inputs, which
 /// emits a `jit_call` boundary carrying the source program into the active outer trace context.
-pub struct CompiledXlaFunction<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> {
+pub struct CompiledXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+{
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
     function: CompiledFunction<XlaDomain<'c>, In, Out>,
 }
 
-impl<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> Clone for CompiledXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     fn clone(&self) -> Self {
         Self { function: self.function.clone() }
     }
 }
 
-impl<
-    'c,
-    In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> CompiledXlaFunction<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> CompiledXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns the flat output [`ArrayType`]s in the order the executor produces them.
     #[inline]
@@ -410,8 +418,10 @@ impl<
         V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
             + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        In: Parameterized<ArrayType>,
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>,
+        Out: Parameterized<ArrayType>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>,
         Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.function.staged().call(inputs)
@@ -421,15 +431,10 @@ impl<
 /// Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued compiled function with
 /// respect to its inputs. The original closure is never re-executed; [`Self::call`] emits a `jit_call` boundary, and
 /// the active transform rewrites that operation through ordinary JVP and transpose rules.
-impl<
-    'c,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
-            To<ArrayType> = In,
-            ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
-        >,
-> CompiledXlaFunction<'c, In, ArrayType>
+impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledXlaFunction<'c, In, ArrayType>
+where
+    In::Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
+    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
     /// respect to its input. Mirrors `jax.grad(jax.jit(f))`.
@@ -446,15 +451,15 @@ impl<
         'c: 'domain,
         In::Family: ParameterizedFamily<XlaCompileTracer<'c>> + ParameterizedFamily<XlaCompileLinearizationTracer<'c>>,
         In::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<XlaCompileTracer<'c>> = In::To<XlaCompileTracer<'c>>,
-                To<ArrayType> = In,
-                To<XlaConstant> = In::To<XlaConstant>,
-            >,
+            XlaCompileTracer<'c>,
+            To<XlaCompileTracer<'c>> = In::To<XlaCompileTracer<'c>>,
+            To<ArrayType> = In,
+            To<XlaConstant> = In::To<XlaConstant>,
+        >,
         In::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
-            >,
+            XlaCompileTracer<'c>,
+            To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
+        >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -489,17 +494,12 @@ impl<
 }
 
 /// Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
-impl<
-    'c,
-    In: Clone
-        + Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
-            To<ArrayType> = In,
-            ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
-        >,
-    Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>>,
-> CompiledXlaFunction<'c, In, Out>
+impl<'c, In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>>
+    CompiledXlaFunction<'c, In, Out>
+where
+    In::Family: ParameterizedFamily<ArrayType, To = In> + ParameterizedFamily<XlaConstant>,
+    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+    Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
 {
     /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
@@ -519,11 +519,11 @@ impl<
             Parameterized<XlaCompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
         Out::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = Out::To<XlaCompileTracer<'c>>>,
         Out::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                Family = Out::Family,
-                ParameterStructure = Out::ParameterStructure,
-                To<ArrayType> = Out,
-            >,
+            XlaCompileTracer<'c>,
+            Family = Out::Family,
+            ParameterStructure = Out::ParameterStructure,
+            To<ArrayType> = Out,
+        >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -589,12 +589,12 @@ impl<
             Parameterized<XlaCompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
         Out::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = Out::To<XlaCompileTracer<'c>>>,
         Out::To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                Family = Out::Family,
-                ParameterStructure = Out::ParameterStructure,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
+            XlaCompileTracer<'c>,
+            Family = Out::Family,
+            ParameterStructure = Out::ParameterStructure,
+            To<ArrayType> = Out,
+            To<XlaConstant> = Out::To<XlaConstant>,
+        >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -677,34 +677,22 @@ fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType
 /// [`CompilationContext`](ryft_core::compilation::CompilationContext) structurally shares equivalent lowerings even
 /// when they originate at different Rust call sites.
 #[track_caller]
-pub fn compile<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+pub fn compile<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     compile_with_options(function, input_types, domain, XlaOptions::new(mesh))
 }
 
@@ -714,35 +702,23 @@ pub fn compile<
 /// executable arguments and are supplied from the returned [`CompiledXlaFunction`] at execution time, so callers of the
 /// compiled function still pass only `In` inputs.
 #[track_caller]
-pub fn compile_with_captures<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+pub fn compile_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     mesh: DeviceMesh,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     compile_with_flat_captures(
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
         captures,
@@ -755,71 +731,47 @@ pub fn compile_with_captures<
 /// Same as [`compile`] but accepts a full [`XlaOptions`] payload for XLA mesh placement, sharding overrides,
 /// and per-input buffer donation flags.
 #[track_caller]
-pub fn compile_with_options<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+pub fn compile_with_options<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     compile_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, domain, options)
 }
 
 #[track_caller]
-fn compile_with_flat_captures<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(
-        Vec<XlaConstant>,
-        Vec<XlaCompileTracer<'c>>,
-        In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+fn compile_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<CompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(
+        Vec<XlaConstant>,
+        Vec<XlaCompileTracer<'c>>,
+        In::To<XlaCompileTracer<'c>>,
+    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     let staged = stage_with_flat_captures::<F, In, Out>(function, captures, input_types, domain, options)?;
     domain.compile_staged_function(staged)
 }
@@ -832,34 +784,22 @@ fn compile_with_flat_captures<
 /// staged handle later with [`XlaDomain::compile_staged_function`] when direct execution is needed. `options` are
 /// applied to the abstract input signature before tracing and retained for subsequent lowering and compilation.
 #[track_caller]
-pub fn stage<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+pub fn stage<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     stage_with_flat_captures(|_, _, inputs| Ok(function(inputs)), Vec::new(), input_types, domain, options)
 }
 
@@ -869,35 +809,23 @@ pub fn stage<
 /// [`compile_with_captures`]. Captures are retained on the staged handle and threaded through `jit_call` boundaries
 /// when the handle is staged into outer traces via [`StagedXlaFunction::call`].
 #[track_caller]
-pub fn stage_with_captures<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+pub fn stage_with_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(Vec<XlaCompileTracer<'c>>, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     stage_with_flat_captures(
         |_, capture_tracers, inputs| Ok(function(capture_tracers, inputs)),
         captures,
@@ -908,39 +836,27 @@ pub fn stage_with_captures<
 }
 
 #[track_caller]
-fn stage_with_flat_captures<
-    'domain,
-    'c: 'domain,
-    F: FnOnce(
-        Vec<XlaConstant>,
-        Vec<XlaCompileTracer<'c>>,
-        In::To<XlaCompileTracer<'c>>,
-    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            ParameterStructure: std::hash::Hash,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'c>>,
-            To<XlaCompileTracer<'c>>: Parameterized<
-                XlaCompileTracer<'c>,
-                To<ArrayType> = Out,
-                To<XlaConstant> = Out::To<XlaConstant>,
-            >,
-        >,
->(
+fn stage_with_flat_captures<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     captures: Vec<Array<'c>>,
     input_types: In,
     domain: &'domain XlaDomain<'c>,
     options: XlaOptions,
-) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError> {
+) -> Result<StagedXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(
+        Vec<XlaConstant>,
+        Vec<XlaCompileTracer<'c>>,
+        In::To<XlaCompileTracer<'c>>,
+    ) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    In::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    In::ParameterStructure: std::hash::Hash,
+    Out::Family:
+        ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>,
+    Out::To<XlaCompileTracer<'c>>:
+        Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
     let function = domain.stage(CompilationStagingRequest::new(function, captures, input_types, options))?;
     Ok(StagedXlaFunction { function })
 }
@@ -948,25 +864,20 @@ fn stage_with_flat_captures<
 /// Traces `function` against `input_types` and returns the abstract output type tree, without
 /// lowering or compiling. Mirrors `jax.eval_shape`.
 #[track_caller]
-pub fn infer_output_types<
-    F: FnOnce(In::To<XlaCompileTracer<'static>>) -> Out::To<XlaCompileTracer<'static>>,
-    In: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'static>>,
-        >,
-    Out: Parameterized<
-            ArrayType,
-            Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<XlaConstant>
-                        + ParameterizedFamily<XlaCompileTracer<'static>>,
-            To<XlaCompileTracer<'static>>: Parameterized<XlaCompileTracer<'static>, To<ArrayType> = Out>,
-        >,
->(
+pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-) -> Result<Out, ProgramError> {
+) -> Result<Out, ProgramError>
+where
+    F: FnOnce(In::To<XlaCompileTracer<'static>>) -> Out::To<XlaCompileTracer<'static>>,
+    In::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<XlaCompileTracer<'static>>,
+    Out::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<XlaCompileTracer<'static>>,
+    Out::To<XlaCompileTracer<'static>>: Parameterized<XlaCompileTracer<'static>, To<ArrayType> = Out>,
+{
     DomainTracingContext::<XlaDomain<'static>, Array<'static>>::infer_output_type(
         |tracers| Ok(function(tracers)),
         input_types,
@@ -981,15 +892,15 @@ mod tests {
     use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{load_cpu_plugin, ClientOptions, CpuClientOptions};
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::experimental::ops::XlaOperation;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
+        compile, compile_with_captures, compile_with_options, infer_output_types, jitted, stage, stage_with_captures,
         AdaptiveProfileGuidedOptions, Array, CompiledXlaFunction, ExecutableXlaProgram, FromPjrt, JittedXlaFunction,
-        StagedXlaFunction, XlaCompileTracer, compile, compile_with_captures, compile_with_options, infer_output_types,
-        jitted, stage, stage_with_captures,
+        StagedXlaFunction, XlaCompileTracer,
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -2117,7 +2028,7 @@ mod tests {
             move |(primal_input, tangent_input)| {
                 let context = primal_input.context().clone();
                 let mut primal_outputs = context
-                    .stage_operation_with_callees(
+                    .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
                         Vec::new(),
                         &[primal_half.clone()],
@@ -2130,7 +2041,7 @@ mod tests {
                 let mut tangent_inputs = vec![tangent_input];
                 tangent_inputs.extend(residuals);
                 let tangent_output = context
-                    .stage_operation_with_callees(
+                    .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
                         Vec::new(),
                         &[tangent_half.clone()],
