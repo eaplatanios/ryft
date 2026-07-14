@@ -2639,7 +2639,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue + BooleanLike,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     S: AsRef<str>,
 >(
     program: &Program<V, O, Input, Output>,
@@ -2806,7 +2806,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
     let mut region = context.region();
@@ -3267,7 +3267,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
     // When the scan body is effectful, the enclosing scope's effect token is carried through the loop as one extra
@@ -3517,7 +3517,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
 ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
     // Read one slice of every stacked input and drop the unit iteration axis.
@@ -3990,7 +3990,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
     lower_nested_region_inline(
@@ -4023,7 +4023,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
     let outputs = replay_region_ref_into_block(
@@ -4171,7 +4171,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
-    O: Clone + LowerableXlaOperation<V>,
+    O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,

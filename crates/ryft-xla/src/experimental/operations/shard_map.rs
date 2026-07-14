@@ -102,10 +102,7 @@ impl<V> ShardMapOperation<V> {
     }
 }
 
-impl<V> Display for ShardMapOperation<V>
-where
-    Self: Operation<ArrayType>,
-{
+impl<V: Value<Type = ArrayType>> Display for ShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
@@ -223,10 +220,10 @@ where
     Constant: Value<Type = ArrayType>,
     C: Context<Type = ArrayType>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
-        _driver: &dyn BatchingDriver<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
@@ -255,12 +252,11 @@ impl<V, C> PartiallyEvaluatableOperation<C> for ShardMapOperation<V>
 where
     V: PartialEq + Value<Type = ArrayType> + BooleanLike,
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
-    ShardMapOperation<V>: Operation<ArrayType>,
 {
-    fn partially_evaluate(
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
         context: &PartialEvaluationContext<C>,
-        driver: &dyn PartialEvaluationDriver<C>,
+        driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed boundary with at least one known-but-symbolic input; everything else keeps the default
@@ -559,10 +555,10 @@ where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
     V: PartialEq + Value<Type = ArrayType> + BooleanLike,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
-        driver: &dyn DifferentiationDriver<C>,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types.len();
@@ -651,10 +647,10 @@ where
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent `shard_map`'s outputs.
-pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>>(
+pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
     operation: &ShardMapOperation<V>,
     context: &mut TracingContext<V, XlaOperation<V>>,
-    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
+    driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
@@ -717,10 +713,10 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>>(
 /// definition time and instantiating this implementation introduces no recursive
 /// [`TransposableOperation`] obligation on [`XlaOperation`].
 impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for ShardMapOperation<V> {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
-        driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
@@ -744,9 +740,9 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for S
 ///   - `driver`: Instruction-scoped access to the attached body region and its recursive transposition machinery.
 ///   - `input_linearity`: Per-input linearity flags over the tangent boundary's global inputs.
 #[allow(clippy::type_complexity)]
-fn transpose_shard_map_body<V: Value<Type = ArrayType>>(
+fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
     operation: &ShardMapOperation<V>,
-    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
+    driver: &D,
     input_linearity: &[bool],
 ) -> Result<(ShardMapOperation<V>, Program<V, XlaOperation<V>, Vec<V>, Vec<V>>), ProgramError> {
     let transposed_program = driver.transpose_program(driver.region(0)?, input_linearity)?;
@@ -882,15 +878,12 @@ impl ShardMapInvocationLeaf for ArrayType {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<ArrayType>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<ArrayType>: Parameterized<ArrayType>;
+            + ParameterizedFamily<ShardMapTracer>,
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -906,16 +899,13 @@ impl ShardMapInvocationLeaf for ArrayType {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<ArrayType>,
+            + ParameterizedFamily<ShardMapTracer>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<ArrayType>: Parameterized<ArrayType>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let shard_map = ShardMap::new(
@@ -963,15 +953,13 @@ macro_rules! implement_shard_map_invocation_leaf {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<$value>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<$value>: Parameterized<$value>;
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -987,7 +975,6 @@ macro_rules! implement_shard_map_invocation_leaf {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType>,
         Output::Family: ParameterizedFamily<Sharding>
@@ -996,7 +983,6 @@ macro_rules! implement_shard_map_invocation_leaf {
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<$value>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<$value>: Parameterized<$value>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let output_structure = out_specs.parameter_structure();

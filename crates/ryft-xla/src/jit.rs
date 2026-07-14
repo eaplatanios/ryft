@@ -172,7 +172,6 @@ impl<
             + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
-        In::To<V>: Parameterized<V>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
         Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
@@ -246,7 +245,6 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
         In: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
-        In::To<Array<'c>>: Parameterized<Array<'c>>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
@@ -262,7 +260,6 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<Execution<Out::To<Array<'c>>>, XlaDomainError>
     where
         In: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
-        In::To<Array<'c>>: Parameterized<Array<'c>>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<Array<'c>>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
@@ -414,7 +411,6 @@ impl<
             + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
-        In::To<V>: Parameterized<V>,
         Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
         Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
@@ -459,7 +455,6 @@ impl<
                 XlaCompileTracer<'c>,
                 To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
             >,
-        In::To<XlaCompileLinearizationTracer<'c>>: Parameterized<XlaCompileLinearizationTracer<'c>>,
     {
         let function = self;
         let staged = function.function.staged();

@@ -1102,7 +1102,7 @@ pub trait DetachedOp<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 }
 
 /// Trait used to represent non-owning references to [`Operation`]s.
-pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Clone + Operation<'o, 'c, 't> {
+pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Operation<'o, 'c, 't> {
     /// Tries to cast this [`OpRef`] to an instance of `O` (e.g., an instance of [`OperationRef`]). If this
     /// is not an instance of the specified [`OpRef`] type, this function will return [`None`].
     unsafe fn cast<O: OpRef<'o, 'c, 't>>(&self) -> Option<O> {

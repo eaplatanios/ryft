@@ -345,10 +345,10 @@ where
     V: PartialEq + Value<Type = ArrayType> + BooleanLike,
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
 {
-    fn partially_evaluate(
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
         context: &PartialEvaluationContext<C>,
-        driver: &dyn PartialEvaluationDriver<C>,
+        driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed call with at least one known-but-symbolic input; everything else keeps the default
@@ -392,10 +392,10 @@ impl<C> BatchableOperation<C> for JitCallOperation
 where
     C: Context<Type = ArrayType, Operation: From<JitCallOperation>>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
-        driver: &dyn BatchingDriver<C>,
+        driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -468,10 +468,10 @@ where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
     V: PartialEq + Value<Type = ArrayType> + BooleanLike,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
-        driver: &dyn DifferentiationDriver<C>,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let callee = driver.region(0)?;
@@ -561,10 +561,10 @@ where
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
-pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
+pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDriver<V, XlaOperation<V>>>(
     _operation: &JitCallOperation,
     context: &mut TracingContext<V, XlaOperation<V>>,
-    driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
+    driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
@@ -633,10 +633,10 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
 /// at definition time and instantiating this implementation introduces no recursive [`TransposableOperation`]
 /// obligation on [`XlaOperation`].
 impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for JitCallOperation {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
         context: &mut TracingContext<V, XlaOperation<V>>,
-        driver: &dyn TranspositionDriver<V, XlaOperation<V>>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {

@@ -29,9 +29,8 @@ pub mod utilities;
 pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
 pub use backends::*;
 pub use batching::{
-    ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation,
-    BatchingContext, BatchingError, BatchingTracer, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
-    batch,
+    ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingDriver,
+    BatchingError, BatchingTracer, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, batch,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
@@ -40,7 +39,7 @@ pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolutio
 pub use differentiation::*;
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error, MaybeFallible};
-pub use interpretation::{InterpretableOperation, InterpretableProgramOperation};
+pub use interpretation::{InterpretableOperation, InterpretationDriver};
 pub use operations::*;
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -48,13 +47,13 @@ pub use parameters::{
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
 pub use partial::{
-    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialTracer, PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation,
-    PartiallyEvaluatableProgramOperation, PartitionedProgram,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
+    PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue, PartialValueMaterialization,
+    PartiallyEvaluatableOperation, PartitionedProgram,
 };
 pub use programs::{
-    Atom, AtomId, FlatProgram, Instruction, InstructionId, InstructionRef, MaybeZero, Program, ProgramBuilder,
-    ProgramError, ProgramLiveSets, Region, RegionId, Value, ValueId,
+    Atom, AtomId, FlatProgram, Instruction, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError,
+    ProgramLiveSets, Region, RegionId, RegionInterface, RegionRef, Value, ValueId,
 };
 pub use sharding::*;
 pub use tracing::{

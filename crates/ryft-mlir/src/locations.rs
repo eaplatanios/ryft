@@ -23,7 +23,7 @@ use crate::{Context, Error, mlir_subtype_trait_impls};
 ///
 /// For more information on MLIR locations refer to the
 /// [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/Builtin/#location-attributes).
-pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + Debug {
+pub trait Location<'c, 't: 'c>: Sized + Copy + Eq + Display + Debug {
     /// Constructs a new [`Location`] of this type from the provided handle
     /// that came from a function in the MLIR C API.
     ///

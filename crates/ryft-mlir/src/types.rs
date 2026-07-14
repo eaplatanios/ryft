@@ -13,7 +13,7 @@ use crate::{AttributeRef, Context, Dialect, Error, StringRef, TypeId, mlir_subty
 /// [`Type::is`] and [`Type::cast`] functions.
 ///
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/LangRef/#type-system) for more information.
-pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + Debug {
+pub trait Type<'c, 't: 'c>: Sized + Copy + Eq + Display + Debug {
     /// Constructs a new type of this type from the provided handle that came from a function in the MLIR C API.
     ///
     /// This function is marked as unsafe because handling the MLIR C API representations in Rust is generally not

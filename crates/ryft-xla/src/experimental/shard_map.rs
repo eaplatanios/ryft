@@ -460,15 +460,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<Self>: Parameterized<Self>;
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
 
     /// Invokes [`shard_map`] for one specific tracing regime.
     fn invoke<
@@ -488,15 +486,13 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<XlaConstant>
-            + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<ShardMapTracer>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Self>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<Self>: Parameterized<Self>;
+        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>;
 }
 
 /// Stages an arbitrary traced XLA function over global tensor types.
@@ -666,7 +662,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
@@ -674,7 +669,6 @@ where
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-    Output::To<Leaf>: Parameterized<Leaf>,
 {
     shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
 }
@@ -715,7 +709,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<Sharding>
         + ParameterizedFamily<ArrayType>
@@ -723,7 +716,6 @@ where
         + ParameterizedFamily<ShardMapTracer>
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-    Output::To<Leaf>: Parameterized<Leaf>,
 {
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
 }
@@ -739,7 +731,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     Output::Family:
         ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
@@ -767,7 +758,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     Output::Family:
         ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Global input types supplied to the traced function.
     global_input_types: Input,
@@ -1023,7 +1013,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     Output::Family:
         ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
@@ -1071,7 +1060,6 @@ where
     Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
     Output::Family:
         ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-    Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
@@ -1230,7 +1218,6 @@ impl FlatTracedShardMap {
         Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant>,
         Output::Family:
             ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
-        Output::To<ShardMapTracer>: Parameterized<ShardMapTracer>,
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();

@@ -579,10 +579,10 @@ impl<'c> Constant<Array<'c>, XlaConstant> for XlaDomain<'c> {
 /// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
 /// through this same domain.
 impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for JitCallOperation {
-    fn interpret(
+    fn interpret<D: InterpretationDriver<Array<'c>, XlaDomain<'c>>>(
         &self,
         context: &XlaDomain<'c>,
-        driver: &dyn InterpretationDriver<Array<'c>, XlaDomain<'c>>,
+        driver: &D,
         inputs: &[Array<'c>],
     ) -> Result<Vec<Array<'c>>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
@@ -600,10 +600,10 @@ impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for JitCallOperation {
 //  interpreting the local body over global values (phase 7 or later of
 //  `.tasks/plan_first_class_program_regions.md`).
 impl<'c> InterpretableOperation<Array<'c>, XlaDomain<'c>> for ShardMapOperation<XlaConstant> {
-    fn interpret(
+    fn interpret<D: InterpretationDriver<Array<'c>, XlaDomain<'c>>>(
         &self,
         _context: &XlaDomain<'c>,
-        _driver: &dyn InterpretationDriver<Array<'c>, XlaDomain<'c>>,
+        _driver: &D,
         _inputs: &[Array<'c>],
     ) -> Result<Vec<Array<'c>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {

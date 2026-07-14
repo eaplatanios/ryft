@@ -455,7 +455,6 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
     pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
         In::Family: ParameterizedFamily<Array<'c>>,
-        In::To<Array<'c>>: Parameterized<Array<'c>>,
         Out::Family: ParameterizedFamily<Array<'c>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
@@ -492,7 +491,6 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
         In::Family: ParameterizedFamily<Array<'c>>,
-        In::To<Array<'c>>: Parameterized<Array<'c>>,
         Out::Family: ParameterizedFamily<Array<'c>>,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,

@@ -34,7 +34,7 @@ use crate::{Context, Dialect, Error, Identifier, StringRef, Type, TypeId, TypeRe
 /// using the [`Attribute::is`] and [`Attribute::cast`] functions.
 ///
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/LangRef/#attributes) for more information.
-pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + Debug {
+pub trait Attribute<'c, 't: 'c>: Sized + Copy + Eq + Display + Debug {
     /// Constructs a new attribute of this type from the provided handle that came from a function in the MLIR C API.
     ///
     /// This function is marked as unsafe because handling the MLIR C API representations in Rust is generally not

@@ -6,10 +6,12 @@ use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::constants::Zero;
+use crate::operations::constants::ZeroOperation;
+use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
+// TODO(eaplatanios): Should we move `AxisIndexOperation` to this module?
 use crate::tracing_v2::operations::collective::AxisIndexOperation;
 use crate::types::ArrayType;
 
@@ -76,7 +78,7 @@ impl<V: Value, O: Operation<V::Type>, C> NamedAxes for TracingContext<V, O, C> {
     }
 }
 
-impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
+impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A lookup resolves against the axes this nested trace was seeded with first, and otherwise delegates to the
@@ -91,7 +93,13 @@ impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
     }
 }
 
-impl<C: Context<Operation: PartiallyEvaluatableOperation<C>> + NamedAxes> NamedAxes for PartialEvaluationContext<C> {
+impl<
+    C: NamedAxes<
+        Operation: PartiallyEvaluatableOperation<C>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    >,
+> NamedAxes for PartialEvaluationContext<C>
+{
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A partial-evaluation context resolves named axes against its known-side inner context, so collectives
@@ -100,7 +108,16 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>> + NamedAxes> NamedA
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + NamedAxes> NamedAxes for BatchingContext<C> {
+impl<
+    C: NamedAxes<
+            Type = ArrayType,
+            Operation: BatchableOperation<C>
+                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<TransposeOperation>
+                           + From<BroadcastOperation>,
+        >,
+> NamedAxes for BatchingContext<C>
+{
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
@@ -115,8 +132,15 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + NamedAxes>
     }
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + NamedAxes + Zero<C::Value>> NamedAxes
-    for DifferentiationContext<C>
+impl<
+    C: NamedAxes<
+        Operation: DifferentiableOperation<C>
+                       + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                       + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+                       + From<ZeroOperation<C::Type>>,
+    >,
+> NamedAxes for DifferentiationContext<C>
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
@@ -156,7 +180,7 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         if self.named_axis(name).is_none() {
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into());
         }
-        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), &[], &[], &[])?;
+        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), Vec::new(), &[], &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

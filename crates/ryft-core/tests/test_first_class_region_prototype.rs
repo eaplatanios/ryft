@@ -505,11 +505,11 @@ mod model {
     // ------------------------------------------------------------------------------------------------------------
 
     pub trait InterpretableOperation<V, C>: Operation {
-        fn interpret(&self, context: &C, driver: &dyn InterpretationDriver<V>, inputs: &[V]) -> R<Vec<V>>;
+        fn interpret<D: InterpretationDriver<V>>(&self, context: &C, driver: &D, inputs: &[V]) -> R<Vec<V>>;
     }
 
     impl<C> InterpretableOperation<f64, C> for Prim {
-        fn interpret(&self, _context: &C, _driver: &dyn InterpretationDriver<f64>, inputs: &[f64]) -> R<Vec<f64>> {
+        fn interpret<D: InterpretationDriver<f64>>(&self, _context: &C, _driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
             match self {
                 Prim::Add => Ok(vec![inputs[0] + inputs[1]]),
                 Prim::Mul => Ok(vec![inputs[0] * inputs[1]]),
@@ -518,7 +518,7 @@ mod model {
     }
 
     impl<C> InterpretableOperation<f64, C> for Cond {
-        fn interpret(&self, _context: &C, driver: &dyn InterpretationDriver<f64>, inputs: &[f64]) -> R<Vec<f64>> {
+        fn interpret<D: InterpretationDriver<f64>>(&self, _context: &C, driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
             // Predicate first, branch operands after; nonzero selects the `true` region.
             let index = if inputs[0] != 0.0 { 0 } else { 1 };
             driver.interpret_region(index, inputs[1..].to_vec())
@@ -531,7 +531,7 @@ mod model {
         Prim: InterpretableOperation<V, C>,
         Cond: InterpretableOperation<V, C>,
     {
-        fn interpret(&self, context: &C, driver: &dyn InterpretationDriver<V>, inputs: &[V]) -> R<Vec<V>> {
+        fn interpret<D: InterpretationDriver<V>>(&self, context: &C, driver: &D, inputs: &[V]) -> R<Vec<V>> {
             match self {
                 Op::Prim(operation) => operation.interpret(context, driver, inputs),
                 Op::Cond(operation) => operation.interpret(context, driver, inputs),
@@ -616,19 +616,19 @@ mod model {
     }
 
     pub trait PartiallyEvaluatableOperation<C: Context>: Operation {
-        fn partially_evaluate(
+        fn partially_evaluate<D: PartialEvaluationDriver<C::Value>>(
             &self,
             context: &C,
-            driver: &dyn PartialEvaluationDriver<C::Value>,
+            driver: &D,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>>;
     }
 
     impl<C: Context<Operation = Op>> PartiallyEvaluatableOperation<C> for Prim {
-        fn partially_evaluate(
+        fn partially_evaluate<D: PartialEvaluationDriver<C::Value>>(
             &self,
             context: &C,
-            _driver: &dyn PartialEvaluationDriver<C::Value>,
+            _driver: &D,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
@@ -641,10 +641,10 @@ mod model {
     }
 
     impl<C: Context<Operation = Op>> PartiallyEvaluatableOperation<C> for Cond {
-        fn partially_evaluate(
+        fn partially_evaluate<D: PartialEvaluationDriver<C::Value>>(
             &self,
             _context: &C,
-            driver: &dyn PartialEvaluationDriver<C::Value>,
+            driver: &D,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             // Semantics stub: production selects the region from the known predicate value and residualizes the
@@ -659,10 +659,10 @@ mod model {
     }
 
     impl<C: Context<Operation = Op>> PartiallyEvaluatableOperation<C> for Op {
-        fn partially_evaluate(
+        fn partially_evaluate<D: PartialEvaluationDriver<C::Value>>(
             &self,
             context: &C,
-            driver: &dyn PartialEvaluationDriver<C::Value>,
+            driver: &D,
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             match self {
@@ -828,10 +828,10 @@ mod model {
     }
 
     pub trait BatchableOperation<C: Context>: Operation {
-        fn batch(
+        fn batch<D: BatchingDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn BatchingDriver<C::Operation>,
+            driver: &D,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>>;
     }
@@ -840,10 +840,10 @@ mod model {
     where
         C::Operation: From<Prim>,
     {
-        fn batch(
+        fn batch<D: BatchingDriver<C::Operation>>(
             &self,
             context: &C,
-            _driver: &dyn BatchingDriver<C::Operation>,
+            _driver: &D,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>> {
             context.bind((*self).into(), &[], &[], inputs)
@@ -854,10 +854,10 @@ mod model {
     where
         C::Operation: From<Cond>,
     {
-        fn batch(
+        fn batch<D: BatchingDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn BatchingDriver<C::Operation>,
+            driver: &D,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>> {
             // The higher-order rule requests transformed regions through its driver and emits one
@@ -873,10 +873,10 @@ mod model {
         Prim: BatchableOperation<C>,
         Cond: BatchableOperation<C>,
     {
-        fn batch(
+        fn batch<D: BatchingDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn BatchingDriver<C::Operation>,
+            driver: &D,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>> {
             match self {
@@ -970,10 +970,10 @@ mod model {
     }
 
     pub trait DifferentiableOperation<C: Context>: Operation {
-        fn jvp(
+        fn jvp<D: DifferentiationDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn DifferentiationDriver<C::Operation>,
+            driver: &D,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>>;
     }
@@ -982,10 +982,10 @@ mod model {
     where
         C::Operation: From<Prim>,
     {
-        fn jvp(
+        fn jvp<D: DifferentiationDriver<C::Operation>>(
             &self,
             context: &C,
-            _driver: &dyn DifferentiationDriver<C::Operation>,
+            _driver: &D,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             let primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -1011,10 +1011,10 @@ mod model {
     where
         C::Operation: From<Cond>,
     {
-        fn jvp(
+        fn jvp<D: DifferentiationDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn DifferentiationDriver<C::Operation>,
+            driver: &D,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             // Semantics stub: production emits one primal condition and one tangent condition over the jvp'd
@@ -1036,10 +1036,10 @@ mod model {
         Prim: DifferentiableOperation<C>,
         Cond: DifferentiableOperation<C>,
     {
-        fn jvp(
+        fn jvp<D: DifferentiationDriver<C::Operation>>(
             &self,
             context: &C,
-            driver: &dyn DifferentiationDriver<C::Operation>,
+            driver: &D,
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             match self {
@@ -1216,19 +1216,19 @@ mod model {
     pub trait TransposableOperation: Operation {
         /// Mirrors the production `&mut TracingContext` destination: the driver borrows the source program
         /// immutably while the rule stages into the mutable destination, with no aliasing between them.
-        fn transpose(
+        fn transpose<D: TranspositionDriver<Op>>(
             &self,
             context: &mut TracingContext,
-            driver: &dyn TranspositionDriver<Op>,
+            driver: &D,
             cotangents: &[usize],
         ) -> R<Vec<usize>>;
     }
 
     impl TransposableOperation for Prim {
-        fn transpose(
+        fn transpose<D: TranspositionDriver<Op>>(
             &self,
             context: &mut TracingContext,
-            _driver: &dyn TranspositionDriver<Op>,
+            _driver: &D,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             // Semantics stub: re-stage the operation on the cotangents.
@@ -1237,10 +1237,10 @@ mod model {
     }
 
     impl TransposableOperation for Cond {
-        fn transpose(
+        fn transpose<D: TranspositionDriver<Op>>(
             &self,
             context: &mut TracingContext,
-            driver: &dyn TranspositionDriver<Op>,
+            driver: &D,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             let true_region = driver.transpose_program(driver.region(0)?)?;
@@ -1250,10 +1250,10 @@ mod model {
     }
 
     impl TransposableOperation for Op {
-        fn transpose(
+        fn transpose<D: TranspositionDriver<Op>>(
             &self,
             context: &mut TracingContext,
-            driver: &dyn TranspositionDriver<Op>,
+            driver: &D,
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             match self {

@@ -77,8 +77,6 @@ pub(crate) fn unroll_concretizable_whiles<C>(
 where
     C: Context,
     <C as Domain>::Value: BooleanLike,
-    <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     if !context.is_eager() {
@@ -122,8 +120,6 @@ fn rewrite_program_into<C>(
 where
     C: Context,
     <C as Domain>::Value: BooleanLike,
-    <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     let mut region_remapping = HashMap::new();
@@ -214,8 +210,6 @@ fn unroll_while_into<C>(
 where
     C: Context,
     <C as Domain>::Value: BooleanLike,
-    <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     let mut completed_iterations = 0;
