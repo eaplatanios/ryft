@@ -69,10 +69,10 @@
 //!
 //! # Captures and Context Composition
 //!
-//! A tracing context implementing [`CapturingContext`] registers a concrete runtime value in its capture table and
-//! returns the staged constant payload referring to it. Transform and nested contexts delegate capture registration
-//! to their parent, so a captured value follows the same context stack as ordinary operations. Compilation uses this
-//! to build [`ClosedProgram`](crate::ClosedProgram)s without embedding runtime data in source IR.
+//! A tracing context implementing [`CapturingContext`](crate::CapturingContext) registers a concrete runtime value in
+//! its capture table and returns the staged constant payload referring to it. Transform and nested contexts delegate
+//! capture registration to their parent, so a captured value follows the same context stack as ordinary operations.
+//! Compilation uses this to build [`ClosedProgram`](crate::ClosedProgram)s without embedding runtime data in source IR.
 //!
 //! # Extending Tracing
 //!
@@ -98,7 +98,7 @@ use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
-use crate::types::Typed;
+use crate::types::{Type, TypeError, Typed};
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -182,7 +182,7 @@ impl<C: StagingContext> Tracer<C> {
     /// unary operation, then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
     pub fn unary<P: Into<C::Operation>>(&self, operation: P) -> Self {
         let operation = operation.into();
-        match self.context.stage_operation(operation, &[self]) {
+        match self.context.stage_operation(operation, [], &[], &[self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
@@ -201,7 +201,7 @@ impl<C: StagingContext> Tracer<C> {
     /// [`TracerState::Poison`].
     pub fn binary<P: Into<C::Operation>>(&self, rhs: &Self, operation: P) -> Self {
         let operation = operation.into();
-        match self.context.stage_operation(operation, &[self, rhs]) {
+        match self.context.stage_operation(operation, Vec::new(), &[], &[self, rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
@@ -262,17 +262,18 @@ impl<C: StagingContext> Value for Tracer<C> {
 /// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs the
 /// staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one tracing
 /// invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
-/// [`Constant`](DispatchDomain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior records each
-/// primitive bind as a program instruction. Transform contexts wrap or replace this context when they need different
-/// binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
+/// [`Constant`](Value::DispatchDomain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior
+/// records each primitive bind as a program instruction. Transform contexts wrap or replace this context when they
+/// need different binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
 ///
 /// The optional capture parameter `C` names the concrete runtime value type stored in the capture table while tracing
 /// a captured [`Program`]. It is deliberately distinct from the staged-constant type `V`.
-/// [`capture`](CapturingContext::capture) takes a runtime value of type `C` and returns a symbolic constant of type
-/// `V` (i.e., a [`CaptureReference`] reference). In a capturing context the two genuinely differ. For example, we might
-/// use a runtime device buffer for `C` versus a [`CaptureReference`] reference for `V`. `C` defaults to `V` for the
-/// common non-capturing case, where no capture table exists and the distinction is moot. Refer to [`CapturingContext`]
-/// and [`CaptureReference`] for more information on what captures are and how they are used in practice.
+/// [`capture`](crate::CapturingContext::capture) takes a runtime value of type `C` and returns a symbolic constant of
+/// type `V` (i.e., a [`CaptureReference`](crate::CaptureReference)). In a capturing context the two genuinely differ.
+/// For example, we might use a runtime device buffer for `C` versus a [`CaptureReference`](crate::CaptureReference)
+/// for `V`. `C` defaults to `V` for the common non-capturing case, where no capture table exists and the distinction
+/// is moot. Refer to [`CapturingContext`](crate::CapturingContext) and [`CaptureReference`](crate::CaptureReference)
+/// for more information on what captures are and how they are used in practice.
 pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
@@ -285,28 +286,20 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     builder: Rc<RefCell<ProgramBuilder<V, O>>>,
 
     /// Capture table of closed-over runtime values, referenced symbolically from the staged [`Program`] via
-    /// [`CaptureReference`]s. It stays empty for ordinary (i.e., non-capturing) tracing and is filled only when tracing
-    /// a captured [`Program`] (e.g., when just-in-time-compiling a function that closes over device buffers), in which
-    /// case those values are passed to the compiled program as runtime arguments rather than being baked into it.
-    /// Capturing is gated at the type level: [`capture`](CapturingContext::capture) is implemented only when the staged
-    /// constant type is [`CaptureReference`], and so an ordinary trace can never push into this table. Refer to the
-    /// documentation of [`CaptureReference`] for more information.
+    /// [`CaptureReference`](crate::CaptureReference)s. It stays empty for ordinary (i.e., non-capturing) tracing and
+    /// is filled only when tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes
+    /// over device buffers), in which case those values are passed to the compiled program as runtime arguments rather
+    /// than being baked into it. Capturing is gated at the type level: [`capture`](crate::CapturingContext::capture)
+    /// is implemented only when the staged constant type is [`CaptureReference`](crate::CaptureReference), and so an
+    /// ordinary trace can never push into this table. Refer to the documentation of
+    /// [`CaptureReference`](crate::CaptureReference) for more information.
     ///
     /// Like the [`builder`](Self::builder), the table is held behind an [`Rc`] and a [`RefCell`] for the same reason:
     /// one capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
-    /// pushing into the *same* accumulating table (which is what keeps [`CaptureReference`] indices consistent) instead
-    /// of forking it, and the [`RefCell`] supplies the interior mutability [`capture`](CapturingContext::capture) needs
-    /// to push through a shared `&self`.
+    /// pushing into the *same* accumulating table (which is what keeps [`CaptureReference`](crate::CaptureReference)
+    /// indices consistent) instead of forking it, and the [`RefCell`] supplies the interior mutability
+    /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
-
-    // TODO(eaplatanios): [regions] Delete this flag together with `CapturingContext::capture_in_nested_trace` once
-    //  the phase 4-6 operation-family migrations make capture discovery recursively region-aware.
-    /// Temporary conservative capture-pruning guard for the first-class-program-regions migration (deleted once
-    /// capture discovery is recursively region-aware for every operation family): set when any capture was
-    /// registered through a nested trace, in which case the resulting [`CaptureReference`] constant lives only in a
-    /// nested payload program that top-level-only capture pruning cannot see. Shared across cloned contexts like the
-    /// [`builder`](Self::builder).
-    nested_captures: Rc<std::cell::Cell<bool>>,
 
     /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
     /// trace binds no named axes and this stays empty. Traces that run inside a manual-parallelism region (e.g., a
@@ -319,7 +312,7 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
 impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// Creates a new [`TracingContext`] over the `(V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
     /// fresh, empty capture table. Use [`builder`](Self::builder) afterward to read or finalize the staged program, and
-    /// [`captures`](Self::captures) to read any values registered through [`capture`](CapturingContext::capture). To
+    /// [`captures`](Self::captures) to read values registered through [`capture`](crate::CapturingContext::capture). To
     /// instead compose further staging onto a trace that already owns prior instructions, do not create a context at
     /// all: an input [`Tracer`]'s [`context`](Tracer::context) shares that trace's [`ProgramBuilder`], and so staging
     /// on it (e.g., via [`stage_operation`](StagingContext::stage_operation)) appends to the same program.
@@ -328,27 +321,8 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         Self {
             builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
-            nested_captures: Rc::new(std::cell::Cell::new(false)),
             named_axes: Rc::new(Vec::new()),
         }
-    }
-
-    // TODO(eaplatanios): [regions] Delete this method together with `CapturingContext::capture_in_nested_trace`;
-    //  refer to the deletion inventory on that method.
-    /// Marks that a capture was registered through a nested trace, so its reference constant may live only inside a
-    /// nested payload program. Part of the temporary conservative capture-pruning guard.
-    #[inline]
-    pub(crate) fn note_nested_capture(&self) {
-        self.nested_captures.set(true);
-    }
-
-    // TODO(eaplatanios): [regions] Delete this method together with `CapturingContext::capture_in_nested_trace`;
-    //  refer to the deletion inventory on that method.
-    /// Returns `true` if any capture was registered through a nested trace. Part of the temporary conservative
-    /// capture-pruning guard.
-    #[inline]
-    pub(crate) fn has_nested_captures(&self) -> bool {
-        self.nested_captures.get()
     }
 
     /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
@@ -357,9 +331,9 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         &self.builder
     }
 
-    /// Returns the shared capture table that [`capture`](CapturingContext::capture) fills while tracing. That table
-    /// stays empty for ordinary traces, since [`capture`](CapturingContext::capture) is only implemented when the
-    /// staged constant type is [`CaptureReference`].
+    /// Returns the shared capture table that [`capture`](crate::CapturingContext::capture) fills while tracing. That
+    /// table stays empty for ordinary traces, since [`capture`](crate::CapturingContext::capture) is only implemented
+    /// when the staged constant type is [`CaptureReference`](crate::CaptureReference).
     #[inline]
     pub fn captures(&self) -> &Rc<RefCell<Vec<C>>> {
         &self.captures
@@ -378,8 +352,9 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation. The type
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
     /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
-    /// type (such as a backend whose runtime [`Value`](DispatchDomain::Value) differs from its staged
-    /// [`Constant`](DispatchDomain::Constant)) observe that same context type.
+    /// type (such as a backend whose runtime [`Value`](Value::DispatchDomain::Value) differs from its staged
+    /// [`Constant`](Value::DispatchDomain::Constant)) observe that same context type.
+    #[inline]
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -409,7 +384,6 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
             let context = Self {
                 builder: builder.clone(),
                 captures: Rc::new(RefCell::new(Vec::new())),
-                nested_captures: Rc::new(std::cell::Cell::new(false)),
                 named_axes: Rc::new(named_axes),
             };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
@@ -445,16 +419,63 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     ) -> Result<Output::To<V::Type>, ProgramError> {
         Ok(Self::trace(function, input_type)?.0)
     }
+
+    // TODO(eaplatanios): Review this function.
+    /// Structurally splices `program` into this trace, replacing its inputs positionally with `inputs` and returning
+    /// tracers for its outputs. The source operations are relocated verbatim rather than rebound, and one
+    /// source-to-destination region remapping preserves sharing across the program's complete reachable region graph.
+    /// This crate-private bridge is used by program rewrites that compose an existing program with newly traced
+    /// operations.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Source program whose entry instructions and reachable regions are relocated into this trace.
+    ///   - `inputs`: Tracers belonging to this context, in source-program input order and with types refining the
+    ///     corresponding source input types.
+    pub(crate) fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
+        &self,
+        program: &Program<V, O, Input, Output>,
+        inputs: Vec<Tracer<Self>>,
+    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        if let Some(error) = self.builder.borrow().error().cloned() {
+            return Err(error);
+        }
+        let expected_input_count = program.input_count();
+        if inputs.len() != expected_input_count {
+            let error = ProgramError::InvalidInputCount { expected: expected_input_count, actual: inputs.len() };
+            return Err(self.error(error));
+        }
+        check_builders!(&self.builder, [inputs.iter().map(Tracer::builder)]).map_err(|error| self.error(error))?;
+        for (input, declared_type) in inputs.iter().zip(program.input_types()) {
+            let actual_type = input.r#type();
+            if !declared_type.is_refined_by(actual_type.as_ref()) {
+                return Err(self.error(
+                    TypeError {
+                        message: format!(
+                            "encountered input type {actual_type} which is incompatible with the program's declared \
+                             type {declared_type}",
+                        ),
+                    }
+                    .into(),
+                ));
+            }
+        }
+
+        let inputs = inputs
+            .iter()
+            .map(Tracer::atom_id)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| self.error(error))?;
+        let outputs = self.builder.borrow_mut().splice_program(program, inputs.as_slice());
+        let outputs = outputs.map_err(|error| self.error(error))?;
+        Ok(outputs.into_iter().map(|atom| self.tracer(atom, None)).collect())
+    }
 }
 
 impl<V: Value, O: Operation<V::Type>, C> Clone for TracingContext<V, O, C> {
+    #[inline]
     fn clone(&self) -> Self {
-        Self {
-            builder: self.builder.clone(),
-            captures: self.captures.clone(),
-            nested_captures: self.nested_captures.clone(),
-            named_axes: self.named_axes.clone(),
-        }
+        Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
     }
 }
 
@@ -486,25 +507,14 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 
     #[inline]
-    fn bind<P: Into<O>>(
+    fn bind<P: Into<O>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: P,
-        regions: &[FlatProgram<Self>],
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Tracer<Self>],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard until `TracingContext`/`NestedTracingContext` binds regions (phases 2-6);
-        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
-        self.stage_operation(operation, inputs)
+        self.stage_operation(operation, regions, callees, inputs)
     }
 
     #[inline]
@@ -537,13 +547,13 @@ impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O,
 
 /// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed in an
 /// *enclosing* [`Context`]'s universe rather than in a raw `(V, O)` type universe of its own. Where [`TracingContext`]
-/// is keyed by the `(V, O)` types it stages and owns its own capture table, [`NestedTracingContext`] is keyed by the
-/// enclosing [`Context`] `C`. It derives its [`Type`](DispatchDomain::Type), [`Constant`](DispatchDomain::Constant),
-/// and [`Operation`](DispatchDomain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for the nested [`Program`]
-/// it stages, and holds a clone of `C`. Runtime capture registration is *not* owned by this context but is rather
-/// delegated to the enclosing context through [`CapturingContext`], and so values captured while tracing the nested
-/// program flow into `C`'s table along the same nesting path as ordinary operation staging. As with [`TracingContext`],
-/// the [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the *same* nested program.
+/// is keyed by the `(V, O)` types it stages and owns its own capture table, [`NestedTracingContext`] is keyed by
+/// the enclosing [`Context`] `C`. It derives its `Type`, `Constant`, and `Operation` types from `C`, owns a fresh
+/// [`ProgramBuilder`] for the nested [`Program`] it stages, and holds a clone of `C`. Runtime capture registration
+/// is *not* owned by this context but is rather delegated to the enclosing context through
+/// [`CapturingContext`](crate::CapturingContext), and so values captured while tracing the nested program flow
+/// into `C`'s table along the same nesting path as ordinary operation staging. As with [`TracingContext`], the
+/// [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the *same* nested program.
 pub struct NestedTracingContext<C: Context> {
     /// [`Context`] that this [`NestedTracingContext`] is nested into.
     parent: C,
@@ -586,10 +596,10 @@ impl<C: Context> NestedTracingContext<C> {
     /// Traces `function` into a flat [`Program`] expressed in the enclosing context `parent`'s universe. This is the
     /// nested-tracing counterpart of [`TracingContext::trace`], following the same tracing protocol, but with two
     /// nested-specific differences: runtime captures registered while tracing delegate to `parent` through
-    /// [`CapturingContext`], so nested traces compose with enclosing capturing traces, and the traced program is flat
-    /// (i.e., [`Vec`]-parameterized) on both boundaries (the canonical shape for nested programs that are replayed
-    /// positionally) with the closure's output [`ParameterStructure`](Parameterized::ParameterStructure) returned
-    /// alongside it so that callers can reassemble structured outputs from the program's flat outputs.
+    /// [`CapturingContext`](crate::CapturingContext), so nested traces compose with enclosing capturing traces, and the
+    /// traced program is flat (i.e., [`Vec`]-parameterized) on both boundaries (the canonical shape for nested programs
+    /// that are replayed positionally) with the closure's output [`Parameter`] structure returned alongside it so that
+    /// callers can reassemble structured outputs from the program's flat outputs.
     #[inline]
     pub fn trace<F, Output>(
         parent: C,
@@ -660,6 +670,7 @@ impl<C: Context> NestedTracingContext<C> {
 }
 
 impl<C: Context> Clone for NestedTracingContext<C> {
+    #[inline]
     fn clone(&self) -> Self {
         Self { parent: self.parent.clone(), builder: self.builder.clone(), named_axes: self.named_axes.clone() }
     }
@@ -686,25 +697,14 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>>(
+    fn bind<P: Into<Self::Operation>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: P,
-        regions: &[FlatProgram<Self>],
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard until `TracingContext`/`NestedTracingContext` binds regions (phases 2-6);
-        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
-        self.stage_operation(operation, inputs)
+        self.stage_operation(operation, regions, callees, inputs)
     }
 
     #[inline]
@@ -739,10 +739,9 @@ impl<C: Context> StagingContext for NestedTracingContext<C> {
 /// type, staged constant, and [`Operation`] representations, and so it is the active tracing context that stages a
 /// [`Program`] expressed in `D`'s universe. The optional capture parameter `C` defaults to `D`'s staged constant
 /// representation, matching the default capture type of [`TracingContext::new`]. Closed program traces over a backend
-/// whose runtime [`Value`](DispatchDomain::Value) differs from its staged [`Constant`](DispatchDomain::Constant) pin
-/// `C` to that runtime value type explicitly. Use this alias at call sites that already hold a [`Domain`] and want to
-/// name the matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(V, O)`
-/// universe.
+/// whose runtime `Value` type differs from its staged `Constant` type pin `C` to that runtime value type explicitly.
+/// Use this alias at call sites that already hold a [`Domain`] and want to name the matching tracing context. Use
+/// [`TracingContext`] directly at sites that already work in terms of a `(V, O)` universe.
 pub type DomainTracingContext<D, C = <D as Domain>::Constant> =
     TracingContext<<D as Domain>::Constant, <D as Domain>::Operation, C>;
 
@@ -818,14 +817,14 @@ impl<D: Domain> Trace for D {}
 
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
-/// contribute only their abstract [`Type`]s. No runtime computation is performed on them and they are not captured by
-/// the resulting program. The trace runs in the input value type's statically known
-/// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batching::batch) and the
-/// differentiation entry points, no context instance needs to be recovered from the input leaves and inputs with no
-/// leaf values are still traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for
-/// the input types through a fresh [`DomainTracingContext`], and returns the inferred output types together with the
-/// finalized program. [`Trace::trace`] exposes the same trace with the tracing universe named explicitly and the
-/// abstract input types supplied directly.
+/// contribute only their abstract [`Type`]s. No runtime computation is performed on them and they are not captured
+/// by the resulting program. The trace runs in the input value type's statically known
+/// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batch) and the differentiation entry
+/// points, no context instance needs to be recovered from the input leaves and inputs with no leaf values are still
+/// traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for the input types through
+/// a fresh [`DomainTracingContext`], and returns the inferred output types together with the finalized program.
+/// [`Trace::trace`] exposes the same trace with the tracing universe named explicitly and the abstract input types
+/// supplied directly.
 #[inline]
 pub fn trace<
     V: Value,
@@ -897,11 +896,12 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
-    use crate::interpretation::InterpretableOperation;
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::Operation;
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
+    use crate::programs::RegionInterface;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::types::{DataType, TypeError, Typed};
 
@@ -1077,14 +1077,23 @@ mod tests {
                 "no_output"
             }
 
-            fn infer_output_types(&self, _input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+            fn infer_output_types(
+                &self,
+                _input_types: &[DataType],
+                _region_interfaces: &[RegionInterface<DataType>],
+            ) -> Result<Vec<DataType>, TypeError> {
                 Ok(Vec::new())
             }
         }
 
         impl<C> InterpretableOperation<Scalar, C> for NoOutputOperation {
             #[inline]
-            fn interpret(&self, _context: &C, _inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
+            fn interpret<D: InterpretationDriver<Scalar, C>>(
+                &self,
+                _context: &C,
+                _driver: &D,
+                _inputs: &[Scalar],
+            ) -> Result<Vec<Scalar>, ProgramError> {
                 Ok(Vec::new())
             }
         }
@@ -1159,7 +1168,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -1189,7 +1198,7 @@ mod tests {
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
         assert!(matches!(
-            context_a.stage_operation(AddOperation, &[&tracer_a, &tracer_b]),
+            context_a.stage_operation(AddOperation, Vec::new(), &[], &[&tracer_a, &tracer_b]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -1201,13 +1210,13 @@ mod tests {
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage_operation(NegOperation, &[&tracer]).unwrap();
+        let outputs = tracing_context.stage_operation(NegOperation, Vec::new(), &[], &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), &TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.stage_operation(AddOperation, &[&tracer]),
+            tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&tracer]),
             Err(ProgramError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
@@ -1219,7 +1228,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage_operation(AddOperation, &[&lhs, &rhs]);
+        let result = tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError { message }))
@@ -1235,10 +1244,20 @@ mod tests {
         let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context.constant(
-            domain.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]).unwrap().into_iter().next().unwrap(),
+            domain
+                .bind(ZeroOperation::new(DataType::F64), Vec::new(), &[], &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
         );
         let one = tracing_context.constant(
-            domain.bind(OneOperation::new(DataType::F64), &[], &[], &[]).unwrap().into_iter().next().unwrap(),
+            domain
+                .bind(OneOperation::new(DataType::F64), Vec::new(), &[], &[])
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
         );
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(one.r#type().into_owned(), DataType::F64);
@@ -1267,16 +1286,16 @@ mod tests {
             .trim_end(),
         );
 
-        // Test staging an existing program through the context, including lifting embedded constants.
+        // Test structurally splicing an existing program into the trace, including its embedded constants.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(4.0));
-        let output = builder.add_instruction(AddOperation, vec![input, constant]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, constant], Vec::new()).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let input = tracing_context.input(DataType::F64);
-        let outputs = tracing_context.stage_program(&program, vec![input]).unwrap();
+        let outputs = tracing_context.splice_program(&program, vec![input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("staged program output should remain live");
@@ -1414,6 +1433,47 @@ mod tests {
         );
     }
 
+    // TODO(eaplatanios): Review this function.
+    #[test]
+    fn test_tracing_context_splice_program_validates_its_input_boundary() {
+        let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let source_input = source_builder.add_input(DataType::F64);
+        let source_program =
+            source_builder.build::<Scalar, Scalar>(vec![source_input], Placeholder, Placeholder).unwrap();
+
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        assert!(matches!(
+            context.splice_program(&source_program, Vec::new()),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        assert_eq!(
+            context.builder().borrow().error().cloned(),
+            Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let foreign_input = foreign_context.input(DataType::F64);
+        assert_eq!(
+            context.splice_program(&source_program, vec![foreign_input]),
+            Err(ProgramError::MismatchedProgramBuilders),
+        );
+        assert_eq!(context.builder().borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let input = context.input(DataType::I64);
+        assert!(matches!(
+            context.splice_program(&source_program, vec![input]),
+            Err(ProgramError::Type(TypeError { message }))
+                if message == "encountered input type i64 which is incompatible with the program's declared type f64",
+        ));
+        assert!(matches!(
+            context.builder().borrow().error(),
+            Some(ProgramError::Type(TypeError { message }))
+                if message == "encountered input type i64 which is incompatible with the program's declared type f64",
+        ));
+    }
+
     #[test]
     fn test_nested_tracing_context() {
         // A nested trace over an eager `EagerContext<Scalar, ScalarOperation<Scalar>>` parent stages its own independent primal program and,
@@ -1429,7 +1489,7 @@ mod tests {
         // as a root trace would.
         let lhs = nested.input(DataType::F64);
         let rhs = nested.input(DataType::F64);
-        let outputs = nested.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
+        let outputs = nested.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
