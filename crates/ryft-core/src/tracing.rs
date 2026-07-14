@@ -420,19 +420,18 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         Ok(Self::trace(function, input_type)?.0)
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Structurally splices `program` into this trace, replacing its inputs positionally with `inputs` and returning
-    /// tracers for its outputs. The source operations are relocated verbatim rather than rebound, and one
-    /// source-to-destination region remapping preserves sharing across the program's complete reachable region graph.
-    /// This crate-private bridge is used by program rewrites that compose an existing program with newly traced
-    /// operations.
+    /// Structurally splices the provided [`Program`] into this [`TracingContext`], replacing its inputs positionally
+    /// with `inputs` and returning [`Tracer`]s for its outputs. The source operations are relocated verbatim rather
+    /// than rebound, and one source-to-destination [`Region`](crate::Region) remapping preserves sharing across the
+    /// program's complete reachable region graph. This function is meant to be used by program rewrites that compose
+    /// existing programs with newly traced operations.
     ///
     /// # Parameters
     ///
-    ///   - `program`: Source program whose entry instructions and reachable regions are relocated into this trace.
-    ///   - `inputs`: Tracers belonging to this context, in source-program input order and with types refining the
-    ///     corresponding source input types.
-    pub(crate) fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
+    ///   - `program`: Source [`Program`] whose entry instructions and reachable regions are relocated into this trace.
+    ///   - `inputs`: [`Tracer`]s belonging to this context, in source-program input order and with types refining the
+    ///     corresponding source program's input types.
+    pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &self,
         program: &Program<V, O, Input, Output>,
         inputs: Vec<Tracer<Self>>,
@@ -440,12 +439,14 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         if let Some(error) = self.builder.borrow().error().cloned() {
             return Err(error);
         }
+        check_builders!(&self.builder, [inputs.iter().map(Tracer::builder)]).map_err(|error| self.error(error))?;
+
         let expected_input_count = program.input_count();
         if inputs.len() != expected_input_count {
             let error = ProgramError::InvalidInputCount { expected: expected_input_count, actual: inputs.len() };
             return Err(self.error(error));
         }
-        check_builders!(&self.builder, [inputs.iter().map(Tracer::builder)]).map_err(|error| self.error(error))?;
+
         for (input, declared_type) in inputs.iter().zip(program.input_types()) {
             let actual_type = input.r#type();
             if !declared_type.is_refined_by(actual_type.as_ref()) {
@@ -453,7 +454,7 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
                     TypeError {
                         message: format!(
                             "encountered input type {actual_type} which is incompatible with the program's declared \
-                             type {declared_type}",
+                             input type {declared_type}",
                         ),
                     }
                     .into(),
@@ -1285,36 +1286,6 @@ mod tests {
             "}
             .trim_end(),
         );
-
-        // Test structurally splicing an existing program into the trace, including its embedded constants.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let constant = builder.add_constant(Scalar::from(4.0));
-        let output = builder.add_instruction(AddOperation, vec![input, constant], Vec::new()).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let builder = tracing_context.builder().clone();
-        let input = tracing_context.input(DataType::F64);
-        let outputs = tracing_context.splice_program(&program, vec![input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        let output_atom = outputs[0].atom_id().expect("staged program output should remain live");
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = add %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
@@ -1433,14 +1404,45 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
-    fn test_tracing_context_splice_program_validates_its_input_boundary() {
+    fn test_tracing_context_splice_program() {
+        // Build a source program with an embedded constant so that the successful path exercises both input remapping
+        // and constant relocation.
         let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let source_input = source_builder.add_input(DataType::F64);
+        let source_constant = source_builder.add_constant(Scalar::from(4.0));
+        let source_output = source_builder
+            .add_instruction(AddOperation, vec![source_input, source_constant], Vec::new())
+            .unwrap()[0];
         let source_program =
-            source_builder.build::<Scalar, Scalar>(vec![source_input], Placeholder, Placeholder).unwrap();
+            source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
 
+        // Splicing relocates the source instructions and maps the source input to the supplied tracer.
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let input = context.input(DataType::F64);
+        let outputs = context.splice_program(&source_program, vec![input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        let output = outputs[0].atom_id().expect("spliced output should remain live");
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                    %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The input count must match the source program's boundary.
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         assert!(matches!(
             context.splice_program(&source_program, Vec::new()),
@@ -1451,6 +1453,7 @@ mod tests {
             Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
+        // Every supplied tracer must belong to the destination context's builder.
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let foreign_input = foreign_context.input(DataType::F64);
@@ -1460,6 +1463,7 @@ mod tests {
         );
         assert_eq!(context.builder().borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
 
+        // Supplied tracer types must refine the corresponding source input types.
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let input = context.input(DataType::I64);
         assert!(matches!(
