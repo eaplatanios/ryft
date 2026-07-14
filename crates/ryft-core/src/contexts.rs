@@ -49,7 +49,7 @@
 //! It is the context used by [`Program::interpret`] and by transforms over concrete values.
 //!
 //! [`StagingContext`] refines [`Context`] for contexts whose flowing value is [`Tracer`]. It exposes a
-//! [`ProgramBuilder`], records operations as instructions, and can stage or splice complete programs.
+//! [`ProgramBuilder`] and records bound operations as instructions.
 //! Ordinary [`TracingContext`] and nested tracing contexts implement this trait.
 //!
 //! Transform contexts wrap another context and change bind semantics locally. Batching maps an operation over logical
@@ -106,7 +106,6 @@
 //! context capabilities to the parent where appropriate.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -116,7 +115,7 @@ use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, RegionId, RegionInterface, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, RegionInterface, Value};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -407,16 +406,17 @@ impl<V: Value, O: InterpretableOperation<V, EagerContext<V, O>>> InterpretationD
     }
 }
 
-/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
-/// records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than interpreting
-/// them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
+/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`].
+/// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
+/// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
 /// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
-/// [`stage_operation`](StagingContext::stage_operation), and [`stage_program`](StagingContext::stage_program).
-/// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
-/// or linearization implement it by delegating to a parent context.
+/// and [`stage_operation`](StagingContext::stage_operation). Ordinary and nested tracing implement it through
+/// [`TracingContext`] and [`NestedTracingContext`](crate::NestedTracingContext), respectively. Transform contexts have
+/// their own flowing value types and delegate rewritten operations to a parent staging context instead of implementing
+/// this trait themselves.
 ///
-/// The flowing value is pinned to [`Tracer<Self>`](Tracer): every staging context records operation invocations as
-/// [`Program`] instructions and hands back [`Tracer`]s standing in for their results.
+/// The flowing value is pinned to [`Tracer<Self>`](Tracer). Every staging context records operation invocations
+/// as [`Program`] instructions and hands back [`Tracer`]s standing in for their results.
 pub trait StagingContext: Context<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;
@@ -519,53 +519,6 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             };
             Ok(outputs.into_iter().map(|atom| self.tracer(atom, None)).collect::<Vec<_>>())
         }
-    }
-
-    /// Stages an entire [`Program`] as a sequence of [`Operation`]s in this context, using the supplied list of input
-    /// [`Tracer`]s in the program's `input_ids` order, and returns the program's flat output tracers in the program's
-    /// `output_ids` order. Constants embedded in the program are lifted into the outer context via
-    /// [`Self::constant`]. This is the "inline a program into a fresh trace" primitive that transform-composition is
-    /// built on. When the outer trace is a JVP, VJP, vectorization, etc., trace, the inlined operations route through
-    /// the active transform's per-[`Operation`] rules automatically; there is no separate "transform a program" pass
-    /// to write.
-    #[inline]
-    fn stage_program<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
-        &self,
-        program: &Program<Self::Constant, Self::Operation, Input, Output>,
-        inputs: Vec<Self::Value>,
-    ) -> Result<Vec<Self::Value>, ProgramError>
-    where
-        Self::Constant: Clone,
-    {
-        // TODO(eaplatanios): Fix this.
-        let mut region_programs = HashMap::<RegionId, Rc<FlatProgram<Self>>>::new();
-        let entry_region = program.entry_region_ref();
-        entry_region.interpret_with(
-            inputs,
-            |_, value| Ok::<_, ProgramError>(self.constant(value.clone())),
-            |instruction, inputs| {
-                if instruction.regions().is_empty() {
-                    self.stage_operation(instruction.operation().clone(), Vec::new(), &[], inputs)
-                } else {
-                    // Replayed attached regions are materialized once per source region id and fed through the
-                    // callee-interning path, so a source region referenced by several instructions remains one
-                    // destination region.
-                    let callees = instruction
-                        .regions()
-                        .iter()
-                        .map(|id| {
-                            if let Some(program) = region_programs.get(id) {
-                                return Ok::<_, ProgramError>(program.clone());
-                            }
-                            let program = Rc::new(entry_region.region_ref(*id)?.into_program());
-                            region_programs.insert(*id, program.clone());
-                            Ok::<_, ProgramError>(program)
-                        })
-                        .collect::<Result<Vec<_>, ProgramError>>()?;
-                    self.stage_operation(instruction.operation().clone(), Vec::new(), callees.as_slice(), inputs)
-                }
-            },
-        )
     }
 }
 
@@ -766,44 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn test_staging_context_stages_programs_by_lifting_constants_and_replaying_instructions() {
-        let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let source_input = source_builder.add_input(DataType::F64);
-        let source_constant = source_builder.add_constant(Scalar::from(4.0));
-        let source_output = source_builder
-            .add_instruction(AddOperation, vec![source_input, source_constant], Vec::new())
-            .unwrap()[0];
-        let source_program =
-            source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
-
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let builder = context.builder().clone();
-        let input = context.input(DataType::F64);
-        let mut outputs = context.stage_program(&source_program, vec![input]).unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        let output = outputs.remove(0);
-        assert_eq!(output.atom_id(), Ok(AtomId::new(2)));
-        assert_eq!(output.r#type().into_owned(), DataType::F64);
-
-        {
-            let builder = builder.borrow();
-            assert_eq!(builder.atoms().len(), 3);
-            assert_eq!(builder.instructions().len(), 1);
-            assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == 4.0));
-            assert_eq!(builder.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(1)]);
-            assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(2)]);
-        }
-
-        let program = builder
-            .borrow()
-            .clone()
-            .build::<Scalar, Scalar>(vec![output.atom_id().unwrap()], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
-    }
-
-    #[test]
     fn test_staging_context_resolve() {
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let input = context.input(DataType::F64);
@@ -833,13 +748,11 @@ mod tests {
         assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
-    fn test_bind_interprets_shared_callee_programs() {
-        // Shared callee programs bind through the same detached-interpretation channel as freshly authored owned
-        // regions, slotted in after the owned regions: the while below receives its condition and body as interned
-        // shared callees and still runs the loop to completion.
-
+    fn test_staging_context_bind_interprets_shared_callee_programs() {
+        // Shared callee programs bind through the same detached-interpretation channel as owned regions, slotted in
+        // after the owned regions. The while loop below receives its condition and body as interned shared callees and
+        // still runs the loop to completion.
         let condition = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);

@@ -57,8 +57,8 @@ pub use programs::{
 };
 pub use sharding::*;
 pub use tracing::{
-    DomainTracer, DomainTracingContext, NestedTracer, Trace, Tracer, TracerState, TracingContext, infer_output_type,
-    trace,
+    DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
+    infer_output_type, trace,
 };
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;
