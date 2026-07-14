@@ -670,7 +670,6 @@ impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for B
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<
     C: Context<
             Type = ArrayType,
@@ -681,15 +680,17 @@ impl<
         >,
 > BatchingDriver<C> for BindingBatchingDriver<'_, C>
 {
+    #[inline]
     fn batch_region(
         &self,
         context: &BatchingContext<C>,
         index: usize,
         inputs: Vec<ArrayBatch<C::Value>>,
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        batch_region_in_context(context, self.region(index)?, inputs)
+        context.batch_region(self.region(index)?, inputs)
     }
 
+    #[inline]
     fn batch_program(
         &self,
         context: &BatchingContext<C>,
@@ -702,47 +703,47 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// [`BatchingDriver`] scoped to one replayed region-carrying [`Instruction`](crate::Instruction). It retains only that
-/// instruction's borrowed region views; each request receives the active durable context from
-/// [`BatchableOperation::batch`].
+/// [`BatchingDriver`] scoped to one replayed region-carrying [`Instruction`](crate::Instruction).
 struct ReplayBatchingDriver<'r, C: Context<Type = ArrayType>> {
-    /// Borrowed views of the instruction's regions, in region order.
+    /// Borrowed views of the [`Instruction`](crate::Instruction)'s [`Region`]s, in region order.
     regions: Vec<RegionRef<'r, C::Constant, C::Operation>>,
 }
 
 impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for ReplayBatchingDriver<'_, C> {
+    #[inline]
     fn region_count(&self) -> usize {
         self.regions.len()
     }
 
+    #[inline]
     fn region(&self, index: usize) -> Result<RegionRef<'_, C::Constant, C::Operation>, ProgramError> {
         self.regions.get(index).copied().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "region index {index} is out of range for the operation application",
-            ))
+            ProgramError::MalformedProgram(format!("region index {index} is out of range"))
         })
     }
 }
 
-// TODO(eaplatanios): Review this.
-impl<C> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>,
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: BatchableOperation<C>
+                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<TransposeOperation>
+                           + From<BroadcastOperation>,
+        >,
+> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
 {
+    #[inline]
     fn batch_region(
         &self,
         context: &BatchingContext<C>,
         index: usize,
         inputs: Vec<ArrayBatch<C::Value>>,
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        batch_region_in_context(context, self.region(index)?, inputs)
+        context.batch_region(self.region(index)?, inputs)
     }
 
+    #[inline]
     fn batch_program(
         &self,
         context: &BatchingContext<C>,
@@ -753,33 +754,6 @@ where
     {
         region.batched(context.axis_size(), input_axes, output_axes_policy)
     }
-}
-
-// TODO(eaplatanios): Review this.
-/// Replays a borrowed region source instruction by instruction through the provided [`BatchingContext`], dispatching
-/// every instruction's [`BatchableOperation`] rule (with driver-backed region access for region-carrying
-/// instructions), and returns the program outputs' batches. This is the batching counterpart of
-/// [`Program::interpret_in_context`](crate::Program::interpret_in_context)'s bind replay.
-fn batch_region_in_context<C>(
-    context: &BatchingContext<C>,
-    region: RegionRef<'_, C::Constant, C::Operation>,
-    inputs: Vec<ArrayBatch<C::Value>>,
-) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>,
-{
-    region.interpret_with(
-        inputs,
-        |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
-        |instruction, instruction_inputs| {
-            let replay_driver = ReplayBatchingDriver { regions: region.attached_regions(instruction)? };
-            instruction.operation().batch(context, &replay_driver, instruction_inputs)
-        },
-    )
 }
 
 /// Represents [`Operation`]s that can be batched (i.e., vectorized).
@@ -1053,6 +1027,36 @@ impl<C> BatchingContext<C> {
     #[inline]
     pub fn axis_name(&self) -> Option<&str> {
         self.axis_name.as_deref()
+    }
+
+    /// Replays `region` [`Instruction`](crate::Instruction) by [`Instruction`](crate::Instruction) through this
+    /// [`BatchingContext`], dispatching every instruction's [`BatchableOperation`] rule with application-scoped access
+    /// to its attached regions, and returns the region output batches. This is the batching counterpart of
+    /// [`Program::interpret_in_context`].
+    #[inline]
+    fn batch_region(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: BatchableOperation<C>
+            + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+            + From<TransposeOperation>
+            + From<BroadcastOperation>,
+    {
+        region.interpret_with(
+            inputs,
+            |_, constant| Ok(ArrayBatch::replicated(self.parent().lift(constant.clone())?)),
+            |instruction, instruction_inputs| {
+                instruction.operation().batch(
+                    self,
+                    &ReplayBatchingDriver { regions: region.attached_regions(instruction)? },
+                    instruction_inputs,
+                )
+            },
+        )
     }
 }
 
@@ -1823,9 +1827,7 @@ mod tests {
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation
-            .batch(&context, &RegionlessDriver, &[left_replicated, right_replicated])
-            .unwrap();
+        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left_replicated, right_replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
