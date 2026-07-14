@@ -51,10 +51,10 @@
 //!
 //! # Nested Programs
 //!
-//! [`BatchableProgramOperation`] is the operation-family fixed point for recursively batching flat nested programs.
-//! [`ProgramBatchingOutputAxesPolicy`] controls whether nested results keep their inferred axes or are forced to
-//! explicit positions, and [`InterpretableBatchableOperation`] connects batching rules to eager interpretation when
-//! an operation needs both capabilities.
+//! Nested flat programs batch structurally through [`Program::batched`], requested by rules through their active
+//! [`BatchingDriver`]. [`ProgramBatchingOutputAxesPolicy`] controls whether nested results keep their inferred axes or
+//! are forced to explicit positions, and [`InterpretableBatchableOperation`] connects batching rules to eager
+//! interpretation when an operation needs both capabilities.
 //!
 //! # Extending Batching
 //!
@@ -63,10 +63,10 @@
 //! implementation for genuinely elementwise operations, and write a dedicated rule when dimensions are reordered,
 //! reduced, created, indexed, or controlled by nested programs.
 //!
-//! For an operation that owns a nested program, keep the recursive batching logic with that operation and implement
-//! [`BatchableProgramOperation`] for the enclosing operation family. Preserve named-axis and sharding semantics when
-//! moving or introducing the logical axis, and return [`BatchingError`] for invalid axis contracts rather than
-//! panicking.
+//! For a region-carrying operation, keep the recursive batching logic with that operation and request nested work
+//! through its active [`BatchingDriver`] (per-item replay via [`BatchingDriver::batch_region`] or structural program
+//! batching via [`BatchingDriver::batch_program`]). Preserve named-axis and sharding semantics when moving or
+//! introducing the logical axis, and return [`BatchingError`] for invalid axis contracts rather than panicking.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -82,9 +82,9 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
-use crate::operations::{ElementwiseOperation, Operation};
+use crate::operations::{ElementwiseOperation, Operation, RegionDriver, RegionlessDriver};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{FlatProgram, Program, ProgramError, Value};
+use crate::programs::{FlatProgram, Program, ProgramError, RegionRef, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Size, TypeError, Typed};
@@ -169,9 +169,9 @@ impl From<BatchingError> for ProgramError {
 /// batch-varying predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e.,
 /// scalar) values. Any shaped constant or input is replicated when none of its physical dimensions indexes the batch.
 ///
-/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the [`Tracer`] metadata.
-/// Carrying it on the value itself lets the per-operation batching rules route the mapped batch axis straight from the
-/// value in hand.
+/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the
+/// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules
+/// route the mapped batch axis straight from the value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub struct BatchAxis(Option<isize>);
 
@@ -590,14 +590,206 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     }
 }
 
+/// Provides [`Instruction`](crate::Instruction)-scoped access to the nested [`Region`](crate::Region)s attached to
+/// an [`Operation`] being batched. Every [`BatchableOperation`] application receives a [`BatchingDriver`]. The driver
+/// keeps any attached regions borrowed and re-enters batching with the durable [`BatchingContext`] supplied by the
+/// operation rule. [`RegionDriver`] provides its structural region access, while this trait adds batching-specific
+/// recursion. Region-free applications expose a region count of zero through the same contract.
+pub trait BatchingDriver<C: Context<Type = ArrayType>>: RegionDriver<C::Constant, C::Operation> {
+    /// Batches the region at `index` over the provided batched values by re-entering the active batching transform.
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C>,
+        index: usize,
+        inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
+
+    /// Batches `region` structurally at the provided input batch axes and output-axes policy, returning the rewritten
+    /// standalone program and its inferred output batch axes.
+    fn batch_program(
+        &self,
+        context: &BatchingContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>;
+}
+
+impl<C: Context<Type = ArrayType>> BatchingDriver<C> for RegionlessDriver {
+    #[inline]
+    fn batch_region(
+        &self,
+        _context: &BatchingContext<C>,
+        _index: usize,
+        _inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Err(ProgramError::MalformedProgram("regionless driver cannot batch a region".to_string()).into())
+    }
+
+    #[inline]
+    fn batch_program(
+        &self,
+        _context: &BatchingContext<C>,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+        _input_axes: &[BatchAxis],
+        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
+    {
+        Err(ProgramError::MalformedProgram("regionless driver cannot batch a program".to_string()).into())
+    }
+}
+
+/// [`BatchingDriver`] scoped to one [`Context::bind`] [`Operation`] application. It exposes exactly that application's
+/// owned [`Region`](crate::Region)s and shared callees, borrowing both collections in place and indexing callees after
+/// the owned regions without a combined program or region-reference allocation.
+struct BindingBatchingDriver<'r, C: Context<Type = ArrayType>> {
+    /// Owned nested region [`Program`]s, in operation-defined order.
+    regions: &'r [FlatProgram<BatchingContext<C>>],
+
+    /// Shared callee [`Program`]s, ordered after [`Self::regions`].
+    callees: &'r [Rc<FlatProgram<BatchingContext<C>>>],
+}
+
+impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for BindingBatchingDriver<'_, C> {
+    #[inline]
+    fn region_count(&self) -> usize {
+        self.regions.len() + self.callees.len()
+    }
+
+    #[inline]
+    fn region(&self, index: usize) -> Result<RegionRef<'_, C::Constant, C::Operation>, ProgramError> {
+        self.regions
+            .get(index)
+            .or_else(|| index.checked_sub(self.regions.len()).and_then(|index| self.callees.get(index)).map(Rc::as_ref))
+            .map(Program::entry_region_ref)
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "region index {index} is out of range for the operation application",
+                ))
+            })
+    }
+}
+
+// TODO(eaplatanios): Review this.
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: BatchableOperation<C>
+                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<TransposeOperation>
+                           + From<BroadcastOperation>,
+        >,
+> BatchingDriver<C> for BindingBatchingDriver<'_, C>
+{
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C>,
+        index: usize,
+        inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        batch_region_in_context(context, self.region(index)?, inputs)
+    }
+
+    fn batch_program(
+        &self,
+        context: &BatchingContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
+    {
+        region.batched(context.axis_size(), input_axes, output_axes_policy)
+    }
+}
+
+// TODO(eaplatanios): Review this.
+/// [`BatchingDriver`] scoped to one replayed region-carrying [`Instruction`](crate::Instruction). It retains only that
+/// instruction's borrowed region views; each request receives the active durable context from
+/// [`BatchableOperation::batch`].
+struct ReplayBatchingDriver<'r, C: Context<Type = ArrayType>> {
+    /// Borrowed views of the instruction's regions, in region order.
+    regions: Vec<RegionRef<'r, C::Constant, C::Operation>>,
+}
+
+impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for ReplayBatchingDriver<'_, C> {
+    fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    fn region(&self, index: usize) -> Result<RegionRef<'_, C::Constant, C::Operation>, ProgramError> {
+        self.regions.get(index).copied().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "region index {index} is out of range for the operation application",
+            ))
+        })
+    }
+}
+
+// TODO(eaplatanios): Review this.
+impl<C> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
+{
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C>,
+        index: usize,
+        inputs: Vec<ArrayBatch<C::Value>>,
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        batch_region_in_context(context, self.region(index)?, inputs)
+    }
+
+    fn batch_program(
+        &self,
+        context: &BatchingContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
+    {
+        region.batched(context.axis_size(), input_axes, output_axes_policy)
+    }
+}
+
+// TODO(eaplatanios): Review this.
+/// Replays a borrowed region source instruction by instruction through the provided [`BatchingContext`], dispatching
+/// every instruction's [`BatchableOperation`] rule (with driver-backed region access for region-carrying
+/// instructions), and returns the program outputs' batches. This is the batching counterpart of
+/// [`Program::interpret_in_context`](crate::Program::interpret_in_context)'s bind replay.
+fn batch_region_in_context<C>(
+    context: &BatchingContext<C>,
+    region: RegionRef<'_, C::Constant, C::Operation>,
+    inputs: Vec<ArrayBatch<C::Value>>,
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
+{
+    region.interpret_with(
+        inputs,
+        |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
+        |instruction, instruction_inputs| {
+            let replay_driver = ReplayBatchingDriver { regions: region.attached_regions(instruction)? };
+            instruction.operation().batch(context, &replay_driver, instruction_inputs)
+        },
+    )
+}
+
 /// Represents [`Operation`]s that can be batched (i.e., vectorized).
 ///
 /// The trait is parameterized by the parent [`Context`] `C` that owns the physical values flowing through the batching
-/// transform, and every rule receives the active [`BatchingContext`] wrapping that parent. Ordinary rules lift their
-/// operation to its batch-carrying inputs and then execute or stage the lifted work through `context.parent()`
-/// (typically via [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager parent interprets it
-/// immediately while a staging parent stages it into the enclosing trace. Rules whose semantics depend on the active
-/// transform frame (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and
+/// transform, and every rule receives the active durable [`BatchingContext`] plus a [`BatchingDriver`]. Ordinary rules
+/// lift their operation to its batch-carrying inputs and then execute or stage the lifted work through
+/// `context.parent()` (typically via [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager
+/// parent interprets it immediately while a staging parent stages it into the enclosing trace. Rules whose semantics
+/// depend on the active transform frame (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and
 /// [`BatchingContext::axis_size`] directly, and recursive higher-order rules replay their nested programs through the
 /// same contract. Consequently, invoking a batching rule always requires an active [`BatchingContext`].
 ///
@@ -610,20 +802,19 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 ///   - A dispatcher at `BatchableOperation<C>`, generic over the parent [`Context`] `C`, that forwards the active
 ///     [`BatchingContext`] to every variant's own rule. One dispatcher covers eager and staging parents alike, because
 ///     the parent/active distinction lives in each rule's body rather than in dispatch.
-///   - A [`BatchableProgramOperation`] witness whose fixed body calls [`Program::batched`], naming the operation-family
-///     fixed point that recursive higher-order payload rules (e.g., control flow) batch their nested programs through
-///     without re-entering the enum's own batching obligation.
+///   - Per-variant `Payload: BatchableOperation<C>` predicates that transport each rule's own capability requirements
+///     to the use site. Nested programs batch structurally through [`Program::batched`], requested by higher-order
+///     rules through their active [`BatchingDriver`], whose concrete implementation establishes the finite
+///     program-level bounds at its construction site.
 ///
-/// Non-recursive payloads carry per-variant `Payload: BatchableOperation<C>` predicates that transport each rule's own
-/// capability requirements to the use site. Recursive payloads are skipped (such a predicate would overflow the trait
-/// solver) and their rules are discharged as definition-time body obligations against the witness and the provided
-/// leaf capabilities: `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds those leaves to the parent context's
-/// value type. The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the
-/// `#[derive(Operation)]` macro.
+/// `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's value
+/// type. The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]`
+/// macro.
 pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
-    /// `context` is the active [`BatchingContext`] for the transform level being applied, while the packed physical
-    /// values in `inputs` (and in the returned outputs) are owned by `context.parent()`.
+    /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
+    /// current operation application's regions and has a region count of zero for region-free applications. Packed
+    /// physical values in `inputs` and the returned outputs are owned by `context.parent()`.
     ///
     /// # Contract
     ///
@@ -646,9 +837,10 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
     /// derived using our `#[derive(BatchableOperation)]` macro, it is a common convention for operations that can be
     /// part of such operation families to implement this trait even if they do not support batching and to have this
     /// function simply return a [`BatchingError::UnsupportedOperation`] error.
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
@@ -668,12 +860,13 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
 // at their batch-axis-inserted shapes so the operation surfaces its own shape error.
 impl<
     C: Context<Type = ArrayType, Value: Broadcast + Transpose>,
-    O: Clone + ElementwiseOperation + InterpretableOperation<C::Value, C>,
+    O: ElementwiseOperation + InterpretableOperation<C::Value, C>,
 > BatchableOperation<C> for O
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
@@ -682,7 +875,7 @@ impl<
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
         let Some(batch_axis) = input_axes.iter().find_map(BatchAxis::axis) else {
             let physical_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let output_count = Operation::infer_output_types(self, physical_types.as_slice())?.len();
+            let output_count = Operation::infer_output_types(self, physical_types.as_slice(), &[])?.len();
             return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
         };
 
@@ -740,7 +933,7 @@ impl<
         // The lifted operation is the original applied to the batch-carrying inputs. Every output takes the common
         // batch axis. Broadcast-incompatible per-item shapes surface the operation's own shape error at this inference.
         let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let output_count = Operation::infer_output_types(self, input_types.as_slice())?.len();
+        let output_count = Operation::infer_output_types(self, input_types.as_slice(), &[])?.len();
         let output_batch_axes = vec![BatchAxis::new(batch_axis); output_count];
         self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)
     }
@@ -764,36 +957,6 @@ pub enum ProgramBatchingOutputAxesPolicy {
     /// [`Transpose`] and broadcasting a replicated output across the batch, while a *replicated* entry keeps that
     /// output's natural axis (it is a lower bound, not an equality constraint).
     AlignEachTo(Vec<BatchAxis>),
-}
-
-/// Represents closed [`Operation`] families whose captured flat [`Program`]s can be batched into standalone batched
-/// programs. This is the batching analogue of [`InterpretableProgramOperation`](crate::InterpretableProgramOperation).
-/// It names the recursive fixed point needed by higher-order batching helpers without requiring the full operation
-/// enum's [`BatchableOperation`] implementation while proving that implementation. Operation families implement it by
-/// replaying captured flat [`Program`]s through their operation-owned batching rules, via
-/// [`Program::batched`](Program::batched).
-///
-/// The re-wrapping batch rules of [`CustomJvpOperation`](crate::CustomJvpOperation) and
-/// [`CustomVjpOperation`](crate::CustomVjpOperation) bound their captured-program operation type by this trait. Routing
-/// program-level batching through this dedicated, lifetime-free witness keeps the trait solver's recursion finite: the
-/// closed enum implementation discharges the derived batching-context obligations once, instead of every batching rule
-/// re-deriving them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
-pub trait BatchableProgramOperation<V: Value<Type = ArrayType>>: Operation<ArrayType> + Sized {
-    /// Batches a captured [`Program`] into a standalone program over batch-carrying physical types. Refer to
-    /// the documentation of [`Program::batched`](Program::batched) for the input and output axis conventions.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Captured program to batch, over per-item input and output types.
-    ///   - `batch_size`: Size of the batch axis (i.e., number of items being batched together).
-    ///   - `input_batch_axes`: [`BatchAxis`] for each program input (mapped at a position or replicated).
-    ///   - `output_axes_policy`: Policy for packaging the batched program's outputs.
-    fn batch_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-        batch_size: usize,
-        input_batch_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
 }
 
 /// Capability to interpret an [`Operation`] on batch-carrying inputs and repackage its outputs as [`ArrayBatch`]es.
@@ -837,7 +1000,7 @@ impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C::Value, C>> Inter
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let output_values = self.interpret(context.parent(), input_values.as_slice())?;
+        let output_values = self.interpret(&context.parent().clone(), &RegionlessDriver, input_values.as_slice())?;
         check_count!("output", output_values, output_batch_axes.len(), ProgramError);
         output_values
             .into_iter()
@@ -893,14 +1056,23 @@ impl<C> BatchingContext<C> {
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Domain for BatchingContext<C> {
+impl<C: Context<Type = ArrayType>> Domain for BatchingContext<C> {
     type Type = ArrayType;
     type Value = BatchingTracer<C>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for BatchingContext<C> {
+impl<
+    C: Context<
+            Type = ArrayType,
+            Operation: BatchableOperation<C>
+                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<TransposeOperation>
+                           + From<BroadcastOperation>,
+        >,
+> Context for BatchingContext<C>
+{
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
         // Lifts a constant by lifting it in the parent context and replicating it across the batch.
@@ -908,10 +1080,10 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>>(
+    fn bind<P: Into<Self::Operation>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
         &self,
         operation: P,
-        regions: &[FlatProgram<Self>],
+        regions: R,
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[BatchingTracer<C>],
     ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
@@ -921,19 +1093,9 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for
         // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard until `BatchingContext` binds regions (phases 2-6);
-        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
-
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
-        let output_batches = operation.batch(self, input_batches.as_slice())?;
+        let driver = BindingBatchingDriver { regions: regions.as_ref(), callees };
+        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
 
@@ -948,13 +1110,13 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for
     }
 }
 
-/// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates
-/// on [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via
-/// [`Context::bind`](Context::bind), which applies the operation's [`BatchableOperation`] implementation against the
-/// parent context. Over an eager parent context the packed value is concrete and so the closure sees real per-item
-/// values (e.g., it can branch on a replicated value, print it, etc.). Over a staging parent context it is a [`Tracer`]
-/// staged into the enclosing trace. Its [`Typed`] view is the *logical* per-item [`ArrayType`] (i.e., with the batch
-/// axis removed), while the inner [`ArrayBatch`] carries the *physical* type and [`BatchAxis`].
+/// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates on
+/// [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via [`Context::bind`],
+/// which applies the operation's [`BatchableOperation`] implementation against the parent context. Over an eager
+/// parent context the packed value is concrete and so the closure sees real per-item values (e.g., it can branch
+/// on a replicated value, print it, etc.). Over a staging parent context it is a [`Tracer`](crate::Tracer) staged into
+/// the enclosing trace. Its [`Typed`] view is the *logical* per-item [`ArrayType`] (i.e., with the batch axis removed),
+/// while the inner [`ArrayBatch`] carries the *physical* type and [`BatchAxis`].
 #[derive(Clone, Parameter)]
 pub struct BatchingTracer<C: Context> {
     /// [`BatchingContext`] this value flows through, used to dispatch operations that involve it.
@@ -1032,8 +1194,7 @@ impl<C: Context<Type = ArrayType>> Typed for BatchingTracer<C> {
     }
 }
 
-/// A batching value flows through the [`BatchingContext`] stamped on it.
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Value for BatchingTracer<C> {
+impl<C: Context<Type = ArrayType>> Value for BatchingTracer<C> {
     type DispatchDomain = BatchingContext<C>;
     type ExecutionDomain = BatchingContext<C>;
 
@@ -1051,15 +1212,15 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Value for B
 impl<
     V: Value<Type = ArrayType>,
     O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
-> Program<V, O, Vec<V>, Vec<V>>
+> RegionRef<'_, V, O>
 {
-    /// Batches this [`Program`] so that the resulting program operates over batched inputs along the specified
-    /// [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations use this function to batch captured
-    /// programs *without* concretizing any batch-item values, so that batched control-flow and custom-derivative
-    /// structure can be staged back into the enclosing trace. This function works by replying this program through
-    /// a [`BatchingContext`] over a fresh [`TracingContext`], lifting every instruction through its
-    /// [`BatchableOperation`] rule, and the resulting staged program is extracted together with the
-    /// requested [`ProgramBatchingOutputAxesPolicy`].
+    /// Batches this borrowed [`Region`](crate::Region) so that the resulting program operates over batched inputs
+    /// along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations use this function
+    /// to batch captured programs *without* concretizing any batch-item values, so that batched control-flow and
+    /// custom-derivative structure can be staged back into the enclosing trace. This function works by replying this
+    /// program through a [`BatchingContext`] over a fresh [`TracingContext`], lifting every instruction through its
+    /// [`BatchableOperation`] rule, and the resulting staged program is extracted together with the requested
+    /// [`ProgramBatchingOutputAxesPolicy`].
     ///
     /// Inputs whose `input_batch_axes[i]` is mapped at position `k` consume the original unbatched input [`ArrayType`]
     /// with a mapped batch axis of size `axis_size` inserted at `k`, while replicated inputs enter at their original
@@ -1082,8 +1243,8 @@ impl<
         axis_size: usize,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
-        let input_count = self.input_count();
+    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError> {
+        let input_count = self.input_ids().len();
         check_count!("input", input_batch_axes, input_count, ProgramError);
 
         let parent_context = TracingContext::<V, O>::new();
@@ -1131,7 +1292,19 @@ impl<
             let outputs = self.interpret_with(
                 inputs,
                 |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
-                |instruction, instruction_inputs| instruction.operation().batch(&batching_context, instruction_inputs),
+                |instruction, instruction_inputs| {
+                    instruction.operation().batch(
+                        &batching_context,
+                        &ReplayBatchingDriver {
+                            regions: instruction
+                                .regions()
+                                .iter()
+                                .map(|id| self.region_ref(*id))
+                                .collect::<Result<Vec<_>, _>>()?,
+                        },
+                        instruction_inputs,
+                    )
+                },
             )?;
 
             // Resolve `output_axes_policy` into one optional alignment declaration per output. The outer `None` keeps
@@ -1176,6 +1349,23 @@ impl<
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
         Ok((program, output_axes))
+    }
+}
+
+impl<
+    V: Value<Type = ArrayType>,
+    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
+> Program<V, O, Vec<V>, Vec<V>>
+{
+    /// Batches this [`Program`] over the provided input axes.
+    #[inline]
+    pub fn batched(
+        &self,
+        axis_size: usize,
+        input_batch_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
+        self.entry_region_ref().batched(axis_size, input_batch_axes, output_axes_policy)
     }
 }
 
@@ -1283,9 +1473,9 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> Batch for C {}
 /// uniformly across the whole stack: an eager backend context interprets each batched operation immediately, an active
 /// [`StagingContext`] stages it into the enclosing trace, and a [`BatchingContext`] nests `batch` inside `batch` (each
 /// level's [`BatchingTracer`] carries its own batch axis and so nested maps thread through with no side table).
-/// Concretely, staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level, concrete
-/// values recover the eager backend domain they name, etc. Inputs with *no leaf values* are the one case this function
-/// cannot serve. With nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
+/// Concretely, staged [`Tracer`](crate::Tracer)s recover their trace, [`BatchingTracer`]s recover their batching level,
+/// concrete values recover the eager backend domain they name, etc. Inputs with *no leaf values* are the one case this
+/// function cannot serve. With nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
 /// `batch_axis` supplies an explicit batch size. [`Batch::batch`] must be used in that case, with an explicit context.
 ///
 /// `input_batch_axes` selects the mapped axis of each input leaf and `output_batch_axes` the position of the mapped
@@ -1612,28 +1802,30 @@ mod tests {
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
         let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
-        let outputs = AddOperation.batch(&context, &[left.clone(), right]).unwrap();
+        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left.clone(), right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &[left.clone(), replicated]).unwrap();
+        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left.clone(), replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
         // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
         let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
-        let outputs = AddOperation.batch(&context, &[left, right_axis_one]).unwrap();
+        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left, right_axis_one]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &[left_replicated, right_replicated]).unwrap();
+        let outputs = AddOperation
+            .batch(&context, &RegionlessDriver, &[left_replicated, right_replicated])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
