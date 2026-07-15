@@ -7,8 +7,9 @@ use ryft_core::operations::control_flow::{Select, WhilePredicate};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::Broadcast;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
+use ryft_core::programs::types::Typed;
 use ryft_core::programs::{ProgramError, Value};
-use ryft_core::types::{DataType, Typed};
+use ryft_core::types::DataType;
 
 use crate::experimental::ops::XlaOperation;
 use crate::{Array, ArrayShard};

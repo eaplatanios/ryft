@@ -36,14 +36,14 @@ use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::BindingRegionDriver;
+use ryft_core::programs::types::{Type, TypeError, Typed};
 use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
 use ryft_core::tracing::DomainTracer;
 use ryft_core::tracing_v2::CoordinateBasis;
 use ryft_core::types::{
-    ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
-    Typed,
+    ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout,
 };
 
 use super::operations::ShardMapOperation;

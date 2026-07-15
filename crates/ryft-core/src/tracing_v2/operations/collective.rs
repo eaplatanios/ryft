@@ -18,8 +18,9 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
+use crate::programs::types::{TypeError, Typed};
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::types::{ArrayType, DataType};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///

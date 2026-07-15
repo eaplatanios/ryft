@@ -7,9 +7,10 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::sharding::Sharding;
-use crate::types::{ArrayType, Shape, Size, TypeError};
+use crate::types::{ArrayType, Shape, Size};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -303,8 +304,9 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
-    use crate::types::{DataType, Typed};
+    use crate::types::DataType;
 
     use super::*;
 

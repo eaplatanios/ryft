@@ -39,13 +39,14 @@ use crate::operations::math::{
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
 use crate::programs::operations::Operation;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
 use crate::tracing_v2::rematerialization::RematerializeOperation;
-use crate::types::{DataType, TypeError, Typed};
+use crate::types::DataType;
 
 // TODO(eaplatanios): Review `ScalarOperation` and its implementations.
 
@@ -114,7 +115,8 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 ///
 /// ```rust
 /// # use ryft_core::backends::scalars::Scalar;
-/// # use ryft_core::types::{DataType, Typed};
+/// # use ryft_core::programs::types::Typed;
+/// # use ryft_core::types::DataType;
 /// let scalar = Scalar::from(1.5f64);
 /// assert_eq!(scalar.r#type().into_owned(), DataType::F64);
 /// assert_eq!(scalar, 1.5f64);

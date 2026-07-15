@@ -14,8 +14,9 @@ use crate::programs::ProgramError;
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef};
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -118,7 +119,7 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), T
 /// Returns the stacked variant of a scan body slice type, prepending a static `length` dimension to its shape. The
 /// stacked type carries no optional layout or sharding metadata, so it is a declared type whose optional components
 /// are unspecified and scan input validation compares it against actual input types with
-/// [`Type::is_refined_by`](crate::types::Type::is_refined_by).
+/// [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
 pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
     dimensions.push(Size::Static(length));

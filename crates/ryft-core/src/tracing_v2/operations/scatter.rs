@@ -24,8 +24,9 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
+use crate::programs::types::{TypeError, Typed};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
-use crate::types::{ArrayType, TypeError, Typed};
+use crate::types::ArrayType;
 
 /// Forward-mode rule for [`ScatterOperation`]. For the [`Add`](ScatterReductionKind::Add) combiner the operation
 /// is jointly linear in its operand and updates, while the integer index operand is a non-differentiated primal operand

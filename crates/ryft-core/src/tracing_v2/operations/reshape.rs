@@ -9,9 +9,10 @@ use crate::macros::check_count;
 use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Shape, Size, Typed};
+use crate::types::{ArrayType, Shape, Size};
 use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
 
 /// Convenience trait for values that support reshape.

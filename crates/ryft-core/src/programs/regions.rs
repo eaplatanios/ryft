@@ -33,8 +33,8 @@ use crate::programs::effects::Effects;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
-use crate::types::{Type, Typed};
 
 /// Unique identifier for a [`Region`] within a [`Program`]. [`RegionId`]s are stable indexes into a [`Program`]'s
 /// region arena. Like [`AtomId`]s, they are meaningful only against the [`Program`] they were derived from.

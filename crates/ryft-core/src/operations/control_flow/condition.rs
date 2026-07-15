@@ -17,8 +17,9 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";

@@ -17,9 +17,9 @@ use crate::operations::constants::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::operations::Operation;
 use crate::programs::regions::CalleeRegionDriver;
+use crate::programs::types::Typed;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer};
-use crate::types::Typed;
 
 use super::contexts::CompilationDomain;
 
@@ -1544,7 +1544,8 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::compilation::{CompilationCacheDomain, CompilationContext};
     use crate::programs::operations::Operation;
-    use crate::types::{DataType, Type, TypeError};
+    use crate::programs::types::{Type, TypeError};
+    use crate::types::DataType;
 
     use super::*;
 

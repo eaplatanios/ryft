@@ -31,10 +31,11 @@ mod tests {
     use crate::operations::math::{AddOperation, MulOperation, Sin, SubOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::programs::types::Typed;
     use crate::tracing_v2::{
         DifferentiableDomainExtension, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev,
     };
-    use crate::types::{Shape, Size, Typed};
+    use crate::types::{Shape, Size};
 
     use super::*;
 

@@ -16,8 +16,9 @@ use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType};
 use crate::{CaptureReference, Tracer};
 
 // TODO(eaplatanios): Review from here onwards.

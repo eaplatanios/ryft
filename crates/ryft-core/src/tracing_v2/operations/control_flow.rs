@@ -26,10 +26,11 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
+use crate::programs::types::{TypeError, Typed};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::types::{ArrayType, DataType};
 
 impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
     /// Returns an [`ArrayBatch`] that wraps the Boolean reinterpretation of the carried value (via the value's own
@@ -1288,11 +1289,12 @@ mod tests {
     use crate::operations::constants::{One, OneLike, OneLikeOperation, Zero, ZeroLike, ZeroLikeOperation};
     use crate::operations::math::{ADD_OPERATION_NAME, AddOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::types::TypeError;
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::types::{DataType, Shape, Size, TypeError};
+    use crate::types::{DataType, Shape, Size};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -1359,7 +1361,7 @@ mod tests {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(false)),
                 DataType::F64 => Ok(TestValue::Number(0.0)),
-                _ => Err(crate::types::TypeError {
+                _ => Err(crate::programs::types::TypeError {
                     message: format!("test value cannot synthesize zero for {value_type}"),
                 }
                 .into()),
@@ -1372,7 +1374,7 @@ mod tests {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(true)),
                 DataType::F64 => Ok(TestValue::Number(1.0)),
-                _ => Err(crate::types::TypeError {
+                _ => Err(crate::programs::types::TypeError {
                     message: format!("test value cannot synthesize one for {value_type}"),
                 }
                 .into()),

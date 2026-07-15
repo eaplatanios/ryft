@@ -9,8 +9,9 @@ use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatab
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
@@ -165,8 +166,9 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::TypeError;
     use crate::tests::TestArray;
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

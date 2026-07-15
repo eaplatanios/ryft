@@ -18,10 +18,11 @@ use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::regions::EmptyRegionDriver;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size};
 
 /// Context capability that synthesizes a packed standard-basis value for dense differential replay.
 ///

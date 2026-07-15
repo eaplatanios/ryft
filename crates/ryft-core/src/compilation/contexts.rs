@@ -17,7 +17,7 @@ use crate::compilation::exchange::{
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
-use crate::types::Type;
+use crate::programs::types::Type;
 
 use super::function::{
     CallRequest, CompileRequest, CompiledFunction, ExecutableProgram, LoweredFunction, LoweringRequest, StageRequest,

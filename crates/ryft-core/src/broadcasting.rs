@@ -35,7 +35,7 @@ pub enum BroadcastingError {
     ShardingError(#[from] ShardingError),
 }
 
-/// Represents [`Type`](crate::types::Type)s or values that can be broadcast together.
+/// Represents [`Type`](crate::Type)s or values that can be broadcast together.
 ///
 /// Broadcasting in Ryft has two orthogonal components:
 ///

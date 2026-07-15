@@ -10,7 +10,7 @@ use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::Typed;
+use crate::programs::types::Typed;
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where

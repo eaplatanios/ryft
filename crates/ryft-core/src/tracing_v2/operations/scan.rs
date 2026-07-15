@@ -16,9 +16,10 @@ use crate::operations::manipulation::{
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::{Type, Typed};
 use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 /// Renders a compact comma-separated list of capture-like payloads.
 pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {

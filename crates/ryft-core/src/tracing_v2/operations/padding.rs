@@ -15,8 +15,9 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
+use crate::programs::types::{TypeError, Typed};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
-use crate::types::{ArrayType, TypeError, Typed};
+use crate::types::ArrayType;
 
 use super::slicing::batch_by_item_expansion;
 

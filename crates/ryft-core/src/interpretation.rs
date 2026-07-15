@@ -53,8 +53,8 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::types::{Type, TypeError, Typed};
 
 /// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]
 /// application. During [`Program`] replay that application is exactly one [`Instruction`]. Direct rule invocation
@@ -441,10 +441,11 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
+    use crate::programs::types::TypeError;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::{TestArray, TestRegionOperation};
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

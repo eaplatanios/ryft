@@ -7,7 +7,7 @@ use crate::contexts::Context;
 use crate::operations::constants::Zero;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
-use crate::types::Typed;
+use crate::programs::types::Typed;
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`](crate::Type).
 /// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward-mode and reverse-mode

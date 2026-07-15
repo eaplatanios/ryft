@@ -5,7 +5,7 @@ use crate::programs::Value;
 use crate::programs::effects::Effects;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
-use crate::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.

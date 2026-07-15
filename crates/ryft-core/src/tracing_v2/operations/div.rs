@@ -10,9 +10,9 @@ use crate::operations::constants::OneLike;
 use crate::operations::math::DivOperation;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation
 where

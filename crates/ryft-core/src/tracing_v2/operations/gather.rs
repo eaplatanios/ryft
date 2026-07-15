@@ -17,8 +17,9 @@ use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
 };
+use crate::programs::types::Typed;
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
-use crate::types::{ArrayType, Typed};
+use crate::types::ArrayType;
 
 /// Forward-mode rule for [`GatherOperation`]: `gather` is linear in the data operand, and the index operand is a
 /// non-differentiated primal operand edge, so the tangent gathers the operand tangent at the same primal indices. A

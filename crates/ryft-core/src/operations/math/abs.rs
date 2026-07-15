@@ -15,9 +15,10 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";

@@ -17,7 +17,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::BatchingDriver;
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size};
 
 /// Transpose (vector-Jacobian product) for a [`SliceOperation`].
 ///

@@ -11,9 +11,9 @@ use crate::operations::constants::{Zero, ZeroLikeOperation};
 use crate::operations::math::NegOperation;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for ComplexOperation
 where

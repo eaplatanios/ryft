@@ -22,7 +22,8 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
-use crate::types::{ArrayType, DataType, Shape, StaticShape, Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, StaticShape};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -731,9 +732,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

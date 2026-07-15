@@ -90,10 +90,11 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Size, TypeError, Typed};
+use crate::types::{ArrayType, Size};
 
 /// Represents batching-related errors.
 ///
@@ -1467,11 +1468,12 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::operations::math::AddOperation;
+    use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing::Trace;
     use crate::tracing_v2::ArrayOperation;
-    use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

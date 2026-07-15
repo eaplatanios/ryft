@@ -16,7 +16,8 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
-use crate::types::{ArrayType, Memory, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, Memory};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
 pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &str = "transfer_to_memory";
@@ -230,10 +231,11 @@ mod tests {
     use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::types::{DataType, Shape, Size, Typed};
+    use crate::types::{DataType, Shape, Size};
 
     use crate::tracing::Trace;
 

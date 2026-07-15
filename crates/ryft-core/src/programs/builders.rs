@@ -11,8 +11,8 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
+use crate::programs::types::Typed;
 use crate::programs::values::Value;
-use crate::types::Typed;
 
 /// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
 /// and [`Instruction`]s), the previously added non-entry [`Region`]s together with their callee-interning state, and

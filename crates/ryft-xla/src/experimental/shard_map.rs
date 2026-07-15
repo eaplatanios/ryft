@@ -14,10 +14,11 @@ use ryft_core::axes::NamedAxis;
 use ryft_core::contexts::StagingContext;
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::types::{ArrayType, Shape, Size, Typed};
+use ryft_core::types::{ArrayType, Shape, Size};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;

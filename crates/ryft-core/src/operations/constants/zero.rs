@@ -9,8 +9,9 @@ use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatab
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &str = "zero";
@@ -170,7 +171,8 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{DataType, TypeError};
+    use crate::programs::types::TypeError;
+    use crate::types::DataType;
 
     use super::*;
 

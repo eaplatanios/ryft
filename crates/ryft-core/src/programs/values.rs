@@ -4,7 +4,7 @@ use crate::contexts::Domain;
 use crate::parameters::Parameter;
 use crate::programs::atoms::AtomId;
 use crate::programs::regions::RegionId;
-use crate::types::Typed;
+use crate::programs::types::Typed;
 
 /// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`], identified by its containing
 /// [`Region`] and its region-local [`AtomId`].

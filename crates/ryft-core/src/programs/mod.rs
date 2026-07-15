@@ -117,7 +117,6 @@ use thiserror::Error;
 
 use crate::errors::CustomError;
 use crate::parameters::ParameterError;
-use crate::types::TypeError;
 
 pub mod atoms;
 pub mod builders;
@@ -126,6 +125,7 @@ pub mod instructions;
 pub mod operations;
 pub mod programs;
 pub mod regions;
+pub mod types;
 pub mod values;
 
 pub use atoms::{Atom, AtomId, MaybeZero};
@@ -138,6 +138,7 @@ pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionDriver, RegionId,
     RegionInterface, RegionRef,
 };
+pub use types::{Type, TypeError, Typed};
 pub use values::{Value, ValueId};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.

@@ -12,9 +12,10 @@ use crate::payloads::{Captured, Input};
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, TypeError, Typed};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`ConstantOperation`].
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
@@ -192,8 +193,9 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::TypeError;
     use crate::tracing::{DomainTracingContext, Tracer};
-    use crate::types::{DataType, TypeError};
+    use crate::types::DataType;
 
     use super::*;
 

@@ -9,8 +9,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`CompareOperation`].
 pub const COMPARE_OPERATION_NAME: &str = "compare";

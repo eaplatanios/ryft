@@ -8,9 +8,10 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingError};
-use crate::types::{ArrayType, Shape, TypeError, Typed};
+use crate::types::{ArrayType, Shape};
 
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
@@ -304,9 +305,10 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
-    use crate::types::{DataType, Size, Typed};
+    use crate::types::{DataType, Size};
 
     use super::*;
 

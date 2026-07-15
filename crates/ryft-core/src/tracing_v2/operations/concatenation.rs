@@ -12,7 +12,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Size, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, Size};
 
 /// Transpose (vector-Jacobian product) for a [`ConcatenateOperation`].
 ///
@@ -170,10 +171,10 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::operations::manipulation::Concatenate;
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
-    use crate::types::Typed;
 
     use super::*;
     use crate::batching::BatchAxis;

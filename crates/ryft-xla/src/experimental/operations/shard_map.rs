@@ -21,7 +21,8 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::differentiation::DifferentiationDual;
-use ryft_core::types::{ArrayType, TypeError, Typed};
+use ryft_core::programs::types::{TypeError, Typed};
+use ryft_core::types::ArrayType;
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
 use crate::experimental::shard_map::{
@@ -1024,9 +1025,10 @@ mod tests {
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
+    use ryft_core::programs::types::Typed;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
-    use ryft_core::types::{ArrayType, DataType, Typed};
+    use ryft_core::types::{ArrayType, DataType};
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};

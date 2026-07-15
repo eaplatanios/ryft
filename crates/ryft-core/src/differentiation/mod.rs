@@ -88,7 +88,7 @@ use thiserror::Error;
 
 use crate::parameters::ParameterError;
 use crate::programs::ProgramError;
-use crate::types::TypeError;
+use crate::programs::types::TypeError;
 
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,

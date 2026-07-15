@@ -20,6 +20,7 @@ use ryft_core::operations::math::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionId, RegionRef};
+use ryft_core::programs::types::Typed;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 #[cfg(any(test, feature = "benchmarking"))]
@@ -28,7 +29,7 @@ use ryft_core::tracing_v2::ArrayOperation;
 use ryft_core::tracing_v2::operations::DotOperation;
 use ryft_core::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveKind, CollectiveOperation};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
-use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
+use ryft_core::types::{ArrayType, DataType, Memory, Size};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{

@@ -32,8 +32,9 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::TypeError;
     use crate::tests::TestArray;
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

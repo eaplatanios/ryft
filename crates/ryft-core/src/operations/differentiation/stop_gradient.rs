@@ -8,8 +8,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";

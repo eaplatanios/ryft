@@ -7,8 +7,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size};
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";

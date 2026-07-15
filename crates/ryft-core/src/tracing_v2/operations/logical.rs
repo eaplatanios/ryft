@@ -6,9 +6,9 @@ use crate::differentiation::{
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::Type;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::Type;
 
 /// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not
 /// linear maps, so a tangent program never contains them on a linear operand (their forwards pair the replayed

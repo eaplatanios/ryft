@@ -18,9 +18,10 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::ArrayType;
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).

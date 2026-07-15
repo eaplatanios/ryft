@@ -8,8 +8,8 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
@@ -95,7 +95,8 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType, TypeError};
+    use crate::programs::types::TypeError;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 

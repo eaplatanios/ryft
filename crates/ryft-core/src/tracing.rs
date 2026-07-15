@@ -102,8 +102,8 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::BindingRegionDriver;
+use crate::programs::types::Typed;
 use crate::programs::values::Value;
-use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -856,7 +856,8 @@ mod tests {
     use crate::programs::atoms::AtomId;
     use crate::programs::operations::Operation;
     use crate::programs::regions::RegionInterface;
-    use crate::types::{DataType, TypeError, Typed};
+    use crate::programs::types::{TypeError, Typed};
+    use crate::types::DataType;
 
     use super::*;
 

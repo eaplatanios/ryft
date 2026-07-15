@@ -26,9 +26,10 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::ArrayType;
 
 /// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
 /// in its [`Atom`] table. The corresponding runtime value lives at [`index`](Self::index) in the surrounding

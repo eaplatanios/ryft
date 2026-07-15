@@ -15,9 +15,10 @@ use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 

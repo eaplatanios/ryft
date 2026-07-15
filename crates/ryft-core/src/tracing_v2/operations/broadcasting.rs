@@ -10,7 +10,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
@@ -182,11 +183,12 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::parameters::Placeholder;
     use crate::programs::Program;
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing::TracingContext;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
-    use crate::types::{DataType, Typed};
+    use crate::types::DataType;
 
     use super::*;
 

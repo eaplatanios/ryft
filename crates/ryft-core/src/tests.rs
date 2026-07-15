@@ -40,10 +40,11 @@ use crate::programs::ProgramError;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
-use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
 /// Asserts that the reverse-mode gradient of `$function` at `$input` matches a central finite-difference estimate
@@ -122,7 +123,7 @@ macro_rules! check_gradient {
             }
             other => panic!(
                 "finite-difference gradient checking requires an f64 or c128 input but got {}",
-                $crate::types::Typed::r#type(&other).into_owned(),
+                $crate::programs::types::Typed::r#type(&other).into_owned(),
             ),
         }
     }};
@@ -3014,7 +3015,7 @@ mod linearization_tests {
         // `custom_vjp` is reverse-mode-only. The forward builds a tangent program containing the opaque
         // `CustomVjpTangent` carrier, but interpreting that tangent program (which forward mode does) replays the
         // carrier, whose interpretation rejects forward mode with the canonical reverse-only error.
-        use crate::types::TypeError;
+        use crate::programs::types::TypeError;
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         match domain.jvp(
@@ -4729,7 +4730,7 @@ mod array_linearization_tests {
         // `CustomVjpTangent` carrier, but interpreting that tangent program (which forward mode does) replays the
         // carrier, whose interpretation rejects forward mode with the canonical reverse-only error rather than
         // silently producing a wrong tangent.
-        use crate::types::TypeError;
+        use crate::programs::types::TypeError;
 
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         match domain.jvp(

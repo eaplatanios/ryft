@@ -10,11 +10,11 @@ use crate::contexts::EagerContext;
 use crate::errors::Error;
 use crate::parameters::Parameter;
 use crate::programs::Value;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::types::data_types::DataType;
 use crate::types::layouts::Layout;
 use crate::types::memories::Memory;
-use crate::types::{Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper

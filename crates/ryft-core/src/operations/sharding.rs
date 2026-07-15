@@ -38,9 +38,10 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::types::{ArrayType, TypeError};
+use crate::types::ArrayType;
 
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";

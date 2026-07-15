@@ -16,7 +16,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Type, Typed};
+use crate::programs::types::{Type, Typed};
+use crate::types::ArrayType;
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
 /// constant is the right value for every batch item, so the rule interprets the operation once

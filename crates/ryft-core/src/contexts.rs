@@ -120,9 +120,9 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::BindingRegionDriver;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
-use crate::types::{Type, Typed};
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
 /// batching and automatic differentiation. A [`Domain`] is purely the type, value, constant, and operation universe
@@ -530,8 +530,9 @@ mod tests {
     use crate::programs::atoms::{Atom, AtomId};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::CalleeRegionDriver;
+    use crate::programs::types::Typed;
     use crate::tracing::{DomainTracingContext, TracerState};
-    use crate::types::{DataType, Typed};
+    use crate::types::DataType;
 
     use super::*;
 

@@ -64,12 +64,13 @@ use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{Region, RegionId, RegionInterface};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
 use crate::tracing_v2::operations::dot::DotOperation;
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
-use crate::types::{ArrayType, Memory, Type, TypeError, Typed};
+use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///

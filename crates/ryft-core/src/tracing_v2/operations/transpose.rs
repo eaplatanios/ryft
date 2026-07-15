@@ -11,7 +11,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Typed};
+use crate::programs::types::Typed;
+use crate::types::ArrayType;
 
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
 where

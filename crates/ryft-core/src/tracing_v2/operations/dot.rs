@@ -17,7 +17,8 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
-use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, StaticShape};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
@@ -1023,8 +1024,9 @@ mod tests {
 
     use crate::operations::math::AddOperation;
     use crate::programs::operations::Operation;
+    use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 

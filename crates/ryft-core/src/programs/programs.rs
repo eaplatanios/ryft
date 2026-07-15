@@ -11,8 +11,8 @@ use crate::programs::effects::Effects;
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
+use crate::programs::types::Typed;
 use crate::programs::values::{Value, ValueId};
-use crate::types::Typed;
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
@@ -1340,8 +1340,9 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationFormatter;
+    use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
-    use crate::types::{DataType, TypeError};
+    use crate::types::DataType;
 
     use super::*;
 

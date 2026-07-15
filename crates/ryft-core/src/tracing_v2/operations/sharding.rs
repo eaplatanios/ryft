@@ -28,7 +28,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::types::{ArrayType, Typed};
+use crate::programs::types::Typed;
+use crate::types::ArrayType;
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
 /// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input

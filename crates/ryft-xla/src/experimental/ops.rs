@@ -49,6 +49,7 @@ use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::tag::TagOperation;
+use ryft_core::programs::types::{TypeError, Typed};
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
@@ -56,7 +57,7 @@ use ryft_core::tracing_v2::operations::memory::TransferToMemoryOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::tracing_v2::{ArrayOperation, AxisIndexOperation, CollectiveOperation, DotOperation};
-use ryft_core::types::{ArrayType, TypeError, Typed};
+use ryft_core::types::ArrayType;
 
 use crate::experimental::operations::ShardMapOperation;
 

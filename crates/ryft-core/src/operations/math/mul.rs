@@ -10,9 +10,10 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::sharding::Sharding;
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";

@@ -22,7 +22,7 @@ macro_rules! check_count {
             let count = values.len();
             let descriptor = $descriptor;
             let noun = if expected == 1 { descriptor.to_string() } else { format!("{descriptor}s") };
-            return Err($crate::types::TypeError { message: format!("expected {expected} {noun} but got {count}") });
+            return Err($crate::TypeError { message: format!("expected {expected} {noun} but got {count}") });
         }
     }};
 }
@@ -41,7 +41,7 @@ macro_rules! check_types {
         let left = &$left[..];
         let right = &$right[..];
         if left != right {
-            return Err($crate::types::TypeError {
+            return Err($crate::TypeError {
                 message: format!(
                     "{} type signature mismatch: expected [{}] but got [{}]",
                     $descriptor,
@@ -164,7 +164,7 @@ macro_rules! define_elementwise_operation {
                 &self,
                 input_types: &[$crate::DataType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
-            ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
+            ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
             }
@@ -181,7 +181,7 @@ macro_rules! define_elementwise_operation {
                 &self,
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
+            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -260,13 +260,13 @@ macro_rules! define_elementwise_operation {
                 &self,
                 input_types: &[$crate::DataType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
-            ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
+            ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 // The fully qualified call is required here because the `Broadcastable` trait is not necessarily
                 // imported at the macro expansion site.
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
-                    .map_err(|_| $crate::types::TypeError {
+                    .map_err(|_| $crate::TypeError {
                         message: format!("'{}' input types are not broadcast-compatible", $name),
                     })
             }
@@ -283,7 +283,7 @@ macro_rules! define_elementwise_operation {
                 &self,
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
-            ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
+            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }

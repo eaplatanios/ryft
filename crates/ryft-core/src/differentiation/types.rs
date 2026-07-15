@@ -1,5 +1,6 @@
+use crate::programs::types::Type;
 use crate::sharding::Sharding;
-use crate::types::{ArrayType, DataType, Type};
+use crate::types::{ArrayType, DataType};
 
 /// A [`Type`] whose reverse-mode cotangents carry a (possibly different) dual, or **cotangent**, [`Type`]. Reverse-mode
 /// differentiation seeds an output cotangent, transposes the linear program, and emits structural zero cotangents for

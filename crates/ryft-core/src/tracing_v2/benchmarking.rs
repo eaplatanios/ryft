@@ -8,8 +8,8 @@ use crate::operations::math::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionRef;
+use crate::programs::types::Type;
 use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
-use crate::types::Type;
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]

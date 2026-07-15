@@ -8,8 +8,9 @@ use thiserror::Error;
 use crate::axes::AxisError;
 use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
+use crate::programs::types::TypeError;
 use crate::sharding::ShardingError;
-use crate::types::{DataTypeError, LayoutError, TypeError};
+use crate::types::{DataTypeError, LayoutError};
 
 /// Represents errors that can occur in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

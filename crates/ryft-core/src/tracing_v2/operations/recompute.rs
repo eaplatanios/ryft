@@ -14,7 +14,8 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::TranspositionDriver;
 use crate::interpretation::InterpretationDriver;
-use crate::types::{ArrayType, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::ArrayType;
 
 /// Linear-program payload for recomputing a primal operation without differentiating through it.
 ///

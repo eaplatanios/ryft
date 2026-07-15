@@ -11,11 +11,12 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size};
 
 use super::scatter::{LinearScatterAddOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use super::slicing::is_integer;
@@ -27,7 +28,7 @@ pub const GATHER_OPERATION_NAME: &str = "gather";
 
 /// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scatter::Scatter), mirroring JAX's
 /// [`GatherScatterMode`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.GatherScatterMode.html). The mode does
-/// not affect the output [`Type`](crate::types::Type) — only how a start index that would read or write outside the
+/// not affect the output [`Type`](crate::programs::types::Type) — only how a start index that would read or write outside the
 /// operand is treated at execution time. It is shared by both operations (gather and scatter both reference it; the
 /// scatter combiner kind lives in [`super::scatter`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -1144,8 +1145,8 @@ mod tests {
     fn test_gather_partitioned_transpose_computes_scatter_add_adjoint() {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
+        use crate::programs::types::Typed;
         use crate::tests::TestArray;
-        use crate::types::Typed;
 
         // Take rows 0 and 2 of a [3, 2] operand: the operand is linear and the [2, 1] index array is the known
         // operand. The gathered output and its cotangent have shape [2, 2].

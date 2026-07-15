@@ -9,8 +9,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -246,9 +247,10 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::operations::BooleanLike;
     use crate::parameters::Placeholder;
+    use crate::programs::types::Typed;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
-    use crate::types::{Shape, Size, Typed};
+    use crate::types::{Shape, Size};
 
     use super::*;
 

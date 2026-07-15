@@ -10,11 +10,12 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Size, TypeError, Typed};
+use crate::types::{ArrayType, Size};
 
 // TODO(eaplatanios): Review this module.
 

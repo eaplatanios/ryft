@@ -8,8 +8,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`Atan2Operation`].
 pub const ATAN2_OPERATION_NAME: &str = "atan2";

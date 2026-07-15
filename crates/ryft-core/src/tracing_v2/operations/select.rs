@@ -15,7 +15,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
+use crate::types::{ArrayType, DataType};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
 ///
@@ -490,8 +491,8 @@ mod tests {
         // The branches are linear operands, so only their type enters the transpose; their values are unused.
         let on_true = TestArray::vector(vec![10.0, 20.0]);
         let cotangent = TestArray::vector(vec![5.0, 7.0]);
-        let condition_type = <TestArray as crate::types::Typed>::r#type(&condition).into_owned();
-        let branch_type = <TestArray as crate::types::Typed>::r#type(&on_true).into_owned();
+        let condition_type = <TestArray as crate::programs::types::Typed>::r#type(&condition).into_owned();
+        let branch_type = <TestArray as crate::programs::types::Typed>::r#type(&on_true).into_owned();
 
         // Build `select(condition, on_true, on_false)` over the test enum, treat only the branches as linear, and
         // interpret the pullback on `[cotangent, condition]`.
