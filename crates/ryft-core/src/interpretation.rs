@@ -46,10 +46,14 @@ use std::fmt::Debug;
 
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
-use crate::programs::{Atom, AtomId, Instruction, Program, ProgramError, Value};
-use crate::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
+use crate::programs::ProgramError;
+use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::instructions::Instruction;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
+use crate::programs::values::Value;
 use crate::types::{Type, TypeError, Typed};
 
 /// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]

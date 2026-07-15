@@ -95,10 +95,14 @@ use ryft_macros::Parameter;
 use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
-use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::regions::BindingRegionDriver;
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::BindingRegionDriver;
+use crate::programs::values::Value;
 use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -845,12 +849,13 @@ mod tests {
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::Operation;
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, ProgramError};
-    use crate::regions::RegionInterface;
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::AtomId;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::RegionInterface;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;

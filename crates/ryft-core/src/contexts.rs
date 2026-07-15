@@ -112,11 +112,15 @@ use std::rc::Rc;
 
 use crate::interpretation::{EagerInterpretationDriver, InterpretableOperation};
 use crate::macros::check_builders;
-use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::regions::BindingRegionDriver;
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::BindingRegionDriver;
+use crate::programs::values::Value;
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -522,8 +526,10 @@ mod tests {
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
-    use crate::regions::CalleeRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::{Atom, AtomId};
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::regions::CalleeRegionDriver;
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 

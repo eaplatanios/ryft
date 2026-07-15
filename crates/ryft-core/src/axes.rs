@@ -5,11 +5,12 @@ use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
 // TODO(eaplatanios): Should we move `AxisIndexOperation` to this module?
 use crate::tracing_v2::operations::collective::AxisIndexOperation;

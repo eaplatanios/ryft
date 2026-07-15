@@ -17,12 +17,16 @@ use crate::batching::{BatchableOperation, BatchingContext};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::ProgramError;
+use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -453,8 +457,8 @@ mod tests {
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
+    use crate::programs::regions::{EmptyRegionDriver, RegionId};
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::{EmptyRegionDriver, RegionId};
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
     use crate::types::DataType;

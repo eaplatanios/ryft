@@ -81,13 +81,16 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
+use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
-use crate::operations::{ElementwiseOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{Program, ProgramError, Value};
-use crate::regions::{
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
+use crate::programs::values::Value;
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Size, TypeError, Typed};

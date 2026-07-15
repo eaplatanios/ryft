@@ -19,6 +19,7 @@ use num_complex::Complex;
 use ryft_macros::{DifferentiableOperation, Operation, Parameter, TransposableOperation};
 
 use crate::contexts::EagerContext;
+use crate::operations::BooleanLike;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -36,8 +37,8 @@ use crate::operations::math::{
     SubOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
-use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
+use crate::programs::operations::Operation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{

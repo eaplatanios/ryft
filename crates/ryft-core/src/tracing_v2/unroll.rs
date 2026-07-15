@@ -34,8 +34,11 @@ use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::BooleanLike;
 use crate::operations::control_flow::WhileOperation;
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
-use crate::regions::RegionRef;
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::programs::Program;
+use crate::programs::regions::RegionRef;
 
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.

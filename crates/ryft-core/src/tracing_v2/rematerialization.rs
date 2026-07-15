@@ -51,15 +51,20 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
 use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{Atom, AtomId, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueId};
-use crate::regions::{Region, RegionId, RegionInterface};
+use crate::programs::atoms::{Atom, AtomId, MaybeZero};
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::instructions::InstructionId;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{Region, RegionId, RegionInterface};
+use crate::programs::values::Value;
+use crate::programs::{ProgramError, ValueId};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
 use crate::tracing_v2::operations::dot::DotOperation;
@@ -3471,7 +3476,7 @@ mod tests {
         /// Test-only operation that returns caller-selected output-region provenance.
         #[derive(Copy, Clone, Debug)]
         struct InvalidOriginOperation {
-            provenance: crate::regions::OutputRegionProvenance,
+            provenance: crate::programs::regions::OutputRegionProvenance,
         }
 
         impl Display for InvalidOriginOperation {
@@ -3498,7 +3503,10 @@ mod tests {
                 &["body"]
             }
 
-            fn output_region_provenance(&self, _output_index: usize) -> Vec<crate::regions::OutputRegionProvenance> {
+            fn output_region_provenance(
+                &self,
+                _output_index: usize,
+            ) -> Vec<crate::programs::regions::OutputRegionProvenance> {
                 vec![self.provenance]
             }
         }
@@ -3515,7 +3523,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 InvalidOriginOperation {
-                    provenance: crate::regions::OutputRegionProvenance { region_index: 0, output_index: 1 },
+                    provenance: crate::programs::regions::OutputRegionProvenance { region_index: 0, output_index: 1 },
                 },
                 vec![body_region],
                 vec![input],
@@ -3537,7 +3545,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 InvalidOriginOperation {
-                    provenance: crate::regions::OutputRegionProvenance { region_index: 1, output_index: 0 },
+                    provenance: crate::programs::regions::OutputRegionProvenance { region_index: 1, output_index: 0 },
                 },
                 vec![body_region],
                 vec![input],
@@ -3589,8 +3597,11 @@ mod tests {
                 &["body"]
             }
 
-            fn output_region_provenance(&self, output_index: usize) -> Vec<crate::regions::OutputRegionProvenance> {
-                vec![crate::regions::OutputRegionProvenance { region_index: 0, output_index }]
+            fn output_region_provenance(
+                &self,
+                output_index: usize,
+            ) -> Vec<crate::programs::regions::OutputRegionProvenance> {
+                vec![crate::programs::regions::OutputRegionProvenance { region_index: 0, output_index }]
             }
         }
 
@@ -3618,7 +3629,7 @@ mod tests {
     fn test_invalid_storage_operations_return_structured_errors() {
         use std::fmt::Display;
 
-        use crate::effects::{Effect, Effects};
+        use crate::programs::effects::{Effect, Effects};
 
         /// Malformed storage operation shape exercised by this test.
         #[derive(Copy, Clone, Debug)]

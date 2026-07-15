@@ -13,11 +13,11 @@ use lru::LruCache;
 use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
-use crate::operations::Operation;
 use crate::operations::constants::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
+use crate::programs::operations::Operation;
+use crate::programs::regions::CalleeRegionDriver;
 use crate::programs::{Program, ProgramError, Value};
-use crate::regions::CalleeRegionDriver;
 use crate::tracing::{DomainTracingContext, Tracer};
 use crate::types::Typed;
 
@@ -1535,7 +1535,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::regions::RegionInterface;
+    use crate::programs::regions::RegionInterface;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1543,7 +1543,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::compilation::{CompilationCacheDomain, CompilationContext};
-    use crate::operations::Operation;
+    use crate::programs::operations::Operation;
     use crate::types::{DataType, Type, TypeError};
 
     use super::*;

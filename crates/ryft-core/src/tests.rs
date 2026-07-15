@@ -24,8 +24,8 @@ use crate::broadcasting::Broadcastable;
 #[cfg(test)]
 use crate::contexts::Context;
 use crate::contexts::EagerContext;
-use crate::effects::{Effect, Effects};
 use crate::macros::check_count;
+use crate::operations::BooleanLike;
 use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::logical::{And, Not, Or, Xor};
@@ -35,10 +35,12 @@ use crate::operations::manipulation::{
 };
 use crate::operations::math::{Abs, Add, Atan2, Cos, Div, Exp, Log, Mul, Neg, Sin, Sqrt, Sub};
 use crate::operations::tag::Tag;
-use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
-use crate::programs::{ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::effects::{Effect, Effects};
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
@@ -323,19 +325,19 @@ impl crate::operations::control_flow::WhilePredicate for TestArray {
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> Zero<TestArray> for EagerContext<TestArray, O> {
+impl<O: crate::programs::operations::Operation<ArrayType>> Zero<TestArray> for EagerContext<TestArray, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> One<TestArray> for EagerContext<TestArray, O> {
+impl<O: crate::programs::operations::Operation<ArrayType>> One<TestArray> for EagerContext<TestArray, O> {
     fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> Fill<Scalar, TestArray> for EagerContext<TestArray, O> {
+impl<O: crate::programs::operations::Operation<ArrayType>> Fill<Scalar, TestArray> for EagerContext<TestArray, O> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
         // `TestArray` stores `f64` elements, so any fill value that widens to `f64` is representable and complex
         // fill values surface the cast's promotion error.
@@ -344,7 +346,7 @@ impl<O: crate::operations::Operation<ArrayType>> Fill<Scalar, TestArray> for Eag
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> crate::operations::constants::Iota<TestArray>
+impl<O: crate::programs::operations::Operation<ArrayType>> crate::operations::constants::Iota<TestArray>
     for EagerContext<TestArray, O>
 {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
@@ -386,7 +388,7 @@ impl OneLike for TestArray {
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> CoordinateBasis<TestArray> for EagerContext<TestArray, O> {
+impl<O: crate::programs::operations::Operation<ArrayType>> CoordinateBasis<TestArray> for EagerContext<TestArray, O> {
     fn coordinate_basis(
         &self,
         leaf_type: &ArrayType,
@@ -2487,7 +2489,7 @@ mod linearization_tests {
         .unwrap();
         let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
-        use crate::operations::Operation;
+        use crate::programs::operations::Operation;
         assert!(
             !jvp_program.instructions().iter().any(|instruction| instruction.operation().name() == "zero"),
             "expected no staged zero instructions in the fused jvp program, but got:\n{jvp_program}",
@@ -2945,11 +2947,11 @@ mod linearization_tests {
 
     #[test]
     fn test_custom_vjp_backward_zero_outputs_are_recovered_as_structural_zeros() {
-        use crate::operations::Operation;
         use crate::operations::constants::ZeroOperation;
         use crate::operations::math::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
+        use crate::programs::operations::Operation;
         use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
 
         // f(x) = custom_vjp(add)(sin(x), cos(x)) with a user backward that returns `[cotangent, zero]`: the second
@@ -3287,13 +3289,13 @@ mod array_linearization_tests {
 
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationTracer, Linearization, LinearizationTracer};
-    use crate::operations::Operation;
     use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::{Select, WhileOperation};
     use crate::operations::manipulation::{Broadcast, Reshape};
     use crate::operations::math::Sin;
     use crate::programs::Program;
+    use crate::programs::operations::Operation;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -4938,13 +4940,13 @@ mod batching_tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
-    use crate::operations::Operation;
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::Transpose;
     use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
