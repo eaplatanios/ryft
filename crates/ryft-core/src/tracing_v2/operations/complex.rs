@@ -1,6 +1,7 @@
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -17,13 +18,13 @@ use crate::types::Typed;
 impl<C: Context> DifferentiableOperation<C> for ComplexOperation
 where
     C: Zero<C::Value>,
-    C::Operation: Clone,
     C::Value: Complex,
     ComplexOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -57,9 +58,10 @@ where
     O: Operation<V::Type> + From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
     ComplexOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -77,13 +79,13 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for ConjugateOperation
 where
-    C::Operation: Clone,
     C::Value: Conjugate,
     ConjugateOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -105,9 +107,10 @@ impl<V: Value, O: Operation<V::Type> + From<ConjugateOperation>> TransposableOpe
 where
     ConjugateOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -122,13 +125,13 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for RealOperation
 where
-    C::Operation: Clone,
     C::Value: Real,
     RealOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -152,9 +155,10 @@ where
     O: Operation<V::Type> + From<ComplexOperation> + From<ZeroLikeOperation>,
     RealOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -172,13 +176,13 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for ImaginaryOperation
 where
-    C::Operation: Clone,
     C::Value: Imaginary,
     ImaginaryOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -202,9 +206,10 @@ where
     O: Operation<V::Type> + From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
     ImaginaryOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -226,8 +231,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
     use crate::tracing_v2::ForwardModeDifferentiate;

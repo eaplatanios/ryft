@@ -12,9 +12,12 @@ use crate::operations::constants::{FillOperation, IotaOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
+use crate::interpretation::InterpretationDriver;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 
@@ -22,7 +25,7 @@ use crate::types::{ArrayType, DataType, TypeError, Typed};
 ///
 /// Collectives operate on a named axis, resolved against the active [`NamedAxes`] environment. When an enclosing
 /// `batch` level binds the name (a [`NamedAxis::Batched`](crate::axes::NamedAxis) axis), the matching
-/// [`BatchingContext`](crate::batching::BatchingContext) consumes the mapped batch axis at trace time.
+/// [`BatchingContext`] consumes the mapped batch axis at trace time.
 /// When a `shard_map` manual region binds the name to a device mesh axis (a
 /// [`NamedAxis::Mesh`](crate::axes::NamedAxis) axis), the collective stays in the staged body and lowers to a
 /// cross-device `all_reduce` over that mesh axis. The operations described here mirror JAX's
@@ -79,7 +82,7 @@ impl Display for CollectiveKind {
 pub trait Collective: Sized {
     /// Stages a collective of the given kind referencing axis `axis_name`, validating that the name is bound by an
     /// enclosing transform. Returns [`AxisError::UnboundAxisName`] (surfaced as
-    /// [`BatchingError::Axis`](crate::batching::BatchingError::Axis) riding a [`ProgramError::Custom`] payload) when no
+    /// [`BatchingError::Axis`] riding a [`ProgramError::Custom`] payload) when no
     /// enclosing binder binds `axis_name`.
     fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError>;
 }
@@ -100,7 +103,7 @@ where
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
         }
         let mut outputs =
-            context.bind(CollectiveOperation::new(axis_name.to_string(), kind), &[], &[], &[self.clone()])?;
+            context.bind(CollectiveOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -110,7 +113,7 @@ where
 ///
 /// [`CollectiveOperation`] is identity at the per-item level (the named axis does not exist in
 /// per-item semantics) and collapses the mapped axis when invoked inside a
-/// [`BatchingContext`](crate::batching::BatchingContext) whose
+/// [`BatchingContext`] whose
 /// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name. Under
 /// nested `batch` levels, the batching rule below owns that decision: a matching level consumes the mapped
 /// batch axis, while a non-matching level forwards the collective untouched to its parent context via
@@ -161,7 +164,11 @@ impl Operation<ArrayType> for CollectiveOperation {
         }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         // The per-item operation is identity; the named axis only exists physically inside an
         // enclosing `BatchingContext` where the batching rule will collapse it.
@@ -174,11 +181,16 @@ impl Operation<ArrayType> for CollectiveOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for CollectiveOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CollectiveOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // Per-item interpretation is identity: the named axis does not exist in per-item semantics, so reducing across
-        // it is a no-op. Staging a collective over an unbound axis is now rejected up front (see [`Collective`]), so an
+        // it is a no-op. Staging a collective over an unbound axis is now rejected up front (see `Collective`), so an
         // enclosing binder always collapses the mapped axis through the batching rule before this per-item fallback
         // matters; it remains defined for a program interpreted directly, where a collective simply passes its operand
         // through per item.
@@ -207,8 +219,11 @@ where
     C: Context<Type = ArrayType>,
     C::Operation: From<CollectiveOperation>,
 {
-    let mut outputs =
-        context.bind(CollectiveOperation::new(axis_name.to_string(), kind), &[], &[], std::slice::from_ref(operand))?;
+    let mut outputs = context.bind(
+        CollectiveOperation::new(axis_name.to_string(), kind),
+        Vec::new(),
+        std::slice::from_ref(operand),
+    )?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -220,11 +235,12 @@ where
 /// error.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CollectiveOperation
 where
-    C::Operation: Clone + From<CollectiveOperation>,
+    C::Operation: From<CollectiveOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -254,11 +270,12 @@ where
 impl<V, O> TransposableOperation<V, O> for CollectiveOperation
 where
     V: Value<Type = ArrayType>,
-    O: Clone + Operation<ArrayType> + From<CollectiveOperation>,
+    O: Operation<ArrayType> + From<CollectiveOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -298,9 +315,10 @@ where
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
     <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        context: &crate::batching::BatchingContext<C>,
+        context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[crate::batching::ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<crate::batching::ArrayBatch<<C as Domain>::Value>>, crate::batching::BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
@@ -312,7 +330,7 @@ where
             // parent, staged into the enclosing trace under a staging parent.
             context
                 .parent()
-                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), &[], &[], &[])?
+                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), Vec::new(), &[])?
                 .into_iter()
                 .next()
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
@@ -326,7 +344,7 @@ where
 /// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through
 /// every inner level untouched: each inner batch item participates in the outer collective independently, so the
 /// operands' mapped axes are preserved as-is on the forwarded outputs. The parent may itself be another
-/// [`BatchingContext`](crate::batching::BatchingContext) — whose own rule dispatch repeats this name
+/// [`BatchingContext`] — whose own rule dispatch repeats this name
 /// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
 /// operations should use this helper for their "not my axis" arm.
 pub fn forward_collective_to_parent<C>(
@@ -338,7 +356,7 @@ where
     C: Context<Type = ArrayType>,
 {
     let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
-    let parent_outputs = context.parent().bind(parent_operation, &[], &[], &parent_input_values)?;
+    let parent_outputs = context.parent().bind(parent_operation, Vec::new(), &parent_input_values)?;
     check_count!("output", parent_outputs, inputs.len(), ProgramError);
     parent_outputs
         .into_iter()
@@ -398,7 +416,7 @@ fn pmean_factor_type(data_type: DataType) -> ArrayType {
 }
 
 /// Canonical operation name for [`AxisIndexOperation`].
-pub const AXIS_INDEX_OPERATION_NAME: &'static str = "axis_index";
+pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 
 /// Nullary primitive that produces the current batch item's or device shard's index along a named axis as a scalar
 /// [`DataType::U64`] value — the ryft analogue of JAX's
@@ -446,7 +464,11 @@ impl Operation<ArrayType> for AxisIndexOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![ArrayType::scalar(DataType::U64)])
     }
@@ -457,8 +479,13 @@ impl Operation<ArrayType> for AxisIndexOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for AxisIndexOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         // A mesh axis index is a per-device coordinate that only exists during sharded execution; there is no eager
         // value to produce. It is lowered inside a `shard_map` manual region and never interpreted directly.
@@ -478,12 +505,13 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for AxisInde
 where
     C::Operation: From<AxisIndexOperation>,
 {
-    fn partially_evaluate(
+    fn partially_evaluate<D: crate::partial::PartialEvaluationDriver<C>>(
         &self,
         context: &crate::partial::PartialEvaluationContext<C>,
+        _driver: &D,
         inputs: &[crate::partial::PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<crate::partial::PartialEvaluationValue<C::Value>>, ProgramError> {
-        context.residualize(self.clone(), inputs)
+        context.residualize(self.clone(), Vec::new(), inputs)
     }
 }
 
@@ -491,19 +519,20 @@ where
 /// is replayed and paired with a typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for AxisIndexOperation
 where
-    C::Operation: Clone + From<AxisIndexOperation>,
+    C::Operation: From<AxisIndexOperation>,
     AxisIndexOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -512,9 +541,10 @@ where
 
 /// Transpose rule for [`AxisIndexOperation`]: it is a nullary constant, so it contributes no operand cotangents.
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for AxisIndexOperation {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -538,9 +568,10 @@ where
     C: Context<Type = ArrayType>,
     C::Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        context: &crate::batching::BatchingContext<C>,
+        context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[crate::batching::ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<crate::batching::ArrayBatch<<C as Domain>::Value>>, crate::batching::BatchingError> {
         if context.axis_name() == Some(self.axis_name.as_str()) {
@@ -551,13 +582,14 @@ where
             let physical_type =
                 ArrayType::new(DataType::U64, crate::types::Shape::new(vec![crate::types::Size::Static(size)]));
             let mut index_vector =
-                context.parent().bind(IotaOperation::new(physical_type.clone(), 0), &[], &[], &[])?;
+                context.parent().bind(IotaOperation::new(physical_type.clone(), 0), Vec::new(), &[])?;
             check_count!("output", index_vector, 1, ProgramError);
             Ok(vec![crate::batching::ArrayBatch::new(physical_type, index_vector.remove(0), Some(0))?])
         } else {
             // The axis is bound by an outer `batch` level or a device mesh: re-bind into the parent, which repeats the
             // resolution, and present the forwarded index as replicated across this level.
-            let mut outputs = context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), &[], &[], &[])?;
+            let mut outputs =
+                context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(vec![crate::batching::ArrayBatch::replicated(outputs.remove(0))])
         }
@@ -568,10 +600,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::batching::ArrayBatch;
-    use crate::batching::BatchAxis;
-    use crate::batching::BatchableOperation;
-    use crate::batching::BatchingContext;
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
@@ -594,7 +623,7 @@ mod tests {
         }
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
-            .batch(&batching_context(3), &[input])
+            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -609,7 +638,7 @@ mod tests {
         }
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax)
-            .batch(&batching_context(3), &[input])
+            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -620,7 +649,7 @@ mod tests {
     fn test_collective_passes_through_replicated_input() {
         let input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
-            .batch(&batching_context(3), &[input])
+            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -630,9 +659,7 @@ mod tests {
     #[test]
     fn test_collective_over_unbound_axis_is_rejected() {
         use crate::axes::AxisError;
-        use crate::batching::Batch;
-        use crate::batching::BatchingTracer;
-        use crate::batching::{BatchAxis, BatchAxisSpecification};
+        use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingTracer};
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
@@ -657,13 +684,11 @@ mod tests {
 
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
-        use crate::batching::Batch;
-        use crate::batching::BatchAxisSpecification;
+        use crate::batching::{Batch, BatchAxisSpecification};
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
         use crate::tests::TestArray;
-        use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::ReverseModeDifferentiate;
+        use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
@@ -693,13 +718,11 @@ mod tests {
 
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
-        use crate::batching::Batch;
-        use crate::batching::BatchAxisSpecification;
+        use crate::batching::{Batch, BatchAxisSpecification};
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
         use crate::tests::TestArray;
-        use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::ReverseModeDifferentiate;
+        use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the

@@ -1,6 +1,8 @@
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::operations::Operation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::partial::PartialValue;
@@ -18,9 +20,10 @@ macro_rules! logical_unsupported_transpose {
         where
             $operation: Operation<T>,
         {
-            fn transpose(
+            fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
                 _context: &mut TracingContext<V, O>,
+                _driver: &D,
                 _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
                 _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
             ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -47,19 +50,20 @@ logical_unsupported_transpose!(XorOperation);
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for NotOperation
 where
-    C::Operation: Clone + From<NotOperation>,
+    C::Operation: From<NotOperation>,
     NotOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -70,19 +74,20 @@ where
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for AndOperation
 where
-    C::Operation: Clone + From<AndOperation>,
+    C::Operation: From<AndOperation>,
     AndOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -93,19 +98,20 @@ where
 /// the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for OrOperation
 where
-    C::Operation: Clone + From<OrOperation>,
+    C::Operation: From<OrOperation>,
     OrOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -116,19 +122,20 @@ where
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for XorOperation
 where
-    C::Operation: Clone + From<XorOperation>,
+    C::Operation: From<XorOperation>,
     XorOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -146,8 +153,7 @@ mod tests {
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::ForwardModeDifferentiate;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
 
     /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn masked_select(

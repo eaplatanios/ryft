@@ -1,22 +1,21 @@
 use std::fmt::Display;
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{
-    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
+    Constant, ConstantOperation, Fill, FillOperation, Iota, IotaOperation, One, OneLikeOperation, OneOperation, Zero,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
@@ -26,32 +25,28 @@ use crate::types::{ArrayType, Type, Typed};
 /// [`ArrayBatch`] (`batch_axis = None`). Downstream elementwise consumers that need the constant
 /// materialized at the batched physical shape will broadcast it through the internal elementwise
 /// batching rule.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<ArrayType>
-where
-    ZeroOperation<ArrayType>: InterpretableOperation<C::Value, C>,
-{
-    fn batch(
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> BatchableOperation<C> for ZeroOperation<ArrayType> {
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(context.parent(), &[])?;
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is replicated by the
 /// same argument.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for OneOperation<ArrayType>
-where
-    OneOperation<ArrayType>: InterpretableOperation<C::Value, C>,
-{
-    fn batch(
+impl<C: Context<Type = ArrayType> + One<C::Value>> BatchableOperation<C> for OneOperation<ArrayType> {
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(context.parent(), &[])?;
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
@@ -62,31 +57,31 @@ where
 impl<Stored, C> BatchableOperation<C> for ConstantOperation<Stored>
 where
     Stored: Clone + Display + Typed<Type = ArrayType>,
-    C: Context<Type = ArrayType>,
-    ConstantOperation<Stored>: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType> + Constant<C::Value, Stored>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(context.parent(), &[])?;
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`FillOperation`] is also replicated because it has no
 /// data inputs.
-impl<F: Clone + Display, C: Context<Type = ArrayType>> BatchableOperation<C> for FillOperation<ArrayType, F>
-where
-    FillOperation<ArrayType, F>: InterpretableOperation<C::Value, C>,
+impl<F: Clone + Display, C: Context<Type = ArrayType> + Fill<F, C::Value>> BatchableOperation<C>
+    for FillOperation<ArrayType, F>
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(context.parent(), &[])?;
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
@@ -94,24 +89,23 @@ where
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`IotaOperation`] is also replicated because it has no data
 /// inputs; a raw iota of a fixed type is the same value for every batch item. (The per-item batch index produced by
 /// `axis_index` is materialized directly against the mapped axis instead of relying on this replicated rule.)
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for IotaOperation<ArrayType>
-where
-    IotaOperation<ArrayType>: InterpretableOperation<C::Value, C>,
-{
-    fn batch(
+impl<C: Context<Type = ArrayType> + Iota<C::Value>> BatchableOperation<C> for IotaOperation<ArrayType> {
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(context.parent(), &[])?;
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -121,9 +115,10 @@ impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> f
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for OneOperation<T> {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -138,10 +133,12 @@ where
     V: Value<Type = T>,
     O: Operation<T>,
     F: Clone + Display + Typed<Type = T>,
+    Mode: Clone,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -151,9 +148,10 @@ where
 }
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOperation {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -164,9 +162,10 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOp
 }
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for OneLikeOperation {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -181,11 +180,12 @@ where
     T: Type,
     V: Value<Type = T>,
     O: Operation<T>,
-    F: Display,
+    F: Clone + Display,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -195,9 +195,10 @@ where
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for IotaOperation<T> {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -210,19 +211,19 @@ impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> f
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for ZeroOperation<C::Type>
 where
-    C::Operation: Clone + From<ZeroOperation<C::Type>>,
-    ZeroOperation<C::Type>: Operation<C::Type>,
+    C::Operation: From<ZeroOperation<C::Type>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -233,19 +234,19 @@ where
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for OneOperation<C::Type>
 where
-    C::Operation: Clone + From<OneOperation<C::Type>>,
-    OneOperation<C::Type>: Operation<C::Type>,
+    C::Operation: From<OneOperation<C::Type>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -256,19 +257,19 @@ where
 /// and paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for ConstantOperation<C::Constant>
 where
-    C::Operation: Clone + From<ConstantOperation<C::Constant>>,
-    ConstantOperation<C::Constant>: Operation<C::Type>,
+    C::Operation: From<ConstantOperation<C::Constant>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -279,19 +280,19 @@ where
 /// `zero_like` of the exemplar) and paired with a typed zero tangent regardless of the exemplar's tangent.
 impl<C: Context> DifferentiableOperation<C> for ZeroLikeOperation
 where
-    C::Operation: Clone + From<ZeroLikeOperation>,
-    ZeroLikeOperation: Operation<C::Type>,
+    C::Operation: From<ZeroLikeOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(*self, &[], &[], &primal_inputs)?
+            .bind(*self, Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -302,19 +303,19 @@ where
 /// `one_like` of the exemplar) and paired with a typed zero tangent regardless of the exemplar's tangent.
 impl<C: Context> DifferentiableOperation<C> for OneLikeOperation
 where
-    C::Operation: Clone + From<OneLikeOperation>,
-    OneLikeOperation: Operation<C::Type>,
+    C::Operation: From<OneLikeOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(*self, &[], &[], &primal_inputs)?
+            .bind(*self, Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -325,19 +326,19 @@ where
 /// value and paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context, F: Clone + Display> DifferentiableOperation<C> for FillOperation<C::Type, F>
 where
-    C::Operation: Clone + From<FillOperation<C::Type, F>>,
-    FillOperation<C::Type, F>: Operation<C::Type>,
+    C::Operation: From<FillOperation<C::Type, F>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -348,19 +349,19 @@ where
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for IotaOperation<C::Type>
 where
-    C::Operation: Clone + From<IotaOperation<C::Type>>,
-    IotaOperation<C::Type>: Operation<C::Type>,
+    C::Operation: From<IotaOperation<C::Type>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -371,10 +372,8 @@ where
 mod tests {
     use indoc::indoc;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
-    use crate::contexts::Context;
-    use crate::contexts::EagerContext;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::contexts::{Context, EagerContext};
     use crate::operations::math::{Cos, Sin};
     use crate::programs::Program;
 

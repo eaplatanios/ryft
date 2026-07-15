@@ -1,8 +1,10 @@
 use std::ops::Mul;
 
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::math::{Cos, Sin, SinOperation};
@@ -12,13 +14,13 @@ use crate::tracing::{Tracer, TracingContext};
 
 impl<C: Context> DifferentiableOperation<C> for SinOperation
 where
-    C::Operation: Clone,
     C::Value: Sin + Cos + Mul<Output = C::Value>,
     SinOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -41,9 +43,10 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for SinOperati
 where
     SinOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -58,8 +61,7 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::operations::math::Sin;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};

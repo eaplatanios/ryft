@@ -7,12 +7,7 @@
 //! kinds (`Overwrite`/`Mul`/`Min`/`Max`) are not linear; differentiating them is not yet implemented (their pullbacks
 //! need a primal-domain mask and a `unique_indices` guarantee, matching JAX's restrictions).
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -27,7 +22,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -39,12 +35,13 @@ use crate::types::{ArrayType, TypeError, Typed};
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation).
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ScatterOperation
 where
-    C::Operation: Clone + From<ScatterOperation>,
+    C::Operation: From<ScatterOperation>,
     C::Value: Scatter,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
@@ -89,9 +86,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScatterOpera
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<GatherOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -158,7 +156,8 @@ where
                     .with_indices_are_sorted(self.indices_are_sorted())
                     .with_unique_indices(self.unique_indices())
                     .with_output_sharding(updates_type.sharding().cloned());
-                let update_cotangents = context.stage_operation(gather_operation, &[cotangent.clone(), indices])?;
+                let update_cotangents =
+                    context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
                 check_count!("output", update_cotangents, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(cotangent.clone()),
@@ -178,12 +177,14 @@ where
 /// the scatter applies once, unbatched.
 impl<C> BatchableOperation<C> for ScatterOperation
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    ScatterOperation: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    ScatterOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
@@ -199,13 +200,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::Context;
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.

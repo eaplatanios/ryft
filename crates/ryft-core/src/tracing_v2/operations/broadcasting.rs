@@ -8,7 +8,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
@@ -26,9 +27,10 @@ where
         + From<TransposeOperation>
         + From<ReshapeOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -87,12 +89,13 @@ where
 /// rule is consulted, so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for BroadcastOperation
 where
-    C::Operation: Clone + From<BroadcastOperation>,
+    C::Operation: From<BroadcastOperation>,
     C::Value: Broadcast,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -136,9 +139,10 @@ pub fn lift_broadcast(
 }
 
 impl<C: Context<Type = ArrayType, Value: Broadcast>> crate::batching::BatchableOperation<C> for BroadcastOperation {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        _context: &crate::batching::BatchingContext<C>,
+        _context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[crate::batching::ArrayBatch<C::Value>],
     ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -175,8 +179,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::parameters::Placeholder;
     use crate::programs::Program;
     use crate::tests::TestArray;
@@ -198,7 +201,12 @@ mod tests {
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let cotangent = context.tracer(cotangent_atom, None);
         let contribution = operation
-            .transpose(&mut context, &[PartialValue::Unknown(input_type.clone())], &[MaybeZero::Value(cotangent)])
+            .transpose(
+                &mut context,
+                &crate::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type.clone())],
+                &[MaybeZero::Value(cotangent)],
+            )
             .unwrap()
             .into_iter()
             .next()
@@ -284,7 +292,12 @@ mod tests {
 
         let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
         let contributions = operation
-            .transpose(&mut context, &[PartialValue::Unknown(input_type)], &[MaybeZero::Zero(output_type)])
+            .transpose(
+                &mut context,
+                &crate::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type)],
+                &[MaybeZero::Zero(output_type)],
+            )
             .unwrap();
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());

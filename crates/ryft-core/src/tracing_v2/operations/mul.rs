@@ -9,18 +9,18 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for MulOperation
 where
-    C::Operation: Clone,
     C::Value: Mul<Output = C::Value> + Add<Output = C::Value>,
     MulOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -57,9 +57,10 @@ impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation
 where
     MulOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -101,8 +102,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::operations::math::MulOperation;
     use crate::parameters::Placeholder;
@@ -141,7 +141,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let residual = builder.add_input(scalar_type.clone());
         let tangent = builder.add_input(scalar_type.clone());
-        let product = builder.add_instruction(MulOperation, vec![residual, tangent]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![residual, tangent], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();

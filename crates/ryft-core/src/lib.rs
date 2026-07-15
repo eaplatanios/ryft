@@ -57,8 +57,8 @@ pub use programs::{
     ProgramLiveSets, Value, ValueId,
 };
 pub use regions::{
-    EmptyRegionDriver, OutputRegionProvenance, Region, RegionAttachments, RegionDriver, RegionId, RegionInterface,
-    RegionRef,
+    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionDriver, RegionId,
+    RegionInterface, RegionRef,
 };
 pub use sharding::*;
 pub use tracing::{

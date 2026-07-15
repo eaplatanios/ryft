@@ -1,15 +1,10 @@
 use std::fmt::Display;
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationError,
-    TransposableOperation, TransposableProgramOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -21,7 +16,7 @@ use crate::operations::manipulation::{
 };
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
-use crate::programs::{Atom, AtomId, Instruction, MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};
 
@@ -41,7 +36,7 @@ pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {
 /// Capture-free forward-mode (JVP) rule for [`ScanOperation`], staging **one fused** jvp `scan` with doubled
 /// carries and doubled scanned inputs as an ordinary primal-enum `scan` operation over the shared builder.
 ///
-/// The rule builds the body's fused jvp program through [`DifferentiableProgramOperation::jvp_program`] and permutes
+/// The rule builds the body's fused jvp program through its instruction-scoped differentiation driver and permutes
 /// its doubled signature into scan order, giving a fused body
 /// `[primal_carries..., tangent_carries..., primal_slices..., tangent_slices...] ->
 /// [primal_next_carries..., tangent_next_carries..., primal_outputs..., tangent_outputs...]`, and stages one scan
@@ -54,39 +49,34 @@ pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {
 /// primal scan — stacking exactly the per-iteration known→unknown edges the tangent side consumes — and a residual
 /// tangent scan over `[tangent_carries..., tangent_slices..., edge_slices...]`, the transposable linear-scan shape.
 /// Residual stacks therefore exist only when linearization actually demands them.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C>
-    for ScanOperation<C::Constant, C::Operation>
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ScanOperation<C::Constant>
 where
-    C::Operation: Clone
-        + From<ZeroOperation<ArrayType>>
-        + From<ScanOperation<C::Constant, C::Operation>>
-        + DifferentiableProgramOperation<C::Constant, C::Operation>,
+    C::Operation: From<ZeroOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The rule requests all nested-computation work through its driver (region 0 is the body), which keeps
+        // its bounds free of the operation family's own semantic traits.
         let carry_count = self.carry_count();
         let length = self.length();
         let reverse = self.reverse();
         let unroll = self.unroll();
-        let body_input_count = self.body().input_types().len();
-        let body_output_count = self.body().output_types().len();
+        let fused_body = driver.jvp_program(driver.region(0)?)?;
+        let body_input_count = fused_body.input_types().len() / 2;
+        let body_output_count = fused_body.output_types().len() / 2;
         check_count!("input", inputs, body_input_count, ProgramError);
 
-        // Build the fused jvp body over `[primal_body_inputs..., tangent_body_inputs...]` and permute its doubled
+        // The fused jvp body is over `[primal_body_inputs..., tangent_body_inputs...]`; permute its doubled
         // signature into scan order (carries lead scanned inputs on both sides).
-        let mut fused_body = C::Operation::jvp_program(self.body())?;
-        let fused_entry = fused_body.entry_region_mut();
-        fused_entry.input_ids =
-            permute_doubled_scan_signature(std::mem::take(&mut fused_entry.input_ids), body_input_count, carry_count);
-        fused_entry.output_ids =
-            permute_doubled_scan_signature(std::mem::take(&mut fused_entry.output_ids), body_output_count, carry_count);
+        let fused_body = permute_doubled_scan_body(fused_body, body_input_count, body_output_count, carry_count)?;
 
         // Stage the fused scan with doubled carries over
         // `[primal_carry_inits..., tangent_carry_inits..., primal_stacks..., tangent_stacks...]`.
-        let fused_scan = ScanOperation::<C::Constant, C::Operation>::new(fused_body, 2 * carry_count, length)?
+        let fused_scan = ScanOperation::<C::Constant>::new(2 * carry_count, length)
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         // The fused scan takes every carry and scanned tangent as a real program input, so materialize structural
@@ -100,7 +90,7 @@ where
         for input in &inputs[carry_count..] {
             operands.push(input.tangent().clone().materialize(context)?);
         }
-        let outputs = context.bind(C::Operation::from(fused_scan), &[], &[], &operands)?;
+        let outputs = context.bind(C::Operation::from(fused_scan), vec![fused_body], &operands)?;
         check_count!("output", outputs, 2 * body_output_count, ProgramError);
 
         // The fused scan's outputs are `[primal_final_carries..., tangent_final_carries..., primal_stacked...,
@@ -120,17 +110,141 @@ where
     }
 }
 
-/// Permutes one side of a fused jvp body's doubled scan signature from jvp order
+/// Returns the permutation that converts one side of a fused JVP body's doubled scan signature from JVP order
 /// (`[primal_entries..., tangent_entries...]`, each of length `half`) into scan order, where carries lead the
 /// scanned entries on both the primal and tangent halves:
 /// `[primal_carries..., tangent_carries..., primal_scanned..., tangent_scanned...]`.
-fn permute_doubled_scan_signature(ids: Vec<AtomId>, half: usize, carry_count: usize) -> Vec<AtomId> {
-    let mut permuted = Vec::with_capacity(ids.len());
-    permuted.extend_from_slice(&ids[..carry_count]);
-    permuted.extend_from_slice(&ids[half..half + carry_count]);
-    permuted.extend_from_slice(&ids[carry_count..half]);
-    permuted.extend_from_slice(&ids[half + carry_count..]);
-    permuted
+fn doubled_scan_signature_permutation(half: usize, carry_count: usize) -> Result<Vec<usize>, ProgramError> {
+    if carry_count > half {
+        return Err(ProgramError::MalformedProgram(format!(
+            "scan carry count {carry_count} exceeds fused body half-signature size {half}",
+        )));
+    }
+    let mut permutation = Vec::with_capacity(2 * half);
+    permutation.extend(0..carry_count);
+    permutation.extend(half..half + carry_count);
+    permutation.extend(carry_count..half);
+    permutation.extend(half + carry_count..2 * half);
+    Ok(permutation)
+}
+
+/// Rebuilds `program` with a new public boundary order. `input_order` and `output_order` list old boundary positions
+/// in the desired new order.
+fn reorder_program_boundary<V, O>(
+    program: Program<V, O, Vec<V>, Vec<V>>,
+    input_order: &[usize],
+    output_order: &[usize],
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+where
+    V: Value,
+    O: Operation<V::Type>,
+{
+    fn inverse_order(order: &[usize], length: usize, label: &str) -> Result<Vec<usize>, ProgramError> {
+        if order.len() != length {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{label} permutation has length {} but boundary has length {length}",
+                order.len(),
+            )));
+        }
+        let mut inverse = vec![None; length];
+        for (new_position, &old_position) in order.iter().enumerate() {
+            let Some(slot) = inverse.get_mut(old_position) else {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "{label} permutation references out-of-range position {old_position}",
+                )));
+            };
+            if slot.is_some() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "{label} permutation references position {old_position} more than once",
+                )));
+            }
+            *slot = Some(new_position);
+        }
+        inverse
+            .into_iter()
+            .enumerate()
+            .map(|(old_position, new_position)| {
+                new_position.ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "{label} permutation does not reference position {old_position}",
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    let input_types = program.input_types();
+    let output_count = program.output_count();
+    let inverse_input_order = inverse_order(input_order, input_types.len(), "input")?;
+    let _ = inverse_order(output_order, output_count, "output")?;
+    let reordered_input_types = input_order.iter().map(|&index| input_types[index].clone()).collect::<Vec<_>>();
+    let mut builder = ProgramBuilder::new();
+    let inputs = reordered_input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+    let original_inputs = inverse_input_order.iter().map(|&new_position| inputs[new_position]).collect::<Vec<_>>();
+    let outputs = builder.splice_program(&program, original_inputs.as_slice())?;
+    let reordered_outputs = output_order.iter().map(|&index| outputs[index]).collect::<Vec<_>>();
+    builder.build(reordered_outputs, vec![Placeholder; input_order.len()], vec![Placeholder; output_order.len()])
+}
+
+/// Rebuilds a fused JVP scan body so its doubled boundary uses scan order instead of JVP order.
+fn permute_doubled_scan_body<V, O>(
+    program: Program<V, O, Vec<V>, Vec<V>>,
+    input_half: usize,
+    output_half: usize,
+    carry_count: usize,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+where
+    V: Value,
+    O: Operation<V::Type>,
+{
+    let input_order = doubled_scan_signature_permutation(input_half, carry_count)?;
+    let output_order = doubled_scan_signature_permutation(output_half, carry_count)?;
+    reorder_program_boundary(program, input_order.as_slice(), output_order.as_slice())
+}
+
+/// Rebuilds a transposed scan body so it produces one carry cotangent output per carry, inserting typed zero
+/// instructions for carries that were known and therefore omitted by transposition.
+fn restore_known_carry_outputs<V, O>(
+    program: Program<V, O, Vec<V>, Vec<V>>,
+    body_output_types: &[ArrayType],
+    operand_linear: &[bool],
+    carry_count: usize,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
+{
+    let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
+    let input_types = program.input_types();
+    let input_count = input_types.len();
+    let mut builder = ProgramBuilder::new();
+    let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+    let mut outputs = builder.splice_program(&program, inputs.as_slice())?;
+    check_count!("output", outputs, program.output_count(), ProgramError);
+    let trailing_outputs = outputs.split_off(linear_carry_count);
+    let mut linear_carry_outputs = outputs.into_iter();
+    let mut restored_outputs = Vec::with_capacity(carry_count + trailing_outputs.len());
+    for (carry_index, &carry_is_linear) in operand_linear[..carry_count].iter().enumerate() {
+        if carry_is_linear {
+            restored_outputs.push(linear_carry_outputs.next().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "scan transpose missing linear carry cotangent output {carry_index}",
+                ))
+            })?);
+        } else {
+            // A differentiable carry's cotangent slot carries its cotangent dual; a non-differentiable carry (the
+            // `float0` analogue) has no cotangent space, so its slot carries only structural zeros typed by the
+            // carry's own primal type.
+            let output_type = &body_output_types[carry_index];
+            let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.clone());
+            let zero = builder.add_instruction(ZeroOperation::new(cotangent_type), Vec::new(), Vec::new())?;
+            check_count!("output", zero, 1, ProgramError);
+            restored_outputs.push(zero[0]);
+        }
+    }
+    restored_outputs.extend(trailing_outputs);
+    let output_count = restored_outputs.len();
+    builder.build(restored_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
 /// Extracts slice `iteration` of a stacked batch along its *logical* leading axis and drops that axis.
@@ -287,21 +401,21 @@ where
 /// against the same active context. Constants lift and stacked-output accumulators seed (via the parent's [`Zero`])
 /// through `context.parent()`, so an eager parent runs the batched scan operationally while a staging parent stages
 /// the per-iteration work into the enclosing trace.
-impl<C, O> BatchableOperation<C> for ScanOperation<C::Constant, O>
+impl<C> BatchableOperation<C> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
-    C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: Slice + UpdateSlice + Reshape,
     C::Operation:
         From<ZeroOperation<ArrayType>> + From<SliceOperation> + From<UpdateSliceOperation> + From<ReshapeOperation>,
-    O: BatchableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        let y_slice_types = self.body().output_types().split_off(self.carry_count());
+        let body = driver.region(0)?;
+        let y_slice_types = body.output_types().split_off(self.carry_count());
         batch_scan_with_interpreter(
             self.carry_count(),
             self.length(),
@@ -309,13 +423,7 @@ where
             y_slice_types.as_slice(),
             inputs,
             |stacked_type| context.parent().zero(stacked_type),
-            |_, iteration_inputs| {
-                self.body().interpret_with(
-                    iteration_inputs,
-                    |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
-                    |instruction, inputs| instruction.operation().batch(context, inputs),
-                )
-            },
+            |_, iteration_inputs| driver.batch_region(context, 0, iteration_inputs),
         )
     }
 }
@@ -326,16 +434,18 @@ where
 /// [`DataType`] rules stay coherent without the operation struct naming its type family as a parameter. The
 /// [`ArrayType`] rule pins the staging target to the scan's own body operation family `O`, while the [`DataType`]
 /// rule keeps an independent `Target` because a scalar linear scan never inlines its body into the pullback.
-pub(crate) trait ScanTransposition<V, O, F, Payload, Target>: Type
+pub(crate) trait ScanTransposition<V, F, Target>: Type
 where
     V: Value<Type = Self>,
+    F: Value<Type = Self>,
     Target: Operation<Self>,
 {
-    /// Applies the type family's `scan` transpose rule; refer to the documentation of
+    /// Applies the type family's `scan` transpose rule using the loop's driver; refer to the documentation of
     /// [`TransposableOperation::transpose`] for the contract.
-    fn transpose_scan(
-        operation: &ScanOperation<V, O, F, Payload>,
+    fn transpose_scan<D: TranspositionDriver<V, Target>>(
+        operation: &ScanOperation<F>,
         context: &mut TracingContext<V, Target>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError>;
@@ -352,33 +462,37 @@ where
 ///
 /// A capture-free scan is a *primal* operand-form scan whose known residual stacks ride as ordinary operands, so it is
 /// forwarded to the partition-aware [`transpose_primal_scan`] rule instead. Both forms recurse into the body through
-/// the [`TransposableProgramOperation`] fixed-point witness, keeping the scan-local fixed point owned by the operation
+/// the instruction-scoped driver's transposition requests, keeping the scan-local recursion owned by the operation
 /// family with no recursive [`TransposableOperation`] obligation on `O`.
-impl<V, F, O, Payload> ScanTransposition<V, O, F, Payload, O> for ArrayType
+impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayType
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    O: TransposableProgramOperation<V> + From<ZeroOperation<ArrayType>> + From<ScanOperation<V, O, F, Payload>>,
+    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<F>>,
 {
-    fn transpose_scan(
-        operation: &ScanOperation<V, O, F, Payload>,
-        context: &mut TracingContext<V, O>,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+    fn transpose_scan<D: TranspositionDriver<V, Target>>(
+        operation: &ScanOperation<F>,
+        context: &mut TracingContext<V, Target>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
+        // The rule requests all nested-computation work through its driver (region 0 is the body), which keeps
+        // its bounds free of the operation family's own semantic traits.
+        //
         // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
         if outputs.iter().all(MaybeZero::is_zero) {
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
         }
         if operation.captures().is_empty() {
-            return transpose_primal_scan(operation, context, inputs, outputs).map_err(DifferentiationError::from);
+            return transpose_primal_scan(operation, context, driver, inputs, outputs)
+                .map_err(DifferentiationError::from);
         }
-        let body = operation.body();
+        let body = driver.region(0)?;
         let carry_count = operation.carry_count();
         let length = operation.length();
-        let transposed_body =
-            <O as TransposableProgramOperation<V>>::transpose_program(body, &vec![true; body.input_ids().len()])?;
-        let transposed = ScanOperation::<V, O, F, Payload>::new_with_payload(transposed_body, carry_count, length)?
+        let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
+        let transposed = ScanOperation::<F>::new(carry_count, length)
             .with_reverse(!operation.reverse())
             .with_unroll(operation.unroll())?
             .with_captures(operation.captures().to_vec());
@@ -390,7 +504,8 @@ where
             .iter()
             .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
-        let cotangents = context.stage_operation(O::from(transposed), materialized.as_slice())?;
+        let cotangents =
+            context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
         check_count!("output", cotangents, inputs.len(), ProgramError);
         Ok(cotangents.into_iter().map(MaybeZero::Value).collect())
     }
@@ -409,7 +524,7 @@ where
 /// operands need not form a leading run: vmapping a bounded `while` threads a non-differentiable Boolean mask as a
 /// known *carry*, so a known operand can sit among the linear carries. This rule therefore:
 ///
-///   1. Transposes the body with [`TransposableProgramOperation::transpose_program`] under each
+///   1. Transposes the body through its instruction-scoped driver under each
 ///      input's own linearity. The transposed body maps every body output's cotangent followed by every known body
 ///      input's runtime value to every *linear* body input's cotangent:
 ///      `[carry_output_cotangent..., y_slice_cotangent..., known_input_value...] -> [linear_input_cotangent...]`.
@@ -430,7 +545,7 @@ where
 /// The returned cotangents place the reversed scan's carry cotangents at the carry-operand positions, its
 /// scanned-output cotangents at the linear scanned-operand positions, and a structural [`MaybeZero::Zero`] at the
 /// known scanned-operand positions, which carry no cotangent. The body recursion happens through the
-/// [`TransposableProgramOperation`] fixed-point witness in the same operation family, so it introduces no recursive
+/// instruction-scoped driver's transposition requests in the same operation family, so it introduces no recursive
 /// [`TransposableOperation`] obligation on `O`.
 ///
 /// # Parameters
@@ -441,16 +556,17 @@ where
 ///     A linear operand is [`Unknown`](PartialValue::Unknown); a known operand is
 ///     [`Known`](PartialValue::Known) of the residual-stack tracer the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the scan's outputs.
-pub fn transpose_primal_scan<V, O, F, Payload>(
-    operation: &ScanOperation<V, O, F, Payload>,
+pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
+    operation: &ScanOperation<F>,
     context: &mut TracingContext<V, O>,
+    driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    O: TransposableProgramOperation<V> + From<ZeroOperation<ArrayType>> + From<ScanOperation<V, O, F, Payload>>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -463,7 +579,7 @@ where
     // Boolean mask as a known *carry*, so a known operand can sit among the linear carries. The leading `carry_count`
     // operands are the carries and the rest are scanned inputs.
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let body = operation.body();
+    let body = driver.region(0)?;
     let carry_count = operation.carry_count();
     let length = operation.length();
     check_count!("input", operand_linear, body.input_types().len(), ProgramError);
@@ -478,7 +594,11 @@ where
     // followed by every known body input's runtime value to the cotangent of every *linear* body input only:
     // `[carry_output_cotangent..., y_slice_cotangent..., known_input_value...] -> [linear_input_cotangent...]`, in body
     // order on each side.
-    let mut transposed_body = O::transpose_program(body, operand_linear.as_slice())?;
+    let mut transposed_body =
+        driver.transpose_program(body, operand_linear.as_slice()).map_err(|error| match error {
+            crate::differentiation::DifferentiationError::Program(error) => error,
+            error => ProgramError::UnsupportedOperation { message: error.to_string() },
+        })?;
 
     // `transpose_with_respect_to` emits one cotangent output per linear input, so a known carry contributes no carry
     // output and the transposed body has fewer carry outputs than the reversed scan's `carry_count` requires. Restore
@@ -488,35 +608,15 @@ where
     // are carried over unchanged, so the reversed body produces `[carry_cotangent..., scanned_input_cotangent...]`.
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     if linear_carry_count != carry_count {
-        let transposed_body_region = transposed_body.entry_region_mut();
-        let trailing_outputs = transposed_body_region.output_ids.split_off(linear_carry_count);
-        let mut linear_carry_outputs = transposed_body_region.output_ids.split_off(0).into_iter();
-        for (carry_index, &carry_is_linear) in operand_linear[..carry_count].iter().enumerate() {
-            if carry_is_linear {
-                transposed_body_region.output_ids.push(linear_carry_outputs.next().unwrap());
-            } else {
-                // A differentiable carry's cotangent slot carries its cotangent dual; a non-differentiable carry (the
-                // `float0` analogue) has no cotangent space, so its slot carries only structural zeros typed by the
-                // carry's own primal type. Either way the slot type matches the reversed scan's carry slot type fed by
-                // the scan output cotangent below.
-                let output_type = &body.output_types()[carry_index];
-                let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.clone());
-                let zero_output = AtomId::new(transposed_body_region.atoms.len());
-                transposed_body_region.atoms.push(Atom::Variable(cotangent_type.clone()));
-                transposed_body_region.instructions.push(Instruction::new(
-                    O::from(ZeroOperation::new(cotangent_type)),
-                    Vec::new(),
-                    vec![zero_output],
-                    Vec::new(),
-                ));
-                transposed_body_region.output_ids.push(zero_output);
-            }
-        }
-        transposed_body_region.output_ids.extend(trailing_outputs);
-        transposed_body.output_structure = vec![Placeholder; transposed_body.output_ids().len()];
+        transposed_body = restore_known_carry_outputs(
+            transposed_body,
+            body.output_types().as_slice(),
+            operand_linear.as_slice(),
+            carry_count,
+        )?;
     }
 
-    let transposed = ScanOperation::<V, O, F, Payload>::new_with_payload(transposed_body, carry_count, length)?
+    let transposed = ScanOperation::<F>::new(carry_count, length)
         .with_reverse(!operation.reverse())
         .with_unroll(operation.unroll())?;
 
@@ -562,7 +662,7 @@ where
     // The reversed scan outputs one carry cotangent per carry and one stacked scanned-output cotangent per *linear*
     // scanned input.
     let linear_scanned_count = operand_linear[carry_count..].iter().filter(|&&linear| linear).count();
-    let scan_cotangents = context.stage_operation(O::from(transposed), operands.as_slice())?;
+    let scan_cotangents = context.stage_operation(O::from(transposed), vec![transposed_body], operands.as_slice())?;
     check_count!("output", scan_cotangents, carry_count + linear_scanned_count, ProgramError);
 
     // Reassemble one cotangent per operand. The reversed scan outputs `[carry_cotangent..., scanned_input_cotangent...]`,
@@ -587,16 +687,16 @@ where
     Ok(cotangents)
 }
 
-impl<V, F, O, Payload, Target> ScanTransposition<V, O, F, Payload, Target> for DataType
+impl<V, F, Target> ScanTransposition<V, F, Target> for DataType
 where
     V: Value<Type = DataType>,
     F: Value<Type = DataType>,
-    O: TransposableProgramOperation<V>,
-    Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<V, O, F, Payload>>,
+    Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<F>>,
 {
-    fn transpose_scan(
-        operation: &ScanOperation<V, O, F, Payload>,
+    fn transpose_scan<D: TranspositionDriver<V, Target>>(
+        operation: &ScanOperation<F>,
         context: &mut TracingContext<V, Target>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
@@ -610,55 +710,53 @@ where
             }
             .into());
         }
-        let body = operation.body();
+        let body = driver.region(0)?;
         let output_types = body.output_types();
         check_count!("output", outputs, output_types.len(), ProgramError);
-        let transposed_body =
-            <O as TransposableProgramOperation<V>>::transpose_program(body, &vec![true; body.input_ids().len()])?;
-        let transposed = ScanOperation::<V, O, F, Payload>::new_with_payload(
-            transposed_body,
-            operation.carry_count(),
-            operation.length(),
-        )?
-        .with_reverse(!operation.reverse())
-        .with_unroll(operation.unroll())?
-        .with_captures(operation.captures().to_vec());
+        let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
+        let transposed = ScanOperation::<F>::new(operation.carry_count(), operation.length())
+            .with_reverse(!operation.reverse())
+            .with_unroll(operation.unroll())?
+            .with_captures(operation.captures().to_vec());
         let materialized = outputs
             .iter()
             .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
-        let cotangents = context.stage_operation(Target::from(transposed), materialized.as_slice())?;
+        let cotangents =
+            context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
         check_count!("output", cotangents, inputs.len(), ProgramError);
         Ok(cotangents.into_iter().map(MaybeZero::Value).collect())
     }
 }
 
-/// Transpose rule for [`ScanOperation`], dispatching to the scan's type family through [`ScanTransposition`]: array
+/// Transpose rule for [`ScanOperation`], dispatching to the scan's type family through the crate-private
+/// `ScanTransposition` trait: array
 /// scans transpose captured linear scans whole and forward operand-form primal scans to [`transpose_primal_scan`],
 /// and scalar scans transpose capture-free carry-only linear scans.
-impl<V, F, O, Payload, Target> TransposableOperation<V, Target> for ScanOperation<V, O, F, Payload>
+impl<V, F, Target> TransposableOperation<V, Target> for ScanOperation<F>
 where
     V: Value,
-    V::Type: ScanTypeSemantics + ScanTransposition<V, O, F, Payload, Target>,
+    V::Type: ScanTypeSemantics + ScanTransposition<V, F, Target>,
     F: Value<Type = V::Type>,
-    O: Operation<V::Type>,
     Target: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, Target>>(
         &self,
         context: &mut TracingContext<V, Target>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        <V::Type>::transpose_scan(self, context, inputs, outputs)
+        <V::Type>::transpose_scan(self, context, driver, inputs, outputs)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::batching::BatchingContext;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::ForwardModeDifferentiate;
     use crate::operations::math::MulOperation;
@@ -674,14 +772,14 @@ mod tests {
 
     type TestOperation = ArrayOperation<TestArray>;
     type TestEagerContext = EagerContext<TestArray, TestOperation>;
-    type TestScanOperation = ScanOperation<TestArray, TestOperation>;
+    type TestScanOperation = ScanOperation<TestArray>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`.
     fn product_body() -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -692,27 +790,65 @@ mod tests {
         ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
     }
 
-    /// Builds a cumulative-product [`ScanOperation`] whose nested depth matches `lengths`.
-    fn product_scan_with_lengths(lengths: &[usize]) -> ScanOperation<TestArray, TestOperation> {
+    /// Builds a cumulative-product [`ScanOperation`] whose nested depth matches `lengths`, returning the
+    /// payload-free operation together with its body region program.
+    fn product_scan_with_lengths(
+        lengths: &[usize],
+    ) -> (ScanOperation<TestArray>, Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>) {
         assert!(!lengths.is_empty());
         if lengths.len() == 1 {
-            return TestScanOperation::new(product_body(), 1, lengths[0]).unwrap();
+            return (TestScanOperation::new(1, lengths[0]), product_body());
         }
-        let inner_scan = product_scan_with_lengths(&lengths[1..]);
+        let (inner_scan, inner_body) = product_scan_with_lengths(&lengths[1..]);
         let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+        let inner_body_region = builder.import_region(inner_body.entry_region_ref());
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let xs = builder.add_input(f64_type(&lengths[1..]));
         let outputs = builder
-            .add_instruction(TestOperation::Scan(Box::new(inner_scan)), vec![carry, xs])
+            .add_instruction(TestOperation::Scan(inner_scan), vec![carry, xs], vec![inner_body_region])
             .unwrap()
             .to_vec();
         let body = builder.build(outputs, vec![Placeholder, Placeholder], vec![Placeholder, Placeholder]).unwrap();
-        TestScanOperation::new(body, 1, lengths[0]).unwrap()
+        (TestScanOperation::new(1, lengths[0]), body)
     }
 
-    /// Builds the cumulative-product [`ScanOperation`] over three iterations used by the differentiation tests.
-    fn product_scan() -> ScanOperation<TestArray, TestOperation> {
+    /// Builds the cumulative-product [`ScanOperation`] over three iterations used by the differentiation tests,
+    /// returning the payload-free operation together with its body region program.
+    fn product_scan() -> (ScanOperation<TestArray>, Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>) {
         product_scan_with_lengths(&[3])
+    }
+
+    /// Batches `scan` through the public [`BatchingContext::bind`] path with `body` as an owned attached region.
+    fn batch_scan(
+        context: &BatchingContext<TestEagerContext>,
+        scan: ScanOperation<TestArray>,
+        body: Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>,
+        inputs: Vec<ArrayBatch<TestArray>>,
+    ) -> Vec<ArrayBatch<TestArray>> {
+        let tracer_inputs =
+            inputs.into_iter().map(|input| BatchingTracer::new(context.clone(), input)).collect::<Vec<_>>();
+        context
+            .bind(TestOperation::Scan(scan), [body], tracer_inputs.as_slice())
+            .unwrap()
+            .into_iter()
+            .map(|output| output.batch().clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_reorder_program_boundary_supports_nullary_programs() {
+        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+        let first = builder.add_constant(TestArray::scalar(1.0));
+        let second = builder.add_constant(TestArray::scalar(2.0));
+        let program = builder.build(vec![first, second], Vec::new(), vec![Placeholder, Placeholder]).unwrap();
+
+        let reordered = reorder_program_boundary(program, &[], &[1, 0]).unwrap();
+
+        assert_eq!(reordered.input_count(), 0);
+        assert_eq!(
+            reordered.outputs().map(|output| output.as_constant().unwrap().values.clone()).collect::<Vec<_>>(),
+            vec![vec![2.0], vec![1.0]],
+        );
     }
 
     /// The fused JVP rule stages exactly one scan with doubled carries and **no** per-iteration residual stacks:
@@ -724,13 +860,17 @@ mod tests {
         use crate::tracing::DomainTracer;
         use crate::types::{Shape, Size};
 
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
             |(init, xs): (
                 DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
                 DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
             )| {
-                let mut outputs = init.context().stage_operation(TestOperation::Scan(Box::new(scan)), &[&init, &xs])?;
+                let mut outputs = init.context().stage_operation(
+                    TestOperation::Scan(scan),
+                    vec![scan_body.clone()],
+                    &[&init, &xs],
+                )?;
                 let ys = outputs.remove(1);
                 Ok((outputs.remove(0), ys))
             },
@@ -744,16 +884,18 @@ mod tests {
             .instructions()
             .iter()
             .filter_map(|instruction| match instruction.operation() {
-                TestOperation::Scan(operation) => Some(operation),
+                TestOperation::Scan(operation) => Some((operation, instruction)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(scans.len(), 1);
-        assert_eq!(scans[0].carry_count(), 2);
+        let (fused_scan, fused_instruction) = scans[0];
+        assert_eq!(fused_scan.carry_count(), 2);
         // The fused body is `[primal_carry, tangent_carry, primal_x, tangent_x] ->
         // [primal_carry', tangent_carry', primal_y, tangent_y]`: doubled arity and nothing else.
-        assert_eq!(scans[0].body().input_types().len(), 4);
-        assert_eq!(scans[0].body().output_types().len(), 4);
+        let fused_body = jvp.region_ref(fused_instruction.regions()[0]).unwrap().to_program();
+        assert_eq!(fused_body.input_types().len(), 4);
+        assert_eq!(fused_body.output_types().len(), 4);
 
         // Linearizing the same program is what materializes residual stacks, as known-scan edges.
         let linearization = program.linearize().unwrap();
@@ -765,14 +907,13 @@ mod tests {
         // Cumulative product over `xs = [2, 3, 4]` starting at `init = 1`: the final carry is 24 and the running
         // products are `[2, 6, 24]`. A unit tangent on `init` propagates as `d(init * x0 * x1 * x2)/d(init) = 24`
         // on the final carry and `[2, 6, 24]` on the stacked outputs.
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        TestOperation::Scan(Box::new(scan)),
-                        &[],
-                        &[],
+                        TestOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[init.clone(), xs.clone()],
                     )?;
                     let ys = outputs.remove(1);
@@ -789,14 +930,13 @@ mod tests {
 
         // A unit tangent on `xs[1]` propagates as `d(init * x0 * x1 * x2)/d(x1) = init * x0 * x2 = 8` on the final
         // carry and `[0, 2, 8]` on the stacked outputs (`y0` does not depend on `x1`).
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let ((carry, _), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        TestOperation::Scan(Box::new(scan)),
-                        &[],
-                        &[],
+                        TestOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[init.clone(), xs.clone()],
                     )?;
                     let ys = outputs.remove(1);
@@ -816,14 +956,13 @@ mod tests {
         // Nested scans differentiate by recursively replaying the inner linear scan inside each outer scan iteration.
         // The final carry is the product of every element, and a unit tangent on the initial carry follows the same
         // cumulative-product path through both scan levels.
-        let scan = product_scan_with_lengths(&[2, 3]);
+        let (scan, scan_body) = product_scan_with_lengths(&[2, 3]);
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        TestOperation::Scan(Box::new(scan)),
-                        &[],
-                        &[],
+                        TestOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[init.clone(), xs.clone()],
                     )?;
                     let ys = outputs.remove(1);
@@ -843,15 +982,14 @@ mod tests {
     fn test_scan_jvp_supports_three_nested_scans_in_linear_scan_bodies() {
         // Three levels catches the recursive fixed point that failed for nested scan bodies: the middle scan's
         // linear body contains another scan whose body also has scan-local residual references.
-        let scan = product_scan_with_lengths(&[2, 2, 2]);
+        let (scan, scan_body) = product_scan_with_lengths(&[2, 2, 2]);
         let xs_type = f64_type(&[2, 2, 2]);
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
-                        TestOperation::Scan(Box::new(scan)),
-                        &[],
-                        &[],
+                        TestOperation::Scan(scan),
+                        vec![scan_body.clone()],
                         &[init.clone(), xs.clone()],
                     )?;
                     let ys = outputs.remove(1);
@@ -872,7 +1010,7 @@ mod tests {
         // Batching a scan whose carry is mapped at axis 0 threads the batch axis through every iteration: each
         // batch item runs its own cumulative product over the shared `xs = [2, 3, 4]`, and the stacked outputs
         // gain the scan axis in front of the batch axis.
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 3, None);
         let carries = {
             let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
@@ -880,7 +1018,7 @@ mod tests {
         }
         .unwrap();
         let stacked_inputs = ArrayBatch::replicated(TestArray::vector(vec![2.0, 3.0, 4.0]));
-        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
+        let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 48.0, 72.0]);
@@ -893,7 +1031,7 @@ mod tests {
     fn test_scan_batching_lifts_batched_stacked_inputs() {
         // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the logical
         // leading axis (physical axis 1 when the batch axis sits at 0), so every batch item scans its own row.
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
@@ -901,7 +1039,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
+        let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
@@ -910,7 +1048,7 @@ mod tests {
 
         // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
         // outputs are identical.
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
@@ -918,7 +1056,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
         }
         .unwrap();
-        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
+        let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
@@ -928,7 +1066,7 @@ mod tests {
     #[test]
     fn test_scan_batching_threads_batched_carries_and_inputs() {
         // Batching both operands pairs batch item `i` of the carries with batch item `i` of the stacked inputs.
-        let scan = product_scan();
+        let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = {
             let value = TestArray::vector(vec![1.0, 10.0]);
@@ -940,7 +1078,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
+        let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![24.0, 2100.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
@@ -952,7 +1090,8 @@ mod tests {
         // A reversed batched scan visits the logical iterations from the back while keeping output iteration `i`
         // aligned with input iteration `i`: the reversed cumulative product over `[2, 3, 4]` is `[24, 12, 4]` per
         // batch item.
-        let scan = product_scan().with_reverse(true);
+        let (scan, scan_body) = product_scan();
+        let scan = scan.with_reverse(true);
         let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
@@ -960,7 +1099,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = scan.batch(&context, &[carries, stacked_inputs]).unwrap();
+        let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].value().values, vec![24.0, 24.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
         assert_eq!(outputs[1].value().values, vec![24.0, 24.0, 12.0, 12.0, 4.0, 4.0]);

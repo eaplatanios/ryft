@@ -4,12 +4,7 @@
 //! ([`LinearGatherOperation`](crate::operations::manipulation::LinearGatherOperation)). That linear form's transpose
 //! is the gather/scatter-add duality.
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::Context;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -18,7 +13,10 @@ use crate::operations::manipulation::{
 };
 use crate::programs::MaybeZero;
 
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, Typed};
 
@@ -27,12 +25,13 @@ use crate::types::{ArrayType, Typed};
 /// zero operand tangent yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for GatherOperation
 where
-    C::Operation: Clone + From<GatherOperation>,
+    C::Operation: From<GatherOperation>,
     C::Value: Gather,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -54,12 +53,14 @@ where
 /// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
 impl<C> BatchableOperation<C> for GatherOperation
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    GatherOperation: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    GatherOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -75,13 +76,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::Context;
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::operations::manipulation::{Gather, GatherDimensionNumbers, GatherOperation};
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.

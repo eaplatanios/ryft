@@ -9,7 +9,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::Typed;
 
 impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for SubOperation
@@ -17,9 +17,10 @@ where
     SubOperation: Operation<V::Type>,
 {
     #[inline]
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -35,13 +36,13 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for SubOperation
 where
-    C::Operation: Clone,
     C::Value: Sub<Output = C::Value> + Neg<Output = C::Value>,
     SubOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);

@@ -2,25 +2,24 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::{ArrayBatch, BatchableOperation};
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::contexts::StagingContext;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
+use crate::interpretation::InterpretationDriver;
 use crate::types::{ArrayType, Memory, TypeError, Typed};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
-pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &'static str = "transfer_to_memory";
+pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &str = "transfer_to_memory";
 
 /// [`Operation`] that moves its operand into a destination [`Memory`] — the analogue of placing a value with
 /// `jax.device_put` and a memory-kind-bearing sharding.
@@ -67,7 +66,11 @@ impl Operation<ArrayType> for TransferToMemoryOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone().with_memory(self.destination)])
     }
@@ -78,14 +81,17 @@ impl Operation<ArrayType> for TransferToMemoryOperation {
     }
 }
 
-impl<V: Clone + Value<Type = ArrayType> + TransferToMemory, C> InterpretableOperation<V, C>
-    for TransferToMemoryOperation
-{
+impl<C: Domain<Type = ArrayType, Value: TransferToMemory>> InterpretableOperation<C> for TransferToMemoryOperation {
     /// Interprets the transfer by delegating to the value-level [`TransferToMemory`] capability. Eager values keep
     /// their payload unchanged but must re-place their carried type in the destination [`Memory`], so that the
     /// interpreted value's type stays faithful to the instruction's declared output type.
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].transfer_to_memory(self.destination)])
     }
@@ -136,7 +142,7 @@ where
 {
     fn transfer_to_memory(&self, destination: Memory) -> Self {
         self.dispatch_domain()
-            .bind(TransferToMemoryOperation::new(destination), &[], &[], &[self.clone()])
+            .bind(TransferToMemoryOperation::new(destination), Vec::new(), &[self.clone()])
             .expect("`transfer_to_memory` operation failed")
             .remove(0)
     }
@@ -148,9 +154,10 @@ where
 /// concrete values it keeps the payload unchanged while re-placing the carried type in the destination, exactly like
 /// interpretation.
 impl<C: Context<Type = ArrayType, Value: TransferToMemory>> BatchableOperation<C> for TransferToMemoryOperation {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -165,12 +172,13 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>> BatchableOperation<C
 /// before this rule is consulted, so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransferToMemoryOperation
 where
-    C::Operation: Clone + From<TransferToMemoryOperation>,
+    C::Operation: From<TransferToMemoryOperation>,
     C::Value: TransferToMemory,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -190,9 +198,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransferToMe
 where
     O: Operation<ArrayType> + From<TransferToMemoryOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -203,6 +212,7 @@ where
             MaybeZero::Value(cotangent) => {
                 let outputs = context.stage_operation(
                     TransferToMemoryOperation::new(inputs[0].r#type().memory()),
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -214,12 +224,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::batching::BatchingContext;
     use approx::assert_abs_diff_eq;
 
-    use crate::batching::ArrayBatch;
-    use crate::batching::Batch;
-    use crate::batching::BatchAxis;
-    use crate::batching::BatchableOperation;
+    use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::tests::TestArray;
@@ -247,14 +255,19 @@ mod tests {
         assert_eq!(operation.name(), TRANSFER_TO_MEMORY_OPERATION_NAME);
         assert_eq!(operation.destination(), PINNED_HOST);
         assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
-        let inferred = operation.infer_output_types(&[vector_type(2)]).unwrap();
+        let inferred = operation.infer_output_types(&[vector_type(2)], &[]).unwrap();
         assert_eq!(inferred, vec![vector_type(2).with_memory(PINNED_HOST)]);
-        assert!(operation.infer_output_types(&[]).is_err());
+        assert!(operation.infer_output_types(&[], &[]).is_err());
         // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
         // the value's carried type in the destination so that it matches the declared output type.
         let input = TestArray::vector(vec![1.0, 2.0]);
-        let outputs =
-            operation.interpret(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
+        let outputs = operation
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &crate::EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            )
+            .unwrap();
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
         assert_eq!(*outputs[0].r#type(), vector_type(2).with_memory(PINNED_HOST));
         assert_eq!(outputs[0].values, vec![1.0, 2.0]);
@@ -344,7 +357,7 @@ mod tests {
         .unwrap();
         let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
-        let outputs = operation.batch(&context, std::slice::from_ref(&input)).unwrap();
+        let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));

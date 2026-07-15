@@ -11,13 +11,14 @@ use crate::differentiation::{
 };
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::BooleanLike;
 use crate::operations::constants::{FillOperation, OneOperation, ZeroLikeOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::operations::math::AddOperation;
-use crate::operations::{BooleanLike, RegionlessDriver};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
+use crate::regions::EmptyRegionDriver;
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
@@ -700,12 +701,12 @@ where
         // A zero-input operation has no operand batch axis to lift through and is replicated by construction, so
         // interpret it once over the per-item value type and surface the result as a replicated value.
         return operation
-            .interpret(&context.parent().clone(), &RegionlessDriver, &[])?
+            .interpret(&context.parent().clone(), &EmptyRegionDriver, &[])?
             .into_iter()
             .map(|value| Ok(ArrayBatch::replicated(value)))
             .collect();
     }
-    operation.batch(context, &RegionlessDriver, inputs)
+    operation.batch(context, &EmptyRegionDriver, inputs)
 }
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.

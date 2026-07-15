@@ -1,6 +1,8 @@
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::operations::Operation;
 use crate::operations::stop_gradient::StopGradientOperation;
 use crate::partial::PartialValue;
@@ -11,19 +13,20 @@ use crate::tracing::{Tracer, TracingContext};
 /// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for StopGradientOperation
 where
-    C::Operation: Clone + From<StopGradientOperation>,
+    C::Operation: From<StopGradientOperation>,
     StopGradientOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -37,9 +40,10 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for StopGradie
 where
     StopGradientOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -52,8 +56,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::operations::stop_gradient::StopGradient;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -68,8 +71,7 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_composes_with_batch() {
-        use crate::batching::Batch;
-        use crate::batching::BatchAxis;
+        use crate::batching::{Batch, BatchAxis};
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;

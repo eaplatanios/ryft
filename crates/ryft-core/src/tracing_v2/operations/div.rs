@@ -1,8 +1,10 @@
 use std::ops::{Add, Div, Mul, Neg};
 
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::OneLike;
@@ -14,14 +16,14 @@ use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation
 where
-    C::Operation: Clone,
     C::Value:
         OneLike + Add<Output = C::Value> + Div<Output = C::Value> + Mul<Output = C::Value> + Neg<Output = C::Value>,
     DivOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -62,9 +64,10 @@ impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation
 where
     DivOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -93,8 +96,7 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::tracing_v2::ForwardModeDifferentiate;
 

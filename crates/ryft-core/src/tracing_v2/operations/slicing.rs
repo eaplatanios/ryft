@@ -1,9 +1,6 @@
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError, InterpretableBatchableOperation,
+};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -18,7 +15,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::BatchingDriver;
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`SliceOperation`].
@@ -41,9 +39,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperati
 where
     O: Operation<ArrayType> + From<UpdateSliceOperation> + From<PadOperation> + From<ZeroOperation<ArrayType>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -55,6 +54,7 @@ where
                 let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let outputs = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
+                    Vec::new(),
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -92,6 +92,7 @@ where
                 let zero = MaybeZero::Zero(ArrayType::scalar(input_type.data_type())).materialize(context)?;
                 let outputs = context.stage_operation(
                     PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
+                    Vec::new(),
                     &[cotangent.clone(), zero],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -112,9 +113,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceO
 where
     O: Operation<ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -131,6 +133,7 @@ where
                 let zeros = MaybeZero::Zero(update_type.clone().into_owned()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
+                    Vec::new(),
                     &[cotangent.clone(), zeros],
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
@@ -139,6 +142,7 @@ where
                 let update_cotangents = context.stage_operation(
                     SliceOperation::new(self.start_indices().to_vec(), limit_indices)
                         .with_strides(vec![1; self.start_indices().len()])?,
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
@@ -179,12 +183,13 @@ pub(crate) fn static_update_sizes(context: &str, update_type: &ArrayType) -> Res
 /// primal start indices. A zero operand tangent yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DynamicSliceOperation
 where
-    C::Operation: Clone + From<DynamicSliceOperation>,
+    C::Operation: From<DynamicSliceOperation>,
     C::Value: DynamicSlice,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let (operand, start_indices) =
@@ -205,12 +210,13 @@ where
 /// yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for DynamicUpdateSliceOperation
 where
-    C::Operation: Clone + From<DynamicUpdateSliceOperation>,
+    C::Operation: From<DynamicUpdateSliceOperation>,
     C::Value: DynamicUpdateSlice,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if inputs.len() < 2 {
@@ -236,12 +242,13 @@ where
 /// output tangent.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for SliceOperation
 where
-    C::Operation: Clone + From<SliceOperation>,
+    C::Operation: From<SliceOperation>,
     C::Value: Slice,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -261,12 +268,13 @@ where
 /// update tangent yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for UpdateSliceOperation
 where
-    C::Operation: Clone + From<UpdateSliceOperation>,
+    C::Operation: From<UpdateSliceOperation>,
     C::Value: UpdateSlice,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -391,8 +399,9 @@ pub(crate) fn batch_by_item_expansion<C, O>(
     axis_size: usize,
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    O: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    O: InterpretableOperation<C>,
 {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -403,7 +412,8 @@ where
             .iter()
             .map(|input| expansion_item(operation_name, input, item))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut outputs = operation.interpret(context.parent(), item_inputs.as_slice())?;
+        let mut outputs =
+            operation.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, item_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     })?;
@@ -414,11 +424,12 @@ where
 /// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for SliceOperation
 where
-    SliceOperation: InterpretableOperation<C::Value, C>,
+    SliceOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -443,13 +454,15 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
 /// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each batch item updates its own block.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for UpdateSliceOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for UpdateSliceOperation
 where
-    UpdateSliceOperation: InterpretableOperation<C::Value, C>,
+    C::Value: Broadcast + Transpose,
+    UpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -487,12 +500,14 @@ where
 /// because it only goes through the value capability traits.
 impl<C> BatchableOperation<C> for DynamicSliceOperation
 where
-    C: Context<Type = ArrayType, Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    DynamicSliceOperation: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    DynamicSliceOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.is_empty() {
@@ -546,12 +561,14 @@ where
 /// only goes through the value capability traits.
 impl<C> BatchableOperation<C> for DynamicUpdateSliceOperation
 where
-    C: Context<Type = ArrayType, Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    DynamicUpdateSliceOperation: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.len() < 2 {
@@ -593,9 +610,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::LinearizationTracer;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::DataType;
 
     use crate::tracing::Trace;
@@ -744,7 +760,11 @@ mod tests {
         }
         .unwrap();
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[input],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -753,7 +773,11 @@ mod tests {
         // Replicated operands pass through the unlifted rule.
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[uniform])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[uniform],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
@@ -767,7 +791,11 @@ mod tests {
         .unwrap();
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
         let outputs = strided
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[input],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 2.0, 4.0, 6.0]);
@@ -822,7 +850,11 @@ mod tests {
         .unwrap();
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input, update])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[input, update],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -836,7 +868,11 @@ mod tests {
         }
         .unwrap();
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input, update])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[input, update],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
@@ -860,6 +896,7 @@ mod tests {
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input, ArrayBatch::replicated(index(1.0))],
             )
             .unwrap();
@@ -876,6 +913,7 @@ mod tests {
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0.0, 2.0])],
             )
             .unwrap();
@@ -894,6 +932,7 @@ mod tests {
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1.0, 3.0])],
             )
             .unwrap();
@@ -910,6 +949,7 @@ mod tests {
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1.0, 2.0])],
             )
             .unwrap();
@@ -928,6 +968,7 @@ mod tests {
         let outputs = DynamicUpdateSliceOperation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input, update, ArrayBatch::replicated(index(1.0))],
             )
             .unwrap();
@@ -949,6 +990,7 @@ mod tests {
         let outputs = DynamicUpdateSliceOperation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
             .unwrap();
@@ -967,6 +1009,7 @@ mod tests {
         let outputs = DynamicUpdateSliceOperation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )
             .unwrap();

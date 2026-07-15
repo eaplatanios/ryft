@@ -9,16 +9,18 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Typed};
 
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
 where
     O: Operation<ArrayType> + From<TransposeOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -37,12 +39,13 @@ where
 /// rule is consulted, so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransposeOperation
 where
-    C::Operation: Clone + From<TransposeOperation>,
+    C::Operation: From<TransposeOperation>,
     C::Value: Transpose,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -76,11 +79,12 @@ pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> 
 
 impl<C: Context<Type = ArrayType>> crate::batching::BatchableOperation<C> for TransposeOperation
 where
-    TransposeOperation: InterpretableOperation<C::Value, C>,
+    TransposeOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        context: &crate::batching::BatchingContext<C>,
+        context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[crate::batching::ArrayBatch<C::Value>],
     ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);

@@ -1,19 +1,19 @@
 use std::fmt::Display;
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::contexts::Context;
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::TransposableOperation;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::TranspositionDriver;
+use crate::interpretation::InterpretationDriver;
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Linear-program payload for recomputing a primal operation without differentiating through it.
@@ -69,8 +69,12 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        self.operation.infer_output_types(input_types)
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        self.operation.infer_output_types(input_types, region_interfaces)
     }
 
     #[inline]
@@ -79,20 +83,25 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 }
 
-impl<V, O, C> InterpretableOperation<V, C> for RecomputeOperation<O>
+impl<O, C> InterpretableOperation<C> for RecomputeOperation<O>
 where
-    V: Value<Type = ArrayType>,
-    O: InterpretableOperation<V, C>,
+    C: Domain<Type = ArrayType>,
+    O: InterpretableOperation<C>,
 {
     #[inline]
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        self.operation.interpret(context, inputs)
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        self.operation.interpret(context, driver, inputs)
     }
 }
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`RecomputeOperation`].
-impl<RecomputedOperation: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
+impl<RecomputedOperation: Operation<ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
     for RecomputeOperation<RecomputedOperation>
 where
     C::Operation: From<RecomputeOperation<RecomputedOperation>>,
@@ -106,14 +115,15 @@ where
     Target: Operation<ArrayType>,
 {
     #[inline]
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, Target>>(
         &self,
         _context: &mut TracingContext<V, Target>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = self.infer_output_types(input_types.as_slice())?;
+        let output_types = self.infer_output_types(input_types.as_slice(), &[])?;
         check_count!("output", outputs, output_types.len(), ProgramError);
         Ok(input_types.into_iter().map(MaybeZero::Zero).collect())
     }
@@ -121,12 +131,13 @@ where
 
 impl<O: BatchableOperation<C>, C: Context<Type = ArrayType>> BatchableOperation<C> for RecomputeOperation<O> {
     #[inline]
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        self.operation.batch(context, inputs)
+        self.operation.batch(context, driver, inputs)
     }
 }
 
@@ -149,6 +160,7 @@ mod tests {
         let cotangents = operation
             .transpose(
                 &mut context,
+                &crate::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(scalar_type.clone()), PartialValue::Unknown(scalar_type.clone())],
                 &[MaybeZero::Zero(scalar_type.clone())],
             )

@@ -2,7 +2,8 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -14,7 +15,6 @@ use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for Atan2Operation
 where
-    C::Operation: Clone,
     C::Value: Atan2
         + Add<Output = C::Value>
         + Sub<Output = C::Value>
@@ -23,9 +23,10 @@ where
         + Neg<Output = C::Value>,
     Atan2Operation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -60,9 +61,10 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for Atan2Opera
 where
     Atan2Operation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {

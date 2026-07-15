@@ -7,7 +7,8 @@ use crate::differentiation::DifferentiationError;
 use crate::operations::Operation;
 use crate::operations::math::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
-use crate::programs::{Atom, AtomId, Program, ProgramError, RegionRef, Value};
+use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
+use crate::regions::RegionRef;
 use crate::types::Type;
 
 /// Error type returned by the IR benchmark tooling.
@@ -535,8 +536,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::math::Sin;
     use crate::programs::Program;

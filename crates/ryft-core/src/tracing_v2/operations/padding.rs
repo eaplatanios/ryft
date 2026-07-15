@@ -1,9 +1,4 @@
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -18,7 +13,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -51,9 +47,10 @@ where
         + From<SubOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -94,6 +91,7 @@ where
                 }
                 let input_cotangents = context.stage_operation(
                     SliceOperation::new(start_indices, limit_indices).with_strides(strides)?,
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
@@ -101,6 +99,7 @@ where
                 let all_axes: Vec<usize> = (0..cotangent.r#type().as_ref().rank()).collect();
                 let total_sums = context.stage_operation(
                     ReduceOperation::new(all_axes.clone(), ReductionKind::Sum),
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", total_sums, 1, ProgramError);
@@ -111,13 +110,17 @@ where
                 } else {
                     let sliced_sums = context.stage_operation(
                         ReduceOperation::new(all_axes, ReductionKind::Sum),
+                        Vec::new(),
                         std::slice::from_ref(&input_cotangent),
                     )?;
                     check_count!("output", sliced_sums, 1, ProgramError);
                     sliced_sums.into_iter().next().unwrap()
                 };
-                let padding_value_cotangents = context
-                    .stage_operation(O::from(SubOperation), &[total_sums.into_iter().next().unwrap(), sliced_sum])?;
+                let padding_value_cotangents = context.stage_operation(
+                    O::from(SubOperation),
+                    Vec::new(),
+                    &[total_sums.into_iter().next().unwrap(), sliced_sum],
+                )?;
                 check_count!("output", padding_value_cotangents, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(input_cotangent),
@@ -132,12 +135,13 @@ where
 /// tangent pads the operand tangent with the padding-value tangent using the same padding amounts.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for PadOperation
 where
-    C::Operation: Clone + From<PadOperation>,
+    C::Operation: From<PadOperation>,
     C::Value: Pad,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -173,12 +177,14 @@ where
 /// batched pullbacks) total even though the padding-value tangent is represented as a per-item batch there.
 impl<C> BatchableOperation<C> for PadOperation
 where
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
-    PadOperation: InterpretableOperation<C::Value, C>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    PadOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -205,14 +211,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::batching::BatchingContext;
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -285,6 +291,7 @@ mod tests {
         let outputs = operation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input.clone(), padding_value],
             )
             .unwrap();
@@ -297,6 +304,7 @@ mod tests {
         let outputs = operation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[uniform, ArrayBatch::replicated(TestArray::scalar(0.0))],
             )
             .unwrap();
@@ -312,6 +320,7 @@ mod tests {
         let outputs = operation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[input, batch_varying.clone()],
             )
             .unwrap();
@@ -324,6 +333,7 @@ mod tests {
         let outputs = operation
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
                 &[uniform_input, batch_varying],
             )
             .unwrap();

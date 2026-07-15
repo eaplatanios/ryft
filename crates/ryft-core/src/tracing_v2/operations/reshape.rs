@@ -1,9 +1,9 @@
-use crate::batching::BatchAxis;
-use crate::batching::BatchingContext;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, InterpretableBatchableOperation};
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -38,7 +38,7 @@ impl<T: Value<Type = ArrayType> + ReshapeOps> ReshapeValue for T {}
 /// in the output shape, and returns `Some((lifted_input_shape, lifted_output_shape, k_out))`. If
 /// no matching position can be found (for example, the batch axis falls in the middle of a
 /// reshape that mixes dimensions on both sides), the helper returns `None` and the caller should
-/// surface a [`BatchingError::UnsupportedOperation`](crate::batching::BatchingError::UnsupportedOperation)
+/// surface a [`BatchingError::UnsupportedOperation`]
 /// pointing at a future fix that emits an explicit transpose before the reshape.
 ///
 /// Dynamic dimensions in `input_shape[..k_in]` or in any candidate `output_shape[..k_out]` are
@@ -99,9 +99,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshapeOpera
 where
     O: Operation<ArrayType> + From<ReshapeOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -121,12 +122,13 @@ where
 /// consulted, so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReshapeOperation
 where
-    C::Operation: Clone + From<ReshapeOperation>,
+    C::Operation: From<ReshapeOperation>,
     C::Value: Reshape,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -139,13 +141,15 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ReshapeOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ReshapeOperation
 where
-    ReshapeOperation: InterpretableOperation<C::Value, C>,
+    C::Value: Broadcast + Transpose,
+    ReshapeOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);

@@ -35,7 +35,7 @@ use ryft_core::operations::control_flow::SelectOperation;
 use ryft_core::operations::math::{AddOperation, MulOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
-use ryft_core::regions::RegionAttachments;
+use ryft_core::regions::BindingRegionDriver;
 use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
@@ -362,7 +362,7 @@ impl<'c> Context for XlaDomain<'c> {
     /// compiled through this domain's compile cache, and executed on this domain's PJRT client via the crate-private
     /// `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the constant
     /// directly through the runtime client without compiling a program.
-    fn bind<P, R: RegionAttachments<Self::Constant, Self::Operation>>(
+    fn bind<P, R: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
         regions: R,
@@ -658,7 +658,7 @@ impl<'c> XlaDomain<'c> {
     /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their
     /// nested programs as attached regions and flow through this same path — the compiler handles the control flow, so
     /// no host interpreter loops are needed.
-    fn eager_bind<R: RegionAttachments<XlaConstant, XlaOperation>>(
+    fn eager_bind<R: BindingRegionDriver<XlaConstant, XlaOperation>>(
         &self,
         operation: XlaOperation,
         regions: R,
@@ -2739,6 +2739,7 @@ mod tests {
     use ryft_core::operations::constants::{FillOperation, OneOperation};
     use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
     use ryft_core::operations::math::{AddOperation, MulOperation, NegOperation};
+    use ryft_core::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -3539,13 +3540,15 @@ mod tests {
         let callee = Rc::new(callee);
 
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
-        let first = domain.bind(operation.clone(), [].with_callees(&[callee.clone()]), &[input.clone()]).unwrap();
+        let first = domain
+            .bind(operation.clone(), CalleeRegionDriver::new(&[callee.clone()]), &[input.clone()])
+            .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, &first[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
-        let second = domain.bind(operation, [].with_callees(&[callee]), &[input]).unwrap();
+        let second = domain.bind(operation, CalleeRegionDriver::new(&[callee]), &[input]).unwrap();
         assert_eq!(read_f32s(&client, &second[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }

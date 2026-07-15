@@ -1,9 +1,4 @@
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -15,7 +10,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`ConcatenateOperation`].
@@ -30,9 +26,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ConcatenateO
 where
     O: Operation<ArrayType> + From<SliceOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -85,6 +82,7 @@ where
                     let strides = vec![1; rank];
                     let outputs = context.stage_operation(
                         SliceOperation::new(start_indices, limit_indices).with_strides(strides)?,
+                        Vec::new(),
                         std::slice::from_ref(cotangent),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
@@ -101,12 +99,13 @@ where
 /// concatenates the operand tangents along the same axis.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ConcatenateOperation
 where
-    C::Operation: Clone + From<ConcatenateOperation>,
+    C::Operation: From<ConcatenateOperation>,
     C::Value: Concatenate,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let primals = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
@@ -129,13 +128,15 @@ where
 /// concatenates its own operands), and the concatenated axis is
 /// shifted past the inserted batch axis when the batch axis sits at or before it. When no operand is batched, the
 /// operation passes through unchanged.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ConcatenateOperation
 where
-    ConcatenateOperation: InterpretableOperation<C::Value, C>,
+    C::Value: Broadcast + Transpose,
+    ConcatenateOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.is_empty() {
@@ -163,15 +164,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::batching::BatchingContext;
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
     use crate::operations::manipulation::Concatenate;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::Typed;
 
     use super::*;
@@ -233,7 +234,11 @@ mod tests {
         }
         .unwrap();
         let outputs = ConcatenateOperation::new(0)
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[first, second])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[first, second],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -248,7 +253,11 @@ mod tests {
         .unwrap();
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
         let outputs = ConcatenateOperation::new(0)
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[batched, uniform])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[batched, uniform],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
@@ -257,7 +266,11 @@ mod tests {
         let left = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
         let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
         let outputs = ConcatenateOperation::new(0)
-            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[left, right])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &crate::EmptyRegionDriver,
+                &[left, right],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);

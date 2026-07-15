@@ -41,7 +41,7 @@ use ryft_core::partial::{
     PartiallyEvaluatableOperation,
 };
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-use ryft_core::regions::{RegionAttachments, RegionInterface};
+use ryft_core::regions::{CalleeRegionDriver, RegionInterface};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::backends::scalars::Scalar;
@@ -238,8 +238,8 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 /// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
 /// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
 /// operation (the single `["callee"]` slot), interned by [`Rc`] identity when the call is staged through the
-/// [`RegionAttachments`] passed to [`Context::bind`], so repeated calls staged from one function handle share one
-/// callee root and remain identity-comparable for call-site deduplication at lowering.
+/// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
+/// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation;
 
@@ -420,7 +420,10 @@ where
                 (callee.to_program(), output_axes)
             }
         };
-        let outputs = context.parent().bind(*self, [].with_callees(&[Rc::new(batched_callee)]), &physical_inputs)?;
+        let outputs =
+            context
+                .parent()
+                .bind(*self, CalleeRegionDriver::new(&[Rc::new(batched_callee)]), &physical_inputs)?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -486,7 +489,7 @@ where
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_call = XlaOperation::JitCall(JitCallOperation::new());
         let mut primal_call_outputs =
-            context.bind(primal_call, [].with_callees(&[Rc::new(primal_program)]), &primal_operands)?;
+            context.bind(primal_call, CalleeRegionDriver::new(&[Rc::new(primal_program)]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -509,7 +512,7 @@ where
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
         let tangent_outputs =
-            context.bind(tangent_call, [].with_callees(&[Rc::new(tangent_program)]), &tangent_operands)?;
+            context.bind(tangent_call, CalleeRegionDriver::new(&[Rc::new(tangent_program)]), &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -608,7 +611,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
     operands.extend(known_values);
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
     let input_cotangents =
-        context.bind(transposed_call, [].with_callees(&[Rc::new(transposed_callee)]), operands.as_slice())?;
+        context.bind(transposed_call, CalleeRegionDriver::new(&[Rc::new(transposed_callee)]), operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -736,8 +739,7 @@ mod tests {
             matches!(residual_instruction.operation(), XlaOperation::JitCall(_)),
             "expected the residual program to contain the residual jit_call",
         );
-        let residual_callee =
-            evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
+        let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert_eq!(residual_callee.input_ids().len(), 2);
         assert_eq!(residual_callee.instructions().len(), 2);
         assert!(residual_callee.atoms().iter().any(|atom| atom.is_constant()));

@@ -1,6 +1,8 @@
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
 use crate::operations::Operation;
 use crate::operations::compare::CompareOperation;
 use crate::partial::PartialValue;
@@ -11,19 +13,20 @@ use crate::tracing::{Tracer, TracingContext};
 /// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for CompareOperation
 where
-    C::Operation: Clone + From<CompareOperation>,
+    C::Operation: From<CompareOperation>,
     CompareOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &[], &[], &primal_inputs)?
+            .bind(self.clone(), Vec::new(), &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -38,9 +41,10 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for CompareOpe
 where
     CompareOperation: Operation<V::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -62,8 +66,7 @@ mod tests {
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::ForwardModeDifferentiate;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
 
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn piecewise_select(

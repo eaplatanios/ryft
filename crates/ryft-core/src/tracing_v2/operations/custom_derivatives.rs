@@ -1,28 +1,26 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::batching::BatchingContext;
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchableProgramOperation, BatchingError,
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
-use crate::effects::Effects;
-use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
+};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::Operation;
-use crate::operations::constants::Constant as ConstantCapability;
 use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
-use crate::types::{ArrayType, TypeError, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
@@ -38,138 +36,128 @@ use crate::types::{ArrayType, TypeError, Typed};
 /// Batching (`batch`) re-wraps the call around batched primal/JVP programs — mirroring JAX's
 /// `custom_jvp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
 /// differentiation, under eager and staging parents alike.
-#[derive(Clone, Debug)]
-pub struct CustomJvpOperation<V: Value, O> {
-    /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
-    /// that cloning the operation does not deep-clone the nested program.
-    primal: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CustomJvpOperation;
 
-    /// Program computing `(outputs..., output_tangents...)` from `(inputs..., input_tangents...)`. The program is
-    /// shared behind an [`Arc`] for the same reason as [`Self::primal`].
-    jvp: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-}
-
-impl<V: Value, O: Operation<V::Type>> CustomJvpOperation<V, O> {
-    /// Creates a custom-JVP operation after validating that the JVP program's signature matches the primal
-    /// program's: its inputs must be the primal inputs followed by their tangents (same types), and its outputs the
-    /// primal outputs followed by their tangents.
-    pub fn new(primal: Program<V, O, Vec<V>, Vec<V>>, jvp: Program<V, O, Vec<V>, Vec<V>>) -> Result<Self, TypeError> {
-        let input_types = primal.input_types();
-        let output_types = primal.output_types();
-        let expected_jvp_input_types: Vec<V::Type> = input_types.iter().chain(input_types.iter()).cloned().collect();
-        check_types!("custom_jvp rule input", &expected_jvp_input_types, &jvp.input_types());
-        let expected_jvp_output_types: Vec<V::Type> = output_types.iter().chain(output_types.iter()).cloned().collect();
-        check_types!("custom_jvp rule output", &expected_jvp_output_types, &jvp.output_types());
-        Ok(Self { primal: Arc::new(primal), jvp: Arc::new(jvp) })
-    }
-
-    /// Returns the primal program.
+impl CustomJvpOperation {
+    /// Creates a custom-JVP operation. The primal and JVP [`Program`]s are supplied separately as the operation's
+    /// attached regions (via the `regions` argument of [`Context::bind`]) in the region order
+    /// `["primal", "jvp"]`; [`Operation::infer_output_types`] validates that the JVP interface matches the primal
+    /// interface (its inputs are the primal inputs followed by their tangents, and its outputs the primal outputs
+    /// followed by their tangents).
     #[inline]
-    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.primal
-    }
-
-    /// Returns the user-supplied JVP program.
-    #[inline]
-    pub fn jvp_program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.jvp
-    }
-
-    /// Returns the primal input types.
-    #[inline]
-    pub fn input_types(&self) -> Vec<V::Type> {
-        self.primal.input_types()
-    }
-
-    /// Returns the primal output types.
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.primal.output_types()
+    pub fn new() -> Self {
+        Self
     }
 }
 
-impl<V: Value, O> Display for CustomJvpOperation<V, O>
-where
-    Self: Operation<V::Type>,
-{
+impl Default for CustomJvpOperation {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for CustomJvpOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        formatter.write_str("custom_jvp")
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for CustomJvpOperation<V, O> {
+/// Validates the custom-JVP contract over the two attached region interfaces (`["primal", "jvp"]` region order) and
+/// returns the primal interface: the JVP interface's inputs must be the primal inputs followed by their tangents
+/// (same types), and its outputs the primal outputs followed by their tangents.
+fn validated_custom_jvp_interfaces<'i, T: Type>(
+    region_interfaces: &'i [RegionInterface<T>],
+) -> Result<&'i RegionInterface<T>, TypeError> {
+    if region_interfaces.len() != 2 {
+        return Err(TypeError {
+            message: format!("custom_jvp expects 2 attached regions but got {}", region_interfaces.len()),
+        });
+    }
+    let primal_interface = &region_interfaces[0];
+    let jvp_interface = &region_interfaces[1];
+    let input_types = primal_interface.input_types();
+    let output_types = primal_interface.output_types();
+    let expected_jvp_input_types: Vec<T> = input_types.iter().chain(input_types.iter()).cloned().collect();
+    check_types!("custom_jvp rule input", &expected_jvp_input_types, jvp_interface.input_types());
+    let expected_jvp_output_types: Vec<T> = output_types.iter().chain(output_types.iter()).cloned().collect();
+    check_types!("custom_jvp rule output", &expected_jvp_output_types, jvp_interface.output_types());
+    Ok(primal_interface)
+}
+
+impl<T: Type> Operation<T> for CustomJvpOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "custom_jvp"
     }
 
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        check_types!("custom_jvp input", &self.input_types(), input_types);
-        Ok(self.output_types())
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        let primal_interface = validated_custom_jvp_interfaces(region_interfaces)?;
+        check_types!("custom_jvp input", primal_interface.input_types(), input_types);
+        Ok(primal_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.primal.effects().union(self.jvp.effects())
+    fn region_names(&self) -> &'static [&'static str] {
+        &["primal", "jvp"]
     }
 }
 
-impl<Constant, O, V, C> InterpretableOperation<V, C> for CustomJvpOperation<Constant, O>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    O: InterpretableProgramOperation<V, C, Constant>,
-{
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        O::interpret_program(context, &self.primal, inputs.to_vec())
+impl<C: Domain> InterpretableOperation<C> for CustomJvpOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`CustomJvpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<V: Value, O: Clone + Operation<V::Type>, C: Context<Type = V::Type>> PartiallyEvaluatableOperation<C>
-    for CustomJvpOperation<V, O>
-where
-    C::Operation: From<CustomJvpOperation<V, O>>,
-{
-}
+impl<C: Context> PartiallyEvaluatableOperation<C> for CustomJvpOperation where C::Operation: From<CustomJvpOperation> {}
 
-/// Capture-free forward-mode (JVP) rule for [`CustomJvpOperation`]: splices the user-supplied JVP program
-/// directly into the shared builder.
+/// Capture-free forward-mode (JVP) rule for [`CustomJvpOperation`]: replays the user-supplied JVP program through the
+/// active context, staging its operations in the shared builder.
 ///
 /// The JVP program is already JVP-shaped over the primal operation family — it maps
 /// `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)` — so the rule simply replays it
 /// through [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual inputs: the primal tracers followed by the
 /// tangent tracers feed the JVP
-/// program, and its outputs split into the primal outputs and the staged output tangents. Because the spliced program
+/// program, and its outputs split into the primal outputs and the staged output tangents. Because the replayed program
 /// is straight-line primal-enum operations referencing those tracers directly, it introduces no symbolic capture and
 /// the enclosing partial-evaluation split discovers the residual operand edges structurally — so
-/// the rule is a leaf needing no [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation)
-/// or [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation)
-/// witness, and reverse mode transposes the spliced bilinear operations exactly as it does for any other straight-line
+/// the rule is a leaf needing no nested differentiation or linearization request, and reverse mode transposes the
+/// replayed bilinear operations exactly as it does for any other straight-line
 /// tangent program.
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Constant, C::Operation>
-where
-    C::Constant: Clone,
-    C::Operation: Clone,
-{
-    fn jvp(
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation {
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let output_count = self.output_types().len();
-        check_count!("input", inputs, self.input_types().len(), ProgramError);
-        // The JVP program consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
+        // The user's JVP computation is region 1 (region 0 is the primal), mapping
+        // `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)`.
+        let jvp_region = driver.region(1)?;
+        let output_count = jvp_region.output_types().len() / 2;
+        check_count!("input", inputs, jvp_region.input_types().len() / 2, ProgramError);
+        // The JVP region consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
         // tangents.
         let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // The user's JVP program takes every input tangent as a real program input, so materialize structural
+        // The user's JVP region takes every input tangent as a real region input, so materialize structural
         // zeros.
         for input in inputs {
             jvp_inputs.push(input.tangent().clone().materialize(context)?);
         }
-        let mut outputs = self.jvp_program().interpret_in_context(context, jvp_inputs)?;
+        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
         Ok(outputs
@@ -181,23 +169,22 @@ where
 }
 
 /// Transpose rule for [`CustomJvpOperation`]: the call is a higher-order primal boundary rather than a linear map,
-/// so a tangent program never contains it on a linear operand (linearization splices the user-supplied JVP program
+/// so a tangent program never contains it on a linear operand (linearization replays the user-supplied JVP program
 /// instead) and the rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V, O, W, OLinear> TransposableOperation<W, OLinear> for CustomJvpOperation<V, O>
+impl<W, OLinear> TransposableOperation<W, OLinear> for CustomJvpOperation
 where
-    V: Value,
-    W: Value<Type = V::Type>,
-    O: Operation<V::Type>,
-    OLinear: Operation<V::Type>,
+    W: Value,
+    OLinear: Operation<W::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<W, OLinear>>(
         &self,
         _context: &mut TracingContext<W, OLinear>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+            message: "operation `custom_jvp` has no partition-aware transpose rule".to_string(),
         }
         .into())
     }
@@ -221,12 +208,17 @@ pub(crate) fn stage_rewrapped_custom_call<C, MakeOperationFn>(
 where
     C: Context<Type = ArrayType>,
     <C as Domain>::Value: Broadcast + Transpose,
-    MakeOperationFn: FnOnce(Option<usize>) -> Result<C::Operation, ProgramError>,
+    MakeOperationFn: FnOnce(
+        Option<usize>,
+    ) -> Result<
+        (C::Operation, Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>),
+        BatchingError,
+    >,
 {
     if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
-        let operation = make_operation(None)?;
+        let (operation, operation_regions) = make_operation(None)?;
         let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let outputs = context.parent().bind(operation, &[], &[], &parent_inputs)?;
+        let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
         return outputs
             .into_iter()
             .map(|tracer| {
@@ -243,9 +235,9 @@ where
             None => input.broadcast(0, axis_size),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let operation = make_operation(Some(axis_size))?;
+    let (operation, operation_regions) = make_operation(Some(axis_size))?;
     let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-    let outputs = context.parent().bind(operation, &[], &[], &parent_inputs)?;
+    let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
     outputs
         .into_iter()
         .map(|tracer| {
@@ -255,15 +247,19 @@ where
         .collect()
 }
 
-/// Batches `program` using the custom-derivative rewrapping convention: every input and output is mapped at axis `0`.
-pub(crate) fn batch_rewrapped_program<V: Value<Type = ArrayType>, O: BatchableProgramOperation<V>>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    axis_size: usize,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-    let input_batch_axes = vec![BatchAxis::new(0); program.input_types().len()];
-    let (program, _) = O::batch_program(
-        program,
-        axis_size,
+/// Batches the region at `index` using the custom-derivative rewrapping convention: every input and output is mapped
+/// at axis `0`.
+pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingDriver<C>>(
+    context: &BatchingContext<C>,
+    driver: &D,
+    index: usize,
+) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
+    let region = driver.region(index)?;
+    let input_count = region.input_types().len();
+    let input_batch_axes = vec![BatchAxis::new(0); input_count];
+    let (program, _) = driver.batch_program(
+        context,
+        region,
         input_batch_axes.as_slice(),
         ProgramBatchingOutputAxesPolicy::AlignAllTo(0),
     )?;
@@ -272,29 +268,24 @@ pub(crate) fn batch_rewrapped_program<V: Value<Type = ArrayType>, O: BatchablePr
 
 /// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C> for CustomJvpOperation<C::Constant, O>
+impl<C, O> BatchableOperation<C> for CustomJvpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: Broadcast + Transpose,
-    O: Clone
-        + Operation<ArrayType>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>
-        + From<CustomJvpOperation<C::Constant, O>>
-        + BatchableProgramOperation<C::Constant>,
+    O: Operation<ArrayType> + From<TransposeOperation> + From<BroadcastOperation> + From<CustomJvpOperation>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
-            None => Ok(O::from(self.clone())),
-            Some(axis_size) => Ok(O::from(CustomJvpOperation::new(
-                batch_rewrapped_program(&self.primal, axis_size)?,
-                batch_rewrapped_program(&self.jvp, axis_size)?,
-            )?)),
+            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
+            Some(_) => Ok((
+                O::from(CustomJvpOperation::new()),
+                vec![batch_rewrapped_program(context, driver, 0)?, batch_rewrapped_program(context, driver, 1)?],
+            )),
         })
     }
 }
@@ -314,157 +305,132 @@ where
 /// Batching (`batch`) re-wraps the call around batched primal/forward/backward programs — mirroring JAX's
 /// `custom_vjp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
 /// differentiation, under eager and staging parents alike.
-#[derive(Clone, Debug)]
-pub struct CustomVjpOperation<V: Value, O> {
-    /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
-    /// that cloning the operation does not deep-clone the nested program.
-    primal: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CustomVjpOperation;
 
-    /// Program computing `(outputs..., residuals...)` from the primal inputs. The program is shared behind an
-    /// [`Arc`] for the same reason as [`Self::primal`].
-    forward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
-    /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`. The
-    /// program is shared behind an [`Arc`] for the same reason as [`Self::primal`].
-    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-}
-
-impl<V: Value, O: Operation<V::Type>> CustomVjpOperation<V, O> {
-    /// Creates a custom-VJP operation after validating the forward/backward program signatures against the primal
-    /// program's: `forward` must consume the primal inputs and produce the primal outputs followed by the residuals,
-    /// and `backward` must consume those residuals followed by one cotangent per primal output and produce one
-    /// cotangent per primal input.
-    pub fn new(
-        primal: Program<V, O, Vec<V>, Vec<V>>,
-        forward: Program<V, O, Vec<V>, Vec<V>>,
-        backward: Program<V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        let input_types = primal.input_types();
-        let output_types = primal.output_types();
-        check_types!("custom_vjp forward input", &input_types, &forward.input_types());
-        let forward_output_types = forward.output_types();
-        if forward_output_types.len() < output_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
-                    output_types.len(),
-                    forward_output_types.len(),
-                ),
-            });
-        }
-        check_types!("custom_vjp forward output", &output_types, &forward_output_types[..output_types.len()]);
-        let residual_types = &forward_output_types[output_types.len()..];
-        let expected_backward_input_types: Vec<V::Type> =
-            residual_types.iter().chain(output_types.iter()).cloned().collect();
-        check_types!("custom_vjp backward input", &expected_backward_input_types, &backward.input_types(),);
-        check_types!("custom_vjp backward output", &input_types, &backward.output_types());
-        Ok(Self { primal: Arc::new(primal), forward: Arc::new(forward), backward: Arc::new(backward) })
-    }
-
-    /// Returns the primal program.
+impl CustomVjpOperation {
+    /// Creates a custom-VJP operation. The primal, forward, and backward [`Program`]s are supplied separately as
+    /// the operation's attached regions (via the `regions` argument of [`Context::bind`]) in
+    /// the region order `["primal", "forward", "backward"]`; [`Operation::infer_output_types`] validates that the
+    /// forward interface consumes the primal inputs and produces the primal outputs followed by the residuals, and
+    /// that the backward interface consumes those residuals followed by one cotangent per primal output and
+    /// produces one cotangent per primal input.
     #[inline]
-    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.primal
-    }
-
-    /// Returns the forward (residual-producing) program.
-    #[inline]
-    pub fn forward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.forward
-    }
-
-    /// Returns the backward (cotangent-producing) program.
-    #[inline]
-    pub fn backward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.backward
-    }
-
-    /// Returns the primal input types.
-    #[inline]
-    pub fn input_types(&self) -> Vec<V::Type> {
-        self.primal.input_types()
-    }
-
-    /// Returns the primal output types.
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.primal.output_types()
+    pub fn new() -> Self {
+        Self
     }
 }
 
-impl<V: Value, O> Display for CustomVjpOperation<V, O>
-where
-    Self: Operation<V::Type>,
-{
+impl Default for CustomVjpOperation {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for CustomVjpOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        formatter.write_str("custom_vjp")
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for CustomVjpOperation<V, O> {
+/// Validates the custom-VJP contract over the three attached region interfaces
+/// (`["primal", "forward", "backward"]` region order) and returns the primal interface; refer to the documentation of
+/// [`CustomVjpOperation::new`] for the contract.
+fn validated_custom_vjp_interfaces<'i, T: Type>(
+    region_interfaces: &'i [RegionInterface<T>],
+) -> Result<&'i RegionInterface<T>, TypeError> {
+    if region_interfaces.len() != 3 {
+        return Err(TypeError {
+            message: format!("custom_vjp expects 3 attached regions but got {}", region_interfaces.len()),
+        });
+    }
+    let primal_interface = &region_interfaces[0];
+    let forward_interface = &region_interfaces[1];
+    let backward_interface = &region_interfaces[2];
+    let input_types = primal_interface.input_types();
+    let output_types = primal_interface.output_types();
+    check_types!("custom_vjp forward input", input_types, forward_interface.input_types());
+    let forward_output_types = forward_interface.output_types();
+    if forward_output_types.len() < output_types.len() {
+        return Err(TypeError {
+            message: format!(
+                "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+                output_types.len(),
+                forward_output_types.len(),
+            ),
+        });
+    }
+    check_types!("custom_vjp forward output", output_types, &forward_output_types[..output_types.len()]);
+    let residual_types = &forward_output_types[output_types.len()..];
+    let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
+    check_types!("custom_vjp backward input", &expected_backward_input_types, backward_interface.input_types());
+    check_types!("custom_vjp backward output", input_types, backward_interface.output_types());
+    Ok(primal_interface)
+}
+
+impl<T: Type> Operation<T> for CustomVjpOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "custom_vjp"
     }
 
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        check_types!("custom_vjp input", &self.input_types(), input_types);
-        Ok(self.output_types())
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        let primal_interface = validated_custom_vjp_interfaces(region_interfaces)?;
+        check_types!("custom_vjp input", primal_interface.input_types(), input_types);
+        Ok(primal_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.primal.effects().union(self.forward.effects()).union(self.backward.effects())
+    fn region_names(&self) -> &'static [&'static str] {
+        &["primal", "forward", "backward"]
     }
 }
 
-impl<Constant, O, V, C> InterpretableOperation<V, C> for CustomVjpOperation<Constant, O>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    O: InterpretableProgramOperation<V, C, Constant>,
-{
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        O::interpret_program(context, &self.primal, inputs.to_vec())
+impl<C: Domain> InterpretableOperation<C> for CustomVjpOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`CustomVjpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<V: Value, O: Clone + Operation<V::Type>, C: Context<Type = V::Type>> PartiallyEvaluatableOperation<C>
-    for CustomVjpOperation<V, O>
-where
-    C::Operation: From<CustomVjpOperation<V, O>>,
-{
-}
+impl<C: Context> PartiallyEvaluatableOperation<C> for CustomVjpOperation where C::Operation: From<CustomVjpOperation> {}
 
 /// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
 /// the custom derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<C> for CustomVjpOperation<C::Constant, O>
+impl<C, O> BatchableOperation<C> for CustomVjpOperation
 where
     C: Context<Type = ArrayType, Operation = O>,
-    C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: Broadcast + Transpose,
-    O: Clone
-        + Operation<ArrayType>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>
-        + From<CustomVjpOperation<C::Constant, O>>
-        + BatchableProgramOperation<C::Constant>,
+    O: Operation<ArrayType> + From<TransposeOperation> + From<BroadcastOperation> + From<CustomVjpOperation>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
-            None => Ok(O::from(self.clone())),
-            Some(axis_size) => Ok(O::from(CustomVjpOperation::new(
-                batch_rewrapped_program(&self.primal, axis_size)?,
-                batch_rewrapped_program(&self.forward, axis_size)?,
-                batch_rewrapped_program(&self.backward, axis_size)?,
-            )?)),
+            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
+            Some(_) => Ok((
+                O::from(CustomVjpOperation::new()),
+                vec![
+                    batch_rewrapped_program(context, driver, 0)?,
+                    batch_rewrapped_program(context, driver, 1)?,
+                    batch_rewrapped_program(context, driver, 2)?,
+                ],
+            )),
         })
     }
 }
@@ -485,287 +451,8 @@ impl<V: Value> CustomVjpResidual<V> for V {
     }
 }
 
-/// Opaque linear operation staged by [`CustomVjpOperation`]'s JVP rule.
-///
-/// In its un-transposed form it stands for the (unknown) tangent map of the custom function and rejects
-/// interpretation: `custom_vjp` functions are reverse-mode-only, matching JAX. Transposition replaces it with its
-/// transposed form, whose interpretation replays the user's backward program on the captured residuals and the
-/// incoming output cotangents.
-#[derive(Clone, Debug)]
-pub struct CustomVjpCallOperation<V: Value, O, F: Value<Type = V::Type>> {
-    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents. The
-    /// program is shared behind an [`Arc`] so that cloning the operation does not deep-clone the nested program.
-    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
-    /// Captured residual factors consumed by the backward program.
-    residuals: Vec<F>,
-
-    /// Whether this call has been transposed into its executable (pullback) form.
-    transposed: bool,
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O> CustomVjpCallOperation<V, O, F> {
-    /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true` for
-    /// the executable pullback form.
-    pub fn new(backward: Program<V, O, Vec<V>, Vec<V>>, residuals: Vec<F>, transposed: bool) -> Self {
-        Self { backward: Arc::new(backward), residuals, transposed }
-    }
-
-    /// Returns the user's backward program.
-    #[inline]
-    pub fn backward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.backward
-    }
-
-    /// Returns the captured residual factors.
-    #[inline]
-    pub fn residuals(&self) -> &[F] {
-        self.residuals.as_slice()
-    }
-
-    /// Returns whether this call is in its transposed (executable pullback) form.
-    #[inline]
-    pub fn transposed(&self) -> bool {
-        self.transposed
-    }
-
-    /// Maps the residual factor payloads with `map_factor`, preserving the backward program and direction.
-    pub fn map_captures<MappedFactor: Value<Type = V::Type>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<CustomVjpCallOperation<V, O, MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-        O: Clone,
-    {
-        Ok(CustomVjpCallOperation {
-            backward: self.backward.clone(),
-            residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
-            transposed: self.transposed,
-        })
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O: Operation<V::Type>> CustomVjpCallOperation<V, O, F> {
-    /// Returns the cotangent types flowing *into* the backward program (one per primal output).
-    fn cotangent_types(&self) -> Vec<V::Type> {
-        self.backward.input_types().split_off(self.residuals.len())
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O> Display for CustomVjpCallOperation<V, O, F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.transposed {
-            formatter.write_str("custom_vjp_backward")
-        } else {
-            formatter.write_str("custom_vjp_tangent")
-        }
-    }
-}
-
-impl<V: Value, F: Value<Type = V::Type>, O: Operation<V::Type>> Operation<V::Type> for CustomVjpCallOperation<V, O, F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        if self.transposed { "custom_vjp_backward" } else { "custom_vjp_tangent" }
-    }
-
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        if self.transposed {
-            check_types!("custom_vjp backward cotangent", &self.cotangent_types(), input_types);
-            Ok(self.backward.output_types())
-        } else {
-            // The un-transposed call maps input tangents (typed like the primal inputs, which are the backward
-            // program's outputs) to output tangents (typed like the primal outputs, which are the backward
-            // program's trailing inputs).
-            check_types!("custom_vjp tangent", &self.backward.output_types(), input_types);
-            Ok(self.cotangent_types())
-        }
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
-        self.backward.effects()
-    }
-}
-
-/// Interprets a [`CustomVjpCallOperation`] in an active [`Context`].
-///
-/// Custom-VJP calls are context-mediated because executing the transposed call means replaying a captured backward
-/// program. Eager contexts replay the program into concrete values, while staging contexts replay it into tracer
-/// instructions by lifting constants and binding each captured instruction through the active context.
-pub trait CustomVjpCall<Constant, O, F, V>: ConstantCapability<V, Constant, Captured>
-where
-    Constant: Value,
-    O: Operation<Constant::Type>,
-    F: Value<Type = Constant::Type>,
-    V: Value<Type = Constant::Type>,
-{
-    /// Interprets `operation` over `inputs`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Custom-VJP call whose backward program is replayed.
-    ///   - `inputs`: Runtime tangent or cotangent inputs for the selected captured program.
-    fn interpret_custom_vjp_call(
-        &self,
-        operation: &CustomVjpCallOperation<Constant, O, F>,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError>;
-}
-
-impl<Constant, O, F, V, C> CustomVjpCall<Constant, O, F, V> for C
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    F: CustomVjpResidual<V>,
-    O: InterpretableOperation<V, C> + Operation<Constant::Type>,
-    C: ConstantCapability<V, Constant, Captured>,
-    Vec<Constant>: Parameterized<Constant, ParameterStructure: Debug + PartialEq>,
-{
-    fn interpret_custom_vjp_call(
-        &self,
-        operation: &CustomVjpCallOperation<Constant, O, F>,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        if !operation.transposed {
-            return Err(TypeError {
-                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_gradient, or jacrev) instead"
-                    .to_string(),
-            }
-            .into());
-        }
-        let mut values = operation
-            .residuals
-            .iter()
-            .map(|residual| residual.residual_value())
-            .collect::<Result<Vec<_>, _>>()?;
-        values.extend(inputs.iter().cloned());
-        operation.backward.interpret_with(
-            values,
-            |_, constant| self.constant(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(self, inputs),
-        )
-    }
-}
-
-impl<Constant, O, F, V, C> InterpretableOperation<V, C> for CustomVjpCallOperation<Constant, O, F>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    F: Value<Type = Constant::Type>,
-    O: Operation<Constant::Type>,
-    C: CustomVjpCall<Constant, O, F, V>,
-{
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        context.interpret_custom_vjp_call(self, inputs)
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
-/// [`CustomVjpCallOperation`]. The residual operation family `O` is independent of the call's primal operation family
-/// `CallOperation`, because partial evaluation never inlines a nested program here and so never builds a residual
-/// program of its own.
-impl<V, CallOperation, F, C> PartiallyEvaluatableOperation<C> for CustomVjpCallOperation<V, CallOperation, F>
-where
-    V: Value,
-    CallOperation: Clone + Operation<V::Type>,
-    F: Value<Type = V::Type>,
-    C: Context<Type = V::Type>,
-    C::Operation: From<CustomVjpCallOperation<V, CallOperation, F>>,
-{
-}
-
-/// Transpose rule for [`CustomVjpCallOperation`]: stages the flipped-direction form of the call on the output
-/// cotangents, materializing structural zeros so the staged call receives every cotangent input. The rule is
-/// generic over the cotangent value type `W`, which need not match the backward program's value type `V`: the staged
-/// flipped call carries the programs and residuals along unchanged.
-///
-/// The un-transposed (tangent-map) call transposes into the executable pullback. The pullback does not transpose back:
-/// user-authored custom VJPs have no tangent program, matching JAX's behavior for second-order reverse mode through
-/// `custom_vjp`.
-impl<V, O, F, W, OLinear> TransposableOperation<W, OLinear> for CustomVjpCallOperation<V, O, F>
-where
-    V: Value,
-    F: Value<Type = V::Type>,
-    W: Value<Type = V::Type>,
-    O: Clone + Operation<V::Type>,
-    OLinear: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<CustomVjpCallOperation<V, O, F>>,
-{
-    fn transpose(
-        &self,
-        context: &mut TracingContext<W, OLinear>,
-        _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
-        if self.transposed {
-            return Err(TypeError {
-                message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
-                    supported"
-                    .to_string(),
-            }
-            .into());
-        }
-        // The staged call's outputs are primal-output-typed for the tangent-map form and primal-input-typed for
-        // the pullback form, so the incoming cotangents are typed accordingly.
-        let cotangent_types = if self.transposed { self.backward.output_types() } else { self.cotangent_types() };
-        check_count!("output", outputs, cotangent_types.len(), ProgramError);
-        let cotangent_tracers = outputs
-            .iter()
-            .map(|cotangent| cotangent.clone().materialize(context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let call = OLinear::from(CustomVjpCallOperation {
-            backward: self.backward.clone(),
-            residuals: self.residuals.to_vec(),
-            transposed: !self.transposed,
-        });
-        let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
-        Ok(outputs.into_iter().map(MaybeZero::Value).collect())
-    }
-}
-
-/// Batching rule for the transposed [`CustomVjpCallOperation`]: replays the backward program through the
-/// per-operation batching rules with the captured residuals lifted through `context.parent()` (the identity under an
-/// eager parent, a lifted constant under a staging parent) as replicated values. Used when a pullback containing
-/// custom-VJP calls is interpreted with batched cotangents (e.g., by `jacrev`). The un-transposed form rejects
-/// batching just as it rejects interpretation.
-impl<C, O, F> BatchableOperation<C> for CustomVjpCallOperation<C::Constant, O, F>
-where
-    C: Context<Type = ArrayType>,
-    C::Constant: Value<Type = ArrayType>,
-    F: CustomVjpResidual<C::Constant>,
-    O: Operation<ArrayType> + BatchableOperation<C>,
-{
-    fn batch(
-        &self,
-        context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        if !self.transposed {
-            return Err(TypeError {
-                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_gradient, or jacrev) instead"
-                    .to_string(),
-            }
-            .into());
-        }
-        let mut values = self
-            .residuals
-            .iter()
-            .map(|residual| Ok(ArrayBatch::replicated(context.parent().lift(residual.residual_value()?)?)))
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        values.extend(inputs.iter().cloned());
-        self.backward.interpret_with(
-            values,
-            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
-            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-        )
-    }
-}
-
-/// Capture-free forward-mode (JVP) rule for [`CustomVjpOperation`]: splices the user-supplied forward program
-/// directly into the shared builder and stages one opaque [`CustomVjpTangentOperation`] carrier for the output
-/// tangents.
+/// Capture-free forward-mode (JVP) rule for [`CustomVjpOperation`]: replays the user-supplied forward program through
+/// the active context and stages one opaque [`CustomVjpTangentOperation`] carrier for the output tangents.
 ///
 /// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
 /// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
@@ -778,26 +465,30 @@ where
 /// fails with the canonical reverse-only error, while [`transpose_primal_custom_vjp`] replays the user's `backward`
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
 /// primal-enum operation, the rule introduces no symbolic capture and needs no
-/// [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation) or
-/// [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation) witness.
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Constant, C::Operation>
+/// nested differentiation or linearization request.
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation
 where
-    C::Constant: Clone,
-    C::Operation: Clone + From<CustomVjpTangentOperation<C::Constant, C::Operation>>,
+    C::Operation: From<CustomVjpTangentOperation>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let output_count = self.output_types().len();
-        check_count!("input", inputs, self.input_types().len(), ProgramError);
-        // Replay the forward program on the dual primals, recovering the primal outputs followed by the residuals.
+        // The attached regions are `["primal", "forward", "backward"]`; the primal interface provides the boundary
+        // types.
+        let primal_region = driver.region(0)?;
+        let forward_region = driver.region(1)?;
+        let backward_region = driver.region(2)?;
+        let output_count = primal_region.output_types().len();
+        check_count!("input", inputs, primal_region.input_types().len(), ProgramError);
+        // Replay the forward region on the dual primals, recovering the primal outputs followed by the residuals.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = self.forward().interpret_in_context(context, primal_operands)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "custom_vjp forward program produced {} outputs which is fewer than its {output_count} primal \
+                "custom_vjp forward region produced {} outputs which is fewer than its {output_count} primal \
                  output(s)",
                 forward_outputs.len(),
             ))
@@ -808,15 +499,15 @@ where
         let residual_count = residuals.len();
 
         // Stage one opaque carrier over `[input_tangents..., residuals...]`, producing the output tangents. The
-        // carrier rejects forward interpretation and transposes by replaying the user's backward program.
+        // carrier rejects forward interpretation and transposes by replaying the user's backward region.
         // The opaque carrier takes every input tangent as a real operand, so materialize structural zeros.
         let mut carrier_operands = inputs
             .iter()
             .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
-        let carrier = CustomVjpTangentOperation { backward: self.backward.clone(), residual_count, transposed: false };
-        let output_tangents = context.bind(carrier, &[], &[], &carrier_operands)?;
+        let carrier = CustomVjpTangentOperation { residual_count, transposed: false };
+        let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -831,21 +522,20 @@ where
 /// so a tangent program never contains it on a linear operand (linearization stages the opaque
 /// [`CustomVjpTangentOperation`] carrier instead, which owns the executable transpose) and the rule reports an
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V, O, W, OLinear> TransposableOperation<W, OLinear> for CustomVjpOperation<V, O>
+impl<W, OLinear> TransposableOperation<W, OLinear> for CustomVjpOperation
 where
-    V: Value,
-    W: Value<Type = V::Type>,
-    O: Operation<V::Type>,
-    OLinear: Operation<V::Type>,
+    W: Value,
+    OLinear: Operation<W::Type>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<W, OLinear>>(
         &self,
         _context: &mut TracingContext<W, OLinear>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+            message: "operation `custom_vjp` has no partition-aware transpose rule".to_string(),
         }
         .into())
     }
@@ -853,23 +543,17 @@ where
 
 /// Opaque primal-enum carrier staged by [`CustomVjpOperation`]'s capture-free forward-mode rule.
 ///
-/// This is the operand-form counterpart of [`CustomVjpCallOperation`]: it plays the same role under the
-/// direct-transpose path (where tangent programs stay in the primal operation family `O` and carry their
-/// residuals as ordinary program operands) that [`CustomVjpCallOperation`] plays under the capture-based reverse
-/// path. The two differ only in how residuals reach the backward program: [`CustomVjpCallOperation`] closes them into
-/// captured factors, whereas this carrier receives them as the trailing operands of the staged operation, after the
-/// input tangents.
+/// The tangent program stays in the primal operation family `O` and carries its residuals as ordinary program
+/// operands: the carrier receives them as the trailing operands of the staged operation, after the input tangents.
+/// (The deleted capture-based `CustomVjpCallOperation` reverse path instead closed residuals into captured factors;
+/// the operand form is the sole surviving mechanism.)
 ///
 /// In its un-transposed form it stands for the (unknown) tangent map of the custom function and rejects
 /// interpretation: `custom_vjp` functions are reverse-mode-only. Transposition (see [`transpose_primal_custom_vjp`])
 /// reads the residual operands from the pullback and replays the user's backward program on them and the incoming
 /// output cotangents, producing the input cotangents — so reverse mode uses exactly the user-supplied gradient.
-#[derive(Clone, Debug)]
-pub struct CustomVjpTangentOperation<V: Value, O> {
-    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents. The
-    /// program is shared behind an [`Arc`] so that cloning the operation does not deep-clone the nested program.
-    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CustomVjpTangentOperation {
     /// Number of residual operands, used to split the backward program's inputs into the residual prefix and the
     /// output-cotangent suffix.
     residual_count: usize,
@@ -878,23 +562,18 @@ pub struct CustomVjpTangentOperation<V: Value, O> {
     transposed: bool,
 }
 
-impl<V: Value, O> CustomVjpTangentOperation<V, O> {
+impl CustomVjpTangentOperation {
     /// Creates a custom-VJP tangent carrier. Use `transposed = false` for the opaque pushforward form and
-    /// `transposed = true` for the transposed pullback form.
+    /// `transposed = true` for the transposed pullback form. The user's backward program (mapping
+    /// `(residuals..., output_cotangents...)` to input cotangents) is supplied separately as the operation's
+    /// single attached `backward` region.
     ///
     /// # Parameters
     ///
-    ///   - `backward`: User backward program mapping `(residuals..., output_cotangents...)` to input cotangents.
     ///   - `residual_count`: Number of trailing residual operands carried alongside the tangents.
     ///   - `transposed`: Whether this carrier is in its transposed (pullback) form.
-    pub fn new(backward: Program<V, O, Vec<V>, Vec<V>>, residual_count: usize, transposed: bool) -> Self {
-        Self { backward: Arc::new(backward), residual_count, transposed }
-    }
-
-    /// Returns the user's backward program.
-    #[inline]
-    pub fn backward(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.backward
+    pub fn new(residual_count: usize, transposed: bool) -> Self {
+        Self { residual_count, transposed }
     }
 
     /// Returns the number of trailing residual operands.
@@ -908,21 +587,17 @@ impl<V: Value, O> CustomVjpTangentOperation<V, O> {
     pub fn transposed(&self) -> bool {
         self.transposed
     }
-}
 
-impl<V: Value, O: Operation<V::Type>> CustomVjpTangentOperation<V, O> {
-    /// Returns the residual types carried as the trailing operands (the backward program's leading inputs).
-    fn residual_types(&self) -> Vec<V::Type> {
-        self.backward.input_types().into_iter().take(self.residual_count).collect()
-    }
-
-    /// Returns the cotangent types flowing *into* the backward program (one per primal output).
-    fn cotangent_types(&self) -> Vec<V::Type> {
-        self.backward.input_types().split_off(self.residual_count)
+    /// Splits the backward interface's input types into the leading residual types and the trailing cotangent
+    /// types (one per primal output).
+    fn split_backward_inputs<T: Type>(&self, backward_interface: &RegionInterface<T>) -> (Vec<T>, Vec<T>) {
+        let mut residual_types = backward_interface.input_types().to_vec();
+        let cotangent_types = residual_types.split_off(self.residual_count);
+        (residual_types, cotangent_types)
     }
 }
 
-impl<V: Value, O> Display for CustomVjpTangentOperation<V, O> {
+impl Display for CustomVjpTangentOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.transposed {
             formatter.write_str("custom_vjp_backward")
@@ -932,32 +607,47 @@ impl<V: Value, O> Display for CustomVjpTangentOperation<V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for CustomVjpTangentOperation<V, O> {
+impl<T: Type> Operation<T> for CustomVjpTangentOperation {
     #[inline]
     fn name(&self) -> &'static str {
         if self.transposed { "custom_vjp_backward" } else { "custom_vjp_tangent" }
     }
 
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError {
+                message: format!(
+                    "{} expects 1 attached region but got {}",
+                    Operation::<T>::name(self),
+                    region_interfaces.len(),
+                ),
+            });
+        }
+        let backward_interface = &region_interfaces[0];
+        let (residual_types, cotangent_types) = self.split_backward_inputs(backward_interface);
         if self.transposed {
             // The transposed (pullback) carrier maps `[output_cotangents..., residuals...]` to the input cotangents
             // (the backward program's outputs, typed like the primal inputs).
-            let expected: Vec<V::Type> = self.cotangent_types().into_iter().chain(self.residual_types()).collect();
+            let expected: Vec<T> = cotangent_types.iter().chain(residual_types.iter()).cloned().collect();
             check_types!("custom_vjp backward", &expected, input_types);
-            Ok(self.backward.output_types())
+            Ok(backward_interface.output_types().to_vec())
         } else {
             // The un-transposed (tangent-map) carrier maps `[input_tangents..., residuals...]` to the output tangents.
             // The input tangents are typed like the primal inputs (the backward program's outputs).
-            let expected: Vec<V::Type> =
-                self.backward.output_types().into_iter().chain(self.residual_types()).collect();
+            let expected: Vec<T> =
+                backward_interface.output_types().iter().chain(residual_types.iter()).cloned().collect();
             check_types!("custom_vjp tangent", &expected, input_types);
-            Ok(self.cotangent_types())
+            Ok(cotangent_types)
         }
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.backward.effects()
+    fn region_names(&self) -> &'static [&'static str] {
+        &["backward"]
     }
 }
 
@@ -968,13 +658,13 @@ impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for CustomVjpTangentOpe
 /// operation either: [`transpose_primal_custom_vjp`] replays the user's backward program directly through the
 /// pullback builder rather than leaving a transposed carrier in the program, so reaching this interpret path means a
 /// forward-mode use slipped through and the same reverse-only error applies.
-impl<Constant, O, V, C> InterpretableOperation<V, C> for CustomVjpTangentOperation<Constant, O>
-where
-    Constant: Value,
-    V: Value<Type = Constant::Type>,
-    O: Operation<Constant::Type>,
-{
-    fn interpret(&self, _context: &C, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Err(TypeError {
             message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                 value_and_gradient, or jacrev) instead"
@@ -987,18 +677,19 @@ where
 /// Batching rule for [`CustomVjpTangentOperation`]: the opaque custom-VJP tangent carrier is a forward-mode tangent
 /// map that never appears in a batched primal program — reverse mode consumes it during transposition rather than
 /// batching it — so batching is rejected for every context.
-impl<Constant, O, C> BatchableOperation<C> for CustomVjpTangentOperation<Constant, O>
+impl<C> BatchableOperation<C> for CustomVjpTangentOperation
 where
-    Constant: Value<Type = ArrayType>,
-    O: Operation<ArrayType>,
     C: Context<Type = ArrayType>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
+        Err(BatchingError::UnsupportedOperation {
+            message: format!("operation `{}` cannot be batched", Operation::<ArrayType>::name(self)),
+        })
     }
 }
 
@@ -1006,17 +697,18 @@ where
 /// forward tangent program, so its tangent carrier rejects forward-mode linearization. The carrier never reaches this
 /// rule on the supported path — the [`CustomVjpOperation`] JVP rule stages it on the tangent side — but the rule is
 /// implemented so the enum dispatch can forward to it uniformly.
-impl<C: Context> DifferentiableOperation<C> for CustomVjpTangentOperation<C::Constant, C::Operation>
-where
-    C::Operation: Clone,
-{
-    fn jvp(
+impl<C: Context> DifferentiableOperation<C> for CustomVjpTangentOperation {
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only", self.name()),
+            message: format!(
+                "{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only",
+                Operation::<C::Type>::name(self),
+            ),
         }
         .into())
     }
@@ -1025,18 +717,16 @@ where
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`CustomVjpTangentOperation`]; the opaque carrier never has all-known operands in practice (its tangent operands
 /// are unknown by construction), so it residualizes unchanged.
-impl<V: Value, O: Clone + Operation<V::Type>, C: Context<Type = V::Type>> PartiallyEvaluatableOperation<C>
-    for CustomVjpTangentOperation<V, O>
-where
-    C::Operation: From<CustomVjpTangentOperation<V, O>>,
+impl<C: Context> PartiallyEvaluatableOperation<C> for CustomVjpTangentOperation where
+    C::Operation: From<CustomVjpTangentOperation>
 {
 }
 
 /// Partition-aware transpose rule for an opaque [`CustomVjpTangentOperation`], used by the direct reverse path
 /// when it transposes a tangent program in the primal operation family `O` rather than re-keying it into the linear
-/// family. This is the operand-form counterpart of the [`CustomVjpCallOperation`] transpose rule: the residuals are
-/// ordinary *operands* (known values supplied through `operand_values`) instead of capture factors, so the rule reads
-/// them from the pullback and replays the user's backward program forward into the pullback builder.
+/// family. The residuals are ordinary *operands* (known values supplied through `operand_values`) rather than the
+/// deleted capture-based path's capture factors, so the rule reads them from the pullback and replays the user's
+/// backward program forward into the pullback builder.
 ///
 /// The forward stages the carrier over `[input_tangents(linear)..., residuals(known)...]` with the tangents
 /// marked linear and the residuals marked known. This rule therefore:
@@ -1062,15 +752,16 @@ where
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge. The [`Unknown`](PartialValue::Unknown) entries are the input
 ///     tangents; the [`Known`](PartialValue::Known) entries carry the residual tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the carrier's outputs (one per primal output).
-pub fn transpose_primal_custom_vjp<V, O>(
-    operation: &CustomVjpTangentOperation<V, O>,
+pub fn transpose_primal_custom_vjp<V, O, D: TranspositionDriver<V, O>>(
+    operation: &CustomVjpTangentOperation,
     context: &mut TracingContext<V, O>,
+    driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value,
-    O: Clone + Operation<V::Type> + MaybeZeroOperation<V::Type> + From<ZeroOperation<V::Type>>,
+    O: Operation<V::Type> + MaybeZeroOperation<V::Type> + From<ZeroOperation<V::Type>>,
 {
     if operation.transposed {
         return Err(TypeError {
@@ -1084,6 +775,7 @@ where
     // Operand layout is `[input_tangents(linear)..., residuals(known)...]`. The input tangents are exactly the linear
     // operands, and the residuals are the trailing known operands read from the pullback. The dispatch guarantees a
     // `Known` operand carries its pullback value, so each residual tracer is read directly.
+    let backward = driver.region(0)?;
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     let tangent_count = operand_linear.iter().filter(|&&linear| linear).count();
     let residual_count = operation.residual_count;
@@ -1104,22 +796,21 @@ where
     // Stage the output cotangents, then replay the user's backward program on `[residuals..., outputs...]`.
     // The backward program is the pullback already, so it is replayed forward into the pullback builder rather than
     // transposed.
-    let cotangent_types = operation.cotangent_types();
-    check_count!("output", outputs, cotangent_types.len(), ProgramError);
+    let cotangent_count = backward.input_types().len() - residual_count;
+    check_count!("output", outputs, cotangent_count, ProgramError);
     let mut backward_inputs = residuals;
     for cotangent in outputs {
         backward_inputs.push(cotangent.clone().materialize(context)?);
     }
-    let input_cotangents = operation.backward().interpret_in_context(context, backward_inputs)?;
+    let input_cotangents = backward.interpret_in_context(context, backward_inputs)?;
     check_count!("output", input_cotangents, tangent_count, ProgramError);
 
-    // The user's backward program is an opaque splice: its outputs come back as plain replayed values, so any
+    // The user's backward program is an opaque replay: its outputs come back as plain values, so any
     // structural zero-ness a user backward expresses (a `zero`/`zero_like` output for a non-differentiated input)
     // would otherwise be lost at this boundary and stage wasted adjoint work upstream. Recover it here with one local
     // pass over the *backward program* itself: an output produced by a nullary canonical zero instruction is a
     // structural zero. This is the reverse-mode analogue of JAX's `custom_vjp` symbolic zeros, recovered
     // automatically instead of through an opt-in.
-    let backward = operation.backward();
     let output_is_zero = backward
         .output_ids()
         .iter()
@@ -1153,18 +844,19 @@ where
 /// [`transpose_primal_custom_vjp`]. The recursion stays value-level (the user's backward program is replayed forward
 /// into the pullback builder through [`Context::bind`]), so instantiating this implementation for a closed operation
 /// enum introduces no recursive [`TransposableOperation`] obligation on `O`.
-impl<V, O> TransposableOperation<V, O> for CustomVjpTangentOperation<V, O>
+impl<V, O> TransposableOperation<V, O> for CustomVjpTangentOperation
 where
     V: Value,
-    O: Clone + Operation<V::Type> + MaybeZeroOperation<V::Type> + From<ZeroOperation<V::Type>>,
+    O: Operation<V::Type> + MaybeZeroOperation<V::Type> + From<ZeroOperation<V::Type>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        transpose_primal_custom_vjp(self, context, inputs, outputs).map_err(DifferentiationError::from)
+        transpose_primal_custom_vjp(self, context, driver, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 
@@ -1225,12 +917,14 @@ where
 
 impl<D, P, J, IT, OT> CustomJvp<D, P, J, IT, OT>
 where
-    D: Domain<Type: PartialEq>,
+    D: Domain,
     P: Fn(IT) -> Result<OT, ProgramError>,
     J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-    D::Operation: Clone + Operation<D::Type> + From<CustomJvpOperation<D::Constant, D::Operation>>,
-    IT: Parameterized<DomainTracer<D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
-    OT: Parameterized<DomainTracer<D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    D::Operation: From<CustomJvpOperation>,
+    IT: Parameterized<DomainTracer<D>>,
+    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+    OT: Parameterized<DomainTracer<D>>,
+    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
     IT::To<D::Type>: Clone
         + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
     OT::To<D::Type>:
@@ -1265,11 +959,11 @@ where
         };
         let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types.clone(), input_types))?;
-        let operation = D::Operation::from(CustomJvpOperation::new(primal.to_flat_program(), jvp.to_flat_program())?);
+        let operation = D::Operation::from(CustomJvpOperation::new());
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, &[], &[], &input_values)?;
+        let outputs = context.bind(operation, vec![primal.to_flat_program(), jvp.to_flat_program()], &input_values)?;
         let output_structure = output_types.0.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -1348,14 +1042,17 @@ where
 
 impl<D, P, F, B, IT, OT, RT> CustomVjp<D, P, F, B, IT, OT, RT>
 where
-    D: Domain<Type: PartialEq>,
+    D: Domain,
     P: Fn(IT) -> Result<OT, ProgramError>,
     F: Fn(IT) -> Result<(OT, RT), ProgramError>,
     B: Fn(RT, OT) -> Result<IT, ProgramError>,
-    D::Operation: Clone + Operation<D::Type> + From<CustomVjpOperation<D::Constant, D::Operation>>,
-    IT: Parameterized<DomainTracer<D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
-    OT: Parameterized<DomainTracer<D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
-    RT: Parameterized<DomainTracer<D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
+    D::Operation: From<CustomVjpOperation>,
+    IT: Parameterized<DomainTracer<D>>,
+    IT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+    OT: Parameterized<DomainTracer<D>>,
+    OT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+    RT: Parameterized<DomainTracer<D>>,
+    RT::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
     IT::To<D::Type>: Clone
         + Parameterized<D::Type, Family = IT::Family, To<DomainTracer<D>> = IT, To<D::Constant> = IT::To<D::Constant>>,
     OT::To<D::Type>: Clone
@@ -1397,14 +1094,14 @@ where
             |(residuals, cotangents)| (self.backward)(residuals, cotangents),
             (residual_types, output_types.clone()),
         )?;
-        let operation = D::Operation::from(CustomVjpOperation::new(
-            primal.to_flat_program(),
-            forward.to_flat_program(),
-            backward.to_flat_program(),
-        )?);
+        let operation = D::Operation::from(CustomVjpOperation::new());
         // Bind through whatever context the inputs flow, so `custom_vjp` composes under `vmap`/`jvp`.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, &[], &[], &input_values)?;
+        let outputs = context.bind(
+            operation,
+            vec![primal.to_flat_program(), forward.to_flat_program(), backward.to_flat_program()],
+            &input_values,
+        )?;
         let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -1414,13 +1111,11 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::operations::math::MulOperation;
-    use crate::operations::math::{Cos, CosOperation, Sin, SinOperation};
+    use crate::operations::math::{Cos, CosOperation, MulOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
@@ -1442,7 +1137,7 @@ mod tests {
     ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
-        let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1454,11 +1149,11 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
         let two = builder.add_constant(TestArray::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![two, cosine], Vec::new()).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx], Vec::new()).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -1470,8 +1165,8 @@ mod tests {
     ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -1484,52 +1179,82 @@ mod tests {
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
         let three = builder.add_constant(TestArray::scalar(3.0));
-        let scaled = builder.add_instruction(MulOperation, vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation, vec![scaled, cotangent]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![three, residual], Vec::new()).unwrap()[0];
+        let gradient = builder.add_instruction(MulOperation, vec![scaled, cotangent], Vec::new()).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_jvp_sin(r#type: &ArrayType) -> ArrayOperation<TestArray> {
-        ArrayOperation::CustomJvp(Box::new(
-            CustomJvpOperation::new(sin_program(r#type), doubled_sin_jvp_program(r#type)).unwrap(),
-        ))
+    fn custom_jvp_sin(
+        r#type: &ArrayType,
+    ) -> (ArrayOperation<TestArray>, Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>)
+    {
+        (
+            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            vec![sin_program(r#type), doubled_sin_jvp_program(r#type)],
+        )
     }
 
-    fn custom_vjp_sin(r#type: &ArrayType) -> ArrayOperation<TestArray> {
-        ArrayOperation::CustomVjp(Box::new(
-            CustomVjpOperation::new(
-                sin_program(r#type),
-                sin_forward_program(r#type),
-                tripled_sin_backward_program(r#type),
-            )
-            .unwrap(),
-        ))
+    fn custom_vjp_sin(
+        r#type: &ArrayType,
+    ) -> (ArrayOperation<TestArray>, Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>)
+    {
+        (
+            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+            vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
+        )
+    }
+
+    /// Returns the [`RegionInterface`] of the provided flat region program.
+    fn custom_region_interface(
+        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+    ) -> RegionInterface<ArrayType> {
+        program.interface()
     }
 
     #[test]
-    fn test_custom_jvp_construction_validates_the_rule_signature() {
+    fn test_custom_jvp_inference_validates_the_rule_signature() {
         let scalar = test_type(&[]);
-        // The JVP program must take `(inputs..., tangents...)`; a primal-only signature is rejected.
-        assert!(CustomJvpOperation::new(sin_program(&scalar), sin_program(&scalar)).is_err());
+        // The JVP interface must take `(inputs..., tangents...)`; a primal-only signature is rejected.
+        assert!(
+            CustomJvpOperation::new()
+                .infer_output_types(
+                    std::slice::from_ref(&scalar),
+                    &[custom_region_interface(&sin_program(&scalar)), custom_region_interface(&sin_program(&scalar))],
+                )
+                .is_err()
+        );
     }
 
     #[test]
-    fn test_custom_vjp_construction_validates_the_rule_signatures() {
+    fn test_custom_vjp_inference_validates_the_rule_signatures() {
         let scalar = test_type(&[]);
-        // The backward program must consume `(residuals..., output cotangents...)`; a single-input program whose
+        // The backward interface must consume `(residuals..., output cotangents...)`; a single-input program whose
         // signature cannot line up with the forward residuals is rejected.
         assert!(
-            CustomVjpOperation::new(sin_program(&scalar), sin_forward_program(&scalar), sin_program(&scalar)).is_err()
+            CustomVjpOperation::new()
+                .infer_output_types(
+                    std::slice::from_ref(&scalar),
+                    &[
+                        custom_region_interface(&sin_program(&scalar)),
+                        custom_region_interface(&sin_forward_program(&scalar)),
+                        custom_region_interface(&sin_program(&scalar)),
+                    ],
+                )
+                .is_err()
         );
     }
 
     #[test]
     fn test_custom_derivative_calls_remain_opaque_to_partial_evaluation() {
         let scalar = test_type(&[]);
-        for operation in [custom_jvp_sin(&scalar), custom_vjp_sin(&scalar)] {
+        for (operation, operation_regions) in [custom_jvp_sin(&scalar), custom_vjp_sin(&scalar)] {
             let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let region_ids = operation_regions
+                .iter()
+                .map(|region| builder.import_region(region.entry_region_ref()))
+                .collect::<Vec<_>>();
             let input = builder.add_input(scalar.clone());
-            let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+            let output = builder.add_instruction(operation, vec![input], region_ids).unwrap()[0];
             let program = builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
@@ -1548,15 +1273,12 @@ mod tests {
     #[test]
     fn test_custom_vjp_tangent_carrier_remains_opaque_to_partial_evaluation() {
         let scalar = test_type(&[]);
-        let operation = ArrayOperation::CustomVjpTangent(Box::new(CustomVjpTangentOperation::new(
-            tripled_sin_backward_program(&scalar),
-            1,
-            false,
-        )));
+        let operation = ArrayOperation::CustomVjpTangent(CustomVjpTangentOperation::new(1, false));
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let backward_region = builder.import_region(tripled_sin_backward_program(&scalar).entry_region_ref());
         let tangent = builder.add_input(scalar.clone());
         let residual = builder.add_input(scalar.clone());
-        let output = builder.add_instruction(operation, vec![tangent, residual]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![tangent, residual], vec![backward_region]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1573,8 +1295,9 @@ mod tests {
     #[test]
     fn test_custom_jvp_interprets_the_primal_program() {
         let scalar = test_type(&[]);
-        let outputs = custom_jvp_sin(&scalar)
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(2.0)])
+        let (operation, operation_regions) = custom_jvp_sin(&scalar);
+        let outputs = crate::EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .bind(operation, operation_regions, &[TestArray::scalar(2.0)])
             .unwrap();
         assert_abs_diff_eq!(outputs[0].values[0], 2.0f64.sin(), epsilon = 1e-9);
     }
@@ -1585,8 +1308,8 @@ mod tests {
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 |x| {
-                    let operation = custom_jvp_sin(&test_type(&[]));
-                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
+                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
                 TestArray::scalar(2.0),
                 TestArray::scalar(1.0),
@@ -1603,8 +1326,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 |x| {
-                    let operation = custom_jvp_sin(&test_type(&[]));
-                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 TestArray::scalar(3.0),
             )
@@ -1619,8 +1342,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 |x| {
-                    let operation = custom_vjp_sin(&test_type(&[]));
-                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 TestArray::scalar(2.0),
             )
@@ -1632,19 +1355,19 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_rejects_forward_mode() {
-        // The staged linear call refuses interpretation in its un-transposed (pushforward) form, which is exactly
-        // the operation `jvp` would need to execute; reverse mode transposes it first and replays `backward`.
-        let scalar = test_type(&[]);
-        let call = CustomVjpCallOperation::<TestArray, ArrayOperation<TestArray>, TestArray>::new(
-            tripled_sin_backward_program(&scalar),
-            vec![TestArray::scalar(2.0f64.cos())],
-            false,
-        );
+        // The staged tangent carrier refuses interpretation in its un-transposed (pushforward) form, which is
+        // exactly the operation `jvp` would need to execute; reverse mode transposes it first and replays
+        // `backward`.
+        let carrier = CustomVjpTangentOperation::new(1, false);
         assert!(matches!(
-            call.interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(1.0)]),
-            Err(ProgramError::Type(TypeError { message }))
-                if message.starts_with("custom_vjp does not support forward-mode differentiation"),
-        ));
+        InterpretableOperation::<_>::interpret(
+                        &carrier,
+                        &crate::EagerContext::<TestArray>::new(), &crate::EmptyRegionDriver,
+                                        &[TestArray::scalar(1.0)],
+                    ),
+                    Err(ProgramError::Type(TypeError { message }))
+                        if message.starts_with("custom_vjp does not support forward-mode differentiation"),
+                ));
     }
 
     #[test]
@@ -1658,8 +1381,8 @@ mod tests {
         let jacobian = jacrev(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
-                let operation = custom_vjp_sin(&test_type(&[2]));
-                Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
+                let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
+                Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
             },
             TestArray::new(vector, vec![0.5, 1.0]),
         )
@@ -1675,7 +1398,7 @@ mod tests {
     fn scalar_sin_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1684,11 +1407,11 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         let dx = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
         let two = builder.add_constant(Scalar::from(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![two, cosine], Vec::new()).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx], Vec::new()).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -1700,7 +1423,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
         builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
         let tangent = builder.add_constant(Scalar::from(1.0));
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
@@ -1711,8 +1434,8 @@ mod tests {
     fn scalar_sin_forward_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -1722,8 +1445,8 @@ mod tests {
         let residual = builder.add_input(DataType::F64);
         let cotangent = builder.add_input(DataType::F64);
         let three = builder.add_constant(Scalar::from(3.0));
-        let scaled = builder.add_instruction(MulOperation, vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation, vec![scaled, cotangent]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![three, residual], Vec::new()).unwrap()[0];
+        let gradient = builder.add_instruction(MulOperation, vec![scaled, cotangent], Vec::new()).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1732,10 +1455,9 @@ mod tests {
         let (primal, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(
                 |x| {
-                    let operation = ScalarOperation::CustomJvp(Box::new(
-                        CustomJvpOperation::new(scalar_sin_program(), scalar_doubled_sin_jvp_program()).unwrap(),
-                    ));
-                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
+                    let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
+                    let operation_regions = vec![scalar_sin_program(), scalar_doubled_sin_jvp_program()];
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
                 Scalar::from(2.0),
                 Scalar::from(1.0),
@@ -1748,17 +1470,20 @@ mod tests {
 
     #[test]
     fn test_linearization_rejects_known_custom_jvp_tangents() {
-        let operation = ScalarOperation::CustomJvp(Box::new(
-            CustomJvpOperation::new(scalar_sin_program(), scalar_known_tangent_jvp_program()).unwrap(),
-        ));
+        let operation = ScalarOperation::CustomJvp(CustomJvpOperation::new());
+        let operation_regions = || vec![scalar_sin_program(), scalar_known_tangent_jvp_program()];
         let expected = "linearization produced a known tangent output; differentiation rules must represent \
                         input-independent zero tangents structurally";
 
         // Program-level direct linearization must reject the malformed rule rather than silently replacing its
         // constant tangent with zero.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_ids = operation_regions()
+            .iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation.clone(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation.clone(), vec![input], region_ids).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1770,7 +1495,7 @@ mod tests {
         // Value-level direct linearization enforces the same rule contract before exposing a reusable pushforward.
         let result = EagerContext::<Scalar, ScalarOperation<Scalar>>::new().linearize(
             |input| {
-                let mut outputs = input.context().bind(operation, &[], &[], &[input.clone()])?;
+                let mut outputs = input.context().bind(operation, operation_regions(), &[input.clone()])?;
                 Ok(outputs.remove(0))
             },
             Scalar::from(2.0),
@@ -1786,15 +1511,10 @@ mod tests {
         let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .value_and_gradient(
                 |x| {
-                    let operation = ScalarOperation::CustomVjp(Box::new(
-                        CustomVjpOperation::new(
-                            scalar_sin_program(),
-                            scalar_sin_forward_program(),
-                            scalar_tripled_sin_backward_program(),
-                        )
-                        .unwrap(),
-                    ));
-                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    let operation = ScalarOperation::CustomVjp(CustomVjpOperation::new());
+                    let operation_regions =
+                        vec![scalar_sin_program(), scalar_sin_forward_program(), scalar_tripled_sin_backward_program()];
+                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 Scalar::from(2.0),
             )
@@ -1924,8 +1644,8 @@ mod tests {
         let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| {
-                    let operation = custom_jvp_sin(&scalar);
-                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
+                    let (operation, operation_regions) = custom_jvp_sin(&scalar);
+                    Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
                 TestArray::vector(vec![0.5, 1.0, 1.5]),
                 BatchAxis::new(0),
@@ -1954,8 +1674,13 @@ mod tests {
                     let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                         &context,
                         |item| {
-                            let operation = custom_jvp_sin(&test_type(&[]));
-                            Ok(item.context().bind(operation, &[], &[], &[item.clone()])?.into_iter().next().unwrap())
+                            let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                            Ok(item
+                                .context()
+                                .bind(operation, operation_regions, &[item.clone()])?
+                                .into_iter()
+                                .next()
+                                .unwrap())
                         },
                         x,
                         BatchAxis::new(0),
@@ -1988,8 +1713,13 @@ mod tests {
                     let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                         &context,
                         |item| {
-                            let operation = custom_vjp_sin(&test_type(&[]));
-                            Ok(item.context().bind(operation, &[], &[], &[item.clone()])?.into_iter().next().unwrap())
+                            let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                            Ok(item
+                                .context()
+                                .bind(operation, operation_regions, &[item.clone()])?
+                                .into_iter()
+                                .next()
+                                .unwrap())
                         },
                         x,
                         BatchAxis::new(0),

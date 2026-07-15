@@ -2,8 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
 use crate::batching::{BatchAxis, BatchingError, InterpretableBatchableOperation};
-use crate::contexts::Domain;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -11,10 +10,13 @@ use crate::operations::manipulation::Transpose;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
+use crate::interpretation::InterpretationDriver;
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -155,7 +157,7 @@ where
 {
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         self.dispatch_domain()
-            .bind(DotOperation::new(dimensions.clone()), &[], &[], &[self.clone(), rhs.clone()])
+            .bind(DotOperation::new(dimensions.clone()), Vec::new(), &[self.clone(), rhs.clone()])
             .expect("`dot` operation failed")
             .remove(0)
     }
@@ -169,8 +171,7 @@ where
         self.dispatch_domain()
             .bind(
                 DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
-                &[],
-                &[],
+                Vec::new(),
                 &[self.clone(), rhs.clone()],
             )
             .expect("`dot` operation failed")
@@ -221,7 +222,7 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
 
 /// Canonical operation name reported by the generalized dot product type-inference rule. The captured-factor linear
 /// forms shared this rule and reported under the same name.
-const DOT_OPERATION_NAME: &'static str = "dot";
+const DOT_OPERATION_NAME: &str = "dot";
 
 /// Computes the abstract output type of one generalized dot product.
 ///
@@ -571,7 +572,11 @@ impl Operation<ArrayType> for DotOperation {
         DOT_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         Ok(vec![dot_abstract(&input_types[0], &input_types[1], &self.dimensions, self.output_sharding.as_ref())?])
     }
@@ -587,8 +592,13 @@ impl Operation<ArrayType> for DotOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Dot, C> InterpretableOperation<V, C> for DotOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Dot>> InterpretableOperation<C> for DotOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         // The requested output sharding flows through the capability method so that interpretation over staging
         // values (e.g., during program batching) preserves it; concrete values ignore it.
@@ -609,11 +619,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 impl<C: Context<Type = ArrayType, Value: crate::operations::manipulation::Broadcast>>
     crate::batching::BatchableOperation<C> for DotOperation
 where
-    DotOperation: InterpretableOperation<C::Value, C>,
+    DotOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        context: &crate::batching::BatchingContext<C>,
+        context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[crate::batching::ArrayBatch<C::Value>],
     ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -651,12 +662,13 @@ where
 /// primal, so the tangent dots match the primal dot exactly and stay capture-free.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DotOperation
 where
-    C::Operation: Clone + From<DotOperation>,
+    C::Operation: From<DotOperation>,
     C::Value: Dot + std::ops::Add<Output = C::Value>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
@@ -702,9 +714,10 @@ where
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> TransposableOperation<V, O>
     for DotOperation
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -746,7 +759,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> T
                         } else {
                             [known_value, output_cotangent.clone()]
                         };
-                        let mut outputs = context.stage_operation(adjoint, &operands)?;
+                        let mut outputs = context.stage_operation(adjoint, Vec::new(), &operands)?;
                         check_count!("output", outputs, 1, ProgramError);
                         MaybeZero::Value(outputs.remove(0))
                     }
@@ -1049,7 +1062,7 @@ mod tests {
             Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4)), Size::Static(3)]),
         );
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs.clone()]),
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Ok(vec![ArrayType::new(
                 DataType::F64,
                 Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]),
@@ -1061,7 +1074,7 @@ mod tests {
         let static_rhs =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(4), Size::Static(3)]));
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), static_rhs]),
+            operation.infer_output_types(&[lhs.clone(), static_rhs], &[]),
             Err(TypeError {
                 message: "'dot' contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string(),
             }),
@@ -1071,7 +1084,7 @@ mod tests {
             Shape::new(vec![Size::Dynamic(Some(8)), Size::Dynamic(Some(4)), Size::Static(3)]),
         );
         assert_eq!(
-            operation.infer_output_types(&[lhs, mismatched_batch_rhs]),
+            operation.infer_output_types(&[lhs, mismatched_batch_rhs], &[]),
             Err(TypeError {
                 message: "'dot' batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string(),
             }),
@@ -1095,7 +1108,7 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::sharded(["n"])],
         );
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[2, 4, 16],
@@ -1118,7 +1131,7 @@ mod tests {
         let replicated_rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
         assert_eq!(
-            operation.infer_output_types(&[replicated_lhs, replicated_rhs]),
+            operation.infer_output_types(&[replicated_lhs, replicated_rhs], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[4, 16],
@@ -1132,7 +1145,7 @@ mod tests {
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["n"])]);
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[4, 16],
@@ -1149,7 +1162,7 @@ mod tests {
         let lhs =
             sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
         assert_eq!(
-            operation.infer_output_types(&[lhs, plain_array(&[8, 16])]),
+            operation.infer_output_types(&[lhs, plain_array(&[8, 16])], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[4, 16],
@@ -1158,7 +1171,7 @@ mod tests {
         );
         // Without any operand shardings, the output carries none.
         assert_eq!(
-            operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])]),
+            operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])], &[]),
             Ok(vec![plain_array(&[4, 16])]),
         );
     }
@@ -1178,7 +1191,7 @@ mod tests {
             vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
         );
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Err(TypeError {
                 message: "'dot' batching dimensions must have consistent shardings, but got {'b'} and {'m'}"
                     .to_string(),
@@ -1196,7 +1209,7 @@ mod tests {
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]);
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs]),
+            operation.infer_output_types(&[lhs.clone(), rhs], &[]),
             Err(TypeError {
                 message: "'dot' contracting dimensions are sharded, making the output sharding ambiguous; request an \
                           explicit output sharding (e.g., one with unreduced axes) to resolve it"
@@ -1207,7 +1220,7 @@ mod tests {
         let mismatched_rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), mismatched_rhs]),
+            operation.infer_output_types(&[lhs.clone(), mismatched_rhs], &[]),
             Err(TypeError {
                 message: "'dot' contracting dimensions must have consistent shardings, but got {'k'} and {'m'}"
                     .to_string(),
@@ -1217,7 +1230,7 @@ mod tests {
         let replicated_rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
         assert_eq!(
-            operation.infer_output_types(&[lhs, replicated_rhs]),
+            operation.infer_output_types(&[lhs, replicated_rhs], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[4, 16],
@@ -1239,7 +1252,7 @@ mod tests {
             vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
         );
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Err(TypeError { message: "'dot' operand shardings must use the same mesh".to_string() }),
         );
     }
@@ -1260,7 +1273,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            operation.infer_output_types(&[unreduced_lhs, plain_array(&[8, 16])]),
+            operation.infer_output_types(&[unreduced_lhs, plain_array(&[8, 16])], &[]),
             Err(TypeError { message: "'dot' operands cannot be unreduced".to_string() }),
         );
 
@@ -1279,7 +1292,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            operation.infer_output_types(&[reduced_lhs, plain_array(&[8, 16])]),
+            operation.infer_output_types(&[reduced_lhs, plain_array(&[8, 16])], &[]),
             Ok(vec![
                 plain_array(&[4, 16])
                     .with_sharding(
@@ -1310,7 +1323,7 @@ mod tests {
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["m"])]);
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Ok(vec![sharded_array(
                 &mesh,
                 &[4, 16],
@@ -1341,7 +1354,7 @@ mod tests {
         let operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
             .with_output_sharding(requested.clone());
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs.clone()]),
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Ok(vec![plain_array(&[2, 4, 16]).with_sharding(requested).unwrap()]),
         );
 
@@ -1350,7 +1363,7 @@ mod tests {
         let operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
             .with_output_sharding(rank_mismatched);
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs.clone()]),
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Err(TypeError { message: "'dot' output sharding rank (1) does not match the output rank (3)".to_string() }),
         );
 
@@ -1360,7 +1373,7 @@ mod tests {
         let operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
             .with_output_sharding(other_mesh_sharding);
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Err(TypeError { message: "'dot' output sharding must use the same mesh as the operands".to_string() }),
         );
 
@@ -1370,7 +1383,7 @@ mod tests {
             Sharding::new(auto_mesh, vec![ShardingDimension::sharded(["a"]), ShardingDimension::replicated()]).unwrap();
         let operation = DotOperation::matmul().with_output_sharding(auto_sharding);
         assert_eq!(
-            operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])]),
+            operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])], &[]),
             Err(TypeError { message: "'dot' output sharding cannot reference auto mesh axes".to_string() }),
         );
     }
@@ -1391,7 +1404,7 @@ mod tests {
         .unwrap();
         let operation = DotOperation::matmul().with_output_sharding(unreduced.clone());
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs.clone()]),
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Ok(vec![plain_array(&[4, 16]).with_sharding(unreduced.clone()).unwrap()]),
         );
 
@@ -1400,7 +1413,7 @@ mod tests {
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
         let operation = DotOperation::matmul().with_output_sharding(unreduced.clone());
         assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), replicated_rhs.clone()]),
+            operation.infer_output_types(&[lhs.clone(), replicated_rhs.clone()], &[]),
             Err(TypeError {
                 message:
                     "'dot' contracting dimensions must be sharded identically when the output sharding is unreduced"
@@ -1417,7 +1430,7 @@ mod tests {
         .unwrap();
         let operation = DotOperation::matmul().with_output_sharding(mismatched);
         assert_eq!(
-            operation.infer_output_types(&[lhs, rhs]),
+            operation.infer_output_types(&[lhs, rhs], &[]),
             Err(TypeError {
                 message:
                     "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
@@ -1428,10 +1441,17 @@ mod tests {
         // Unsharded contracting dimensions cannot produce an unreduced output.
         let operation = DotOperation::matmul().with_output_sharding(unreduced);
         assert_eq!(
-            operation.infer_output_types(&[
-                replicated_rhs.clone(),
-                sharded_array(&mesh, &[16, 4], vec![ShardingDimension::replicated(), ShardingDimension::replicated()],)
-            ]),
+            operation.infer_output_types(
+                &[
+                    replicated_rhs.clone(),
+                    sharded_array(
+                        &mesh,
+                        &[16, 4],
+                        vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                    )
+                ],
+                &[]
+            ),
             Err(TypeError {
                 message:
                     "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
@@ -1444,10 +1464,7 @@ mod tests {
     fn test_dot_batching_stages_the_lifted_output_sharding() {
         use std::rc::Rc;
 
-        use crate::batching::ArrayBatch;
-        use crate::batching::BatchAxis;
-        use crate::batching::BatchableOperation;
-        use crate::batching::BatchingContext;
+        use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;
         use crate::tracing_v2::ArrayOperation;
@@ -1475,7 +1492,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = operation.batch(&batching_context, &[lhs, rhs]).unwrap();
+        let outputs = operation.batch(&batching_context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         let output_atom = outputs[0].value().atom_id().unwrap();
         drop(outputs);
@@ -1534,8 +1551,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, TestDotOperation<TestArray>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
-        let product =
-            builder.add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input]).unwrap()[0];
+        let product = builder
+            .add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input], Vec::new())
+            .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -1552,8 +1570,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, TestDotOperation<TestArray>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
-        let product =
-            builder.add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input]).unwrap()[0];
+        let product = builder
+            .add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input], Vec::new())
+            .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();

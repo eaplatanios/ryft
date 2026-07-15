@@ -886,7 +886,7 @@ where
 mod tests {
     use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::math::{Cos, Sin};
-    use ryft_core::regions::RegionAttachments;
+    use ryft_core::regions::CalleeRegionDriver;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
@@ -2029,7 +2029,7 @@ mod tests {
                 let mut primal_outputs = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
-                        [].with_callees(&[primal_half.clone()]),
+                        CalleeRegionDriver::new(&[primal_half.clone()]),
                         &[primal_input],
                     )
                     .expect("primal jit_call should stage");
@@ -2041,7 +2041,7 @@ mod tests {
                 let tangent_output = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
-                        [].with_callees(&[tangent_half.clone()]),
+                        CalleeRegionDriver::new(&[tangent_half.clone()]),
                         tangent_inputs.as_slice(),
                     )
                     .expect("tangent jit_call should stage")

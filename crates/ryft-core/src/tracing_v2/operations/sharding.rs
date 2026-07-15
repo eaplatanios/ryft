@@ -14,12 +14,7 @@
 //!   dimension (the hinted axes are the ones the type system does not track, so the new dimension is left open for
 //!   the backend to fill), matching JAX's `with_sharding_constraint` batcher.
 
-use crate::batching::ArrayBatch;
-use crate::batching::BatchAxis;
-use crate::batching::BatchableOperation;
-use crate::batching::BatchingContext;
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -31,7 +26,8 @@ use crate::programs::{MaybeZero, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::differentiation::DifferentiationDual;
+use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::types::{ArrayType, Typed};
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
@@ -41,9 +37,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshardOpera
 where
     O: Operation<ArrayType> + From<ReshardOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -67,12 +64,13 @@ where
 /// consulted, so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReshardOperation
 where
-    C::Operation: Clone + From<ReshardOperation>,
+    C::Operation: From<ReshardOperation>,
     C::Value: Reshard,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -89,11 +87,12 @@ where
 /// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ReshardOperation
 where
-    ReshardOperation: InterpretableOperation<C::Value, C>,
+    ReshardOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -122,9 +121,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ShardingCons
 where
     O: Operation<ArrayType> + From<ShardingConstraintOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -142,12 +142,13 @@ where
 /// so the operand tangent reaching here is always live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ShardingConstraintOperation
 where
-    C::Operation: Clone + From<ShardingConstraintOperation>,
+    C::Operation: From<ShardingConstraintOperation>,
     C::Value: ConstrainSharding,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -166,11 +167,12 @@ where
 /// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ShardingConstraintOperation
 where
-    ShardingConstraintOperation: InterpretableOperation<C::Value, C>,
+    ShardingConstraintOperation: InterpretableOperation<C>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -195,8 +197,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::batching::Batch;
-    use crate::batching::BatchAxis;
+    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, ReverseModeDifferentiate};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
