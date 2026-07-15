@@ -133,12 +133,12 @@ pub use builders::ProgramBuilder;
 pub use effects::{Effect, Effects};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{Operation, OperationFormatter};
-pub use programs::{FlatProgram, Program, ProgramLiveSets, ValueId};
+pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionDriver, RegionId,
     RegionInterface, RegionRef,
 };
-pub use values::Value;
+pub use values::{Value, ValueId};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

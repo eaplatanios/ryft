@@ -2,7 +2,40 @@ use std::fmt::{Debug, Display};
 
 use crate::contexts::Domain;
 use crate::parameters::Parameter;
+use crate::programs::atoms::AtomId;
+use crate::programs::regions::RegionId;
 use crate::types::Typed;
+
+/// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`], identified by its containing
+/// [`Region`] and its region-local [`AtomId`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueId {
+    /// [`Region`] containing the atom.
+    region: RegionId,
+
+    /// Region-local [`AtomId`] of the value.
+    atom: AtomId,
+}
+
+impl ValueId {
+    /// Creates a new [`ValueId`] from the provided containing region and region-local atom identifier.
+    #[inline]
+    pub fn new(region: RegionId, atom: AtomId) -> Self {
+        Self { region, atom }
+    }
+
+    /// Returns the [`RegionId`] of the [`Region`] containing the atom.
+    #[inline]
+    pub fn region(self) -> RegionId {
+        self.region
+    }
+
+    /// Returns the region-local [`AtomId`] of the value.
+    #[inline]
+    pub fn atom(self) -> AtomId {
+        self.atom
+    }
+}
 
 /// Represents leaf values that can participate in traced [`Program`]s. [`Value`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and

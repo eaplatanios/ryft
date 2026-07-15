@@ -11,39 +11,8 @@ use crate::programs::effects::Effects;
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::values::Value;
+use crate::programs::values::{Value, ValueId};
 use crate::types::Typed;
-
-/// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`], identified by its containing
-/// [`Region`] and its region-local [`AtomId`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueId {
-    /// [`Region`] containing the atom.
-    region: RegionId,
-
-    /// Region-local [`AtomId`] of the value.
-    atom: AtomId,
-}
-
-impl ValueId {
-    /// Creates a new [`ValueId`] from the provided containing region and region-local atom identifier.
-    #[inline]
-    pub fn new(region: RegionId, atom: AtomId) -> Self {
-        Self { region, atom }
-    }
-
-    /// Returns the [`RegionId`] of the [`Region`] containing the atom.
-    #[inline]
-    pub fn region(self) -> RegionId {
-        self.region
-    }
-
-    /// Returns the region-local [`AtomId`] of the value.
-    #[inline]
-    pub fn atom(self) -> AtomId {
-        self.atom
-    }
-}
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region

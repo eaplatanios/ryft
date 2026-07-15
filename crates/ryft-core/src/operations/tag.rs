@@ -7,11 +7,14 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::ElementwiseOperation;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{Type, TypeError};
 

@@ -4,10 +4,12 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::{BooleanLike, ElementwiseOperation, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`CompareOperation`].
@@ -207,8 +209,8 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::operations::Operation;
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 

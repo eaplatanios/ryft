@@ -5,14 +5,17 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
     TranspositionDriver,
 };
-use crate::effects::{Effect, Effects};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::ElementwiseOperation;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
+use crate::programs::effects::{Effect, Effects};
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError};
 
@@ -186,7 +189,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::tracing::{DomainTracer, Trace};
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
