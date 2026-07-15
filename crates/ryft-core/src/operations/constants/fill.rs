@@ -1,31 +1,28 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
-use crate::contexts::Context;
-use crate::contexts::StagingContext;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
-};
-use crate::interpretation::InterpretableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
+use crate::programs::ProgramError;
+use crate::regions::RegionInterface;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`FillOperation`].
-pub const FILL_OPERATION_NAME: &'static str = "fill";
+pub const FILL_OPERATION_NAME: &str = "fill";
 
 /// [`Operation`] that has no inputs and that produces a single output equal to the [`Type`] it holds (i.e., its
 /// `r#type` field) filled with a captured scalar `V` value. [`FillOperation`] is the scalar-broadcast counterpart of
 /// [`ConstantOperation`](super::ConstantOperation). Rather than carrying a fully typed value, it carries a target
 /// [`Type`] plus a scalar `V` and synthesizes its output value through the [`Fill`] trait when interpreted. For arrays,
 /// this corresponds to an array of the held type and shape with every element set to the captured scalar. It mirrors
-/// [`ZeroOperation`](super::ZeroOperation) and [`OneOperation`](super::OneOperation), generalizing the fixed `zero` or
+/// [`ZeroOperation`](crate::ZeroOperation) and [`OneOperation`](super::OneOperation), generalizing the fixed `zero` or
 /// `one` value to an arbitrary captured scalar value.
 #[derive(Copy, Clone, Debug)]
 pub struct FillOperation<T: Type, V> {
@@ -56,20 +53,24 @@ impl<T: Type, V> FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Display> Display for FillOperation<T, V> {
+impl<T: Type, V: Clone + Display> Display for FillOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
+impl<T: Type, V: Clone + Display> Operation<T> for FillOperation<T, V> {
     #[inline]
     fn name(&self) -> &'static str {
         FILL_OPERATION_NAME
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
     }
@@ -83,11 +84,16 @@ impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Value<Type = T>, S: Clone + Display, C: Fill<S, V>> InterpretableOperation<V, C>
+impl<T: Type, S: Clone + Display, C: Domain<Type = T> + Fill<S, C::Value>> InterpretableOperation<C>
     for FillOperation<T, S>
 {
     #[inline]
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.fill(&self.r#type, self.value.clone())?])
     }
@@ -100,8 +106,8 @@ impl<T: Type, Constant: Clone + Display, C: Context<Type = T, Operation: From<Fi
 
 /// Represents the ability to synthesize a value for a given [`Type`] filled with a captured scalar in an interpretation
 /// context. [`Fill`] is the [`Type`]-driven counterpart needed by [`FillOperation`] for its [`InterpretableOperation`]
-/// implementation. It sits alongside [`Zero`] and [`One`](crate::One) in the same type-driven family, but generalizes
-/// the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
+/// implementation. It sits alongside [`Zero`](crate::Zero) and [`One`](crate::One) in the same type-driven family, but
+/// generalizes the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
 pub trait Fill<S, V: Typed> {
     /// Returns a value of `type` with every element set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
@@ -116,20 +122,21 @@ impl<V: Clone + Display, C: StagingContext<Operation: From<FillOperation<C::Type
     }
 }
 
-impl<S: Clone + Display, C: Context<Operation: PartiallyEvaluatableOperation<C> + From<FillOperation<C::Type, S>>>>
-    Fill<S, PartialTracer<C>> for PartialEvaluationContext<C>
+impl<S: Clone + Display, C: Context> Fill<S, PartialTracer<C>> for PartialEvaluationContext<C>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<FillOperation<C::Type, S>>,
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), &[], &[], &[])?;
+        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Fill<S, C::Value>, S> Fill<S, BatchingTracer<C>>
-    for BatchingContext<C>
-{
+impl<C: Context<Type = ArrayType> + Fill<S, C::Value>, S> Fill<S, BatchingTracer<C>> for BatchingContext<C> {
     #[inline]
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
@@ -137,9 +144,7 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Fill<S, C:
     }
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> + Fill<S, C::Value>, S>
-    Fill<S, DifferentiationTracer<C>> for DifferentiationContext<C>
-{
+impl<C: Context + Fill<S, C::Value>, S> Fill<S, DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?);
@@ -158,6 +163,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
@@ -184,30 +190,32 @@ mod tests {
         assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
         assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.value(), &Scalar::from(3.5));
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[]), Ok(vec![r#type.clone()]));
+        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[]
             ),
             Ok(vec![TestArray::new(r#type.clone(), vec![3.5, 3.5])]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()], &[]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[TestArray::new(r#type.clone(), vec![0.0, 0.0])],
             ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
         let mut builder = ProgramBuilder::<TestArray, FillOperation<ArrayType, Scalar>>::new();
-        let output = builder.add_instruction(operation, vec![]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![], Vec::new()).unwrap()[0];
         let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

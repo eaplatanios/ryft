@@ -1,21 +1,19 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
-use crate::contexts::Context;
-use crate::contexts::StagingContext;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
-};
-use crate::interpretation::InterpretableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
+use crate::programs::ProgramError;
+use crate::regions::RegionInterface;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ZeroOperation`].
-pub const ZERO_OPERATION_NAME: &'static str = "zero";
+pub const ZERO_OPERATION_NAME: &str = "zero";
 
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
 /// [`Type`] that it holds (i.e., for its `r#type` field). Note that for arrays, this would typically correspond to an
@@ -53,7 +51,11 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
     }
@@ -65,9 +67,14 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 }
 
-impl<T: Type, V: Value<Type = T>, C: Zero<V>> InterpretableOperation<V, C> for ZeroOperation<T> {
+impl<T: Type, C: Domain<Type = T> + Zero<C::Value>> InterpretableOperation<C> for ZeroOperation<T> {
     #[inline]
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.zero(&self.r#type)?])
     }
@@ -119,20 +126,21 @@ impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<Tracer<C>>
     }
 }
 
-impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<ZeroOperation<C::Type>>>> Zero<PartialTracer<C>>
-    for PartialEvaluationContext<C>
+impl<C: Context> Zero<PartialTracer<C>> for PartialEvaluationContext<C>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<ZeroOperation<C::Type>>,
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), &[], &[], &[])?;
+        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Zero<C::Value>> Zero<BatchingTracer<C>>
-    for BatchingContext<C>
-{
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C>> for BatchingContext<C> {
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().zero(r#type)?, BatchAxis::replicated())?;
@@ -140,9 +148,7 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Zero<C::Va
     }
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> Zero<DifferentiationTracer<C>>
-    for DifferentiationContext<C>
-{
+impl<C: Context + Zero<C::Value>> Zero<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().zero(r#type)?);
@@ -162,6 +168,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::types::{DataType, TypeError};
 
     use super::*;
@@ -187,38 +194,41 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero [type=f64]");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
+        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[]
             ),
             Ok(vec![Scalar::from(0.0)]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[Scalar::from(2.5)],
             ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &ZeroOperation::new(DataType::F32),
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[],
             ),
             Ok(vec![Scalar::from(0.0f32)]),
         );
 
         let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();
-        let output = builder.add_instruction(operation, vec![]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![], Vec::new()).unwrap()[0];
         let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

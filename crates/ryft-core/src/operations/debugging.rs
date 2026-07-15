@@ -11,7 +11,8 @@ use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, RegionInterface, Value};
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError};
 
@@ -135,7 +136,7 @@ where
     #[inline]
     fn print(self, label: &str) -> Self {
         self.dispatch_domain()
-            .bind(PrintOperation::new(label), Vec::new(), &[], std::slice::from_ref(&self))
+            .bind(PrintOperation::new(label), Vec::new(), std::slice::from_ref(&self))
             .expect("`print` operation failed")
             .remove(0)
     }
@@ -155,12 +156,8 @@ where
         // through unchanged (printing tangents would change the observable output of the differentiated program).
         // The print binds through the context so the rule works uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let mut primal = context.bind(
-            PrintOperation::new(self.label()),
-            Vec::new(),
-            &[],
-            std::slice::from_ref(inputs[0].primal()),
-        )?;
+        let mut primal =
+            context.bind(PrintOperation::new(self.label()), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }
@@ -189,6 +186,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::tracing::{DomainTracer, Trace};
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
@@ -222,9 +220,8 @@ mod tests {
     fn test_print_interprets_as_the_identity() {
         let context = EagerContext::<TestArray>::new();
         let input = TestArray::scalar(3.0);
-        let outputs = PrintOperation::new("x")
-            .interpret(&context.clone(), &crate::RegionlessDriver, &[input.clone()])
-            .unwrap();
+        let outputs =
+            PrintOperation::new("x").interpret(&context.clone(), &EmptyRegionDriver, &[input.clone()]).unwrap();
         assert_eq!(outputs, vec![input]);
     }
 

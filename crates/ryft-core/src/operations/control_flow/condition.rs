@@ -1,56 +1,45 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::contexts::{Context, StagingContext};
-use crate::effects::Effects;
-use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
-    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
+    PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::payloads::{Captured, Input};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
+use crate::regions::{OutputRegionProvenance, RegionInterface};
+use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`ConditionOperation`].
-pub const CONDITION_OPERATION_NAME: &'static str = "condition";
+pub const CONDITION_OPERATION_NAME: &str = "condition";
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate. Ordinary
-/// conditions use the [`Input`] predicate payload: the predicate is supplied as the first operation input (a scalar
-/// Boolean input) and the remaining operation inputs are forwarded to the selected branch. Linearized conditions use
-/// the [`Captured`] predicate payload: the predicate is stored in the operation payload as a residual value and the
-/// operation inputs are exactly the branch input tangents or cotangents.
+/// [`Operation`] that evaluates one of its two attached branch [`Region`](crate::Region)s depending on a Boolean
+/// predicate. Ordinary conditions use the [`Input`] predicate payload: the predicate is supplied as the first
+/// operation input (a scalar Boolean input) and the remaining operation inputs are forwarded to the selected branch.
+/// Linearized conditions use the [`Captured`] predicate payload: the predicate is stored in the operation payload as
+/// a residual value and the operation inputs are exactly the branch input tangents or cotangents.
+///
+/// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
+/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
+/// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Freshly
+/// authored conditions supply the two branch [`Program`]s through the `regions` argument of
+/// [`Context::bind`].
 ///
 /// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
 /// constant still lowers to a `stablehlo.if` operation whose constant predicate the backend folds away (via
 /// [StableHLO canonicalization](https://openxla.org/stablehlo/generated/stablehlo_passes) and XLA's conditional
 /// simplification), so `ryft` performs no predicate folding of its own.
-///
-/// The nested branches are stored as flat `Vec`-parameter [`Program`]s because they consume the operation inputs
-/// directly. Structured Rust parameters are flattened before a branch is captured (i.e., via
-/// [`Parameterized`](crate::parameters::Parameterized) helpers) and reconstructed later as needed. The operation
-/// itself only needs the ordered parameter signature for type checking, interpretation, batching, differentiation,
-/// transposition, and other transforms.
 #[derive(Clone)]
-pub struct ConditionOperation<V: Value, O, F: Value<Type = V::Type> = V, PredicatePayload = Input> {
-    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true. The program
-    /// is shared behind an [`Arc`] so that cloning the operation (e.g., while rebuilding or transforming a
-    /// surrounding program) does not deep-clone the nested program.
-    pub(crate) true_branch: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
-    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is false. The program
-    /// is shared behind an [`Arc`] for the same reason as [`Self::true_branch`].
-    pub(crate) false_branch: Arc<Program<V, O, Vec<V>, Vec<V>>>,
-
+pub struct ConditionOperation<F: Value, PredicatePayload = Input> {
     /// Captured predicate for captured-predicate conditions, or `None` for input-predicate conditions.
     pub(crate) predicate: Option<F>,
 
@@ -58,13 +47,9 @@ pub struct ConditionOperation<V: Value, O, F: Value<Type = V::Type> = V, Predica
     pub(crate) predicate_payload: PhantomData<PredicatePayload>,
 }
 
-impl<V: Value, O: Debug, F: Value<Type = V::Type>, PredicatePayload> Debug
-    for ConditionOperation<V, O, F, PredicatePayload>
-{
+impl<F: Value, PredicatePayload> Debug for ConditionOperation<F, PredicatePayload> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("ConditionOperation");
-        debug.field("true_branch", &self.true_branch);
-        debug.field("false_branch", &self.false_branch);
         if let Some(predicate) = &self.predicate {
             debug.field("predicate", predicate);
         }
@@ -72,58 +57,31 @@ impl<V: Value, O: Debug, F: Value<Type = V::Type>, PredicatePayload> Debug
     }
 }
 
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O> {
-    /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The predicate
-    /// input is not described by the operation itself: it must simply be a scalar Boolean type, which
-    /// [`Operation::infer_output_types`] validates structurally against the actual first input type.
-    ///
-    /// # Parameters
-    ///
-    ///   - `true_branch`: Branch [`Program`] evaluated when the predicate is true.
-    ///   - `false_branch`: Branch [`Program`] evaluated when the predicate is false. This program must have the same
-    ///     input and output type signatures as `true_branch`.
-    pub fn new(
-        true_branch: Program<V, O, Vec<V>, Vec<V>>,
-        false_branch: Program<V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        let input_types = true_branch.input_types();
-        check_types!("condition branch input", &input_types, &false_branch.input_types());
-        let output_types = true_branch.output_types();
-        check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self {
-            true_branch: Arc::new(true_branch),
-            false_branch: Arc::new(false_branch),
-            predicate: None,
-            predicate_payload: PhantomData,
-        })
+impl<F: Value> ConditionOperation<F> {
+    /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The two branch
+    /// [`Program`]s are supplied separately as the operation's attached regions (via the `regions` argument of
+    /// [`Context::bind`]); [`Operation::infer_output_types`] validates that the branch
+    /// interfaces agree and that the predicate input is a scalar Boolean.
+    #[inline]
+    pub fn new() -> Self {
+        Self { predicate: None, predicate_payload: PhantomData }
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, F: Value<Type = V::Type>> ConditionOperation<V, O, F, Captured> {
+impl<F: Value> Default for ConditionOperation<F> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Value> ConditionOperation<F, Captured> {
     /// Creates a new [`ConditionOperation`] whose predicate is captured in the operation payload rather than supplied
-    /// as an operation input.
-    ///
-    /// # Parameters
-    ///
-    ///   - `predicate`: Captured Boolean predicate that selects the branch program to run.
-    ///   - `true_branch`: Branch [`Program`] evaluated when the predicate is true.
-    ///   - `false_branch`: Branch [`Program`] evaluated when the predicate is false. This program must have the same
-    ///     input and output type signatures as `true_branch`.
-    pub fn new_captured(
-        predicate: F,
-        true_branch: Program<V, O, Vec<V>, Vec<V>>,
-        false_branch: Program<V, O, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        let input_types = true_branch.input_types();
-        check_types!("condition branch input", &input_types, &false_branch.input_types());
-        let output_types = true_branch.output_types();
-        check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self {
-            true_branch: Arc::new(true_branch),
-            false_branch: Arc::new(false_branch),
-            predicate: Some(predicate),
-            predicate_payload: PhantomData,
-        })
+    /// as an operation input. The two branch [`Program`]s are supplied separately as the operation's attached regions
+    /// (via the `regions` argument of [`Context::bind`]).
+    #[inline]
+    pub fn new_captured(predicate: F) -> Self {
+        Self { predicate: Some(predicate), predicate_payload: PhantomData }
     }
 
     /// Returns the captured Boolean predicate that selects the branch to run.
@@ -133,119 +91,127 @@ impl<V: Value, O: Operation<V::Type>, F: Value<Type = V::Type>> ConditionOperati
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, F: Value<Type = V::Type>, PredicatePayload>
-    ConditionOperation<V, O, F, PredicatePayload>
-{
-    /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
-    #[inline]
-    pub fn true_branch(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.true_branch
-    }
-
-    /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is false.
-    #[inline]
-    pub fn false_branch(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.false_branch
-    }
-
-    /// Returns the output types produced by both branches of this [`ConditionOperation`].
-    #[inline]
-    pub fn output_types(&self) -> Vec<V::Type> {
-        self.true_branch.output_types()
-    }
-}
-
-impl<V: Value, O, F: Value<Type = V::Type>, PredicatePayload> Display for ConditionOperation<V, O, F, PredicatePayload>
-where
-    Self: Operation<V::Type>,
-{
+impl<F: Value<Type: BooleanLike>> Display for ConditionOperation<F, Input> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> Operation<V::Type> for ConditionOperation<V, O, V, Input>
+impl<F: Value<Type = ArrayType>> Display for ConditionOperation<F, Captured> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+/// Validates that the two condition branch interfaces agree on their input and output boundary types and returns
+/// them, so both predicate payloads share one interface contract.
+fn validated_branch_interfaces<'i, T: Type>(
+    region_interfaces: &'i [RegionInterface<T>],
+) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
+    if region_interfaces.len() != 2 {
+        return Err(TypeError {
+            message: format!("condition expects 2 attached regions but got {}", region_interfaces.len()),
+        });
+    }
+    let true_interface = &region_interfaces[0];
+    let false_interface = &region_interfaces[1];
+    check_types!("condition branch input", true_interface.input_types(), false_interface.input_types());
+    check_types!("condition branch output", true_interface.output_types(), false_interface.output_types());
+    Ok((true_interface, false_interface))
+}
+
+impl<F: Value> Operation<F::Type> for ConditionOperation<F, Input>
 where
-    V::Type: BooleanLike,
+    F::Type: BooleanLike,
 {
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
-        let branch_input_types = self.true_branch.input_types();
-        check_count!("input", input_types, branch_input_types.len() + 1, TypeError);
+    fn infer_output_types(
+        &self,
+        input_types: &[F::Type],
+        region_interfaces: &[RegionInterface<F::Type>],
+    ) -> Result<Vec<F::Type>, TypeError> {
+        let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
+        check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
         if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
             return Err(TypeError {
                 message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
             });
         }
-        check_types!("condition input", &branch_input_types, &input_types[1..]);
-        Ok(self.output_types())
+        check_types!("condition input", true_interface.input_types(), &input_types[1..]);
+        Ok(true_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.true_branch.effects().union(self.false_branch.effects())
+    fn region_names(&self) -> &'static [&'static str] {
+        &["true", "false"]
     }
 
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?.bracketed(|operation| {
-            operation.program("true_branch", &self.true_branch)?;
-            operation.program("false_branch", &self.false_branch)
-        })
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![
+            OutputRegionProvenance { region_index: 0, output_index },
+            OutputRegionProvenance { region_index: 1, output_index },
+        ]
     }
 }
 
-impl<V: Value<Type = ArrayType>, F: Value<Type = ArrayType>, O: Operation<ArrayType>> Operation<ArrayType>
-    for ConditionOperation<V, O, F, Captured>
-{
+impl<F: Value<Type = ArrayType>> Operation<ArrayType> for ConditionOperation<F, Captured> {
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        let branch_input_types = self.true_branch.input_types();
-        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
-        let output_types = self.true_branch.output_types();
-        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
-        check_count!("input", input_types, branch_input_types.len(), TypeError);
-        check_types!("condition input", &branch_input_types, input_types);
-        Ok(output_types)
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
+        check_count!("input", input_types, true_interface.input_types().len(), TypeError);
+        check_types!("condition input", true_interface.input_types(), input_types);
+        Ok(true_interface.output_types().to_vec())
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        self.true_branch.effects().union(self.false_branch.effects())
+    fn region_names(&self) -> &'static [&'static str] {
+        &["true", "false"]
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![
+            OutputRegionProvenance { region_index: 0, output_index },
+            OutputRegionProvenance { region_index: 1, output_index },
+        ]
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("predicate", self.predicate())?;
-            operation.program("true_branch", &self.true_branch)?;
-            operation.program("false_branch", &self.false_branch)
-        })
+        OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("predicate", self.predicate()))
     }
 }
 
-impl<Constant, V, O, C> InterpretableOperation<V, C> for ConditionOperation<Constant, O, Constant, Input>
+impl<F, C> InterpretableOperation<C> for ConditionOperation<F, Input>
 where
-    Constant: Value,
-    Constant::Type: BooleanLike,
-    V: Value<Type = Constant::Type> + BooleanLike,
-    O: InterpretableProgramOperation<V, C, Constant>,
+    F: Value,
+    F::Type: BooleanLike,
+    C: Domain<Type = F::Type, Value: BooleanLike>,
 {
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        if inputs.is_empty() {
+            return Err(ProgramError::MalformedProgram(
+                "condition interpretation requires a predicate input".to_string(),
+            ));
+        }
         let (predicate, branch_inputs) = (inputs[0].boolean()?, &inputs[1..]);
-        O::interpret_program(
-            context,
-            if predicate { &self.true_branch } else { &self.false_branch },
-            branch_inputs.to_vec(),
-        )
+        driver.interpret_region(context, if predicate { 0 } else { 1 }, branch_inputs.to_vec())
     }
 }
 
@@ -274,23 +240,20 @@ where
 /// value (a [`PartialEvaluationInput::Known`]) is propagated outward as a fresh known trace value, and one fed by an
 /// unknown branch input (a [`PartialEvaluationInput::Unknown`] of branch input `k`) maps back to condition input
 /// `k + 1`.
-impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V, O, V, Input>
+impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V, Input>
 where
     V: Value<Type = ArrayType> + BooleanLike,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    O: Clone
-        + Operation<ArrayType>
-        + PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableProgramOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<V, O>>
-        + From<ConditionOperation<V, O>>
-        + From<ZeroOperation<ArrayType>>,
+    O: Operation<ArrayType> + From<ConditionOperation<V>> + From<ZeroOperation<ArrayType>>,
 {
-    fn partially_evaluate(
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
         context: &PartialEvaluationContext<C>,
+        driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // The rule requests all nested-computation work through its region access (region 0 is the `true` branch and
+        // region 1 the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
         // Input 0 is the predicate; inputs 1.. feed both branches.
         if let PartialValue::Known(predicate) = inputs[0].value() {
             // A known predicate selects a branch only when it resolves to a concrete constant: under a staging
@@ -300,35 +263,47 @@ where
             // split instead.
             if let Some(predicate) = context.parent().resolve(predicate).into_concrete() {
                 if let Ok(predicate) = predicate.boolean() {
-                    let branch = if predicate { self.true_branch() } else { self.false_branch() };
-                    return context.inline_program(branch, inputs[1..].to_vec());
+                    let index = if predicate { 0 } else { 1 };
+                    return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
                 }
             }
             if inputs.iter().all(PartialEvaluationValue::is_known) {
-                return context.fold_or_residualize(O::from(self.clone()), inputs);
+                return context.fold_or_residualize(
+                    O::from(self.clone()),
+                    driver.regions().map(|region| region.to_program()).collect(),
+                    inputs,
+                );
             }
-            return split_condition_by_knownness(context, self, inputs);
+            return split_condition_by_knownness(context, driver, self, inputs);
         }
 
         // Unknown predicate: partially evaluate each branch against the input knowledge and reconcile the two
         // residual branch programs into a single rewritten condition. The recursive branch partial evaluation goes
-        // through the `PartiallyEvaluatableProgramOperation` witness rather than `Program::partially_evaluate`
-        // directly, so this impl avoids re-entering the operation-enum trait-solver cycle.
+        // through the partial-evaluation driver's split requests rather than `Program::partially_evaluate` directly, so
+        // this impl carries no operation-enum semantic bounds of its own.
         //
         // Two conservative gates keep the conditional whole instead: effectful branches, because the branch folds
         // below run through the *live* known-side context and would execute or stage a branch's effects
         // speculatively (the predicate is unknown, so neither branch is selected yet); and symbolic knowns, because
         // the reconciled branch programs must embed folded known values as inline constants, which a live-trace
         // tracer cannot be.
-        if !self.true_branch().effects().is_pure()
-            || !self.false_branch().effects().is_pure()
+        let true_branch = driver.region(0)?;
+        let false_branch = driver.region(1)?;
+        if !true_branch.effects().is_pure()
+            || !false_branch.effects().is_pure()
             || context.any_known_is_symbolic(&inputs[1..])
         {
-            return context.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(
+                O::from(self.clone()),
+                vec![true_branch.to_program(), false_branch.to_program()],
+                inputs,
+            );
         }
         let branch_knowledge = inputs[1..].iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let true_evaluation = O::partially_evaluate_program(context.parent(), self.true_branch(), &branch_knowledge)?;
-        let false_evaluation = O::partially_evaluate_program(context.parent(), self.false_branch(), &branch_knowledge)?;
+        let true_evaluation =
+            driver.partially_evaluate_program(context, driver.region(0)?, branch_knowledge.as_slice())?;
+        let false_evaluation =
+            driver.partially_evaluate_program(context, driver.region(1)?, branch_knowledge.as_slice())?;
 
         // Map each branch's residual inputs (true then false) back to a source feeding the rewritten condition.
         let source = |residual_input: &PartialEvaluationInput<C::Value>| match residual_input {
@@ -346,35 +321,42 @@ where
         let reconciled_true = reconcile_branch(context, &combined_input_types, 0, &true_evaluation)?;
         let reconciled_false = reconcile_branch(context, &combined_input_types, true_count, &false_evaluation)?;
 
-        let condition = ConditionOperation::new(reconciled_true, reconciled_false)?;
+        let condition = ConditionOperation::new();
         let mut rewritten_inputs = Vec::with_capacity(combined_inputs.len() + 1);
         rewritten_inputs.push(inputs[0].clone());
         rewritten_inputs.extend(combined_inputs);
-        context.fold_or_residualize(O::from(condition), rewritten_inputs.as_slice())
+        context.fold_or_residualize(
+            O::from(condition),
+            vec![reconciled_true, reconciled_false],
+            rewritten_inputs.as_slice(),
+        )
     }
 }
 
-/// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's fresh known-side context, its
-/// split, and the positions of its residual edges.
+/// Bookkeeping for one branch of [`split_condition_by_knownness`]: the branch's partitioned programs, boundary
+/// mappings, and residual edges.
 struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>> {
-    /// Fresh known-side context the branch was split through; its builder holds the branch's known work.
-    fresh: TracingContext<V, O>,
+    /// Known-side program reified by partitioning the branch through a fresh staging context.
+    known_program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Partial evaluation of the branch against the boundary knowledge.
-    evaluation: PartialEvaluation<TracingContext<V, O>>,
+    /// Residual-side program produced by partitioning the branch.
+    residual_program: Program<V, O, Vec<V>, Vec<V>>,
+
+    /// Source of each residual-program input.
+    residual_inputs: Vec<PartialEvaluationInput<usize>>,
+
+    /// Source of each original branch output.
+    outputs: Vec<PartialEvaluationOutput<usize>>,
 
     /// Per-edge local types, in edge order (feeders first, then instantiated known outputs of residual-owned slots).
     edge_types: Vec<ArrayType>,
 
-    /// For each of the branch evaluation's residual inputs, the edge ordinal it maps to when it is a known feeder.
-    feeder_edge_ordinals: Vec<Option<usize>>,
+    /// Known-program output providing each edge, in edge order.
+    edge_program_outputs: Vec<usize>,
 
     /// For each branch output, the edge ordinal carrying its folded value when the output is residual-owned but this
     /// branch folded it (the instantiation case).
     instantiated_edge_ordinals: Vec<Option<usize>>,
-
-    /// Fresh-context atoms of the branch's edges, in edge order.
-    edge_atoms: Vec<AtomId>,
 }
 
 /// Splits an [`Input`]-predicate `condition` with a known-but-symbolic predicate into a *known* condition bound in
@@ -391,104 +373,122 @@ struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
 /// dead outputs that keep the signatures aligned). The residual condition's branches share the signature
 /// `[unknown inputs..., true edges..., false edges...] -> [residual outputs...]`, each branch reading only its own
 /// edges.
-fn split_condition_by_knownness<V, O, C>(
+fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
     context: &PartialEvaluationContext<C>,
-    condition: &ConditionOperation<V, O, V, Input>,
+    driver: &D,
+    condition: &ConditionOperation<V, Input>,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
     V: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
-    O: Clone
-        + Operation<ArrayType>
-        + PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<V, O>>
-        + From<ConditionOperation<V, O>>
-        + From<ZeroOperation<ArrayType>>,
+    O: Operation<ArrayType> + From<ConditionOperation<V>> + From<ZeroOperation<ArrayType>>,
 {
+    let true_branch = driver.region(0)?;
+    let false_branch = driver.region(1)?;
     let branch_inputs = &inputs[1..];
-    let branch_input_types = condition.true_branch.input_types();
+    let branch_input_types = true_branch.input_types();
     check_count!("input", branch_inputs, branch_input_types.len(), ProgramError);
     let input_known = branch_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-    let output_count = condition.true_branch.output_types().len();
+    let output_count = true_branch.output_types().len();
 
-    // Split each branch through its own fresh known-side context.
-    let split_branch = |branch: &Program<V, O, Vec<V>, Vec<V>>| -> Result<
-        (TracingContext<V, O>, PartialEvaluation<TracingContext<V, O>>),
-        ProgramError,
-    > {
-        let fresh = TracingContext::<V, O>::new();
-        let knowledge = branch_input_types
-            .iter()
-            .zip(input_known.iter())
-            .map(|(input_type, &known)| {
-                if known {
-                    PartialValue::Known(fresh.input(input_type.clone()))
-                } else {
-                    PartialValue::Unknown(input_type.clone())
-                }
-            })
-            .collect::<Vec<_>>();
-        let evaluation = branch.partially_evaluate_in_context(&fresh, knowledge.as_slice())?;
-        Ok((fresh, evaluation))
-    };
-    let (true_fresh, true_evaluation) = split_branch(&condition.true_branch)?;
-    let (false_fresh, false_evaluation) = split_branch(&condition.false_branch)?;
+    // Partition each branch through its own fresh known-side context, requested through the driver so that this rule
+    // carries no fresh-trace semantic bounds of its own.
+    let true_partition = driver.partition_program(true_branch, input_known.as_slice())?;
+    let false_partition = driver.partition_program(false_branch, input_known.as_slice())?;
 
     // An output is known only when both branches folded it.
     let out_known = (0..output_count)
         .map(|index| {
-            matches!(&true_evaluation.outputs[index], PartialEvaluationOutput::Known(_))
-                && matches!(&false_evaluation.outputs[index], PartialEvaluationOutput::Known(_))
+            matches!(true_partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)))
+                && matches!(false_partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)))
         })
         .collect::<Vec<bool>>();
 
     // Collect each branch's residual edges: its known feeders plus the instantiated folded values of residual-owned
     // outputs.
-    let collect_branch = |fresh: TracingContext<V, O>,
-                          evaluation: PartialEvaluation<TracingContext<V, O>>|
-     -> Result<ConditionBranchSplit<V, O>, ProgramError> {
+    let collect_branch = |partition: PartitionedProgram<V, O>| -> Result<ConditionBranchSplit<V, O>, ProgramError> {
+        let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
+        check_count!("output", outputs, output_count, ProgramError);
+        let expected_known_input_indices = input_known
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &known)| known.then_some(index))
+            .collect::<Vec<_>>();
+        if known_input_indices != expected_known_input_indices {
+            return Err(ProgramError::MalformedProgram(format!(
+                "condition branch partition reported known input indices {known_input_indices:?} but expected \
+                 {expected_known_input_indices:?}",
+            )));
+        }
+        check_count!("input", residual_program.input_ids(), residual_inputs.len(), ProgramError);
+
+        let known_result_count =
+            outputs.iter().filter(|output| matches!(output, PartialEvaluationOutput::Known(_))).count();
+        let feeder_edge_count =
+            residual_inputs.iter().filter(|input| matches!(input, PartialEvaluationInput::Known(_))).count();
+        check_count!("output", known_program.output_ids(), known_result_count + feeder_edge_count, ProgramError);
+        let known_program_output_types = known_program.output_types();
+
         let mut edge_types = Vec::new();
-        let mut edge_atoms = Vec::new();
-        let mut feeder_edge_ordinals = Vec::with_capacity(evaluation.inputs.len());
-        for input in evaluation.inputs.iter() {
-            match input {
-                PartialEvaluationInput::Known(value) => {
-                    feeder_edge_ordinals.push(Some(edge_types.len()));
-                    edge_types.push(value.r#type().into_owned());
-                    edge_atoms.push(value.atom_id()?);
+        let mut edge_program_outputs = Vec::new();
+        for input in residual_inputs.iter() {
+            if let PartialEvaluationInput::Known(edge) = input {
+                if *edge != edge_types.len() {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "condition branch partition reported residual edge {edge} out of order",
+                    )));
                 }
-                PartialEvaluationInput::Unknown(_) => feeder_edge_ordinals.push(None),
+                let output = known_result_count + edge;
+                let output_type = known_program_output_types.get(output).ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "condition branch partition residual edge {edge} has no known-program output",
+                    ))
+                })?;
+                edge_types.push(output_type.clone());
+                edge_program_outputs.push(output);
             }
         }
         let mut instantiated_edge_ordinals = vec![None; output_count];
-        for (index, output) in evaluation.outputs.iter().enumerate() {
+        for (index, output) in outputs.iter().enumerate() {
             if !out_known[index] {
-                if let PartialEvaluationOutput::Known(value) = output {
+                if let PartialEvaluationOutput::Known(output) = output {
+                    let output_type = known_program_output_types.get(*output).ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "condition branch partition output {index} references missing known-program output \
+                             {output}",
+                        ))
+                    })?;
                     instantiated_edge_ordinals[index] = Some(edge_types.len());
-                    edge_types.push(value.r#type().into_owned());
-                    edge_atoms.push(value.atom_id()?);
+                    edge_types.push(output_type.clone());
+                    edge_program_outputs.push(*output);
                 }
             }
         }
         Ok(ConditionBranchSplit {
-            fresh,
-            evaluation,
+            known_program,
+            residual_program,
+            residual_inputs,
+            outputs,
             edge_types,
-            feeder_edge_ordinals,
+            edge_program_outputs,
             instantiated_edge_ordinals,
-            edge_atoms,
         })
     };
-    let true_split = collect_branch(true_fresh, true_evaluation)?;
-    let false_split = collect_branch(false_fresh, false_evaluation)?;
+    let true_split = collect_branch(true_partition)?;
+    let false_split = collect_branch(false_partition)?;
 
     // An empty known side (no known output and no edge on either branch) means the split folds nothing; residualize
     // the condition unchanged through the default rule, with the symbolic predicate as a known feeder.
-    let known_side_is_empty =
-        !out_known.iter().any(|&known| known) && true_split.edge_atoms.is_empty() && false_split.edge_atoms.is_empty();
+    let known_side_is_empty = !out_known.iter().any(|&known| known)
+        && true_split.edge_program_outputs.is_empty()
+        && false_split.edge_program_outputs.is_empty();
     if known_side_is_empty {
-        return context.fold_or_residualize(O::from(condition.clone()), inputs);
+        return context.fold_or_residualize(
+            O::from(condition.clone()),
+            vec![true_branch.to_program(), false_branch.to_program()],
+            inputs,
+        );
     }
 
     // Build each known branch over the shared `[known outputs..., true edges..., false edges...]` output signature,
@@ -497,11 +497,25 @@ where
                               other: &ConditionBranchSplit<V, O>,
                               own_first: bool|
      -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let known_inputs = own
+            .known_program
+            .input_types()
+            .into_iter()
+            .map(|input_type| builder.add_input(input_type))
+            .collect::<Vec<_>>();
+        let known_outputs = builder.splice_program(&own.known_program, known_inputs.as_slice())?;
         let mut output_atoms = Vec::new();
-        for (index, output) in own.evaluation.outputs.iter().enumerate() {
+        for (index, output) in own.outputs.iter().enumerate() {
             if out_known[index] {
                 match output {
-                    PartialEvaluationOutput::Known(value) => output_atoms.push(value.atom_id()?),
+                    PartialEvaluationOutput::Known(output) => {
+                        output_atoms.push(*known_outputs.get(*output).ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "condition branch partition references missing known-program output {output}",
+                            ))
+                        })?)
+                    }
                     PartialEvaluationOutput::Unknown(_) => {
                         return Err(ProgramError::MalformedProgram(
                             "condition known-ness split lost a known output".to_string(),
@@ -512,26 +526,33 @@ where
         }
         let mut zero_atoms = Vec::with_capacity(other.edge_types.len());
         for edge_type in other.edge_types.iter() {
-            let zeros = own.fresh.bind(ZeroOperation::new(edge_type.clone()), &[], &[], &[])?;
+            let zeros = builder.add_instruction(ZeroOperation::new(edge_type.clone()), Vec::new(), Vec::new())?;
             check_count!("output", zeros, 1, ProgramError);
-            zero_atoms.push(zeros[0].atom_id()?);
+            zero_atoms.push(zeros[0]);
         }
+        let edge_atoms = own
+            .edge_program_outputs
+            .iter()
+            .map(|&output| {
+                known_outputs.get(output).copied().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "condition branch partition references missing edge output {output}",
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if own_first {
-            output_atoms.extend(own.edge_atoms.iter().copied());
+            output_atoms.extend(edge_atoms);
             output_atoms.extend(zero_atoms);
         } else {
             output_atoms.extend(zero_atoms);
-            output_atoms.extend(own.edge_atoms.iter().copied());
+            output_atoms.extend(edge_atoms);
         }
-        let known_input_count = input_known.iter().filter(|&&known| known).count();
         let output_count = output_atoms.len();
-        own.fresh
-            .builder()
-            .borrow()
-            .clone()
+        builder
             .build::<Vec<V>, Vec<V>>(
                 output_atoms,
-                vec![Placeholder; known_input_count],
+                vec![Placeholder; known_inputs.len()],
                 vec![Placeholder; output_count],
             )?
             .into_simplified()
@@ -540,7 +561,7 @@ where
     let known_false = build_known_branch(&false_split, &true_split, false)?;
 
     // Bind the known condition into the enclosing known-side context over the predicate and the known inputs.
-    let known_condition = ConditionOperation::new(known_true, known_false)?;
+    let known_condition = ConditionOperation::new();
     let mut known_condition_inputs = Vec::with_capacity(inputs.len());
     known_condition_inputs.push(inputs[0].clone());
     known_condition_inputs.extend(
@@ -550,7 +571,11 @@ where
             .filter(|(_, known)| **known)
             .map(|(input, _)| input.clone()),
     );
-    let known_outputs = context.fold_or_residualize(O::from(known_condition), known_condition_inputs.as_slice())?;
+    let known_outputs = context.fold_or_residualize(
+        O::from(known_condition),
+        vec![known_true, known_false],
+        known_condition_inputs.as_slice(),
+    )?;
     let known_output_count = out_known.iter().filter(|&&known| known).count();
     let true_edge_offset = known_output_count;
     let false_edge_offset = known_output_count + true_split.edge_types.len();
@@ -569,8 +594,10 @@ where
         }
         ordinals
     };
-    let has_residual_outputs = residual_output_ordinals.iter().any(Option::is_some);
-    let residual_outputs = if has_residual_outputs {
+    let needs_residual_condition = residual_output_ordinals.iter().any(Option::is_some)
+        || !true_split.residual_program.effects().is_pure()
+        || !false_split.residual_program.effects().is_pure();
+    let residual_outputs = if needs_residual_condition {
         let build_residual_branch = |own: &ConditionBranchSplit<V, O>,
                                      own_edges_first: bool|
          -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
@@ -595,28 +622,29 @@ where
                 .collect::<Vec<_>>();
             let own_edge_atoms = if own_edges_first { &leading_edge_atoms } else { &trailing_edge_atoms };
 
-            let mut spliced_inputs = Vec::with_capacity(own.evaluation.inputs.len());
-            for (input, edge_ordinal) in own.evaluation.inputs.iter().zip(own.feeder_edge_ordinals.iter()) {
-                match (input, edge_ordinal) {
-                    (PartialEvaluationInput::Unknown(slot), _) => {
-                        spliced_inputs.push(unknown_input_atoms[*slot].ok_or_else(|| {
+            let mut spliced_inputs = Vec::with_capacity(own.residual_inputs.len());
+            for input in own.residual_inputs.iter() {
+                match input {
+                    PartialEvaluationInput::Unknown(index) => {
+                        spliced_inputs.push(unknown_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
                             ProgramError::MalformedProgram(
                                 "condition known-ness split saw a residual feeder for a known input".to_string(),
                             )
                         })?);
                     }
-                    (PartialEvaluationInput::Known(_), Some(edge)) => spliced_inputs.push(own_edge_atoms[*edge]),
-                    (PartialEvaluationInput::Known(_), None) => {
-                        return Err(ProgramError::MalformedProgram(
-                            "condition known-ness split lost a residual edge".to_string(),
-                        ));
+                    PartialEvaluationInput::Known(edge) => {
+                        spliced_inputs.push(*own_edge_atoms.get(*edge).ok_or_else(|| {
+                            ProgramError::MalformedProgram(
+                                "condition known-ness split lost a residual edge".to_string(),
+                            )
+                        })?)
                     }
                 }
             }
-            let spliced_outputs = builder.add_program(&own.evaluation.program, &spliced_inputs)?;
+            let spliced_outputs = builder.splice_program(&own.residual_program, &spliced_inputs)?;
 
             let mut output_atoms = Vec::new();
-            for (index, output) in own.evaluation.outputs.iter().enumerate() {
+            for (index, output) in own.outputs.iter().enumerate() {
                 if out_known[index] {
                     continue;
                 }
@@ -644,7 +672,7 @@ where
         };
         let residual_true = build_residual_branch(&true_split, true)?;
         let residual_false = build_residual_branch(&false_split, false)?;
-        let residual_condition = ConditionOperation::new(residual_true, residual_false)?;
+        let residual_condition = ConditionOperation::new();
 
         let mut residual_condition_inputs = Vec::new();
         residual_condition_inputs.push(inputs[0].clone());
@@ -669,7 +697,11 @@ where
                 )
             })?);
         }
-        context.residualize(O::from(residual_condition), residual_condition_inputs.as_slice())?
+        context.residualize(
+            O::from(residual_condition),
+            vec![residual_true, residual_false],
+            residual_condition_inputs.as_slice(),
+        )?
     } else {
         Vec::new()
     };
@@ -724,14 +756,11 @@ fn reconcile_branch<C: Context>(
     combined_input_types: &[C::Type],
     offset: usize,
     evaluation: &PartialEvaluation<C>,
-) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, ProgramError>
-where
-    C::Operation: Clone,
-{
+) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, ProgramError> {
     let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
     let input_atoms = combined_input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
     let branch_inputs = &input_atoms[offset..offset + evaluation.inputs.len()];
-    let residual_outputs = builder.add_program(&evaluation.program, branch_inputs)?;
+    let residual_outputs = builder.splice_program(&evaluation.program, branch_inputs)?;
     let output_atoms = evaluation
         .outputs
         .iter()
@@ -751,13 +780,11 @@ where
 /// Partial-evaluation override for a [`Captured`]-predicate [`ConditionOperation`], whose predicate is stored in the
 /// operation payload rather than supplied as an input. Because the predicate is not part of the inputs offered to
 /// partial evaluation, this defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`].
-impl<V, F, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V, O, F, Captured>
+impl<F, C> PartiallyEvaluatableOperation<C> for ConditionOperation<F, Captured>
 where
-    V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    O: Clone + Operation<ArrayType>,
     C: Context<Type = ArrayType>,
-    C::Operation: From<ConditionOperation<V, O, F, Captured>>,
+    C::Operation: From<ConditionOperation<F, Captured>>,
 {
 }
 
@@ -766,8 +793,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::AddOperation;
@@ -787,133 +813,155 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let inputs = if matches!(operation, ArrayOperation::Add(_)) { vec![input, input] } else { vec![input] };
-        let output = builder.add_instruction(operation, inputs).unwrap()[0];
+        let output = builder.add_instruction(operation, inputs, Vec::new()).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Returns the [`RegionInterface`] of the provided flat branch program.
+    fn branch_interface(
+        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+    ) -> RegionInterface<ArrayType> {
+        program.interface()
     }
 
     #[test]
     fn test_condition() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
-        let operation = ConditionOperation::new(
-            scalar_branch(ArrayOperation::Add(AddOperation)),
-            scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation)),
-        )
-        .unwrap();
+        let operation = ConditionOperation::<TestArray>::new();
+        let true_branch = scalar_branch(ArrayOperation::Add(AddOperation));
+        let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation));
+        let interfaces = vec![branch_interface(&true_branch), branch_interface(&false_branch)];
 
-        // Operation identity and accessors.
+        // Operation identity, declared region slots, output provenance, and payload-free rendering.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
-        assert_eq!(operation.true_branch().input_types(), vec![operand_type.clone()]);
-        assert_eq!(operation.true_branch().output_types(), vec![operand_type.clone()]);
-        assert_eq!(operation.false_branch().output_types(), vec![operand_type.clone()]);
-        assert_eq!(operation.output_types(), vec![operand_type.clone()]);
+        assert_eq!(operation.region_names(), &["true", "false"]);
         assert_eq!(
-            format!("{operation}"),
-            indoc! {"
-                condition [
-                    true_branch={
-                        lambda %0:f64[] .
-                        let %1:f64[] = add %0 %0
-                        in (%1)
-                    },
-                    false_branch={
-                        lambda %0:f64[] .
-                        let %1:f64[] = zero_like %0
-                        in (%1)
-                    },
-                ]
-            "}
-            .trim_end(),
+            operation.output_region_provenance(0),
+            vec![
+                OutputRegionProvenance { region_index: 0, output_index: 0 },
+                OutputRegionProvenance { region_index: 1, output_index: 0 },
+            ],
         );
+        assert_eq!(format!("{operation}"), "condition");
 
-        // Type inference validates the predicate and input types and returns the branch output types.
+        // Type inference validates the branch interfaces, the predicate, and the input types, and returns the
+        // branch output types.
         assert_eq!(
-            operation.infer_output_types(&[predicate_type.clone(), operand_type.clone()]),
+            operation.infer_output_types(&[predicate_type.clone(), operand_type.clone()], interfaces.as_slice()),
             Ok(vec![operand_type.clone()]),
         );
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[predicate_type.clone(), operand_type.clone()], &[]),
+            Err(TypeError { message: "condition expects 2 attached regions but got 0".to_string() }),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[], interfaces.as_slice()),
             Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[operand_type.clone(), operand_type.clone()]),
+            operation.infer_output_types(&[operand_type.clone(), operand_type.clone()], interfaces.as_slice()),
             Err(TypeError { message: "condition predicate type must be a scalar boolean, but got f64[]".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])),
-                operand_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])), operand_type.clone()],
+                interfaces.as_slice(),
+            ),
             Err(TypeError {
                 message: "condition predicate type must be a scalar boolean, but got bool[2]".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                predicate_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-            ]),
+            operation.infer_output_types(
+                &[predicate_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                interfaces.as_slice(),
+            ),
             Err(TypeError {
                 message: "condition input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string(),
             }),
         );
 
-        // Construction rejects mismatched branch signatures.
+        // Inference rejects branch interfaces with mismatched output signatures.
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(ZeroLikeOperation, vec![input]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation, vec![input], Vec::new()).unwrap()[0];
         let boolean_output = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![input, zero])
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![input, zero], Vec::new())
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            ConditionOperation::new(scalar_branch(ArrayOperation::Add(AddOperation)), boolean_branch).map(|_| ()),
+            operation.infer_output_types(
+                &[predicate_type.clone(), operand_type.clone()],
+                &[branch_interface(&true_branch), branch_interface(&boolean_branch)],
+            ),
             Err(TypeError {
                 message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
                     .to_string(),
             }),
         );
 
-        // Interpretation extracts the predicate from the first input and selects between the two branches.
+        // Eager binding interprets the predicate-selected branch through detached region access, and interpretation
+        // without a predicate input is rejected.
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let predicate = |value: f64| TestArray::new(predicate_type.clone(), vec![value]);
-        let outputs = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[predicate(1.0), TestArray::scalar(4.0)])
+        let outputs = context
+            .bind(
+                operation.clone(),
+                vec![true_branch.clone(), false_branch.clone()],
+                &[predicate(1.0), TestArray::scalar(4.0)],
+            )
             .unwrap();
         assert_eq!(outputs[0].values, vec![8.0]);
-        let outputs = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[predicate(0.0), TestArray::scalar(4.0)])
+        let outputs = context
+            .bind(
+                operation.clone(),
+                vec![true_branch.clone(), false_branch.clone()],
+                &[predicate(0.0), TestArray::scalar(4.0)],
+            )
             .unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<TestArray>::new(), &[] as &[TestArray]),
-            Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 0".to_string() })),
+            operation.interpret(&context.clone(), &crate::EmptyRegionDriver, &[] as &[TestArray]),
+            Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
         );
 
-        // Staging records the condition payload into the active program instead of trying to concretize the staged
-        // predicate.
+        // Staging imports the branch programs as attached regions of the staged instruction instead of trying to
+        // concretize the staged predicate.
         let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
         let builder = context.builder().clone();
         let staged_predicate = context.input(predicate_type.clone());
         let staged_operand = context.input(operand_type.clone());
         let outputs = context
-            .stage_operation(operation.clone(), &[staged_predicate.clone(), staged_operand.clone()])
+            .stage_operation(
+                operation.clone(),
+                vec![true_branch.clone(), false_branch.clone()],
+                &[staged_predicate.clone(), staged_operand.clone()],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         let builder = builder.borrow();
         assert_eq!(builder.instructions().len(), 1);
         assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::Condition(_)));
+        assert_eq!(builder.instructions()[0].regions().len(), 2);
         assert_eq!(
             builder.instructions()[0].inputs(),
             &[staged_predicate.atom_id().unwrap(), staged_operand.atom_id().unwrap()],
         );
         assert_eq!(outputs[0].atom_id(), Ok(builder.instructions()[0].outputs()[0]));
 
-        // Program rendering uses the canonical operation name and includes the nested branch programs.
+        // Program rendering shows the attached branch regions at the instruction with their declared slot names.
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
         let program_predicate = builder.add_input(predicate_type);
         let program_operand = builder.add_input(operand_type);
         let program_output = builder
-            .add_instruction(ArrayOperation::Condition(Box::new(operation)), vec![program_predicate, program_operand])
+            .add_instruction(
+                ArrayOperation::Condition(operation),
+                vec![program_predicate, program_operand],
+                vec![true_region, false_region],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
@@ -926,21 +974,87 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[] = condition [
-                    true_branch={
+                let %2:f64[] = condition %0 %1 [
+                    true={
                         lambda %0:f64[] .
                         let %1:f64[] = add %0 %0
                         in (%1)
                     },
-                    false_branch={
+                    false={
                         lambda %0:f64[] .
                         let %1:f64[] = zero_like %0
                         in (%1)
                     },
-                ] %0 %1
+                ]
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    /// A known-symbolic predicate splits known branch results from residual branch work without dropping an
+    /// effectful residual condition whose branches have no data outputs.
+    #[test]
+    fn test_partially_evaluate_condition_preserves_zero_output_residual_effects() {
+        use crate::operations::debugging::PrintOperation;
+        use crate::partial::{PartialEvaluationOutput, PartialValue};
+        use crate::tracing::TracingContext;
+
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::scalar(DataType::F64);
+        let branch = |label| {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let input = builder.add_input(operand_type.clone());
+            builder.add_instruction(PrintOperation::new(label), vec![input], Vec::new()).unwrap();
+            let output = builder.add_constant(TestArray::scalar(1.0));
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let true_branch = branch("true");
+        let false_branch = branch("false");
+        assert!(true_branch.partition(&[false]).unwrap().residual_program().effects().is_ordered());
+        assert!(false_branch.partition(&[false]).unwrap().residual_program().effects().is_ordered());
+
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(predicate_type.clone());
+        let operand = builder.add_input(operand_type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![predicate, operand],
+                vec![true_region, false_region],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let symbolic_predicate = outer.input(predicate_type);
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(symbolic_predicate), PartialValue::Unknown(operand_type)],
+            )
+            .unwrap();
+
+        assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Known(_)]));
+        assert!(evaluation.program.effects().is_ordered());
+        assert_eq!(evaluation.program.output_ids().len(), 0);
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let residual_condition = &evaluation.program.instructions()[0];
+        assert!(matches!(residual_condition.operation(), ArrayOperation::Condition(_)));
+        assert_eq!(residual_condition.outputs().len(), 0);
+        assert!(
+            residual_condition.regions().iter().all(|&region| evaluation
+                .program
+                .region_ref(region)
+                .unwrap()
+                .effects()
+                .is_ordered())
         );
     }
 }

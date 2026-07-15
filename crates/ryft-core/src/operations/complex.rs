@@ -5,7 +5,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, DataType, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -152,7 +153,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<ComplexOperation>>>> Compl
     fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(ComplexOperation, Vec::new(), &[], &[self.clone(), imaginary.clone()])?
+            .bind(ComplexOperation, Vec::new(), &[self.clone(), imaginary.clone()])?
             .remove(0))
     }
 }
@@ -247,7 +248,7 @@ pub trait Conjugate: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ConjugateOperation>>>> Conjugate for V {
     #[inline]
     fn conjugate(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ConjugateOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ConjugateOperation, Vec::new(), &[self.clone()])?.remove(0))
     }
 }
 
@@ -340,7 +341,7 @@ pub trait Real: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<RealOperation>>>> Real for V {
     #[inline]
     fn real(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(RealOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(RealOperation, Vec::new(), &[self.clone()])?.remove(0))
     }
 }
 
@@ -433,7 +434,7 @@ pub trait Imaginary: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ImaginaryOperation>>>> Imaginary for V {
     #[inline]
     fn imaginary(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ImaginaryOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ImaginaryOperation, Vec::new(), &[self.clone()])?.remove(0))
     }
 }
 
@@ -444,6 +445,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{Shape, Size};
 
@@ -486,7 +488,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(1.5f32), Scalar::from(-2.0f32)],
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f32, -2.0f32))]),
@@ -495,7 +497,7 @@ mod tests {
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[TestArray::scalar(1.5), TestArray::scalar(-2.0)],
             )
             .is_err()
@@ -522,7 +524,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f64, 2.0f64))]),
@@ -558,7 +560,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(1.5f64)]),
@@ -585,7 +587,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(-2.0f64)]),

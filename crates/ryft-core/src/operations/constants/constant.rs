@@ -10,7 +10,8 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::payloads::{Captured, Input};
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -184,9 +185,10 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::{Operation, RegionlessDriver};
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tracing::{DomainTracingContext, Tracer};
     use crate::types::{DataType, TypeError};
 
@@ -205,7 +207,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::<Scalar>::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Ok(vec![Scalar::from(3.5)]),
@@ -218,7 +220,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::<Scalar>::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(0.0)],
             ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
@@ -247,7 +249,7 @@ mod tests {
             InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
                 &operation,
                 &context.clone(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             )
             .unwrap();
@@ -271,7 +273,7 @@ mod tests {
             InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
                 &operation,
                 &context.clone(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             )
             .unwrap();
@@ -286,7 +288,7 @@ mod tests {
             InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
                 &operation,
                 &foreign_context.clone(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::MismatchedProgramBuilders),

@@ -1714,14 +1714,15 @@ mod tests {
             Ok(constant)
         }
 
-        fn bind<P: Into<Self::Operation>, R: crate::BindingRegionDriver<Self::Constant, Self::Operation>>(
+        fn bind<P: Into<Self::Operation>, D: crate::BindingRegionDriver<Self::Constant, Self::Operation>>(
             &self,
             operation: P,
-            regions: R,
+            driver: D,
             inputs: &[Self::Value],
         ) -> Result<Vec<Self::Value>, ProgramError> {
-            // Region-carrying binds route through the eager context's own bind, which grants detached region access.
-            crate::EagerContext::<TestArray, Self::Operation>::new().bind(operation, regions, inputs)
+            // Region-carrying binds route through the eager context's own bind, which grants application-scoped region
+            // access.
+            crate::EagerContext::<TestArray, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
         fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {

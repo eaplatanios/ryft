@@ -1,15 +1,16 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Canonical operation name for [`BroadcastOperation`].
-pub const BROADCAST_OPERATION_NAME: &'static str = "broadcast";
+pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
 
 /// [`Operation`] that performs general N-dimensional broadcasting.
 /// Refer to the documentation of [`Broadcast`] for more information.
@@ -57,7 +58,11 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match input_types[0].broadcast(self.output_type.clone(), self.output_axes.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -75,9 +80,14 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast, C> InterpretableOperation<V, C> for BroadcastOperation {
+impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> for BroadcastOperation {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
     }
@@ -356,7 +366,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), &[], &[], &[self.clone()])?
+            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), Vec::new(), &[self.clone()])?
             .remove(0))
     }
 }
@@ -369,6 +379,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::DataType;
 
@@ -387,7 +398,7 @@ mod tests {
 
         // Type inference validates the axis mapping and returns the target type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![output_type.clone()]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
 
         // Type-level (abstract) broadcasting validates the axis mapping and returns the target type without
         // consuming the borrowed input type.
@@ -395,7 +406,9 @@ mod tests {
 
         // Interpretation replicates the payload along the added axis.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation.interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
@@ -409,40 +422,42 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))], &[]),
             Err(TypeError {
                 message: "broadcasting input data type f32 does not match output data type f64".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(std::slice::from_ref(&output_type)),
+            operation.infer_output_types(std::slice::from_ref(&output_type), &[]),
             Err(TypeError { message: "broadcasting output axes has length 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            BroadcastOperation::new(output_type.clone(), vec![2]).infer_output_types(std::slice::from_ref(&input_type)),
+            BroadcastOperation::new(output_type.clone(), vec![2])
+                .infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError {
                 message: "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string()
             }),
         );
         assert_eq!(
-            BroadcastOperation::new(output_type.clone(), vec![1, 1]).infer_output_types(&[ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(3), Size::Static(3)]),
-            )]),
+            BroadcastOperation::new(output_type.clone(), vec![1, 1]).infer_output_types(
+                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]),)],
+                &[]
+            ),
             Err(TypeError { message: "broadcasting output axes map two input axes to output axis 1".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
             Err(TypeError { message: "broadcasting input axis 0 has size 2, which is neither 3 nor 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -457,7 +472,7 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured metadata.
         let mut builder = ProgramBuilder::<TestArray, BroadcastOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
+        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

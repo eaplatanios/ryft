@@ -1,24 +1,21 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
-use crate::contexts::Context;
-use crate::contexts::StagingContext;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
-};
-use crate::interpretation::InterpretableOperation;
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
+use crate::programs::ProgramError;
+use crate::regions::RegionInterface;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`IotaOperation`].
-pub const IOTA_OPERATION_NAME: &'static str = "iota";
+pub const IOTA_OPERATION_NAME: &str = "iota";
 
 /// [`Operation`] that has no inputs and that produces a single output of the [`Type`] it holds (i.e., its `r#type`
 /// field) whose elements increase from `0` along a chosen dimension. Along
@@ -69,7 +66,11 @@ impl<T: Type> Operation<T> for IotaOperation<T> {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
     }
@@ -83,9 +84,14 @@ impl<T: Type> Operation<T> for IotaOperation<T> {
     }
 }
 
-impl<T: Type, V: Value<Type = T>, C: Iota<V>> InterpretableOperation<V, C> for IotaOperation<T> {
+impl<T: Type, C: Domain<Type = T> + Iota<C::Value>> InterpretableOperation<C> for IotaOperation<T> {
     #[inline]
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.iota(&self.r#type, self.iota_dimension)?])
     }
@@ -100,7 +106,7 @@ impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for IotaOpe
 
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for
-/// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](super::Zero), [`One`](super::One), and
+/// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](crate::Zero), [`One`](super::One), and
 /// [`Fill`](super::Fill) in the same type-driven family.
 pub trait Iota<V: Typed> {
     /// Returns a value of `type` whose elements increase from `0` along `dimension` and are constant along every other
@@ -122,20 +128,21 @@ impl<C: StagingContext<Operation: From<IotaOperation<C::Type>>>> Iota<Tracer<C>>
     }
 }
 
-impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<IotaOperation<C::Type>>>> Iota<PartialTracer<C>>
-    for PartialEvaluationContext<C>
+impl<C: Context> Iota<PartialTracer<C>> for PartialEvaluationContext<C>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<IotaOperation<C::Type>>,
 {
     #[inline]
     fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), &[], &[], &[])?;
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Iota<C::Value>> Iota<BatchingTracer<C>>
-    for BatchingContext<C>
-{
+impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C>> for BatchingContext<C> {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
@@ -143,9 +150,7 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Iota<C::Va
     }
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> + Iota<C::Value>>
-    Iota<DifferentiationTracer<C>> for DifferentiationContext<C>
-{
+impl<C: Context + Iota<C::Value>> Iota<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?);
@@ -184,14 +189,14 @@ mod tests {
         assert_eq!(format!("{operation}"), "iota [type=f64[2, 3], dimension=1]");
         assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.iota_dimension(), 1);
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[]), Ok(vec![r#type.clone()]));
+        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()], &[]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
 
         let mut builder = ProgramBuilder::<TestArray, IotaOperation<ArrayType>>::new();
-        let output = builder.add_instruction(operation, vec![]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![], Vec::new()).unwrap()[0];
         let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

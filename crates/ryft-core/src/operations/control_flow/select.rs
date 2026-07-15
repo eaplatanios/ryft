@@ -1,19 +1,19 @@
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, DataType, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`SelectOperation`].
-pub const SELECT_OPERATION_NAME: &'static str = "select";
+pub const SELECT_OPERATION_NAME: &str = "select";
 
 /// [`Operation`] that performs an elementwise selection between two values driven by a Boolean condition. Refer to the
 /// documentation of [`Select`] for more information.
@@ -32,7 +32,11 @@ impl Operation<DataType> for SelectOperation {
         SELECT_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
         if input_types[0] != DataType::Boolean {
             return Err(TypeError {
@@ -59,7 +63,11 @@ impl Operation<ArrayType> for SelectOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
     }
 
@@ -103,16 +111,21 @@ impl ElementwiseOperation for SelectOperation {
 /// Interpretation selects through the value-level [`Select`] capability, with the condition operand's
 /// [`SelectCondition`] view providing the condition representation of the active value semantics: eager scalar values
 /// decode the in-band Boolean into a plain [`bool`], eager array values pass themselves as the Boolean mask, and
-/// context-carrying values (e.g., staged [`Tracer`](crate::Tracer)s) select by binding a [`SelectOperation`] through
+/// context-carrying values (e.g., staged [`Tracer`](crate::Tracer)(crate::Tracer)s) select by binding a [`SelectOperation`] through
 /// their own context.
-impl<V, C> InterpretableOperation<V, C> for SelectOperation
+impl<C: Domain> InterpretableOperation<C> for SelectOperation
 where
-    V: Value + SelectCondition + Select<Condition = <V as SelectCondition>::Condition>,
-    Self: Operation<V::Type>,
+    C::Value: SelectCondition + Select<Condition = <C::Value as SelectCondition>::Condition>,
+    Self: Operation<C::Type>,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![V::select(&inputs[0].select_condition()?, &inputs[1], &inputs[2])?])
+        Ok(vec![C::Value::select(&inputs[0].select_condition()?, &inputs[1], &inputs[2])?])
     }
 }
 
@@ -130,7 +143,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for SelectOperation where C::O
 /// `on_false` need not share a shape and the branches need not share a data type (see [`SelectOperation`]). The
 /// condition and branch value types may differ: for scalar values the condition is a plain [`bool`], while array
 /// value types pair with a Boolean-typed condition array. Value types that participate in closed staged operation
-/// sets (e.g., [`Tracer`]) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
+/// sets (e.g., [`Tracer`](crate::Tracer)) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
 ///
 /// # Example
 ///
@@ -172,8 +185,8 @@ pub trait Select: Sized {
 /// condition is the value itself, while for scalar domains it is the decoded in-band Boolean.
 ///
 /// The condition of a [`SelectOperation`] crosses the primal/tangent boundary differently per domain: array and
-/// staged [`Tracer`] values implement [`Select`] with `Condition = Self`, whereas eager scalar values implement it
-/// with `Condition = bool` by decoding an in-band Boolean via [`BooleanLike::boolean`]. This trait gives the generic
+/// staged [`Tracer`](crate::Tracer) values implement [`Select`] with `Condition = Self`, whereas eager scalar values implement it
+/// with `Condition = bool` by decoding an in-band Boolean via [`BooleanLike::boolean`](crate::operations::BooleanLike::boolean). This trait gives the generic
 /// JVP rule of [`SelectOperation`] a single hook to obtain the right [`Select`] condition from a primal value (and
 /// from the captured-condition factor that the linear select interprets) without committing to one domain's condition
 /// representation.
@@ -201,8 +214,7 @@ where
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let mut outputs = condition.dispatch_domain().bind(
             SelectOperation,
-            &[],
-            &[],
+            Vec::new(),
             &[condition.clone(), on_true.clone(), on_false.clone()],
         )?;
         Ok(outputs.remove(0))
@@ -249,23 +261,32 @@ mod tests {
 
         // Scalar (`DataType`) type inference validates the Boolean condition and promotes the two branch data types.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean, DataType::F64, DataType::F64]),
+            Operation::<DataType>::infer_output_types(
+                &operation,
+                &[DataType::Boolean, DataType::F64, DataType::F64],
+                &[]
+            ),
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64, DataType::F64], &[]),
             Err(TypeError { message: "'select' condition data type f64 is not bool".to_string() }),
         );
         // Mixed-but-promotable branch data types promote to their common type (`jnp.where`-style).
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean, DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(
+                &operation,
+                &[DataType::Boolean, DataType::F32, DataType::F64],
+                &[]
+            ),
             Ok(vec![DataType::F64]),
         );
         // Non-promotable branch data types are rejected.
         assert_eq!(
             Operation::<DataType>::infer_output_types(
                 &operation,
-                &[DataType::Boolean, DataType::F8E3M4, DataType::F32]
+                &[DataType::Boolean, DataType::F8E3M4, DataType::F32],
+                &[]
             ),
             Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
         );
@@ -273,11 +294,19 @@ mod tests {
         // Scalar interpretation treats the in-band condition as true exactly when it is nonzero.
         let branches = [Scalar::from(2.0), Scalar::from(3.0)];
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(1.0), branches[0], branches[1]]),
+            operation.interpret(
+                &crate::EagerContext::<Scalar>::new(),
+                &crate::EmptyRegionDriver,
+                &[Scalar::from(1.0), branches[0], branches[1]]
+            ),
             Ok(vec![Scalar::from(2.0)]),
         );
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(0.0), branches[0], branches[1]]),
+            operation.interpret(
+                &crate::EagerContext::<Scalar>::new(),
+                &crate::EmptyRegionDriver,
+                &[Scalar::from(0.0), branches[0], branches[1]]
+            ),
             Ok(vec![Scalar::from(3.0)]),
         );
 
@@ -297,6 +326,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[condition_type.clone(), branch_type.clone(), branch_type.clone()],
+                &[],
             ),
             Ok(vec![branch_type.clone()]),
         );
@@ -311,6 +341,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[condition_type.clone(), scalar_branch.clone(), branch_type.clone()],
+                &[],
             ),
             Ok(vec![branch_type.clone()]),
         );
@@ -318,6 +349,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[scalar_condition, branch_type.clone(), branch_type.clone()],
+                &[],
             ),
             Ok(vec![branch_type.clone()]),
         );
@@ -327,7 +359,11 @@ mod tests {
         let on_true = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[condition, on_true, on_false])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &crate::EmptyRegionDriver,
+                &[condition, on_true, on_false],
+            )
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
@@ -338,7 +374,11 @@ mod tests {
         let on_true = TestArray::new(scalar_branch.clone(), vec![7.0]);
         let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[condition, on_true, on_false])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &crate::EmptyRegionDriver,
+                &[condition, on_true, on_false],
+            )
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].values, vec![7.0, 5.0, 7.0]);
@@ -350,7 +390,11 @@ mod tests {
             TestArray::new(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])), vec![1.0, 2.0, 3.0]);
         let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[condition, on_true, on_false])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &crate::EmptyRegionDriver,
+                &[condition, on_true, on_false],
+            )
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
@@ -367,13 +411,14 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 3 inputs but got 0".to_string() }),
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[branch_type.clone(), branch_type.clone(), branch_type.clone()],
+                &[],
             ),
             Err(TypeError { message: "'select' condition data type f64 is not bool".to_string() }),
         );
@@ -385,7 +430,8 @@ mod tests {
                     ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])),
                     branch_type.clone(),
                     branch_type.clone(),
-                ]
+                ],
+                &[]
             ),
             Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
         );
@@ -396,7 +442,8 @@ mod tests {
                     condition_type.clone(),
                     branch_type.clone(),
                     ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-                ]
+                ],
+                &[]
             ),
             Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
         );
@@ -408,14 +455,16 @@ mod tests {
                     condition_type.clone(),
                     branch_type.clone(),
                     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-                ]
+                ],
+                &[]
             ),
             Ok(vec![branch_type.clone()]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<crate::EagerContext<TestArray>>::interpret(
                 &operation,
                 &crate::EagerContext::<TestArray>::new(),
+                &crate::EmptyRegionDriver,
                 &[]
             ),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
@@ -427,7 +476,7 @@ mod tests {
         let program_on_true = builder.add_input(branch_type.clone());
         let program_on_false = builder.add_input(branch_type);
         let program_output = builder
-            .add_instruction(operation, vec![program_condition, program_on_true, program_on_false])
+            .add_instruction(operation, vec![program_condition, program_on_true, program_on_false], Vec::new())
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(

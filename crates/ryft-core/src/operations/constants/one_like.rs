@@ -1,15 +1,16 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`OneLikeOperation`].
-pub const ONE_LIKE_OPERATION_NAME: &'static str = "one_like";
+pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
 
 /// [`Operation`] that has one exemplar input and that produces a single output that corresponds to the _one_ value
 /// with the same [`Type`] as that input.
@@ -29,7 +30,11 @@ impl<T: Type> Operation<T> for OneLikeOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
@@ -42,9 +47,14 @@ impl ElementwiseOperation for OneLikeOperation {
     }
 }
 
-impl<V: Value + OneLike, C> InterpretableOperation<V, C> for OneLikeOperation {
+impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].one_like()])
     }
@@ -63,7 +73,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation>>>> OneLi
     #[inline]
     fn one_like(&self) -> Self {
         self.dispatch_domain()
-            .bind(OneLikeOperation, &[], &[], &[self.clone()])
+            .bind(OneLikeOperation, Vec::new(), &[self.clone()])
             .expect("`one_like` operation failed")
             .remove(0)
     }
@@ -81,6 +91,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::types::{ArrayType, DataType, TypeError};
 
     use super::*;
@@ -99,35 +110,40 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), ONE_LIKE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "OneLikeOperation");
         assert_eq!(format!("{operation}"), ONE_LIKE_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(
-            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
+            Ok(vec![DataType::F64])
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &EmptyRegionDriver,
                 &[Scalar::from(2.5)],
             ),
             Ok(vec![Scalar::from(1.0)]),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &[]
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         let mut builder = ProgramBuilder::<Scalar, OneLikeOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

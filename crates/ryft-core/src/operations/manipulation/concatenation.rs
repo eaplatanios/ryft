@@ -1,19 +1,19 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::Sharding;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ConcatenateOperation`].
-pub const CONCATENATE_OPERATION_NAME: &'static str = "concatenate";
+pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
 /// [`Operation`] that joins two or more input arrays end to end along one axis. Refer to the documentation of
 /// [`Concatenate`] for more information.
@@ -49,7 +49,11 @@ impl Operation<ArrayType> for ConcatenateOperation {
         CONCATENATE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         match ArrayType::concatenate(input_types, self.axis) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
@@ -63,8 +67,13 @@ impl Operation<ArrayType> for ConcatenateOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Concatenate, C> InterpretableOperation<V, C> for ConcatenateOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(vec![Concatenate::concatenate(inputs, self.axis)?])
     }
 }
@@ -277,7 +286,7 @@ where
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
-        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), &[], &[], operands)?;
+        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), Vec::new(), operands)?;
         crate::macros::check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -288,8 +297,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{DataType, Typed};
 
@@ -310,7 +321,7 @@ mod tests {
         let second_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[first_type.clone(), second_type.clone()]),
+            operation.infer_output_types(&[first_type.clone(), second_type.clone()], &[]),
             Ok(vec![output_type.clone()]),
         );
         assert_eq!(ArrayType::concatenate(&[first_type.clone(), second_type.clone()], 0), Ok(output_type.clone()),);
@@ -321,7 +332,9 @@ mod tests {
         // Interpretation joins the row-major payloads along axis 0.
         let first = TestArray::matrix(1, 2, vec![1.0, 2.0]);
         let second = TestArray::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = operation.interpret(&crate::EagerContext::<TestArray>::new(), &[first, second]).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[first, second])
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
@@ -330,7 +343,7 @@ mod tests {
         let left = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
         let right = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         assert_eq!(
-            middle.infer_output_types(&[left.clone(), right.clone()]),
+            middle.infer_output_types(&[left.clone(), right.clone()], &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]))]),
         );
 
@@ -340,41 +353,44 @@ mod tests {
         let dynamic_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
         let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[dynamic_stack.clone(), fixed_slice.clone()]),
+            operation.infer_output_types(&[dynamic_stack.clone(), fixed_slice.clone()], &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]))]),
         );
         let bounded_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[bounded_stack.clone(), fixed_slice.clone()]),
+            operation.infer_output_types(&[bounded_stack.clone(), fixed_slice.clone()], &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(6)), Size::Static(2)]))]),
         );
         let dynamic_non_axis = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(None)]));
         assert_eq!(
-            operation.infer_output_types(&[dynamic_non_axis.clone(), dynamic_non_axis.clone()]),
+            operation.infer_output_types(&[dynamic_non_axis.clone(), dynamic_non_axis.clone()], &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Dynamic(None)]))]),
         );
 
         // Invalid inputs report precise operation and capability errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }),
         );
         assert_eq!(
-            ConcatenateOperation::new(2).infer_output_types(&[first_type.clone(), second_type.clone()]),
+            ConcatenateOperation::new(2).infer_output_types(&[first_type.clone(), second_type.clone()], &[]),
             Err(TypeError { message: "'concatenate' axis 2 is out of bounds for operands of rank 2".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[first_type.clone(), ArrayType::scalar(DataType::F64)]),
+            operation.infer_output_types(&[first_type.clone(), ArrayType::scalar(DataType::F64)], &[]),
             Err(TypeError {
                 message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 2"
                     .to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                first_type.clone(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
-            ]),
+            operation.infer_output_types(
+                &[
+                    first_type.clone(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+                ],
+                &[]
+            ),
             Err(TypeError {
                 message: "'concatenate' operands must share one data type but operand 1 has data type f32 and operand \
                     0 has data type f64"
@@ -382,10 +398,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                first_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
-            ]),
+            operation.infer_output_types(
+                &[
+                    first_type.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
+                ],
+                &[]
+            ),
             Err(TypeError {
                 message: "'concatenate' operands must agree on every axis other than 0 but operand 1 has size 5 on \
                     axis 1 and operand 0 has size 2"
@@ -394,10 +413,13 @@ mod tests {
         );
         // A non-concatenated dynamic axis must match per `Size` equality across operands.
         assert_eq!(
-            operation.infer_output_types(&[
-                dynamic_non_axis.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(Some(3))])),
-            ]),
+            operation.infer_output_types(
+                &[
+                    dynamic_non_axis.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(Some(3))])),
+                ],
+                &[]
+            ),
             Err(TypeError {
                 message: "'concatenate' operands must agree on every axis other than 0 but operand 1 has size <3 on \
                     axis 1 and operand 0 has size *"
@@ -409,7 +431,8 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ConcatenateOperation>::new();
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
-        let program_output = builder.add_instruction(operation, vec![program_first, program_second]).unwrap()[0];
+        let program_output =
+            builder.add_instruction(operation, vec![program_first, program_second], Vec::new()).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -447,7 +470,7 @@ mod tests {
         };
 
         // Operands sharded identically: the output (size summed on axis 0) inherits the common sharding.
-        let output = operation.infer_output_types(&[row(sharded()), row(sharded())]).unwrap();
+        let output = operation.infer_output_types(&[row(sharded()), row(sharded())], &[]).unwrap();
         assert_eq!(output[0].sharding(), Some(&sharded()));
         assert_eq!(output[0].dimension(0), Size::Static(8));
 
@@ -466,18 +489,18 @@ mod tests {
                 )
                 .unwrap()
         };
-        let output = operation.infer_output_types(&[varying("m"), row(sharded())]).unwrap();
+        let output = operation.infer_output_types(&[varying("m"), row(sharded())], &[]).unwrap();
         assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
 
         // A conflicting Explicit-axis placement is an error.
         let replicated =
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
                 .unwrap();
-        assert!(operation.infer_output_types(&[row(sharded()), row(replicated)]).is_err());
+        assert!(operation.infer_output_types(&[row(sharded()), row(replicated)], &[]).is_err());
 
         // Operands without a sharding leave the output unsharded.
         let plain = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(&[plain.clone(), plain]).unwrap()[0].sharding(), None);
+        assert_eq!(operation.infer_output_types(&[plain.clone(), plain], &[]).unwrap()[0].sharding(), None);
     }
 
     #[test]

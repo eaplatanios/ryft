@@ -1,17 +1,18 @@
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{Sharding, ShardingError};
 use crate::types::{ArrayType, Shape, TypeError, Typed};
 
 /// Canonical operation name for [`TransposeOperation`].
-pub const TRANSPOSE_OPERATION_NAME: &'static str = "transpose";
+pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
 
 /// An axis permutation used by [`TransposeOperation`] and the [`Transpose`] capability. For each output axis `i`,
 /// `permutation[i]` is the input axis routed to it. [`Permutation`] is a thin wrapper over the axis vector. It
@@ -107,7 +108,11 @@ impl Operation<ArrayType> for TransposeOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match (&input_types[0]).transpose(&self.permutation) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -123,9 +128,14 @@ impl Operation<ArrayType> for TransposeOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Transpose, C> InterpretableOperation<V, C> for TransposeOperation {
+impl<C: Domain<Type = ArrayType, Value: Transpose>> InterpretableOperation<C> for TransposeOperation {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].transpose(&self.permutation)?])
     }
@@ -278,7 +288,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         }
         Ok(self
             .dispatch_domain()
-            .bind(TransposeOperation::new(permutation.to_vec()), &[], &[], &[self.clone()])?
+            .bind(TransposeOperation::new(permutation.to_vec()), Vec::new(), &[self.clone()])?
             .remove(0))
     }
 }
@@ -291,6 +301,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{DataType, Size, Typed};
@@ -329,42 +340,45 @@ mod tests {
         // Type inference permutes the input shape, including dynamic dimension sizes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![output_type.clone()]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]),
-            )]),
+            operation.infer_output_types(
+                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]))],
+                &[],
+            ),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]))]),
         );
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
             Err(TypeError { message: "'transpose' permutation has length 2 but input has rank 1".to_string() }),
         );
         assert_eq!(
-            TransposeOperation::new(vec![0, 2]).infer_output_types(std::slice::from_ref(&input_type)),
+            TransposeOperation::new(vec![0, 2]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
         );
         assert_eq!(
-            TransposeOperation::new(vec![0, 0]).infer_output_types(std::slice::from_ref(&input_type)),
+            TransposeOperation::new(vec![0, 0]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -373,7 +387,7 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured permutation.
         let mut builder = ProgramBuilder::<TestArray, TransposeOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
+        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
@@ -427,12 +441,12 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![expected]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![expected]));
 
         // An input without a sharding yields an output without one.
         let unsharded =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&unsharded)).unwrap()[0].sharding(), None);
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&unsharded), &[]).unwrap()[0].sharding(), None);
     }
 
     #[test]

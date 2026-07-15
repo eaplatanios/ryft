@@ -5,7 +5,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`StopGradientOperation`].
@@ -112,7 +113,7 @@ where
     #[inline]
     fn stop_gradient(&self) -> Self {
         self.dispatch_domain()
-            .bind(StopGradientOperation, Vec::new(), &[], &[self.clone()])
+            .bind(StopGradientOperation, Vec::new(), &[self.clone()])
             .expect("`stop_gradient` operation failed")
             .remove(0)
     }

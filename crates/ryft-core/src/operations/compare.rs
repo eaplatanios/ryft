@@ -6,7 +6,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{BooleanLike, ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`CompareOperation`].
@@ -195,7 +196,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(CompareOperation::new(direction), Vec::new(), &[], &[self.clone(), rhs.clone()])?
+            .bind(CompareOperation::new(direction), Vec::new(), &[self.clone(), rhs.clone()])?
             .remove(0))
     }
 }
@@ -207,6 +208,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::Operation;
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -297,7 +299,7 @@ mod tests {
             <CompareOperation as InterpretableOperation<EagerContext<Scalar>>>::interpret(
                 &operation,
                 &EagerContext::<Scalar>::new(),
-                &crate::RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(2.0), Scalar::from(3.0)],
             ),
             Ok(vec![Scalar::from(true)])
@@ -307,7 +309,7 @@ mod tests {
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
         let outputs = CompareOperation::new(ComparisonDirection::LessThan)
-            .interpret(&EagerContext::<TestArray>::new(), &crate::RegionlessDriver, &[lhs, rhs])
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs])
             .unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 

@@ -1,17 +1,15 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::contexts::StagingContext;
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::TransposableOperation;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
@@ -23,7 +21,7 @@ use super::slicing::is_integer;
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`GatherOperation`].
-pub const GATHER_OPERATION_NAME: &'static str = "gather";
+pub const GATHER_OPERATION_NAME: &str = "gather";
 
 /// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scatter::Scatter), mirroring JAX's
 /// [`GatherScatterMode`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.GatherScatterMode.html). The mode does
@@ -293,7 +291,11 @@ impl Operation<ArrayType> for GatherOperation {
         GATHER_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         match input_types[0].gather(&input_types[1], self) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -675,14 +677,20 @@ where
     <V::DispatchDomain as Domain>::Operation: From<GatherOperation>,
 {
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(operation.clone(), &[], &[], &[self.clone(), indices.clone()])?;
+        let mut outputs =
+            self.dispatch_domain().bind(operation.clone(), Vec::new(), &[self.clone(), indices.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<Type = ArrayType> + Gather, C> InterpretableOperation<V, C> for GatherOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Gather>> InterpretableOperation<C> for GatherOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].gather(&inputs[1], self)?])
     }
@@ -830,9 +838,14 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearGatherOperation<
         GATHER_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        self.operation.infer_output_types(&[input_types[0].clone(), self.indices.r#type().into_owned()])
+        self.operation
+            .infer_output_types(&[input_types[0].clone(), self.indices.r#type().into_owned()], &[])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -841,12 +854,17 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearGatherOperation<
     }
 }
 
-impl<V, F, C> InterpretableOperation<V, C> for LinearGatherOperation<F>
+impl<F, C> InterpretableOperation<C> for LinearGatherOperation<F>
 where
-    V: Value<Type = ArrayType> + Gather,
-    F: CustomVjpResidual<V>,
+    C: Domain<Type = ArrayType, Value: Gather>,
+    F: CustomVjpResidual<C::Value>,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].gather(&self.indices().residual_value()?, self.operation())?])
     }
@@ -869,9 +887,10 @@ impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOper
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScatterAddOperation<F>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -897,6 +916,7 @@ where
                     .with_unique_indices(self.operation().unique_indices());
                 let outputs = context.stage_operation(
                     LinearScatterAddOperation::new(scatter_operation, self.indices().clone()),
+                    Vec::new(),
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -918,9 +938,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperat
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -952,7 +973,8 @@ where
                     .with_mode(self.mode())
                     .with_indices_are_sorted(self.indices_are_sorted())
                     .with_unique_indices(self.unique_indices());
-                let outputs = context.stage_operation(scatter_operation, &[zeros, indices, cotangent.clone()])?;
+                let outputs =
+                    context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(outputs.into_iter().next().unwrap()),
@@ -991,7 +1013,7 @@ mod tests {
 
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
-        let output = operation.infer_output_types(&[operand.clone(), indices.clone()]).unwrap();
+        let output = operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).unwrap();
         assert_eq!(output, vec![float_type(vec![2, 2])]);
 
         assert_eq!(
@@ -1013,19 +1035,19 @@ mod tests {
 
         // Non-integer indices are rejected.
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), float_type(vec![2, 1])]).is_err());
+        assert!(operation.infer_output_types(&[operand.clone(), float_type(vec![2, 1])], &[]).is_err());
 
         // start_index_map length must equal the index vector extent (here 1, not 2).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()]).is_err());
+        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).is_err());
 
         // A collapsed axis must have slice size 1.
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![2, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()]).is_err());
+        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).is_err());
 
         // offset_dimensions count must equal the non-collapsed, non-batching operand axes (here 1).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1, 2], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand, indices]).is_err());
+        assert!(operation.infer_output_types(&[operand, indices], &[]).is_err());
     }
 
     #[test]
@@ -1045,7 +1067,7 @@ mod tests {
         let indices = indices_type(vec![3, 1]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         // Output [3, 2]: the query axis (from the indices) is replicated, the feature axis keeps `y`.
-        let output = operation.infer_output_types(&[operand, indices]).unwrap();
+        let output = operation.infer_output_types(&[operand, indices], &[]).unwrap();
         assert_eq!(
             output[0].sharding().unwrap().dimensions(),
             &[ShardingDimension::Replicated, ShardingDimension::sharded(["y"])],
@@ -1060,7 +1082,7 @@ mod tests {
             .unwrap();
         let indices = indices_type(vec![3, 1]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand, indices]).is_err());
+        assert!(operation.infer_output_types(&[operand, indices], &[]).is_err());
     }
 
     #[test]
@@ -1099,14 +1121,15 @@ mod tests {
     }
 
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestGatherOperation<V>> for TestGatherOperation<V> {
-        fn transpose(
+        fn transpose<D: TranspositionDriver<V, TestGatherOperation<V>>>(
             &self,
             context: &mut TracingContext<V, TestGatherOperation<V>>,
+            driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
         ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>>, DifferentiationError> {
             match self {
-                Self::Gather(operation) => operation.transpose(context, inputs, outputs),
+                Self::Gather(operation) => operation.transpose(context, driver, inputs, outputs),
                 _ => Err(ProgramError::UnsupportedOperation {
                     message: format!("{} is not transposed in this test enum", self.name()),
                 }
@@ -1137,7 +1160,8 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, TestGatherOperation<TestArray>>::new();
         let operand_input = builder.add_input(operand_type.clone());
         let indices_input = builder.add_input(indices_type.clone());
-        let output = builder.add_instruction(operation.clone(), vec![operand_input, indices_input]).unwrap()[0];
+        let output =
+            builder.add_instruction(operation.clone(), vec![operand_input, indices_input], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
