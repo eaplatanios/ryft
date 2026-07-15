@@ -1844,8 +1844,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         )
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Imports the provided borrowed rooted [`RegionRef`] as a fresh attachable region root, copying its complete
+    /// Imports the provided borrowed rooted [`RegionRef`] as a fresh attachable [`Region`] root, copying its complete
     /// reachable closure and preserving sharing within that closure. Each call creates an independent import. Use
     /// [`Self::import_regions`] when importing several roots from the same source arena whose shared descendants must
     /// remain shared.
@@ -1854,14 +1853,13 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
-        self.clone_region_closure_into_arena(region.regions(), region.id(), &mut HashMap::new())
+        self.import_region_with_remapping(region, &mut HashMap::new())
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Imports several borrowed roots from one source arena as attachable region roots, preserving shared roots and
-    /// descendants across the complete batch.
-    ///
-    /// All provided [`RegionRef`]s must belong to the same source arena. An empty batch imports nothing.
+    /// Imports several borrowed [`RegionRef`]s from a source arena as attachable [`Region`] roots, preserving shared
+    /// roots and descendants across the complete batch. All provided [`RegionRef`]s must belong to the same source
+    /// arena. An empty batch imports nothing.
+    #[inline]
     pub fn import_regions(&mut self, regions: &[RegionRef<'_, V, O>]) -> Result<Vec<RegionId>, ProgramError>
     where
         O: Clone,
@@ -1870,21 +1868,18 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             && remaining.iter().any(|region| !std::ptr::eq(first.regions(), region.regions()))
         {
             return Err(ProgramError::MalformedProgram(
-                "one region import batch cannot combine roots from different source arenas".to_string(),
+                "all imported regions must belong to the same program".to_string(),
             ));
         }
         let mut remapping = HashMap::new();
-        Ok(regions
-            .iter()
-            .map(|region| self.clone_region_closure_into_arena(region.regions(), region.id(), &mut remapping))
-            .collect())
+        Ok(regions.iter().map(|region| self.import_region_with_remapping(*region, &mut remapping)).collect())
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Imports one borrowed rooted [`RegionRef`] using an existing source-to-destination remapping.
-    ///
-    /// Callers use one remapping for one source arena while discovering attached regions incrementally. Public callers
-    /// should use [`Self::import_region`] or [`Self::import_regions`] instead.
+    /// Imports one borrowed rooted [`RegionRef`] using an existing source-to-destination remapping, recursively copying
+    /// its reachable closure into this [`ProgramBuilder`]'s arena in post-order (i.e., children before parents).
+    /// Reusing one remapping preserves shared roots and descendants across incrementally discovered imports.
+    /// Callers must scope `remapping` to one source arena and this destination builder. Public callers should use
+    /// [`Self::import_region`] or [`Self::import_regions`] instead.
     pub(crate) fn import_region_with_remapping(
         &mut self,
         region: RegionRef<'_, V, O>,
@@ -1893,36 +1888,21 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
-        self.clone_region_closure_into_arena(region.regions(), region.id(), remapping)
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Copies the [`Region`]s of `regions[root]` that are reachable from `root` into this builder's arena in post
-    /// order (i.e., children before parents) so that every copied instruction references previously appended regions,
-    /// memoizing the [`RegionId`] remapping in `remapping` so that sharing within one remapping scope is preserved
-    /// (one import scope per [`Self::import_region`]/[`Self::intern_callee`] call and one per whole
-    /// [`Self::splice_program`] call).
-    pub(crate) fn clone_region_closure_into_arena(
-        &mut self,
-        regions: &[Region<V, O>],
-        root: RegionId,
-        remapping: &mut HashMap<RegionId, RegionId>,
-    ) -> RegionId
-    where
-        O: Clone,
-    {
-        if let Some(mapped) = remapping.get(&root) {
+        if let Some(mapped) = remapping.get(&region.id()) {
             return *mapped;
         }
-        let mut region = regions[root.index()].clone();
-        for instruction in &mut region.instructions {
+        let source_id = region.id();
+        let source_regions = region.regions();
+        let mut imported = region.region().clone();
+        for instruction in &mut imported.instructions {
             for attached in &mut instruction.regions {
-                *attached = self.clone_region_closure_into_arena(regions, *attached, remapping);
+                let nested = RegionRef::new(source_regions, *attached).unwrap();
+                *attached = self.import_region_with_remapping(nested, remapping);
             }
         }
         let id = RegionId::new(self.regions.len());
-        self.regions.push(region);
-        remapping.insert(root, id);
+        self.regions.push(imported);
+        remapping.insert(source_id, id);
         id
     }
 
@@ -2035,8 +2015,8 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
         // Entry instructions may only reference previously added regions (i.e., regions with identifiers strictly
         // below the entry's own, which is assigned last). Non-entry regions uphold the same property by construction,
-        // because region imports copy them in post order (i.e., children before parents). Every referenced region
-        // identifier is therefore in range and the region graph is acyclic, which is what allows the reachability walk
+        // because region imports copy them in post-order (i.e., children before parents). Every referenced region
+        // identifier is therefore in range, and the region graph is acyclic, which is what allows the reachability walk
         // (and any future recursive derivation over regions, such as recursive effect inference) to recurse without
         // cycle tracking.
         let entry = RegionId::new(self.regions.len());
