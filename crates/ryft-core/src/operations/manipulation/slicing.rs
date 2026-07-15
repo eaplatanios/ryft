@@ -1554,7 +1554,7 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured indices.
         let mut builder = ProgramBuilder::<TestArray, SliceOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
+        let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
@@ -1684,7 +1684,7 @@ mod tests {
         let program_input = builder.add_input(input_type);
         let program_update = builder.add_input(update_type);
         let program_output =
-            builder.add_instruction(operation, vec![program_input, program_update], Vec::new()).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![program_input, program_update]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -1832,7 +1832,7 @@ mod tests {
         let program_index_0 = builder.add_input(index_type.clone());
         let program_index_1 = builder.add_input(index_type);
         let program_output = builder
-            .add_instruction(operation, vec![program_input, program_index_0, program_index_1], Vec::new())
+            .add_instruction(operation, Vec::new(), vec![program_input, program_index_0, program_index_1])
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(
@@ -2015,8 +2015,8 @@ mod tests {
         let program_output = builder
             .add_instruction(
                 operation,
-                vec![program_input, program_update, program_index_0, program_index_1],
                 Vec::new(),
+                vec![program_input, program_update, program_index_0, program_index_1],
             )
             .unwrap()[0];
         let program = builder
@@ -2221,8 +2221,8 @@ mod tests {
         let output = builder
             .add_instruction(
                 DynamicSliceOperation::new(sizes.clone()),
-                vec![operand_input, row_input, col_input],
                 Vec::new(),
+                vec![operand_input, row_input, col_input],
             )
             .unwrap()[0];
         let program = builder
@@ -2259,8 +2259,8 @@ mod tests {
         let output = builder
             .add_instruction(
                 DynamicUpdateSliceOperation,
-                vec![input_input, update_input, row_input, col_input],
                 Vec::new(),
+                vec![input_input, update_input, row_input, col_input],
             )
             .unwrap()[0];
         let program = builder

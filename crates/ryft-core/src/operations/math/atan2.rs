@@ -266,7 +266,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, Atan2Operation>::new();
         let y = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![y, x], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![y, x]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

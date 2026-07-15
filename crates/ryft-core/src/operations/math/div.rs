@@ -177,7 +177,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, DivOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

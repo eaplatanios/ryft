@@ -1464,7 +1464,7 @@ mod tests {
     fn scalar_doubling_body() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
         let carry = builder.add_input(DataType::F64);
         let eight = builder.add_constant(Scalar::from(8.0));
         let predicate = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight], Vec::new())
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![carry, eight])
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1922,9 +1922,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::C64);
         let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
-        let output = builder
-            .add_instruction(crate::operations::math::MulOperation, vec![input, constant], Vec::new())
-            .unwrap()[0];
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();

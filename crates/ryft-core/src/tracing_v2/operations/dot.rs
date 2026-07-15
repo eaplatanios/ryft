@@ -1552,7 +1552,7 @@ mod tests {
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder
-            .add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input], Vec::new())
+            .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
             .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
@@ -1571,7 +1571,7 @@ mod tests {
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder
-            .add_instruction(DotOperation::new(matmul.clone()), vec![left_input, right_input], Vec::new())
+            .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
             .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)

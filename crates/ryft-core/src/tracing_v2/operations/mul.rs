@@ -141,7 +141,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let residual = builder.add_input(scalar_type.clone());
         let tangent = builder.add_input(scalar_type.clone());
-        let product = builder.add_instruction(MulOperation, vec![residual, tangent], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();

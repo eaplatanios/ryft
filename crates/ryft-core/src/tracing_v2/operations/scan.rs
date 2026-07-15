@@ -779,7 +779,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -805,7 +805,7 @@ mod tests {
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let xs = builder.add_input(f64_type(&lengths[1..]));
         let outputs = builder
-            .add_instruction(TestOperation::Scan(inner_scan), vec![carry, xs], vec![inner_body_region])
+            .add_instruction(TestOperation::Scan(inner_scan), vec![inner_body_region], vec![carry, xs])
             .unwrap()
             .to_vec();
         let body = builder.build(outputs, vec![Placeholder, Placeholder], vec![Placeholder, Placeholder]).unwrap();

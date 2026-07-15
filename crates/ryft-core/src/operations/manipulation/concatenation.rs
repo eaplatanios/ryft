@@ -432,7 +432,7 @@ mod tests {
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
         let program_output =
-            builder.add_instruction(operation, vec![program_first, program_second], Vec::new()).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![program_first, program_second]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();

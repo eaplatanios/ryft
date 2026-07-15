@@ -76,7 +76,7 @@ mod tests {
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<TestArray, NotOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
+        let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

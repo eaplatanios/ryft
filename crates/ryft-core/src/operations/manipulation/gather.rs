@@ -1161,7 +1161,7 @@ mod tests {
         let operand_input = builder.add_input(operand_type.clone());
         let indices_input = builder.add_input(indices_type.clone());
         let output =
-            builder.add_instruction(operation.clone(), vec![operand_input, indices_input], Vec::new()).unwrap()[0];
+            builder.add_instruction(operation.clone(), Vec::new(), vec![operand_input, indices_input]).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

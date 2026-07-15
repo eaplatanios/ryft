@@ -681,9 +681,9 @@ mod tests {
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
-            let shifted = builder.add_instruction(AddOperation, vec![known_input, literal], Vec::new()).unwrap()[0];
-            let scaled = builder.add_instruction(MulOperation, vec![runtime_input, literal], Vec::new()).unwrap()[0];
-            let product = builder.add_instruction(MulOperation, vec![shifted, runtime_input], Vec::new()).unwrap()[0];
+            let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![known_input, literal]).unwrap()[0];
+            let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![runtime_input, literal]).unwrap()[0];
+            let product = builder.add_instruction(MulOperation, Vec::new(), vec![shifted, runtime_input]).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![shifted, scaled, product],
@@ -700,7 +700,7 @@ mod tests {
         let callee_region = builder.intern_callee(&Rc::new(callee));
         let call = XlaOperation::JitCall(JitCallOperation::new());
         let outputs = builder
-            .add_instruction(call, vec![known_input, runtime_input], vec![callee_region])
+            .add_instruction(call, vec![callee_region], vec![known_input, runtime_input])
             .unwrap()
             .to_vec();
         let program = builder

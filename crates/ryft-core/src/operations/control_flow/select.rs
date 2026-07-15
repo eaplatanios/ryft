@@ -476,7 +476,7 @@ mod tests {
         let program_on_true = builder.add_input(branch_type.clone());
         let program_on_false = builder.add_input(branch_type);
         let program_output = builder
-            .add_instruction(operation, vec![program_condition, program_on_true, program_on_false], Vec::new())
+            .add_instruction(operation, Vec::new(), vec![program_condition, program_on_true, program_on_false])
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(

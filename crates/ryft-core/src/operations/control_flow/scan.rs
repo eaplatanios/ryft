@@ -1276,7 +1276,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -1286,7 +1286,7 @@ mod tests {
     fn doubling_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-        let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1369,7 +1369,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
-        let product = builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         let no_output_body = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -1381,12 +1381,12 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
         let mismatched_output =
-            builder.add_instruction(ZeroLikeOperation, vec![mismatched_carry], Vec::new()).unwrap()[0];
+            builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![mismatched_carry]).unwrap()[0];
         let mismatched_output = builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::Equal),
-                vec![mismatched_output, mismatched_carry],
                 Vec::new(),
+                vec![mismatched_output, mismatched_carry],
             )
             .unwrap()[0];
         let mismatched_body = builder
@@ -1486,7 +1486,7 @@ mod tests {
         let program_carry = builder.add_input(scalar_f64);
         let program_xs = builder.add_input(stacked_f64);
         let program_outputs = builder
-            .add_instruction(ArrayOperation::Scan(operation), vec![program_carry, program_xs], vec![body_region])
+            .add_instruction(ArrayOperation::Scan(operation), vec![body_region], vec![program_carry, program_xs])
             .unwrap()
             .to_vec();
         let program = builder
@@ -1578,10 +1578,10 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let printed = builder.add_instruction(PrintOperation::new("k"), vec![k], Vec::new()).unwrap()[0];
-            let ksq = builder.add_instruction(MulOperation, vec![printed, k], Vec::new()).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, vec![ksq, x], Vec::new()).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx], Vec::new()).unwrap()[0];
+            let printed = builder.add_instruction(PrintOperation::new("k"), Vec::new(), vec![k]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![printed, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(
                     vec![next_acc, k, next_acc],
@@ -1598,7 +1598,7 @@ mod tests {
         let k_init = builder.add_input(scalar());
         let xs = builder.add_input(stacked.clone());
         let outputs = builder
-            .add_instruction(ArrayOperation::Scan(scan), vec![acc_init, k_init, xs], vec![body_region])
+            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![acc_init, k_init, xs])
             .unwrap()
             .to_vec();
         let program = builder
@@ -1645,7 +1645,7 @@ mod tests {
         let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = body_builder.add_input(scalar());
         let input = body_builder.add_input(scalar());
-        body_builder.add_instruction(PrintOperation::new("x"), vec![input], Vec::new()).unwrap();
+        body_builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1658,8 +1658,8 @@ mod tests {
         let output = builder
             .add_instruction(
                 ArrayOperation::Scan(TestScanOperation::new(1, 3)),
-                vec![carry_init, inputs],
                 vec![body_region],
+                vec![carry_init, inputs],
             )
             .unwrap()[0];
         let program = builder
@@ -1705,9 +1705,9 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let ksq = builder.add_instruction(MulOperation, vec![k, k], Vec::new()).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, vec![ksq, x], Vec::new()).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx], Vec::new()).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(
                     vec![next_acc, k, next_acc],
@@ -1724,7 +1724,7 @@ mod tests {
         let k_init = builder.add_input(scalar());
         let xs = builder.add_input(stacked.clone());
         let outputs = builder
-            .add_instruction(ArrayOperation::Scan(scan), vec![acc_init, k_init, xs], vec![body_region])
+            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![acc_init, k_init, xs])
             .unwrap()
             .to_vec();
         let program = builder
@@ -1793,8 +1793,8 @@ mod tests {
             let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
             let c = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let xsq = builder.add_instruction(MulOperation, vec![x, x], Vec::new()).unwrap()[0];
-            let next = builder.add_instruction(AddOperation, vec![c, xsq], Vec::new()).unwrap()[0];
+            let xsq = builder.add_instruction(MulOperation, Vec::new(), vec![x, x]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation, Vec::new(), vec![c, xsq]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![next, xsq], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -1805,7 +1805,7 @@ mod tests {
         let c_init = builder.add_input(scalar());
         let xs = builder.add_input(stacked.clone());
         let outputs = builder
-            .add_instruction(ArrayOperation::Scan(scan), vec![c_init, xs], vec![body_region])
+            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![c_init, xs])
             .unwrap()
             .to_vec();
         let program = builder
@@ -1864,9 +1864,9 @@ mod tests {
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
-            let ksq = builder.add_instruction(MulOperation, vec![k, k], Vec::new()).unwrap()[0];
-            let kx = builder.add_instruction(MulOperation, vec![ksq, x], Vec::new()).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx], Vec::new()).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(
                     vec![next_acc, k, next_acc],
@@ -1885,7 +1885,7 @@ mod tests {
         let k_init = builder.add_input(scalar());
         let xs = builder.add_input(stacked.clone());
         let outputs = builder
-            .add_instruction(ArrayOperation::Scan(scan), vec![acc_init, k_init, xs], vec![body_region])
+            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![acc_init, k_init, xs])
             .unwrap()
             .to_vec();
         let program = builder

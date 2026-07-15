@@ -182,13 +182,13 @@ mod model {
         regions: Vec<Region<C, O>>,
         /// Callee interning table keyed by live `Rc` pointer identity; `kept` holds the interned sources alive so
         /// the addresses stay valid and unique for the builder's lifetime.
-        interned_callees: HashMap<*const (), RegionId>,
+        callees: HashMap<*const (), RegionId>,
         kept: Vec<Rc<Program<C, O>>>,
     }
 
     impl<C: Clone, O: Clone> ProgramBuilder<C, O> {
         pub fn new() -> Self {
-            Self { regions: Vec::new(), interned_callees: HashMap::new(), kept: Vec::new() }
+            Self { regions: Vec::new(), callees: HashMap::new(), kept: Vec::new() }
         }
 
         /// Consumes a region builder into a sealed, attachable region.
@@ -240,11 +240,11 @@ mod model {
         /// Imports a program as a shareable callee root, interning by live `Rc` identity within this builder.
         pub fn intern_callee(&mut self, source: &Rc<Program<C, O>>) -> RegionId {
             let key = Rc::as_ptr(source) as *const ();
-            if let Some(id) = self.interned_callees.get(&key) {
+            if let Some(id) = self.callees.get(&key) {
                 return *id;
             }
             let id = self.add_region_closure(source, source.entry, &mut HashMap::new());
-            self.interned_callees.insert(key, id);
+            self.callees.insert(key, id);
             self.kept.push(source.clone());
             id
         }

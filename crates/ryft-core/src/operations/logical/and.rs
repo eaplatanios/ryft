@@ -85,7 +85,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, AndOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
+        let program_output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![program_output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

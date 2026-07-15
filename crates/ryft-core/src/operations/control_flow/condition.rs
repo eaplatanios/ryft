@@ -813,7 +813,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let inputs = if matches!(operation, ArrayOperation::Add(_)) { vec![input, input] } else { vec![input] };
-        let output = builder.add_instruction(operation, inputs, Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -885,9 +885,9 @@ mod tests {
         // Inference rejects branch interfaces with mismatched output signatures.
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(ZeroLikeOperation, vec![input], Vec::new()).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![input]).unwrap()[0];
         let boolean_output = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), vec![input, zero], Vec::new())
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
@@ -959,8 +959,8 @@ mod tests {
         let program_output = builder
             .add_instruction(
                 ArrayOperation::Condition(operation),
-                vec![program_predicate, program_operand],
                 vec![true_region, false_region],
+                vec![program_predicate, program_operand],
             )
             .unwrap()[0];
         let program = builder
@@ -1005,7 +1005,7 @@ mod tests {
         let branch = |label| {
             let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
             let input = builder.add_input(operand_type.clone());
-            builder.add_instruction(PrintOperation::new(label), vec![input], Vec::new()).unwrap();
+            builder.add_instruction(PrintOperation::new(label), Vec::new(), vec![input]).unwrap();
             let output = builder.add_constant(TestArray::scalar(1.0));
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1024,8 +1024,8 @@ mod tests {
         let output = builder
             .add_instruction(
                 ArrayOperation::Condition(ConditionOperation::new()),
-                vec![predicate, operand],
                 vec![true_region, false_region],
+                vec![predicate, operand],
             )
             .unwrap()[0];
         let program = builder

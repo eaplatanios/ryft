@@ -500,7 +500,7 @@ mod tests {
         let on_true_input = builder.add_input(branch_type.clone());
         let on_false_input = builder.add_input(branch_type.clone());
         let output = builder
-            .add_instruction(SelectOperation, vec![condition_input, on_true_input, on_false_input], Vec::new())
+            .add_instruction(SelectOperation, Vec::new(), vec![condition_input, on_true_input, on_false_input])
             .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray, TestArray), TestArray>(

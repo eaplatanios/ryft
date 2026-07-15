@@ -322,7 +322,7 @@ mod tests {
         // Program rendering uses the canonical operation name, with the complex magnitude typed by its real part.
         let mut builder = ProgramBuilder::<Scalar, AbsOperation>::new();
         let input = builder.add_input(DataType::C128);
-        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

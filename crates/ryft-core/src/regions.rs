@@ -261,7 +261,7 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
         let mut remapping = HashMap::new();
         let mut region = self.region().clone();
         for instruction in &mut region.instructions {
-            for attached in instruction.regions_mut() {
+            for attached in &mut instruction.regions {
                 *attached = builder.clone_region_closure_into_arena(self.regions, *attached, &mut remapping);
             }
         }
@@ -662,7 +662,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         let shared_descendant = builder.import_program(identity_program(DataType::F64));
-        root_region.instructions[0].regions_mut()[0] = shared_descendant;
+        root_region.instructions[0].regions[0] = shared_descendant;
         let first_root = RegionId::new(builder.regions.len());
         builder.regions.push(root_region.clone());
         let second_root = RegionId::new(builder.regions.len());

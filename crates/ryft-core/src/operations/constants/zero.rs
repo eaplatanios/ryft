@@ -228,7 +228,7 @@ mod tests {
         );
 
         let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();
-        let output = builder.add_instruction(operation, vec![], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
         let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

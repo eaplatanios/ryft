@@ -397,7 +397,7 @@ mod tests {
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
         let program_output =
-            builder.add_instruction(operation, vec![program_input, program_padding_value], Vec::new()).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![program_input, program_padding_value]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();

@@ -1698,8 +1698,8 @@ mod differentiation_tests {
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
-                vec![condition_state, threshold],
                 Vec::new(),
+                vec![condition_state, threshold],
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -1708,7 +1708,7 @@ mod differentiation_tests {
 
         let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let body_state = body_builder.add_input(scalar_f64);
-        let doubled = body_builder.add_instruction(AddOperation, vec![body_state, body_state], Vec::new()).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, Vec::new(), vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1739,7 +1739,7 @@ mod differentiation_tests {
         let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let carry = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let x = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = body_builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![product, product],
@@ -1934,8 +1934,8 @@ mod linearization_tests {
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),
-                    vec![carry, threshold],
                     Vec::new(),
+                    vec![carry, threshold],
                 )
                 .unwrap()[0];
             builder
@@ -1945,7 +1945,7 @@ mod linearization_tests {
         let body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
-            let squared = builder.add_instruction(MulOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+            let squared = builder.add_instruction(MulOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2001,8 +2001,8 @@ mod linearization_tests {
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),
-                    vec![carry, threshold],
                     Vec::new(),
+                    vec![carry, threshold],
                 )
                 .unwrap()[0];
             builder
@@ -2012,7 +2012,7 @@ mod linearization_tests {
         let inner_body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
-            let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2026,8 +2026,8 @@ mod linearization_tests {
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::LessThan),
-                    vec![carry, threshold],
                     Vec::new(),
+                    vec![carry, threshold],
                 )
                 .unwrap()[0];
             builder
@@ -2040,9 +2040,9 @@ mod linearization_tests {
             let inner_body_region = builder.import_region(inner_body.entry_region_ref());
             let carry = builder.add_input(DataType::F64);
             let inner_output = builder
-                .add_instruction(inner_while, vec![carry], vec![inner_condition_region, inner_body_region])
+                .add_instruction(inner_while, vec![inner_condition_region, inner_body_region], vec![carry])
                 .unwrap()[0];
-            let next = builder.add_instruction(AddOperation, vec![carry, inner_output], Vec::new()).unwrap()[0];
+            let next = builder.add_instruction(AddOperation, Vec::new(), vec![carry, inner_output]).unwrap()[0];
             builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![next], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         (WhileOperation::new(), vec![outer, outer_body])
@@ -2344,7 +2344,7 @@ mod linearization_tests {
             let carry = builder.add_input(DataType::F64);
             let eight = builder.add_constant(Scalar::from(8.0));
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight], Vec::new())
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![carry, eight])
                 .unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -2353,7 +2353,7 @@ mod linearization_tests {
         let body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
-            let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2511,15 +2511,15 @@ mod linearization_tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let factor = builder.add_constant(Scalar::from(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![input, factor], Vec::new()).unwrap()[0];
-        let one_like = builder.add_instruction(OneLikeOperation, vec![input], Vec::new()).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        let one_like = builder.add_instruction(OneLikeOperation, Vec::new(), vec![input]).unwrap()[0];
         let one = builder
             .add_instruction(OneOperation::<DataType>::new(DataType::F64), Vec::new(), Vec::new())
             .unwrap()[0];
-        let zero_like = builder.add_instruction(ZeroLikeOperation, vec![input], Vec::new()).unwrap()[0];
-        let first = builder.add_instruction(AddOperation, vec![scaled, one_like], Vec::new()).unwrap()[0];
-        let second = builder.add_instruction(AddOperation, vec![first, one], Vec::new()).unwrap()[0];
-        let total = builder.add_instruction(AddOperation, vec![second, zero_like], Vec::new()).unwrap()[0];
+        let zero_like = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let first = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, one_like]).unwrap()[0];
+        let second = builder.add_instruction(AddOperation, Vec::new(), vec![first, one]).unwrap()[0];
+        let total = builder.add_instruction(AddOperation, Vec::new(), vec![second, zero_like]).unwrap()[0];
         let primal_program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![total], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2722,7 +2722,7 @@ mod linearization_tests {
 
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -2736,11 +2736,11 @@ mod linearization_tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let x = builder.add_input(DataType::F64);
         let dx = builder.add_input(DataType::F64);
-        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
         let two = builder.add_constant(Scalar::from(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![cosine, two], Vec::new()).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx], Vec::new()).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![cosine, two]).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, dx]).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -2872,13 +2872,13 @@ mod linearization_tests {
 
         let mut primal_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_input = primal_builder.add_input(DataType::F64);
-        let primal_output = primal_builder.add_instruction(SinOperation, vec![primal_input], Vec::new()).unwrap()[0];
+        let primal_output = primal_builder.add_instruction(SinOperation, Vec::new(), vec![primal_input]).unwrap()[0];
         let primal = primal_builder.build(vec![primal_output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let mut forward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let x = forward_builder.add_input(DataType::F64);
-        let y = forward_builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
-        let residual = forward_builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
+        let y = forward_builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
+        let residual = forward_builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
         let forward =
             forward_builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
 
@@ -2887,8 +2887,8 @@ mod linearization_tests {
         let cotangent = backward_builder.add_input(DataType::F64);
         let three = backward_builder.add_constant(Scalar::from(3.0));
         let scaled =
-            backward_builder.add_instruction(MulOperation, vec![backward_residual, three], Vec::new()).unwrap()[0];
-        let gradient = backward_builder.add_instruction(MulOperation, vec![scaled, cotangent], Vec::new()).unwrap()[0];
+            backward_builder.add_instruction(MulOperation, Vec::new(), vec![backward_residual, three]).unwrap()[0];
+        let gradient = backward_builder.add_instruction(MulOperation, Vec::new(), vec![scaled, cotangent]).unwrap()[0];
         let backward =
             backward_builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
@@ -2963,13 +2963,13 @@ mod linearization_tests {
             let mut primal_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let a = primal_builder.add_input(DataType::F64);
             let b = primal_builder.add_input(DataType::F64);
-            let y = primal_builder.add_instruction(AddOperation, vec![a, b], Vec::new()).unwrap()[0];
+            let y = primal_builder.add_instruction(AddOperation, Vec::new(), vec![a, b]).unwrap()[0];
             let primal = primal_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
             let mut forward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let a = forward_builder.add_input(DataType::F64);
             let b = forward_builder.add_input(DataType::F64);
-            let y = forward_builder.add_instruction(AddOperation, vec![a, b], Vec::new()).unwrap()[0];
+            let y = forward_builder.add_instruction(AddOperation, Vec::new(), vec![a, b]).unwrap()[0];
             let forward = forward_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
             let mut backward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -3550,8 +3550,8 @@ mod array_linearization_tests {
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
-                vec![condition_state, threshold],
                 Vec::new(),
+                vec![condition_state, threshold],
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -3559,7 +3559,7 @@ mod array_linearization_tests {
             .unwrap();
         let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
-        let squared = body_builder.add_instruction(MulOperation, vec![state, state], Vec::new()).unwrap()[0];
+        let squared = body_builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4072,9 +4072,9 @@ mod array_linearization_tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let two = builder.add_constant(TestArray::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![input, two], Vec::new()).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, two]).unwrap()[0];
         let one = builder.add_constant(TestArray::scalar(1.0));
-        let output = builder.add_instruction(AddOperation, vec![scaled, one], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, one]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4089,7 +4089,7 @@ mod array_linearization_tests {
 
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4186,7 +4186,7 @@ mod array_linearization_tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation, vec![carry, x], Vec::new()).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -4338,8 +4338,8 @@ mod array_linearization_tests {
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
-                vec![condition_state, threshold],
                 Vec::new(),
+                vec![condition_state, threshold],
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4348,7 +4348,7 @@ mod array_linearization_tests {
 
         let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
-        let squared = body_builder.add_instruction(MulOperation, vec![state, state], Vec::new()).unwrap()[0];
+        let squared = body_builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4426,8 +4426,8 @@ mod array_linearization_tests {
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
-                vec![condition_state, threshold],
                 Vec::new(),
+                vec![condition_state, threshold],
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4435,7 +4435,7 @@ mod array_linearization_tests {
             .unwrap();
         let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
-        let squared = body_builder.add_instruction(MulOperation, vec![state, state], Vec::new()).unwrap()[0];
+        let squared = body_builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4473,7 +4473,7 @@ mod array_linearization_tests {
 
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4489,11 +4489,11 @@ mod array_linearization_tests {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let dx = builder.add_input(ArrayType::scalar(DataType::F64));
-        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
         let two = builder.add_constant(TestArray::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![cosine, two], Vec::new()).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation, vec![scaled, dx], Vec::new()).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![cosine, two]).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, dx]).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -4633,7 +4633,7 @@ mod array_linearization_tests {
 
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4647,8 +4647,8 @@ mod array_linearization_tests {
 
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let y = builder.add_instruction(SinOperation, vec![x], Vec::new()).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation, vec![x], Vec::new()).unwrap()[0];
+        let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -4667,8 +4667,8 @@ mod array_linearization_tests {
         let residual = builder.add_input(ArrayType::scalar(DataType::F64));
         let cotangent = builder.add_input(ArrayType::scalar(DataType::F64));
         let three = builder.add_constant(TestArray::scalar(3.0));
-        let scaled = builder.add_instruction(MulOperation, vec![residual, three], Vec::new()).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation, vec![scaled, cotangent], Vec::new()).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![residual, three]).unwrap()[0];
+        let gradient = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, cotangent]).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4770,8 +4770,8 @@ mod array_linearization_tests {
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
-                vec![condition_state, threshold],
                 Vec::new(),
+                vec![condition_state, threshold],
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4780,7 +4780,7 @@ mod array_linearization_tests {
 
         let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
-        let doubled = body_builder.add_instruction(AddOperation, vec![state, state], Vec::new()).unwrap()[0];
+        let doubled = body_builder.add_instruction(AddOperation, Vec::new(), vec![state, state]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();

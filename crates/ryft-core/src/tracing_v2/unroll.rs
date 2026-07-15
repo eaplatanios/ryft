@@ -169,7 +169,7 @@ where
                 .map(|region| builder.borrow_mut().import_region_with_remapping(*region, &mut region_remapping))
                 .collect();
             let output_atoms =
-                builder.borrow_mut().add_instruction(operation.clone(), input_atoms, region_ids)?.to_vec();
+                builder.borrow_mut().add_instruction(operation.clone(), region_ids, input_atoms)?.to_vec();
             let output_values = context.bind(
                 operation.clone(),
                 instruction_regions.into_iter().map(RegionRef::to_program).collect::<Vec<_>>(),

@@ -124,7 +124,7 @@ mod tests {
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, CosOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

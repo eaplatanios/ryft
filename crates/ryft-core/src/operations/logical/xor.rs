@@ -46,9 +46,7 @@ mod tests {
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs])
-            .unwrap();
+        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.
@@ -87,7 +85,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, XorOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
+        let program_output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![program_output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

@@ -420,7 +420,7 @@ where
                 (operation.clone(), region_ids)
             }
         };
-        let new_outputs = builder.add_instruction(operation, inputs, region_ids)?.to_vec();
+        let new_outputs = builder.add_instruction(operation, region_ids, inputs)?.to_vec();
         let mut next_new_output = new_outputs.into_iter();
         for (output, live) in instruction.outputs().iter().copied().zip(live_outputs) {
             if live {
@@ -3617,8 +3617,8 @@ mod tests {
                                 let output = builder
                                     .add_instruction(
                                         CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
-                                        vec![input],
                                         Vec::new(),
+                                        vec![input],
                                     )
                                     .unwrap()[0];
                                 builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
