@@ -365,6 +365,22 @@ pub trait RegionDriver<V: Value, O: Operation<V::Type>> {
     }
 }
 
+impl<
+    V: Value,
+    O: Operation<V::Type>,
+    R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
+> RegionDriver<V, O> for R
+{
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.as_ref().iter().map(Program::entry_region_ref)
+    }
+}
+
 /// Zero-region [`RegionDriver`] scoped to one operation application outside a staged [`Instruction`]. Normal program
 /// and context replay always provide their concrete application driver, including for [`Operation`] applications with
 /// no attached [`Region`]s, which is what this driver is intended for. Any attempted nested-region request will result
@@ -397,25 +413,37 @@ pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, 
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError>;
 }
 
-/// Shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind) [`Operation`] application.
-/// Callees are exposed in the order provided at construction and are interned by [`Rc`] identity when imported into
-/// a [`StagingContext`](crate::StagingContext), preserving sharing between repeated references to the same program.
-pub struct CalleeRegionAttachments<'r, V: Value, O: Operation<V::Type>> {
+impl<
+    V: Value,
+    O: Operation<V::Type>,
+    R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
+> BindingRegionDriver<V, O> for R
+{
+    #[inline]
+    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
+        let mut builder = builder.borrow_mut();
+        Ok(self.into_iter().map(|region| builder.import_program(region)).collect())
+    }
+}
+
+/// [`BindingRegionDriver`] for shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind)
+/// [`Operation`] application. Callees are exposed in the order provided at construction and are interned by [`Rc`]
+/// identity when imported into a [`StagingContext`](crate::StagingContext), preserving sharing between repeated
+/// references to the same program.
+pub struct CalleeRegionDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Shared callee [`Program`]s in [`Operation`]-defined region order.
     callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>],
 }
 
-impl<'r, V: Value, O: Operation<V::Type>> CalleeRegionAttachments<'r, V, O> {
-    /// Creates a new [`CalleeRegionAttachments`].
+impl<'r, V: Value, O: Operation<V::Type>> CalleeRegionDriver<'r, V, O> {
+    /// Creates a new [`CalleeRegionDriver`].
     #[inline]
     pub fn new(callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>]) -> Self {
         Self { callees }
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -426,7 +454,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionAttachm
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         let mut builder = builder.borrow_mut();
@@ -434,41 +462,14 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegion
     }
 }
 
-impl<V, O, R> RegionDriver<V, O> for R
-where
-    V: Value,
-    O: Operation<V::Type>,
-    R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
-{
-    #[inline]
-    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
-    where
-        V: 'r,
-        O: 'r,
-    {
-        self.as_ref().iter().map(Program::entry_region_ref)
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
-impl<V, O, R> BindingRegionDriver<V, O> for R
-where
-    V: Value,
-    O: Operation<V::Type>,
-    R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
-{
-    #[inline]
-    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        let mut builder = builder.borrow_mut();
-        Ok(self.into_iter().map(|region| builder.import_program(region)).collect())
-    }
-}
-
-/// Borrowed attached regions of one replayed [`Instruction`]. The roots remain in their source region arena and are
-/// exposed in instruction order through [`RegionDriver`]. When a staging context imports them, `mappings` preserves
-/// their source identities across every instruction in the surrounding replay. Construction validates that every root
-/// belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain non-fallible without trusting callers to
-/// preserve that relationship.
-pub(crate) struct ReplayedRegionAttachments<'r, V: Value, O: Operation<V::Type>> {
+/// [`BindingRegionDriver`] for the borrowed regions attached to one replayed [`Instruction`]. The roots remain in their
+/// source region arena and are exposed in instruction order through [`RegionDriver`]. When a staging context imports
+/// them, `mappings` preserves their source identities across every instruction in the surrounding replay. Construction
+/// validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain non-fallible
+/// without trusting callers to preserve that relationship.
+pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Borrowed view used to access every root's shared source arena.
     source: RegionRef<'r, V, O>,
 
@@ -479,9 +480,9 @@ pub(crate) struct ReplayedRegionAttachments<'r, V: Value, O: Operation<V::Type>>
     mappings: &'r RegionReplayMappings<V, O>,
 }
 
-impl<'r, V: Value, O: Operation<V::Type>> ReplayedRegionAttachments<'r, V, O> {
-    /// Creates borrowed attachments for one instruction in an active replay, returning an error if any root does not
-    /// belong to `source`'s arena.
+impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
+    /// Creates a driver for one instruction in an active replay, returning an error if any root does not belong to
+    /// `source`'s arena.
     ///
     /// # Parameters
     ///
@@ -501,7 +502,7 @@ impl<'r, V: Value, O: Operation<V::Type>> ReplayedRegionAttachments<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayedRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
@@ -512,7 +513,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayedRegionAttac
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayedRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         self.mappings.import_into(builder, self.source, self.roots)
@@ -676,10 +677,10 @@ mod tests {
     }
 
     #[test]
-    fn test_callee_region_attachments_intern_callees() {
+    fn test_callee_region_driver_interns_callees() {
         let callee = Rc::new(identity_program(DataType::F64));
         let callees = [Rc::clone(&callee), callee];
-        let regions = CalleeRegionAttachments::new(&callees);
+        let regions = CalleeRegionDriver::new(&callees);
         assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F64]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
@@ -688,23 +689,23 @@ mod tests {
     }
 
     #[test]
-    fn test_replayed_region_attachments_iterate_in_application_order() {
+    fn test_replay_region_driver_iterates_in_application_order() {
         let (source, first_root, second_root) = program_with_shared_descendant();
         let mappings = RegionReplayMappings::new();
         let roots = [second_root, first_root, second_root];
-        let regions = ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap();
+        let regions = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
 
         assert_eq!(regions.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
     }
 
     #[test]
-    fn test_replayed_region_attachments_reject_out_of_range_roots() {
+    fn test_replay_region_driver_rejects_out_of_range_roots() {
         let source = identity_program(DataType::F64);
         let mappings = RegionReplayMappings::new();
         let roots = [RegionId::new(42)];
 
         assert!(matches!(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
         ));
     }
@@ -717,7 +718,7 @@ mod tests {
         let duplicate_roots = [first_root, first_root];
         let duplicate_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let imported = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &duplicate_roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &duplicate_roots, &mappings).unwrap(),
             &duplicate_destination,
         );
         assert_eq!(imported[0], imported[1]);
@@ -726,7 +727,7 @@ mod tests {
         let roots = [first_root, second_root];
         let shared_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let imported = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &shared_destination,
         );
         let shared_destination = shared_destination.borrow();
@@ -746,16 +747,16 @@ mod tests {
 
         let first_roots = [first_root];
         let first = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
             &destination,
         )[0];
         let second_roots = [second_root];
         let second = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &second_roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &second_roots, &mappings).unwrap(),
             &destination,
         )[0];
         let repeated = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
             &destination,
         )[0];
 
@@ -778,11 +779,11 @@ mod tests {
         let roots = [first_root];
 
         let first = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &first_destination,
         )[0];
         let second = import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &second_destination,
         )[0];
         assert_ne!(first, second);
@@ -799,7 +800,7 @@ mod tests {
         let weak_destination = Rc::downgrade(&destination);
 
         import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &destination,
         );
         assert_eq!(Rc::strong_count(&destination), 1);
@@ -809,7 +810,7 @@ mod tests {
 
         let replacement = Rc::new(RefCell::new(ProgramBuilder::new()));
         import_attachments(
-            ReplayedRegionAttachments::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
+            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &replacement,
         );
         assert_eq!(mappings.destinations.borrow().len(), 1);
