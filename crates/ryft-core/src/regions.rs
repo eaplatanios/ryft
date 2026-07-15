@@ -474,21 +474,40 @@ pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Source [`RegionId`]s attached to the replayed instruction, in application order.
     roots: &'r [RegionId],
 
-    /// Replay-wide source-to-destination [`RegionReplayMappings`].
+    /// Source-to-destination [`Region`] mappings shared by every [`Instruction`] driver in the surrounding replay.
+    /// A [`Program`] is replayed one [`Instruction`] at a time, and so each instruction receives a distinct
+    /// [`ReplayRegionDriver`]. Region identity, however, belongs to the complete source region arena. Two instructions
+    /// can attach to the same source region, and two attached roots can share a descendant:
+    ///
+    /// ```text
+    /// source instruction A ──┐
+    ///                        ├──▶ region 3 ──▶ region 1
+    /// source instruction B ──┘
+    /// ```
+    ///
+    /// Importing each instruction with a fresh source-to-destination map would copy region 3 and region 1 once for A
+    /// and again for B. The resulting program might contain equivalent region bodies, but it would no longer preserve
+    /// the source graph's sharing. Keeping one [`RegionReplayMappings`] value for the complete source replay lets the
+    /// second import reuse the destination identifiers established by the first:
+    ///
+    /// ```text
+    /// source region 1 ──▶ destination region 0
+    /// source region 3 ──▶ destination region 1
+    /// ```
+    ///
+    /// The replay may feed different instructions to different destination [`ProgramBuilder`]s as composed contexts
+    /// decide whether and where to stage them. Because a [`RegionId`] is meaningful only within its owning arena, each
+    /// destination builder needs an independent source-to-destination map. [`RegionReplayMappings`] therefore stores
+    /// one [`DestinationRegionMapping`] per live destination [`ProgramBuilder`]. The same source region might map to
+    /// region 1 in one builder and region 7 in another without either mapping affecting the other.
+    ///
+    /// One [`RegionReplayMappings`] value must be scoped to exactly one source-arena replay. Its per-destination state
+    /// is shared across that replay's instruction drivers, but must not be reused for a different source arena.
     mappings: &'r RegionReplayMappings<V, O>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
-    /// Creates a driver for one instruction in an active replay, returning an error if any root does not belong to
-    /// `source`'s arena.
-    ///
-    /// # Parameters
-    ///
-    ///   - `source`: Any valid region reference in the source arena.
-    ///   - `roots`: Region identifiers attached to the instruction, in application order.
-    ///   - `mappings`: Replay-wide mappings shared by every instruction in this source replay.
+    /// Creates a new [`ReplayRegionDriver`].
     #[inline]
     pub(crate) fn new(
         source: RegionRef<'r, V, O>,
@@ -520,11 +539,14 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
     }
 }
 
-/// Replay-scoped source-to-destination [`RegionId`] mappings. A source identifier is meaningful only in the replayed
-/// arena, while an imported identifier is meaningful only in one destination builder. One value is therefore shared
-/// across the complete replay of one source arena and maintains a separate [`DestinationRegionMapping`] for every live
-/// destination builder. Reusing those mappings prevents repeated roots or shared descendants from being copied into
-/// distinct destination regions merely because they appear in different operation applications.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Replay-scoped collection of source-to-destination [`RegionId`] mappings.
+///
+/// One value is shared by all [`ReplayRegionDriver`]s created while replaying one source arena. It maintains a separate
+/// [`DestinationRegionMapping`] for every live destination builder so repeated roots and shared descendants retain
+/// their identity across instruction applications without mixing the unrelated identifier spaces of different
+/// builders. See [`ReplayRegionDriver::mappings`] for an example and a detailed explanation of the required scope.
 pub(crate) struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
     /// Per-destination mappings accumulated during this replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
@@ -566,9 +588,10 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
     }
 }
 
-/// Source-to-destination [`RegionId`] mapping for one live destination builder participating in a region replay. This
-/// is per-destination state because a transform stack may route applications from one source replay into several
-/// builders, whose region identifiers are unrelated even when their imported source region is the same.
+/// Source-to-destination [`RegionId`] mapping for one live destination builder participating in a region replay.
+///
+/// [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local to their owning
+/// arenas. See [`ReplayRegionDriver::mappings`] for how replay-wide sharing and destination-local identifiers interact.
 pub(crate) struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
     /// Weak identity of the destination builder. Weak ownership prevents replay bookkeeping from keeping a completed
     /// builder alive or interfering with trace finalization through `Rc::try_unwrap`.
