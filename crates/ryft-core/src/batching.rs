@@ -82,9 +82,12 @@ use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolu
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
-use crate::operations::{ElementwiseOperation, Operation, RegionDriver, RegionlessDriver};
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{FlatProgram, Program, ProgramError, RegionRef, Value};
+use crate::programs::{Program, ProgramError, Value};
+use crate::regions::{
+    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+};
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Size, TypeError, Typed};
@@ -615,7 +618,7 @@ pub trait BatchingDriver<C: Context<Type = ArrayType>>: RegionDriver<C::Constant
     ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>;
 }
 
-impl<C: Context<Type = ArrayType>> BatchingDriver<C> for RegionlessDriver {
+impl<C: Context<Type = ArrayType>> BatchingDriver<C> for EmptyRegionDriver {
     #[inline]
     fn batch_region(
         &self,
@@ -623,7 +626,7 @@ impl<C: Context<Type = ArrayType>> BatchingDriver<C> for RegionlessDriver {
         _index: usize,
         _inputs: Vec<ArrayBatch<C::Value>>,
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(ProgramError::MalformedProgram("regionless driver cannot batch a region".to_string()).into())
+        Err(ProgramError::MalformedProgram("empty region driver cannot batch a region".to_string()).into())
     }
 
     #[inline]
@@ -635,83 +638,34 @@ impl<C: Context<Type = ArrayType>> BatchingDriver<C> for RegionlessDriver {
         _output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
     {
-        Err(ProgramError::MalformedProgram("regionless driver cannot batch a program".to_string()).into())
+        Err(ProgramError::MalformedProgram("empty region driver cannot batch a program".to_string()).into())
     }
 }
 
-/// [`BatchingDriver`] scoped to one [`Context::bind`] [`Operation`] application. It exposes exactly that application's
-/// owned [`Region`](crate::Region)s and shared callees, borrowing both collections in place and indexing callees after
-/// the owned regions without a combined program or region-reference allocation.
-struct BindingBatchingDriver<'r, C: Context<Type = ArrayType>> {
-    /// Owned nested region [`Program`]s, in operation-defined order.
-    regions: &'r [FlatProgram<BatchingContext<C>>],
-
-    /// Shared callee [`Program`]s, ordered after [`Self::regions`].
-    callees: &'r [Rc<FlatProgram<BatchingContext<C>>>],
+/// [`BatchingDriver`] scoped to one [`Operation`] application. It borrows the application's complete region driver,
+/// which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees without
+/// materializing a combined region collection. Recursive requests re-enter the active batching transform or batch a
+/// selected region structurally.
+struct RecursiveBatchingDriver<'r, D> {
+    /// Application-scoped [`RegionDriver`], in [`Operation`]-defined order.
+    driver: &'r D,
 }
 
-impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for BindingBatchingDriver<'_, C> {
-    #[inline]
-    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, C::Constant, C::Operation>>
-    where
-        C::Constant: 'r,
-        C::Operation: 'r,
-    {
-        self.regions
-            .iter()
-            .map(Program::entry_region_ref)
-            .chain(self.callees.iter().map(|program| program.entry_region_ref()))
-    }
-}
-
-impl<C: Context<Type = ArrayType>> BatchingDriver<C> for BindingBatchingDriver<'_, C>
-where
-    C::Operation: BatchableOperation<C>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>,
+impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>, D: RegionDriver<V, O>> RegionDriver<V, O>
+    for RecursiveBatchingDriver<'_, D>
 {
     #[inline]
-    fn batch_region(
-        &self,
-        context: &BatchingContext<C>,
-        index: usize,
-        inputs: Vec<ArrayBatch<C::Value>>,
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        context.batch_region(self.region(index)?, inputs)
-    }
-
-    #[inline]
-    fn batch_program(
-        &self,
-        context: &BatchingContext<C>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        input_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
-    {
-        region.batched(context.axis_size(), input_axes, output_axes_policy)
-    }
-}
-
-/// [`BatchingDriver`] scoped to one replayed region-carrying [`Instruction`](crate::Instruction).
-struct ReplayBatchingDriver<'r, C: Context<Type = ArrayType>> {
-    /// Borrowed views of the [`Instruction`](crate::Instruction)'s [`Region`]s, in region order.
-    regions: Vec<RegionRef<'r, C::Constant, C::Operation>>,
-}
-
-impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for ReplayBatchingDriver<'_, C> {
-    #[inline]
-    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, C::Constant, C::Operation>>
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
-        C::Constant: 'r,
-        C::Operation: 'r,
+        V: 'r,
+        O: 'r,
     {
-        self.regions.iter().copied()
+        self.driver.regions()
     }
 }
 
-impl<C: Context<Type = ArrayType>> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
+impl<C: Context<Type = ArrayType>, D: RegionDriver<C::Constant, C::Operation>> BatchingDriver<C>
+    for RecursiveBatchingDriver<'_, D>
 where
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>
@@ -957,7 +911,7 @@ impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C>> InterpretableBa
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let output_values = self.interpret(&context.parent().clone(), &RegionlessDriver, input_values.as_slice())?;
+        let output_values = self.interpret(&context.parent().clone(), &EmptyRegionDriver, input_values.as_slice())?;
         check_count!("output", output_values, output_batch_axes.len(), ProgramError);
         output_values
             .into_iter()
@@ -1029,15 +983,15 @@ impl<C> BatchingContext<C> {
             + From<TransposeOperation>
             + From<BroadcastOperation>,
     {
+        let region_mappings = RegionReplayMappings::new();
         region.interpret_with(
             inputs,
             |_, constant| Ok(ArrayBatch::replicated(self.parent().lift(constant.clone())?)),
             |instruction, instruction_inputs| {
-                instruction.operation().batch(
-                    self,
-                    &ReplayBatchingDriver { regions: region.attached_regions(instruction)? },
-                    instruction_inputs,
-                )
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                instruction
+                    .operation()
+                    .batch(self, &RecursiveBatchingDriver { driver: &regions }, instruction_inputs)
             },
         )
     }
@@ -1064,11 +1018,10 @@ where
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
+    fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
-        regions: R,
-        callees: &[Rc<FlatProgram<Self>>],
+        driver: D,
         inputs: &[BatchingTracer<C>],
     ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
         // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
@@ -1078,8 +1031,8 @@ where
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
-        let driver = BindingBatchingDriver { regions: regions.as_ref(), callees };
-        let output_batches = operation.batch(self, &driver, input_batches.as_slice())?;
+        let batching_driver = RecursiveBatchingDriver { driver: &driver };
+        let output_batches = operation.batch(self, &batching_driver, input_batches.as_slice())?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
 
@@ -1273,19 +1226,15 @@ impl<
             // threading the batch-carrying inputs through. Constants lift in the parent trace and replicate across the
             // batch. This only requires this program's own operation family to be batchable, so staged higher-order
             // batching rules can batch a captured sub-program without concretizing any batch-item values.
+            let region_mappings = RegionReplayMappings::new();
             let outputs = self.interpret_with(
                 inputs,
                 |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
                 |instruction, instruction_inputs| {
+                    let regions = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
                     instruction.operation().batch(
                         &batching_context,
-                        &ReplayBatchingDriver {
-                            regions: instruction
-                                .regions()
-                                .iter()
-                                .map(|id| self.region_ref(*id))
-                                .collect::<Result<Vec<_>, _>>()?,
-                        },
+                        &RecursiveBatchingDriver { driver: &regions },
                         instruction_inputs,
                     )
                 },
@@ -1786,28 +1735,28 @@ mod tests {
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
         let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
-        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left.clone(), right]).unwrap();
+        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left.clone(), right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left.clone(), replicated]).unwrap();
+        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left.clone(), replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
         // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
         let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
-        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left, right_axis_one]).unwrap();
+        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right_axis_one]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&context, &RegionlessDriver, &[left_replicated, right_replicated]).unwrap();
+        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left_replicated, right_replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
