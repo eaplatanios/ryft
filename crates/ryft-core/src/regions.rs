@@ -539,21 +539,19 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Replay-scoped collection of source-to-destination [`RegionId`] mappings.
-///
-/// One value is shared by all [`ReplayRegionDriver`]s created while replaying one source arena. It maintains a separate
-/// [`DestinationRegionMapping`] for every live destination builder so repeated roots and shared descendants retain
-/// their identity across instruction applications without mixing the unrelated identifier spaces of different
-/// builders. See [`ReplayRegionDriver::mappings`] for an example and a detailed explanation of the required scope.
+/// Replay-scoped collection of source-to-destination [`RegionId`] mappings. One instance of this type is shared
+/// by all [`ReplayRegionDriver`]s created while replaying one source [`Region`] arena. It maintains a separate
+/// [`DestinationRegionMapping`] for every live destination [`ProgramBuilder`] so repeated roots and shared
+/// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
+/// spaces of different builders. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is
+/// used and why it is needed.
 pub(crate) struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
-    /// Per-destination mappings accumulated during this replay.
+    /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
 }
 
 impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
-    /// Creates empty mappings for a new source-arena replay.
+    /// Creates a new [`RegionReplayMappings`].
     #[inline]
     pub(crate) fn new() -> Self {
         Self { destinations: RefCell::new(Vec::new()) }
@@ -587,6 +585,8 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
             .collect()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source-to-destination [`RegionId`] mapping for one live destination builder participating in a region replay.
 ///
@@ -669,11 +669,11 @@ mod tests {
         (program, first_root, second_root)
     }
 
-    fn import_attachments<R: BindingRegionDriver<Scalar, TestRegionOperation>>(
-        regions: R,
+    fn import_regions<D: BindingRegionDriver<Scalar, TestRegionOperation>>(
+        driver: D,
         builder: &Rc<RefCell<ProgramBuilder<Scalar, TestRegionOperation>>>,
     ) -> Vec<RegionId> {
-        regions.import_into(builder).unwrap()
+        driver.import_into(builder).unwrap()
     }
 
     fn attached_input_types<R: RegionDriver<Scalar, TestRegionOperation>>(regions: &R) -> Vec<DataType> {
@@ -681,21 +681,21 @@ mod tests {
     }
 
     #[test]
-    fn test_owned_region_attachments_support_empty_arrays_and_vectors() {
+    fn test_owned_region_drivers_support_empty_arrays_and_vectors() {
         let empty_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert!(import_attachments([], &empty_builder).is_empty());
+        assert!(import_regions([], &empty_builder).is_empty());
         assert!(empty_builder.borrow().regions.is_empty());
 
         let array = [identity_program(DataType::F32), identity_program(DataType::F64)];
         assert_eq!(attached_input_types(&array), vec![DataType::F32, DataType::F64]);
         let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_attachments(array, &array_builder), vec![RegionId::new(0), RegionId::new(1)]);
+        assert_eq!(import_regions(array, &array_builder), vec![RegionId::new(0), RegionId::new(1)]);
         assert_eq!(array_builder.borrow().regions.len(), 2);
 
         let regions = vec![identity_program(DataType::F64), identity_program(DataType::F32)];
         assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F32]);
         let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_attachments(regions, &vector_builder), vec![RegionId::new(0), RegionId::new(1)]);
+        assert_eq!(import_regions(regions, &vector_builder), vec![RegionId::new(0), RegionId::new(1)]);
         assert_eq!(vector_builder.borrow().regions.len(), 2);
     }
 
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F64]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_attachments(regions, &builder), vec![RegionId::new(0), RegionId::new(0)]);
+        assert_eq!(import_regions(regions, &builder), vec![RegionId::new(0), RegionId::new(0)]);
         assert_eq!(builder.borrow().regions.len(), 1);
     }
 
@@ -740,7 +740,7 @@ mod tests {
 
         let duplicate_roots = [first_root, first_root];
         let duplicate_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let imported = import_attachments(
+        let imported = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &duplicate_roots, &mappings).unwrap(),
             &duplicate_destination,
         );
@@ -749,7 +749,7 @@ mod tests {
 
         let roots = [first_root, second_root];
         let shared_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let imported = import_attachments(
+        let imported = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &shared_destination,
         );
@@ -769,16 +769,16 @@ mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
 
         let first_roots = [first_root];
-        let first = import_attachments(
+        let first = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
             &destination,
         )[0];
         let second_roots = [second_root];
-        let second = import_attachments(
+        let second = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &second_roots, &mappings).unwrap(),
             &destination,
         )[0];
-        let repeated = import_attachments(
+        let repeated = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
             &destination,
         )[0];
@@ -801,11 +801,11 @@ mod tests {
         second_destination.borrow_mut().import_program(identity_program(DataType::F32));
         let roots = [first_root];
 
-        let first = import_attachments(
+        let first = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &first_destination,
         )[0];
-        let second = import_attachments(
+        let second = import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &second_destination,
         )[0];
@@ -822,7 +822,7 @@ mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let weak_destination = Rc::downgrade(&destination);
 
-        import_attachments(
+        import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &destination,
         );
@@ -832,7 +832,7 @@ mod tests {
         assert!(weak_destination.upgrade().is_none());
 
         let replacement = Rc::new(RefCell::new(ProgramBuilder::new()));
-        import_attachments(
+        import_regions(
             ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
             &replacement,
         );
