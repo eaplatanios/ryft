@@ -23,9 +23,10 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::{Operation, RegionlessDriver};
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout, TypeError};
@@ -53,7 +54,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(0.5)],
             ),
             Ok(vec![Scalar::from(0.5f64.cos())]),
@@ -62,7 +63,7 @@ mod tests {
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[TestArray::scalar(0.5)],
             ),
             Ok(vec![TestArray::scalar(0.5f64.cos())]),
@@ -105,7 +106,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -114,7 +115,7 @@ mod tests {
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),

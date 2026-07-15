@@ -36,7 +36,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::types::{ArrayType, TypeError};
 
@@ -183,7 +184,7 @@ where
 {
     fn reshard(&self, sharding: &Sharding) -> Self {
         self.dispatch_domain()
-            .bind(ReshardOperation::new(sharding.clone()), Vec::new(), &[], &[self.clone()])
+            .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
             .expect("`reshard` operation failed")
             .remove(0)
     }
@@ -314,7 +315,7 @@ where
 {
     fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         self.dispatch_domain()
-            .bind(ShardingConstraintOperation::new(sharding.clone()), Vec::new(), &[], &[self.clone()])
+            .bind(ShardingConstraintOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
             .expect("`constrain_sharding` operation failed")
             .remove(0)
     }

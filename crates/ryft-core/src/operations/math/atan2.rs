@@ -5,7 +5,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, RegionInterface, Value};
+use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`Atan2Operation`].
@@ -116,7 +117,7 @@ pub trait Atan2: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<Atan2Operation>>>> Atan2 for V {
     #[inline]
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(Atan2Operation, Vec::new(), &[], &[self.clone(), x.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(Atan2Operation, Vec::new(), &[self.clone(), x.clone()])?.remove(0))
     }
 }
 
@@ -128,9 +129,9 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::operations::RegionlessDriver;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{Layout, Shape, Size, StridedLayout};
@@ -164,7 +165,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(0.5), Scalar::from(-0.25)],
             ),
             Ok(vec![Scalar::from(0.5f64.atan2(-0.25f64))]),
@@ -173,7 +174,7 @@ mod tests {
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[TestArray::scalar(0.5), TestArray::scalar(-0.25)],
             ),
             Ok(vec![TestArray::scalar(0.5f64.atan2(-0.25f64))]),
@@ -235,7 +236,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -244,7 +245,7 @@ mod tests {
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -253,7 +254,7 @@ mod tests {
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &RegionlessDriver,
+                &EmptyRegionDriver,
                 &[Scalar::from(0.5f32), Scalar::from(-0.25f64)],
             ),
             Err(ProgramError::Type(TypeError {

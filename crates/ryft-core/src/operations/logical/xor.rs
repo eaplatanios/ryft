@@ -1,7 +1,7 @@
 use crate::macros::{define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`XorOperation`].
-pub const XOR_OPERATION_NAME: &'static str = "xor";
+pub const XOR_OPERATION_NAME: &str = "xor";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
@@ -30,6 +30,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
@@ -45,7 +46,9 @@ mod tests {
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &[lhs, rhs]).unwrap();
+        let outputs = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs])
+            .unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.
@@ -60,19 +63,21 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[ArrayType::scalar(DataType::Boolean), input_type.clone()],
+                &[],
             ),
             Ok(vec![input_type.clone()]),
         );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&input_type)),
+            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[]
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
@@ -82,7 +87,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, XorOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
+        let program_output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray), TestArray>(vec![program_output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

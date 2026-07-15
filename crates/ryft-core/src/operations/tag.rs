@@ -10,7 +10,8 @@ use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, RegionInterface, Value};
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{Type, TypeError};
 
@@ -104,7 +105,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
     #[inline]
     fn tag(self, key: &str) -> Self {
         self.dispatch_domain()
-            .bind(TagOperation::new(key), Vec::new(), &[], std::slice::from_ref(&self))
+            .bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))
             .expect("`tag` operation failed")
             .remove(0)
     }
@@ -125,7 +126,7 @@ where
         // uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
         let mut primal =
-            context.bind(TagOperation::new(self.key()), Vec::new(), &[], std::slice::from_ref(inputs[0].primal()))?;
+            context.bind(TagOperation::new(self.key()), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }

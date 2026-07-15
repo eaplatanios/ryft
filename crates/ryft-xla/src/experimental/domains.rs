@@ -362,10 +362,10 @@ impl<'c> Context for XlaDomain<'c> {
     /// compiled through this domain's compile cache, and executed on this domain's PJRT client via the crate-private
     /// `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the constant
     /// directly through the runtime client without compiling a program.
-    fn bind<P, R: BindingRegionDriver<Self::Constant, Self::Operation>>(
+    fn bind<P, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
-        regions: R,
+        driver: D,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>
     where
@@ -385,7 +385,7 @@ impl<'c> Context for XlaDomain<'c> {
                 return Ok(vec![value]);
             }
         }
-        self.eager_bind(operation, regions, inputs)
+        self.eager_bind(operation, driver, inputs)
     }
 
     /// A client-backed domain executes every bound operation for real and its concrete [`Array`]s support host
@@ -658,10 +658,10 @@ impl<'c> XlaDomain<'c> {
     /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their
     /// nested programs as attached regions and flow through this same path — the compiler handles the control flow, so
     /// no host interpreter loops are needed.
-    fn eager_bind<R: BindingRegionDriver<XlaConstant, XlaOperation>>(
+    fn eager_bind<D: BindingRegionDriver<XlaConstant, XlaOperation>>(
         &self,
         operation: XlaOperation,
-        regions: R,
+        driver: D,
         inputs: &[Array<'c>],
     ) -> Result<Vec<Array<'c>>, ProgramError> {
         let Some(client) = self.client else {
@@ -678,7 +678,7 @@ impl<'c> XlaDomain<'c> {
         // provided region bodies to that instruction.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
-        let region_ids = regions.import_into(&builder)?;
+        let region_ids = driver.import_into(&builder)?;
         let output_atoms = {
             let mut builder = builder.borrow_mut();
             let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();

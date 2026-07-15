@@ -230,7 +230,7 @@ macro_rules! define_elementwise_operation {
                 // Fully qualified calls are required here because the `Value` and `Context` traits are not
                 // necessarily imported at the macro expansion site.
                 let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, Vec::new(), &[self.clone()])?.remove(0))
+                Ok($crate::Context::bind(&domain, $operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
             }
         }
     };

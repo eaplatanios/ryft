@@ -32,9 +32,9 @@
 //!
 //! # Entry Points
 //!
-//! [`Domain::trace`] is the usual domain-oriented entry point. It creates a fresh [`DomainTracingContext`], converts
+//! [`Trace::trace`] is the usual domain-oriented entry point. It creates a fresh [`DomainTracingContext`], converts
 //! the abstract input structure into tracers, invokes the closure, and returns both output types and the finalized
-//! program, while [`Domain::infer_output_type`] runs the same trace but retains only abstract outputs.
+//! program, while [`Trace::infer_output_type`] runs the same trace but retains only abstract outputs.
 //!
 //! Use [`TracingContext::trace`] directly when the value, operation, and capture types are named independently rather
 //! than through a domain. [`TracingContext::trace_with_named_axes`] additionally installs named-axis bindings for the
@@ -97,7 +97,8 @@ use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::regions::BindingRegionDriver;
 use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -182,7 +183,7 @@ impl<C: StagingContext> Tracer<C> {
     /// unary operation, then the resulting [`Tracer`] will contain a [`TracerState::Poison`].
     pub fn unary<P: Into<C::Operation>>(&self, operation: P) -> Self {
         let operation = operation.into();
-        match self.context.stage_operation(operation, [], &[], &[self]) {
+        match self.context.stage_operation(operation, [], &[self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
@@ -201,7 +202,7 @@ impl<C: StagingContext> Tracer<C> {
     /// [`TracerState::Poison`].
     pub fn binary<P: Into<C::Operation>>(&self, rhs: &Self, operation: P) -> Self {
         let operation = operation.into();
-        match self.context.stage_operation(operation, Vec::new(), &[], &[self, rhs]) {
+        match self.context.stage_operation(operation, Vec::new(), &[self, rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
@@ -259,12 +260,12 @@ impl<C: StagingContext> Value for Tracer<C> {
     }
 }
 
-/// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs the
-/// staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one tracing
-/// invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
-/// [`Constant`](Value::DispatchDomain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior
-/// records each primitive bind as a program instruction. Transform contexts wrap or replace this context when they
-/// need different binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
+/// Ordinary active tracing [`Context`] over a [`Type`](crate::Type)/[`Value`]/[`Operation`] universe.
+/// [`TracingContext`] pairs the staged-constant and operation representations `(V, O)` of a program with the
+/// [`ProgramBuilder`] used for one tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is
+/// [`Tracer<Self>`](Tracer) and whose [`Domain::Constant`] is `V`. Its default [`StagingContext::stage_operation`]
+/// behavior records each primitive bind as a program instruction. Transform contexts wrap or replace this context when
+/// they need different binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
 ///
 /// The optional capture parameter `C` names the concrete runtime value type stored in the capture table while tracing
 /// a captured [`Program`]. It is deliberately distinct from the staged-constant type `V`.
@@ -352,8 +353,8 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation. The type
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
     /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
-    /// type (such as a backend whose runtime [`Value`](Value::DispatchDomain::Value) differs from its staged
-    /// [`Constant`](Value::DispatchDomain::Constant)) observe that same context type.
+    /// type (such as a backend whose runtime [`Domain::Value`] differs from its staged [`Domain::Constant`]) observe
+    /// that same context type.
     #[inline]
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -456,14 +457,13 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 
     #[inline]
-    fn bind<P: Into<O>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
+    fn bind<P: Into<O>, D: BindingRegionDriver<V, O>>(
         &self,
         operation: P,
-        regions: R,
-        callees: &[Rc<FlatProgram<Self>>],
+        driver: D,
         inputs: &[Tracer<Self>],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation(operation, regions, callees, inputs)
+        self.stage_operation(operation, driver, inputs)
     }
 
     #[inline]
@@ -646,14 +646,13 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 
     #[inline]
-    fn bind<P: Into<Self::Operation>, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
+    fn bind<P: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
-        regions: R,
-        callees: &[Rc<FlatProgram<Self>>],
+        driver: D,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        self.stage_operation(operation, regions, callees, inputs)
+        self.stage_operation(operation, driver, inputs)
     }
 
     #[inline]
@@ -766,8 +765,8 @@ impl<D: Domain> Trace for D {}
 
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
-/// contribute only their abstract [`Type`]s. No runtime computation is performed on them and they are not captured
-/// by the resulting program. The trace runs in the input value type's statically known
+/// contribute only their abstract [`Type`](crate::Type)s; no runtime computation is performed on them, and they are
+/// not captured by the resulting program. The trace runs in the input value type's statically known
 /// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batch) and the differentiation entry
 /// points, no context instance needs to be recovered from the input leaves and inputs with no leaf values are still
 /// traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for the input types through
@@ -850,7 +849,8 @@ mod tests {
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, ProgramError, RegionInterface};
+    use crate::programs::{AtomId, ProgramError};
+    use crate::regions::RegionInterface;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
@@ -1116,7 +1116,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let outputs = tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]).unwrap();
+        let outputs = tracing_context.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].state(), &TracerState::Live(AtomId::new(2)));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -1146,7 +1146,7 @@ mod tests {
         let tracer_a = context_a.tracer(atom_a, None);
         let tracer_b = context_b.tracer(atom_b, None);
         assert!(matches!(
-            context_a.stage_operation(AddOperation, Vec::new(), &[], &[&tracer_a, &tracer_b]),
+            context_a.stage_operation(AddOperation, Vec::new(), &[&tracer_a, &tracer_b]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
@@ -1158,13 +1158,13 @@ mod tests {
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         builder.borrow_mut().error = Some(builder_error.clone());
         let tracer = tracing_context.tracer(atom, None);
-        let outputs = tracing_context.stage_operation(NegOperation, Vec::new(), &[], &[&tracer]).unwrap();
+        let outputs = tracing_context.stage_operation(NegOperation, Vec::new(), &[&tracer]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].state(), &TracerState::Poison));
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
-            tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&tracer]),
+            tracing_context.stage_operation(AddOperation, Vec::new(), &[&tracer]),
             Err(ProgramError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
@@ -1176,7 +1176,7 @@ mod tests {
         let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
         let lhs = tracing_context.tracer(lhs_atom, None);
         let rhs = tracing_context.tracer(rhs_atom, None);
-        let result = tracing_context.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]);
+        let result = tracing_context.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]);
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError { message }))
@@ -1192,20 +1192,10 @@ mod tests {
         let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context.constant(
-            domain
-                .bind(ZeroOperation::new(DataType::F64), Vec::new(), &[], &[])
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap(),
+            domain.bind(ZeroOperation::new(DataType::F64), Vec::new(), &[]).unwrap().into_iter().next().unwrap(),
         );
         let one = tracing_context.constant(
-            domain
-                .bind(OneOperation::new(DataType::F64), Vec::new(), &[], &[])
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap(),
+            domain.bind(OneOperation::new(DataType::F64), Vec::new(), &[]).unwrap().into_iter().next().unwrap(),
         );
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(one.r#type().into_owned(), DataType::F64);
@@ -1256,7 +1246,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Test using an escaped [`ProgramBuilder`].
+        // Test using an escaped `ProgramBuilder`.
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
@@ -1269,7 +1259,7 @@ mod tests {
             Err(ProgramError::EscapedProgramBuilder),
         ));
 
-        // Test that [`TypeError`]s are returned in certain cases.
+        // Test that `TypeError`s are returned in certain cases.
         assert!(matches!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
             Err(ProgramError::Type(TypeError { message }))
@@ -1366,7 +1356,7 @@ mod tests {
         // as a root trace would.
         let lhs = nested.input(DataType::F64);
         let rhs = nested.input(DataType::F64);
-        let outputs = nested.stage_operation(AddOperation, Vec::new(), &[], &[&lhs, &rhs]).unwrap();
+        let outputs = nested.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
