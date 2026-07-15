@@ -280,25 +280,15 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         lift_fn: LiftFn,
         interpret_fn: InterpretFn,
     ) -> Result<Vec<RuntimeValue>, Error> {
-        interpret_region_with(
-            self.atoms(),
-            self.input_ids(),
-            self.instructions(),
-            self.output_ids(),
-            inputs,
-            lift_fn,
-            interpret_fn,
-        )
+        self.entry_region_ref().interpret_with(inputs, lift_fn, interpret_fn)
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
-    /// Interprets this borrowed region through the supplied [`Context`] using flat input and output values.
-    ///
-    /// The region and every nested region attached to its instructions are replayed directly from the source arena.
-    /// When the supplied context stages an unchanged nested region, one replay-scoped mapping preserves repeated roots
-    /// and shared descendants in the destination arena.
+    /// Interprets this borrowed [`Region`](crate::Region) through the provided [`Context`] using flat input and output
+    /// values. The region and every nested region attached to its [`Instruction`]s are replayed directly from the
+    /// source arena. When the provided context stages an unchanged nested region, one replay-scoped mapping preserves
+    /// repeated roots and shared descendants in the destination arena.
     pub fn interpret_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         self,
         context: &C,
@@ -319,7 +309,6 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
                 .into());
             }
         }
-
         let region_mappings = RegionReplayMappings::new();
         self.interpret_with(
             inputs,
@@ -335,11 +324,9 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
     }
 
     /// Interprets/executes this borrowed [`RegionRef`]'s [`Instruction`]s using the caller-supplied value and error
-    /// semantics.
-    ///
-    /// This is the borrowed-region counterpart of [`Program::interpret_with`]. It replays the region directly from
-    /// its source arena without first materializing a standalone [`Program`], while preserving the same flat input,
-    /// constant-lifting, instruction-dispatch, and output-gathering behavior.
+    /// semantics. This is the borrowed-[`Region`](crate::Region) counterpart of [`Program::interpret_with`]. It replays
+    /// the region directly from its source arena without first materializing a standalone [`Program`], while preserving
+    /// the same flat input, constant-lifting, instruction-dispatch, and output-gathering behavior.
     pub fn interpret_with<
         RuntimeValue: Clone,
         Error: From<ProgramError>,
@@ -348,123 +335,98 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
     >(
         self,
         inputs: Vec<RuntimeValue>,
-        lift_fn: LiftFn,
-        interpret_fn: InterpretFn,
+        mut lift_fn: LiftFn,
+        mut interpret_fn: InterpretFn,
     ) -> Result<Vec<RuntimeValue>, Error> {
-        interpret_region_with(
-            self.atoms(),
-            self.input_ids(),
-            self.instructions(),
-            self.output_ids(),
-            inputs,
-            lift_fn,
-            interpret_fn,
-        )
-    }
-}
+        let atoms = self.atoms();
+        let input_ids = self.input_ids();
+        let instructions = self.instructions();
+        let output_ids = self.output_ids();
+        check_count!("input", inputs, input_ids.len(), ProgramError);
 
-// TODO(eaplatanios): Review this.
-/// Interprets/executes one borrowed region boundary using caller-supplied value and error semantics.
-pub(crate) fn interpret_region_with<
-    V: Value,
-    O: Operation<V::Type>,
-    RuntimeValue: Clone,
-    Error: From<ProgramError>,
-    LiftFn: FnMut(AtomId, &V) -> Result<RuntimeValue, Error>,
-    InterpretFn: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,
->(
-    atoms: &[Atom<V>],
-    input_ids: &[AtomId],
-    instructions: &[Instruction<O>],
-    output_ids: &[AtomId],
-    inputs: Vec<RuntimeValue>,
-    mut lift_fn: LiftFn,
-    mut interpret_fn: InterpretFn,
-) -> Result<Vec<RuntimeValue>, Error> {
-    check_count!("input", inputs, input_ids.len(), ProgramError);
-
-    // Count every future consumer of each atom, including final program outputs. These counts let us move each
-    // value out on its last use and clone it only when a later consumer still needs it.
-    let mut remaining_uses = vec![0usize; atoms.len()];
-    for instruction in instructions {
-        for input_id in instruction.inputs().iter().copied() {
-            let Some(remaining_uses) = remaining_uses.get_mut(input_id.index()) else {
-                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
+        // Count every future consumer of each atom, including final region outputs. These counts let us move each
+        // value out on its last use and clone it only when a later consumer still needs it.
+        let mut remaining_uses = vec![0usize; atoms.len()];
+        for instruction in instructions {
+            for input_id in instruction.inputs().iter().copied() {
+                let Some(remaining_uses) = remaining_uses.get_mut(input_id.index()) else {
+                    return Err(ProgramError::UnboundAtomId { id: input_id }.into());
+                };
+                *remaining_uses += 1;
+            }
+        }
+        for output_id in output_ids.iter().copied() {
+            let Some(remaining_uses) = remaining_uses.get_mut(output_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
             };
             *remaining_uses += 1;
         }
-    }
-    for output_id in output_ids.iter().copied() {
-        let Some(remaining_uses) = remaining_uses.get_mut(output_id.index()) else {
-            return Err(ProgramError::UnboundAtomId { id: output_id }.into());
-        };
-        *remaining_uses += 1;
-    }
 
-    // Store concrete input values in a sparse value table indexed by `AtomId`.
-    let mut values = vec![None; atoms.len()];
-    for (input_id, input) in input_ids.iter().copied().zip(inputs) {
-        let Some(slot) = values.get_mut(input_id.index()) else {
-            return Err(ProgramError::UnboundAtomId { id: input_id }.into());
-        };
-        *slot = Some(input);
-    }
-
-    // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
-    // program output will read them.
-    for (atom_index, atom) in atoms.iter().enumerate() {
-        if remaining_uses[atom_index] == 0 {
-            continue;
-        }
-        if let Atom::Constant(value) = atom {
-            values[atom_index] = Some(lift_fn(AtomId::new(atom_index), value)?);
-        }
-    }
-
-    // Replay instructions in program order, reusing one scratch input buffer to avoid per-instruction allocation.
-    let max_input_count = instructions.iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
-    let mut instruction_inputs = Vec::with_capacity(max_input_count);
-    for instruction in instructions {
-        instruction_inputs.clear();
-        for input_id in instruction.inputs().iter().copied() {
-            // Consume the appropriate input value for the current instruction. If this is the last consumer,
-            // move the value out of the table. Otherwise, clone it so later consumers can still read it.
-            let remaining_uses = remaining_uses.get_mut(input_id.index()).unwrap();
-            debug_assert!(*remaining_uses > 0);
-            *remaining_uses -= 1;
-            let value = values.get_mut(input_id.index()).unwrap();
-            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-            instruction_inputs.push(value);
-        }
-
-        // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
-        let outputs = interpret_fn(instruction, instruction_inputs.as_slice())?;
-        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-
-        for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
-            let Some(value) = values.get_mut(output_id.index()) else {
-                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
+        // Store concrete input values in a sparse value table indexed by `AtomId`.
+        let mut values = vec![None; atoms.len()];
+        for (input_id, input) in input_ids.iter().copied().zip(inputs) {
+            let Some(slot) = values.get_mut(input_id.index()) else {
+                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
             };
+            *slot = Some(input);
+        }
 
-            // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
-            if remaining_uses[output_id.index()] != 0 {
-                *value = Some(output);
+        // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
+        // region output will read them.
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            if remaining_uses[atom_index] == 0 {
+                continue;
+            }
+            if let Atom::Constant(value) = atom {
+                values[atom_index] = Some(lift_fn(AtomId::new(atom_index), value)?);
             }
         }
-    }
 
-    // Gather the program outputs using the same last-use transfer logic that we used for the instruction inputs.
-    let mut outputs = Vec::with_capacity(output_ids.len());
-    for output_id in output_ids.iter().copied() {
-        let remaining_uses = remaining_uses.get_mut(output_id.index()).unwrap();
-        debug_assert!(*remaining_uses > 0);
-        *remaining_uses -= 1;
-        let value = values.get_mut(output_id.index()).unwrap();
-        let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-        outputs.push(value);
-    }
+        // Replay instructions in region order, reusing one scratch input buffer to avoid per-instruction allocation.
+        let max_input_count = instructions.iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
+        let mut instruction_inputs = Vec::with_capacity(max_input_count);
+        for instruction in instructions {
+            instruction_inputs.clear();
+            for input_id in instruction.inputs().iter().copied() {
+                // Consume the appropriate input value for the current instruction. If this is the last consumer,
+                // move the value out of the table. Otherwise, clone it so later consumers can still read it.
+                let remaining_uses = remaining_uses.get_mut(input_id.index()).unwrap();
+                debug_assert!(*remaining_uses > 0);
+                *remaining_uses -= 1;
+                let value = values.get_mut(input_id.index()).unwrap();
+                let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
+                instruction_inputs.push(value);
+            }
 
-    Ok(outputs)
+            // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
+            let outputs = interpret_fn(instruction, instruction_inputs.as_slice())?;
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+
+            for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
+                let Some(value) = values.get_mut(output_id.index()) else {
+                    return Err(ProgramError::UnboundAtomId { id: output_id }.into());
+                };
+
+                // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
+                if remaining_uses[output_id.index()] != 0 {
+                    *value = Some(output);
+                }
+            }
+        }
+
+        // Gather the region outputs using the same last-use transfer logic that we used for instruction inputs.
+        let mut outputs = Vec::with_capacity(output_ids.len());
+        for output_id in output_ids.iter().copied() {
+            let remaining_uses = remaining_uses.get_mut(output_id.index()).unwrap();
+            debug_assert!(*remaining_uses > 0);
+            *remaining_uses -= 1;
+            let value = values.get_mut(output_id.index()).unwrap();
+            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
+            outputs.push(value);
+        }
+
+        Ok(outputs)
+    }
 }
 
 #[cfg(test)]

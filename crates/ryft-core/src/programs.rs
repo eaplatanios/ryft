@@ -3341,7 +3341,7 @@ mod tests {
         assert!(matches!(
             mixed_destination.import_regions(&[source.entry_region_ref(), other.entry_region_ref()]),
             Err(ProgramError::MalformedProgram(message))
-                if message == "one region import batch cannot combine roots from different source arenas",
+                if message == "all imported regions must belong to the same program",
         ));
         assert!(mixed_destination.regions.is_empty());
     }
