@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(attribute.element(1).unwrap().attribute().unwrap(), string_attribute);
         assert!(attribute.element(2).is_err());
 
-        // Test [`DictionaryAttributeRef::element_by_name`].
+        // Test `DictionaryAttributeRef::element_by_name`.
         let element = attribute.element_by_name("int_key").unwrap().unwrap();
         assert_eq!(element.cast::<crate::IntegerAttributeRef>().unwrap(), i32_attribute);
 

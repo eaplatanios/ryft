@@ -402,7 +402,7 @@ pub(crate) mod tests {
             panic_payload_ptr: usize,
         }
 
-        // Use an [`AtomicUsize`] to ensure that each invocation of this function uses a different FFI handler name.
+        // Use an `AtomicUsize` to ensure that each invocation of this function uses a different FFI handler name.
         static HANDLER_ID: AtomicI32 = AtomicI32::new(0);
         let handler_id = HANDLER_ID.fetch_add(1, Ordering::Relaxed) + 1;
 

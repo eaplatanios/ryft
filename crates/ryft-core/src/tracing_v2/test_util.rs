@@ -22,17 +22,13 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::ArrayBatch;
-    use crate::batching::BatchAxis;
-    use crate::batching::BatchableOperation;
-    use crate::batching::{BatchingContext, BatchingTracer};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::ConditionOperation;
-    use crate::operations::math::Sin;
-    use crate::operations::math::{AddOperation, MulOperation, SubOperation};
+    use crate::operations::math::{AddOperation, MulOperation, Sin, SubOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
@@ -59,7 +55,7 @@ mod tests {
         let outputs = DotOperation::new(dimensions)
             .batch(
                 &BatchingContext::new(EagerContext::<TestArray>::new(), 2, None),
-                &crate::RegionlessDriver,
+                &crate::EmptyRegionDriver,
                 &[lhs, rhs],
             )
             .unwrap();
@@ -80,7 +76,7 @@ mod tests {
 
         // Primal: reduce(x, [0], Sum) on `TestArray` directly.
         let primal_output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &crate::RegionlessDriver, std::slice::from_ref(&primal))
+            .interpret(&EagerContext::<TestArray>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&primal))
             .unwrap()
             .into_iter()
             .next()
@@ -92,7 +88,7 @@ mod tests {
         let tangent_outputs = operation
             .interpret(
                 &EagerContext::<TestArray>::new(),
-                &crate::RegionlessDriver,
+                &crate::EmptyRegionDriver,
                 std::slice::from_ref(&tangent_value),
             )
             .unwrap();
@@ -148,7 +144,7 @@ mod tests {
         .unwrap();
         let inputs = [BatchingTracer::new(context.clone(), initial_state)];
         let outputs = context
-            .bind(while_op, vec![condition.clone(), body.clone()], &[], &inputs)
+            .bind(while_op, vec![condition.clone(), body.clone()], &inputs)
             .unwrap()
             .into_iter()
             .map(BatchingTracer::into_batch)
@@ -169,7 +165,7 @@ mod tests {
         .unwrap();
         let inputs = [BatchingTracer::new(context.clone(), initial_state)];
         let outputs = context
-            .bind(bounded_while_op, vec![condition.clone(), body.clone()], &[], &inputs)
+            .bind(bounded_while_op, vec![condition.clone(), body.clone()], &inputs)
             .unwrap()
             .into_iter()
             .map(BatchingTracer::into_batch)
@@ -180,7 +176,7 @@ mod tests {
         let initial_state = ArrayBatch::replicated(TestArray::scalar(5.0));
         let inputs = [BatchingTracer::new(context.clone(), initial_state)];
         let outputs = context
-            .bind(bounded_while_op, vec![condition, body], &[], &inputs)
+            .bind(bounded_while_op, vec![condition, body], &inputs)
             .unwrap()
             .into_iter()
             .map(BatchingTracer::into_batch)
@@ -341,9 +337,7 @@ mod tests {
 
     #[test]
     fn test_condition_batches_replicated_true_predicate_over_array_batches() {
-        use crate::batching::ArrayBatch;
-        use crate::batching::BatchAxis;
-        use crate::batching::BatchingTracer;
+        use crate::batching::{ArrayBatch, BatchAxis, BatchingTracer};
 
         // A replicated `true` predicate selects scalar_scale_branch(2.0). Pass a 3-item batched operand and
         // verify each batch item is independently scaled by 2.
@@ -361,7 +355,6 @@ mod tests {
             .bind(
                 operation,
                 condition_regions,
-                &[],
                 &[
                     BatchingTracer::new(context.clone(), replicated_predicate(true)),
                     BatchingTracer::new(context.clone(), batched_input),
@@ -376,9 +369,7 @@ mod tests {
 
     #[test]
     fn test_condition_batches_false_branch_when_replicated_predicate_is_false() {
-        use crate::batching::ArrayBatch;
-        use crate::batching::BatchAxis;
-        use crate::batching::BatchingTracer;
+        use crate::batching::{ArrayBatch, BatchAxis, BatchingTracer};
 
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
@@ -394,7 +385,6 @@ mod tests {
             .bind(
                 operation,
                 condition_regions,
-                &[],
                 &[
                     BatchingTracer::new(context.clone(), replicated_predicate(false)),
                     BatchingTracer::new(context.clone(), batched_input),
@@ -523,7 +513,6 @@ mod tests {
             .bind(
                 operation,
                 condition_regions,
-                &[],
                 &[
                     BatchingTracer::new(context.clone(), predicate_batch),
                     BatchingTracer::new(context.clone(), operand_batch),
@@ -595,7 +584,7 @@ mod tests {
         let outputs = SelectOperation
             .batch(
                 &BatchingContext::new(EagerContext::<TestArray>::new(), 3, None),
-                &crate::RegionlessDriver,
+                &crate::EmptyRegionDriver,
                 &[pred_batch, on_true_batch, on_false_batch],
             )
             .unwrap();
@@ -619,7 +608,7 @@ mod tests {
                     2,
                     None,
                 ),
-                &crate::RegionlessDriver,
+                &crate::EmptyRegionDriver,
                 &[],
             )
             .unwrap();
@@ -642,7 +631,7 @@ mod tests {
                     2,
                     None,
                 ),
-                &crate::RegionlessDriver,
+                &crate::EmptyRegionDriver,
                 &[],
             )
             .unwrap();
@@ -662,7 +651,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
 
         let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
-        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &crate::RegionlessDriver, &[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![0.0]);
@@ -671,7 +660,7 @@ mod tests {
             scalar,
             crate::backends::scalars::Scalar::from(7.5),
         ));
-        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &crate::RegionlessDriver, &[]).unwrap();
+        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![7.5]);
@@ -722,7 +711,7 @@ mod tests {
         let context = x.dispatch_domain();
         let predicate = context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
         let mut outputs = context
-            .bind(ArrayOperation::Condition(condition), condition_regions.clone(), &[], &[predicate, x])
+            .bind(ArrayOperation::Condition(condition), condition_regions.clone(), &[predicate, x])
             .unwrap();
         outputs.remove(0)
     }
@@ -791,7 +780,6 @@ mod tests {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
                         while_regions.clone(),
-                        &[],
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -817,7 +805,6 @@ mod tests {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
                         while_regions.clone(),
-                        &[],
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -841,7 +828,7 @@ mod tests {
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[], &[x.clone()])
+                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -864,7 +851,7 @@ mod tests {
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[], &[x.clone()])
+                        .bind(ArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -889,7 +876,6 @@ mod tests {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
                         while_regions.clone(),
-                        &[],
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -930,7 +916,6 @@ mod tests {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
                         while_regions.clone(),
-                        &[],
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -995,7 +980,7 @@ mod tests {
                 move |(init, xs)| {
                     let mut outputs = init
                         .context()
-                        .bind(ArrayOperation::Scan(scan), vec![scan_body.clone()], &[], &[init.clone(), xs.clone()])
+                        .bind(ArrayOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -1019,7 +1004,6 @@ mod tests {
                     let mut outputs = init.context().bind(
                         ArrayOperation::Scan(scan),
                         vec![scan_body.clone()],
-                        &[],
                         &[init.clone(), xs.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -1059,7 +1043,6 @@ mod tests {
                     let mut outputs = init.context().bind(
                         ArrayOperation::Scan(scan),
                         vec![scan_body.clone()],
-                        &[],
                         &[init.clone(), xs.clone()],
                     )?;
                     let ys = outputs.remove(1);
@@ -1083,7 +1066,6 @@ mod tests {
                     let mut outputs = init.context().bind(
                         ArrayOperation::Scan(scan),
                         vec![scan_body.clone()],
-                        &[],
                         &[init.clone(), xs.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -1111,7 +1093,7 @@ mod tests {
         let predicate = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         assert_eq!(
             EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .bind(operation, condition_regions, &[], &[predicate, TestArray::scalar(4.0)])
+                .bind(operation, condition_regions, &[predicate, TestArray::scalar(4.0)])
                 .map(|outputs| outputs[0].values[0]),
             Ok(12.0),
         );
@@ -1131,7 +1113,6 @@ mod tests {
                     let mut outputs = predicate.context().bind(
                         ArrayOperation::Condition(condition),
                         condition_regions.clone(),
-                        &[],
                         &[predicate.clone(), operand.clone()],
                     )?;
                     Ok(outputs.remove(0))
@@ -1155,7 +1136,6 @@ mod tests {
                     let mut outputs = predicate.context().bind(
                         ArrayOperation::Condition(condition),
                         condition_regions.clone(),
-                        &[],
                         &[predicate.clone(), operand.clone()],
                     )?;
                     Ok(outputs.remove(0))

@@ -1713,11 +1713,11 @@ mod tests {
 
     #[test]
     fn test_scalar_domain() {
-        // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is a zero-sized token.
+        // `EagerContext<Scalar, ScalarOperation<Scalar>>` is a zero-sized token.
         assert_eq!(size_of::<EagerContext<Scalar, ScalarOperation<Scalar>>>(), 0);
 
         // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
-        // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
+        // `Scalar` values, yielding the corresponding scalar identity for the requested `DataType`.
         assert_eq!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ZeroOperation::new(DataType::F64),

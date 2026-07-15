@@ -146,13 +146,13 @@ impl<'o> Array<'o> {
             }
         };
 
-        // Compute the global [`ShardLayout`] implied by the normalized array type and concrete device mesh.
+        // Compute the global `ShardLayout` implied by the normalized array type and concrete device mesh.
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
         let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
         let layout = ShardLayout::new(&shape, &mesh, sharding)?;
         let (descriptors, shard_index_by_device) = layout.into_parts();
 
-        // Index the provided [`Buffer`]s by device while rejecting duplicate local buffers for the same device.
+        // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device.
         let mut buffers_by_device = HashMap::with_capacity(buffers.len());
         for buffer in buffers {
             let device = Device::from_pjrt(buffer.device()?)?;
@@ -264,7 +264,7 @@ impl<'o> Array<'o> {
         }
 
         // Derive the global shard layout and transfer only the shards owned by this process. Remote shards remain
-        // represented by metadata when [`Self::from_addressable_buffers`] materializes the final array.
+        // represented by metadata when `Self::from_addressable_buffers` materializes the final array.
         let data_type = r#type.data_type();
         let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
         let sharding = r#type.sharding().unwrap();
@@ -378,7 +378,7 @@ impl<'o> Array<'o> {
 
         // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly; it
         // also attaches the client that transferred the local shard buffers so that it can be recovered later via
-        // [`Self::client`].
+        // `Self::client`.
         Ok(Self::from_addressable_buffers(client, r#type, mesh, addressable_buffers)?)
     }
 
@@ -592,7 +592,7 @@ impl<'o> Value for Array<'o> {
     // backend crate cannot take that route because the coherence check cannot rule out future
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
     // capability surface and only capabilities without operation-binding blankets (`BooleanLike`,
-    // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in [`crate::eager`].
+    // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
     type DispatchDomain = XlaDomain<'o>;
     type ExecutionDomain = XlaDomain<'o>;
 
@@ -1036,7 +1036,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // Construct via [`Array::from_addressable_buffers`] and exercise every canonical [`Array`] accessor.
+        // Construct via `Array::from_addressable_buffers` and exercise every canonical `Array` accessor.
         let array = Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
 
         assert_eq!(array.r#type().as_ref(), &array_type);
@@ -1064,7 +1064,7 @@ mod tests {
         assert!(array.device_shard(absent_device_id).is_none());
         assert!(array.addressable_device_shard(absent_device_id).is_none());
 
-        // Layout metadata stored on the underlying array type is exposed verbatim by [`Array::layout`].
+        // Layout metadata stored on the underlying array type is exposed verbatim by `Array::layout`.
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
         let layout_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
             .with_layout(layout.clone())
@@ -1075,7 +1075,7 @@ mod tests {
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
 
-        // Construct via [`Array::from_host_buffer`] and verify that it partitions the dense row-major host bytes
+        // Construct via `Array::from_host_buffer` and verify that it partitions the dense row-major host bytes
         // over the shard layout implied by the mesh and sharding. With a `[4, 4]` `F32` array sharded over both
         // mesh axes, the first mesh device owns the `2x2` block over rows `0..2` and columns `0..2`.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
@@ -1114,7 +1114,7 @@ mod tests {
             .with_sharding(sharding)
             .unwrap();
 
-        // Arrays constructed via [`Array::from_host_buffer`] carry the client that transferred their shard buffers,
+        // Arrays constructed via `Array::from_host_buffer` carry the client that transferred their shard buffers,
         // and cloning an array preserves the attached client.
         let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
         let bytes = values_to_bytes::<f32>(values.as_slice());
@@ -1125,7 +1125,7 @@ mod tests {
         assert_eq!(recovered_client.addressable_devices().unwrap().len(), client_devices.len());
         assert!(std::ptr::eq(array.clone().client().unwrap(), &client));
 
-        // Arrays constructed via [`Array::from_addressable_buffers`] carry the client passed at construction, which
+        // Arrays constructed via `Array::from_addressable_buffers` carry the client passed at construction, which
         // is validated to own every addressable shard buffer.
         let shard_buffers = || {
             client_devices
@@ -1140,7 +1140,7 @@ mod tests {
             Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
         assert!(std::ptr::eq(array.client().unwrap(), &client));
 
-        // A `None` client builds a client-less array, and [`Array::with_client`] attaches one after the fact with
+        // A `None` client builds a client-less array, and `Array::with_client` attaches one after the fact with
         // the same buffer-ownership validation.
         let array = Array::from_addressable_buffers(None, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
         assert!(array.client().is_none());
@@ -1148,7 +1148,7 @@ mod tests {
         assert!(std::ptr::eq(array.client().unwrap(), &client));
 
         // A client that does not own the addressable shard buffers is rejected — both at construction time and
-        // through [`Array::with_client`] — even when that client was created from the same plugin with identical
+        // through `Array::with_client` — even when that client was created from the same plugin with identical
         // options.
         let other_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
         let error = array.with_client(&other_client).unwrap_err();

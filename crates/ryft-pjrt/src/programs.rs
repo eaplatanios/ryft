@@ -904,15 +904,14 @@ impl<'c> LoadedExecutable<'c> {
         }
 
         // We need to handle memory related to send and receive callbacks _very_ carefully here. Specifically,
-        // [`SendCallback::to_c_api`] returns a data structure which contains a pointer that was allocated by using
-        // [`Box::into_raw`]. We shall pass those pointers to the C API [`PJRT_LoadedExecutable_Execute`] function
-        // later on, but we need to make sure that we free the underlying memory _after_ the execution completes and
-        // also in the case when something goes wrong. For that reason, we take ownership of these pointers using
-        // [`Box::from_raw`] in `owned_send_callbacks`. This will ensure that if anything goes wrong later on in this
-        // function, the underlying memory will be freed. Furthermore, after the call to
-        // [`PJRT_LoadedExecutable_Execute`] and assuming that everything went well, we move ownership of the callbacks
-        // to the corresponding [`Event::on_ready`] callbacks so that the underlying memory will be freed once execution
-        // completes.
+        // `SendCallback::to_c_api` returns a data structure which contains a pointer that was allocated by using
+        // `Box::into_raw`. We shall pass those pointers to the C API `PJRT_LoadedExecutable_Execute` function later on,
+        // but we need to make sure that we free the underlying memory _after_ the execution completes and also in the
+        // case when something goes wrong. For that reason, we take ownership of these pointers using `Box::from_raw`
+        // in `owned_send_callbacks`. This will ensure that if anything goes wrong later on in this function, the
+        // underlying memory will be freed. Furthermore, after the call to `PJRT_LoadedExecutable_Execute` and assuming
+        // that everything went well, we move ownership of the callbacks to the corresponding `Event::on_ready`
+        // callbacks so that the underlying memory will be freed once execution completes.
         let mut send_callbacks = unsafe {
             inputs
                 .iter_mut()
@@ -938,7 +937,7 @@ impl<'c> LoadedExecutable<'c> {
 
         // We handle HLO output callbacks in the same way as send and receive callbacks, except that they are flat
         // (i.e., not per-device) and so their owned state must be freed only after execution completes on _all_
-        // participating devices. We achieve that by moving the owned callbacks behind an [`Arc`] whose clones are
+        // participating devices. We achieve that by moving the owned callbacks behind an `Arc` whose clones are
         // dropped by the per-device completion events.
         let hlo_output_callback_count = hlo_output_callbacks.len();
         let mut hlo_output_callback_infos =
@@ -990,7 +989,7 @@ impl<'c> LoadedExecutable<'c> {
             hlo_output_callback_count,
         );
 
-        // We prepare the input buffer handles array. This is an array of [`Buffer`] handle arrays where the outer
+        // We prepare the input buffer handles array. This is an array of `Buffer` handle arrays where the outer
         // dimension corresponds to devices and the inner dimension corresponds to program inputs.
         let inputs = inputs
             .iter()
@@ -998,10 +997,10 @@ impl<'c> LoadedExecutable<'c> {
             .collect::<Vec<_>>();
         let input_pointers = inputs.iter().map(|inputs| inputs.as_ptr()).collect::<Vec<_>>();
 
-        // We pre-allocate the backing arrays for the output [`Buffer`] and [`Event`] handles. The output buffer handles
-        // array is an array of [`Buffer`] handles arrays where the outer dimension corresponds to devices and the inner
-        // dimension corresponds to program outputs. The [`Event`] handles array contains an [`Event`] for each
-        // [`Device`], which can be used to track when the computation for this program is completed on each [`Device`].
+        // We pre-allocate the backing arrays for the output `Buffer` and `Event` handles. The output buffer handles
+        // array is an array of `Buffer` handles arrays where the outer dimension corresponds to devices and the inner
+        // dimension corresponds to program outputs. The `Event` handles array contains an `Event` for each
+        // `Device`, which can be used to track when the computation for this program is completed on each `Device`.
         let output_count = self.executable()?.output_count()?;
         let mut output_buffers: Vec<*mut crate::buffers::ffi::PJRT_Buffer> =
             vec![std::ptr::null_mut(); device_count * output_count];
@@ -1035,7 +1034,7 @@ impl<'c> LoadedExecutable<'c> {
             if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callback_count > 0 {
                 // Move the owned callback allocations into the event completion handler so that they
                 // are released *only after* the runtime signals the device execution is done. HLO output
-                // callbacks are shared across all devices and so each device holds one clone of the [`Arc`],
+                // callbacks are shared across all devices and so each device holds one clone of the `Arc`,
                 // releasing the callbacks only after the last device execution is done.
                 let hlo_output_callbacks = Arc::clone(&hlo_output_callbacks);
                 done_event.on_ready(move |_| {
@@ -3495,7 +3494,7 @@ mod tests {
         let devices = executable.addressable_devices().unwrap();
         assert_eq!(devices.len(), 2);
 
-        // [`LoadedExecutable::execute`] expects a [`Vec`] of inputs per device.
+        // `LoadedExecutable::execute` expects a `Vec` of inputs per device.
         assert!(matches!(
             executable.execute(Vec::new(), vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
@@ -3512,7 +3511,7 @@ mod tests {
             client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
         ];
 
-        // [`LoadedExecutable::execute`] expects a [`Vec`] of inputs per device, where each [`Vec`] contains two inputs.
+        // `LoadedExecutable::execute` expects a `Vec` of inputs per device, where each `Vec` contains two inputs.
         let inputs = vec![
             ExecutionDeviceInputs { inputs: &device_0_inputs, ..Default::default() },
             ExecutionDeviceInputs { inputs: &device_1_inputs[..1], ..Default::default() },
@@ -3523,7 +3522,7 @@ mod tests {
                 if message == "expected 2 input(s) for each device but got 1 for device 1",
         ));
 
-        // [`LoadedExecutable::execute`] expects a [`Vec`] of _send_ callbacks per device, where each [`Vec`]
+        // `LoadedExecutable::execute` expects a `Vec` of _send_ callbacks per device, where each `Vec`
         // contains the same number of _send_ callbacks across all devices.
         let inputs = vec![
             ExecutionDeviceInputs {
@@ -3539,7 +3538,7 @@ mod tests {
                 if message == "expected 1 send callback(s) for each device but got 0 for device 1",
         ));
 
-        // [`LoadedExecutable::execute`] expects a [`Vec`] of _receive_ callbacks per device, where each [`Vec`]
+        // `LoadedExecutable::execute` expects a `Vec` of _receive_ callbacks per device, where each `Vec`
         // contains the same number of _receive_ callbacks across all devices.
         let inputs = vec![
             ExecutionDeviceInputs {
@@ -3555,7 +3554,7 @@ mod tests {
                 if message == "expected 1 receive callback(s) for each device but got 0 for device 1",
         ));
 
-        // [`LoadedExecutable::execute`] expects the provided call location to not contain the `nul` byte/character.
+        // `LoadedExecutable::execute` expects the provided call location to not contain the `nul` byte/character.
         let inputs = vec![
             ExecutionDeviceInputs { inputs: &device_0_inputs, ..Default::default() },
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
@@ -3565,7 +3564,7 @@ mod tests {
             Err(Error::InvalidArgument { message, .. }) if message == "nul byte found in provided data at position: 7",
         ));
 
-        // [`LoadedExecutable::execute`] expects a [`Vec`] of inputs per device, where each [`Vec`] contains two inputs,
+        // `LoadedExecutable::execute` expects a `Vec` of inputs per device, where each `Vec` contains two inputs,
         // and the `donatable` flag for each input at the same index must be the same across all devices.
         let device_1_inputs: Vec<ExecutionInput> = vec![
             ExecutionInput {

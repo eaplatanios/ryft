@@ -3861,7 +3861,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
         let input_values = (0..function.input_types.len())
             .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
             .collect::<Vec<_>>();
-        // Deduplicated callees are pure by construction ([`collect_jit_call_functions`] skips effectful programs),
+        // Deduplicated callees are pure by construction (`collect_jit_call_functions` skips effectful programs),
         // so the shared function body never needs an effect token.
         let mut token = None;
         let outputs = lower_nested_program_inline(
@@ -3915,7 +3915,7 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue + BooleanLike>(
     collective_state: &CollectiveLoweringState,
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    // Only pure callees are ever deduplicated ([`collect_jit_call_functions`] skips effectful programs), so the
+    // Only pure callees are ever deduplicated (`collect_jit_call_functions` skips effectful programs), so the
     // shared-function path below never interacts with the caller's effect token; effectful callees always take the
     // inline path, which threads the caller's token through the callee body in program order.
     if let Some(map) = nested_functions {
@@ -4037,7 +4037,7 @@ where
                 .iter()
                 .map(|output| region.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            // Region programs lower through the trait's canonical [`XlaOperation`] surface, so embed the enclosing
+            // Region programs lower through the trait's canonical `XlaOperation` surface, so embed the enclosing
             // operation type into it while materializing each attached region. The operation hook still takes owned
             // nested programs, so this remains a genuine operation-family mapping boundary.
             let regions = instruction
@@ -4194,7 +4194,7 @@ where
                 .iter()
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            // Region programs lower through the trait's canonical [`XlaOperation`] surface, so embed the enclosing
+            // Region programs lower through the trait's canonical `XlaOperation` surface, so embed the enclosing
             // program's operation type into it while materializing each attached region.
             let regions = instruction
                 .regions()
@@ -4237,7 +4237,7 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
 {
     // Mirror table of every lowered atom value. Shard-map operations look up captured global primals by `AtomId`,
-    // so we keep a parallel table alongside [`Program::interpret_with`]'s use-count-tracked one. [`ValueRef`] is
+    // so we keep a parallel table alongside `Program::interpret_with`'s use-count-tracked one. `ValueRef` is
     // `Copy`, so this mirror is cheap.
     let mut atom_values = vec![None; program.atoms().len()];
     let input_values = program

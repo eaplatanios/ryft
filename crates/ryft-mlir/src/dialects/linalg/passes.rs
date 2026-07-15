@@ -6,7 +6,7 @@ use crate::{GLOBAL_REGISTRATION_MUTEX, mlir_pass};
 
 /// Registers the MLIR `linalg` [`Dialect`](crate::Dialect) passes with the global registry.
 pub fn register_linalg_passes() {
-    // Use [`OnceLock`] to ensure that [`register_linalg_passes`] is called at most once.
+    // Use `OnceLock` to ensure that `register_linalg_passes` is called at most once.
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| unsafe {
         let _guard = GLOBAL_REGISTRATION_MUTEX.lock();

@@ -91,12 +91,12 @@ impl UrlWithChecksum {
             bail!("encountered HTTP error ({}) while downloading '{}'", response.status(), self.url);
         }
 
-        // Create the parent directory of the destination [`Path`], if it does not exist already.
+        // Create the parent directory of the destination `Path`, if it does not exist already.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // Write the downloaded content into a [`File`] at the destination [`Path`].
+        // Write the downloaded content into a `File` at the destination `Path`.
         let content = response.bytes()?;
         let mut file = File::create(path)?;
         file.write_all(&content)?;

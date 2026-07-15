@@ -17,7 +17,7 @@ use crate::operations::Operation;
 use crate::operations::constants::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
-use crate::regions::{RegionAttachments, RegionlessDriver};
+use crate::regions::RegionAttachments;
 use crate::tracing::{DomainTracingContext, Tracer};
 use crate::types::Typed;
 
@@ -555,7 +555,7 @@ where
         flat_inputs.extend(inputs.into_parameters());
         let outputs = context.bind(
             D::Operation::compiled_call(),
-            RegionlessDriver.with_callees(&[self.lifted_program()?]),
+            [].with_callees(&[self.lifted_program()?]),
             flat_inputs.as_slice(),
         )?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
@@ -617,11 +617,7 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(
-            D::Operation::compiled_call(),
-            RegionlessDriver.with_callees(&[self.lifted_program()?]),
-            flat_inputs.as_slice(),
-        )
+        context.bind(D::Operation::compiled_call(), [].with_callees(&[self.lifted_program()?]), flat_inputs.as_slice())
     }
 
     /// Returns the source program with runtime captures lifted into leading flat inputs.

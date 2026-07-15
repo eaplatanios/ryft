@@ -369,7 +369,7 @@ mod tests {
             })
             .unwrap();
 
-        // Convert to LLVM-compatible MLIR so that the resulting [`Module`] is supposed by [`ExecutionEngine`]s.
+        // Convert to LLVM-compatible MLIR so that the resulting `Module` is supposed by `ExecutionEngine`s.
         let mut pass_manager = context.pass_manager().unwrap();
         pass_manager.add_pass(builtin::passes::create_conversion_to_llvm_pass().unwrap());
         assert!(pass_manager.run(&module.as_operation().unwrap()).is_success());
@@ -385,7 +385,7 @@ mod tests {
         unsafe {
             let engine = engine.initialize();
 
-            // Verify that we can directly invoke the `@example` function using the [`ExecutionEngine`].
+            // Verify that we can directly invoke the `@example` function using the `ExecutionEngine`.
             let mut argument = 42;
             let mut result = -1;
             let mut argument_and_result = [&mut argument as *mut i32 as *mut _, &mut result as *mut i32 as *mut _];
@@ -421,7 +421,7 @@ mod tests {
 
             let engine = engine.initialize();
 
-            // Verify that we can directly invoke the `@example` function using the [`ExecutionEngine`].
+            // Verify that we can directly invoke the `@example` function using the `ExecutionEngine`.
             let mut argument = 42;
             let mut result = -1;
             let mut argument_and_result = [&mut argument as *mut i32 as *mut _, &mut result as *mut i32 as *mut _];

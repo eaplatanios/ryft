@@ -740,7 +740,7 @@ fn test_generics() {
 
 #[test]
 fn test_map_parameters() {
-    // This test implements a toy forward-differentiation approach to test [`Parameterized::map_parameters`].
+    // This test implements a toy forward-differentiation approach to test `Parameterized::map_parameters`.
 
     #[derive(Parameter, Parameterized, Debug, Clone, PartialEq, Eq)]
     struct ValueWithTangent<P: Parameter> {
@@ -795,7 +795,7 @@ fn test_map_parameters() {
     }
 
     // We will go a little weird and compute a second derivative which means we need two layers
-    // of [`ValueWithTangent`] wrapping.
+    // of `ValueWithTangent` wrapping.
     let x = ValueWithTangent { primal: 1f64, tangent: 1f64 };
     let x = ValueWithTangent { primal: x.clone(), tangent: x };
     let linear1 = Linear { weights: 4f64, bias: 2f64 };

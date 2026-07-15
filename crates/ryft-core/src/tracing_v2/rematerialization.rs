@@ -58,10 +58,8 @@ use crate::operations::math::AddOperation;
 use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{
-    Atom, AtomId, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, RegionInterface,
-    Value, ValueId,
-};
+use crate::programs::{Atom, AtomId, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError, Value, ValueId};
+use crate::regions::{Region, RegionId, RegionInterface};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
 use crate::tracing_v2::operations::dot::DotOperation;
@@ -314,7 +312,7 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
-            None => Ok((O::from(*self), driver.regions().map(|region| region.into_program()).collect())),
+            None => Ok((O::from(*self), driver.regions().map(|region| region.to_program()).collect())),
             Some(_) => Ok((
                 O::from(RematerializeOperation::new().with_prevent_cse(self.prevent_cse)),
                 vec![
@@ -1796,7 +1794,7 @@ where
         if let Some((operation, operation_regions, output_structure)) = cached {
             let operation = <D as Domain>::Operation::from(operation);
             let context = first.dispatch_domain();
-            let outputs = context.bind(operation, operation_regions, &[], &input_tracers)?;
+            let outputs = context.bind(operation, operation_regions, &input_tracers)?;
             return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
 
@@ -1975,8 +1973,7 @@ where
             .borrow_mut()
             .push((input_types, operation, operation_regions.clone(), output_structure.clone()));
         let context = first.dispatch_domain();
-        let outputs =
-            context.bind(<D as Domain>::Operation::from(operation), operation_regions, &[], &input_tracers)?;
+        let outputs = context.bind(<D as Domain>::Operation::from(operation), operation_regions, &input_tracers)?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -2051,7 +2048,7 @@ mod tests {
         let regions = instruction
             .regions()
             .iter()
-            .map(|region| program.region_ref(*region).unwrap().into_program())
+            .map(|region| program.region_ref(*region).unwrap().to_program())
             .collect::<Vec<_>>();
         StagedRematerialization { regions }
     }
@@ -2154,7 +2151,7 @@ mod tests {
             let xs = StagingContext::constant(&context, stacked.clone());
             let scan = ScanOperation::new(1, 3);
             let outputs =
-                context.stage_operation(ArrayOperation::Scan(scan), vec![body.clone()], &[], &[carry, xs])?;
+                context.stage_operation(ArrayOperation::Scan(scan), vec![body.clone()], &[carry, xs])?;
             Ok(outputs.into_iter().next().unwrap())
         };
 
@@ -2372,7 +2369,6 @@ mod tests {
                 let mut outputs = context.bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![true_branch.clone(), false_branch.clone()],
-                    &[],
                     &[predicate, input],
                 )?;
                 Ok(outputs.remove(0))
@@ -3475,7 +3471,7 @@ mod tests {
         /// Test-only operation that returns caller-selected output-region provenance.
         #[derive(Copy, Clone, Debug)]
         struct InvalidOriginOperation {
-            provenance: crate::operations::OutputRegionProvenance,
+            provenance: crate::regions::OutputRegionProvenance,
         }
 
         impl Display for InvalidOriginOperation {
@@ -3502,7 +3498,7 @@ mod tests {
                 &["body"]
             }
 
-            fn output_region_provenance(&self, _output_index: usize) -> Vec<crate::operations::OutputRegionProvenance> {
+            fn output_region_provenance(&self, _output_index: usize) -> Vec<crate::regions::OutputRegionProvenance> {
                 vec![self.provenance]
             }
         }
@@ -3519,7 +3515,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 InvalidOriginOperation {
-                    provenance: crate::operations::OutputRegionProvenance { region_index: 0, output_index: 1 },
+                    provenance: crate::regions::OutputRegionProvenance { region_index: 0, output_index: 1 },
                 },
                 vec![input],
                 vec![body_region],
@@ -3541,7 +3537,7 @@ mod tests {
         let output = builder
             .add_instruction(
                 InvalidOriginOperation {
-                    provenance: crate::operations::OutputRegionProvenance { region_index: 1, output_index: 0 },
+                    provenance: crate::regions::OutputRegionProvenance { region_index: 1, output_index: 0 },
                 },
                 vec![input],
                 vec![body_region],
@@ -3593,8 +3589,8 @@ mod tests {
                 &["body"]
             }
 
-            fn output_region_provenance(&self, output_index: usize) -> Vec<crate::operations::OutputRegionProvenance> {
-                vec![crate::operations::OutputRegionProvenance { region_index: 0, output_index }]
+            fn output_region_provenance(&self, output_index: usize) -> Vec<crate::regions::OutputRegionProvenance> {
+                vec![crate::regions::OutputRegionProvenance { region_index: 0, output_index }]
             }
         }
 
@@ -3888,7 +3884,6 @@ mod tests {
                 let outputs = context.stage_operation(
                     ArrayOperation::While(operation),
                     vec![remat_condition.clone(), remat_body.clone()],
-                    &[],
                     &[x],
                 )?;
                 Ok(outputs.into_iter().next().unwrap())
@@ -3906,7 +3901,7 @@ mod tests {
                     let context = x.context().clone();
                     let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
                     let outputs = context
-                        .bind(ArrayOperation::While(operation), vec![condition.clone(), body.clone()], &[], &[x])
+                        .bind(ArrayOperation::While(operation), vec![condition.clone(), body.clone()], &[x])
                         .unwrap();
                     outputs.into_iter().next().unwrap()
                 },

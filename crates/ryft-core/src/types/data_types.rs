@@ -1437,8 +1437,8 @@ impl Type for DataType {
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is not quite a subtyping relationship in that certain type
-        // promotions can result in loss of information for values of those types (e.g., [`DataType::U64`] to
-        // [`DataType::F64`]). However, it is intended to make ergonomics better for when working with `ryft`
+        // promotions can result in loss of information for values of those types (e.g., `DataType::U64` to
+        // `DataType::F64`). However, it is intended to make ergonomics better for when working with `ryft`
         // for scientific applications.
         self.is_promotable_to(*other)
     }

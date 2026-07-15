@@ -115,7 +115,7 @@ pub(crate) mod tests {
     ) {
         assert_eq!(format!("{}", location), expected);
 
-        // Extract the type name for `L` to check the [`Debug`] implementation.
+        // Extract the type name for `L` to check the `Debug` implementation.
         let type_name = std::any::type_name::<L>().rsplit("::").next().unwrap_or("").split("<").next().unwrap_or("");
         assert_eq!(format!("{:?}", location), format!("{type_name}[{expected}]"));
     }

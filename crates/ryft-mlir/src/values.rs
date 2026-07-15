@@ -544,8 +544,8 @@ mod tests {
         let value = unsafe { ValueRef::from_c_api(bad_handle, &context) };
         assert!(value.is_err());
 
-        // We are also checking that [`Value::dump`] runs successfully without crashing.
-        // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
+        // We are also checking that `Value::dump` runs successfully without crashing. Ideally, we would want a way
+        // to capture the standard error stream and verify that it printed the right thing.
         result.dump();
     }
 

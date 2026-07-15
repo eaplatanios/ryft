@@ -212,7 +212,7 @@ impl<'c, 't: 'c, F: Clone + FnMut(OperationRef<'_, 'c, 't>) -> LogicalResult> Ex
     for ClosurePass<'c, 't, F>
 {
     fn type_id(&self) -> Result<TypeId<'c>, Error> {
-        // We need to make sure that the reference data used to create the [`TypeId`] is 8-byte aligned.
+        // We need to make sure that the reference data used to create the `TypeId` is 8-byte aligned.
         #[repr(align(8))]
         struct AlignedClosure<F>(F);
         let aligned_closure = AlignedClosure(self.closure.clone());

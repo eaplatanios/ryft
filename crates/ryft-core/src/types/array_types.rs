@@ -650,7 +650,7 @@ impl ArrayType {
         dimensions.insert(index, size);
 
         // The inserted array dimension is replicated. Reuse the sharding-level insertion so that this method stays a
-        // thin wrapper. For more information, refer to the documentation of [`Sharding::with_inserted_dimension`].
+        // thin wrapper. For more information, refer to the documentation of `Sharding::with_inserted_dimension`.
         let sharding = self
             .sharding
             .as_ref()
@@ -685,7 +685,7 @@ impl ArrayType {
 
         // Delegate the per-dimension sharding bookkeeping (i.e., manual axes become varying and non-manual sharded
         // dimensions cannot be dropped) to the sharding itself. For more information, refer to the documentation of
-        // [`Sharding::without_dimension`].
+        // `Sharding::without_dimension`.
         let sharding = self
             .sharding
             .as_ref()

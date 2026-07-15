@@ -34,7 +34,8 @@ use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::BooleanLike;
 use crate::operations::control_flow::WhileOperation;
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, RegionRef};
+use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
+use crate::regions::RegionRef;
 
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.
@@ -136,8 +137,8 @@ where
                         instruction.regions().len(),
                     )));
                 };
-                let condition = program.region_ref(*condition_region)?;
-                let body = program.region_ref(*body_region)?;
+                let condition = RegionRef::new(program.regions(), *condition_region)?;
+                let body = RegionRef::new(program.regions(), *body_region)?;
                 if let Some(outputs) = unroll_while_into(
                     context,
                     builder,
@@ -161,7 +162,7 @@ where
             let instruction_regions = instruction
                 .regions()
                 .iter()
-                .map(|id| program.region_ref(*id))
+                .map(|id| RegionRef::new(program.regions(), *id))
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let region_ids = instruction_regions
                 .iter()
@@ -171,8 +172,7 @@ where
                 builder.borrow_mut().add_instruction(operation.clone(), input_atoms, region_ids)?.to_vec();
             let output_values = context.bind(
                 operation.clone(),
-                instruction_regions.into_iter().map(RegionRef::into_program).collect::<Vec<_>>(),
-                &[],
+                instruction_regions.into_iter().map(RegionRef::to_program).collect::<Vec<_>>(),
                 &input_values,
             )?;
             check_count!("output", output_values, output_atoms.len(), ProgramError);

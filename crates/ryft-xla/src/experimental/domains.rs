@@ -1128,7 +1128,7 @@ impl XlaOptions {
 
 impl std::hash::Hash for XlaOptions {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // [`DeviceMesh`] does not derive [`Hash`]; hash its (logical mesh, device order) pair
+        // `DeviceMesh` does not derive `Hash`; hash its (logical mesh, device order) pair
         // manually instead. Everything else here derives `Hash` already.
         self.mesh.logical_mesh().hash(state);
         self.mesh.devices().hash(state);

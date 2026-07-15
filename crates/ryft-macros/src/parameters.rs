@@ -159,14 +159,14 @@ impl CodeGenerator {
     pub(crate) fn generate_parameterized_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
 
-        // Replace any instances of [`Self`] with its fully-qualified path. This is necessary in order to be able to
-        // handle recursive types when deriving our [`Parameterized`] implementation.
+        // Replace any instances of `Self` with its fully-qualified path. This is necessary in order to be able to
+        // handle recursive types when deriving our `Parameterized` implementation.
         replace_self_type(&mut input);
 
-        // Construct a new [`CodeGenerator`] using inconsequential default values for fields whose values need to be
+        // Construct a new `CodeGenerator` using inconsequential default values for fields whose values need to be
         // extracted from the provided input. These values are inconsequential because if we fail to extract them from
-        // the provided input, then we will accumulate all relevant [`syn::Error`]s in [`CodeGenerator::errors`] and
-        // return a compiler error before we get to use them.
+        // the provided input, then we will accumulate all relevant `syn::Error`s in `CodeGenerator::errors` and return
+        // a compiler error before we get to use them.
         let mut generator = CodeGenerator {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
@@ -177,7 +177,7 @@ impl CodeGenerator {
             errors: Vec::new(),
         };
 
-        // Extracts all the necessary information from our [`syn::DeriveInput`].
+        // Extracts all the necessary information from our `syn::DeriveInput`.
         generator.extract_attributes(&input);
         generator.extract_parameter_type(&input);
         generator.extract_data(&input);
@@ -275,7 +275,7 @@ impl CodeGenerator {
     fn extract_parameter_type(&mut self, input: &syn::DeriveInput) {
         let generics = &input.generics;
 
-        // Helper that checks if the provided [`syn::TypeParamBound`] is a [`ryft::Parameter`] bound. Given that
+        // Helper that checks if the provided `syn::TypeParamBound` is a `ryft::Parameter` bound. Given that
         // procedural macros are executed before type checking and inference is performed by the Rust compiler,
         // we cannot consider all possible ways of specifying this bound (e.g., using aliases) and therefore
         // this function simply checks for a match to either `Parameter` or `ryft::Parameter`, with `ryft`
@@ -293,7 +293,7 @@ impl CodeGenerator {
             bounds.into_iter().any(|bound| check_bound(ryft_crate, bound))
         };
 
-        // Collect all parameters that are bounded by [`ryft::Parameter`].
+        // Collect all parameters that are bounded by `ryft::Parameter`.
         let where_predicates = generics.where_clause.iter().flat_map(|clause| clause.predicates.iter());
         let parameter_types: HashSet<&syn::Ident> = generics
             .type_params()
@@ -305,7 +305,7 @@ impl CodeGenerator {
             }))
             .collect();
 
-        // Check that there is only a single unique type parameter bounded by [`ryft::Parameter`].
+        // Check that there is only a single unique type parameter bounded by `ryft::Parameter`.
         if parameter_types.len() > 1 {
             self.add_error(
                 generics,
@@ -395,7 +395,7 @@ impl CodeGenerator {
                 _ => {}
             }
 
-            // Construct a [`Field`] from the provided information.
+            // Construct a `Field` from the provided information.
             Field {
                 is_parameter,
                 index: field_index,
@@ -442,7 +442,7 @@ impl CodeGenerator {
                 .filter(|f| f.attrs.iter().any(|attr| attr.path() == &RYFT_ATTRIBUTE))
                 .for_each(|f| generator.add_error(f, FIELD_ATTRIBUTE_ERROR));
 
-            // Construct a [`Variant`] from the provided information.
+            // Construct a `Variant` from the provided information.
             let fields = variant
                 .fields
                 .iter()
@@ -496,7 +496,7 @@ impl CodeGenerator {
             // and maybe even impossible to eliminate these redundancies in a robust manner here because procedural
             // macros are executed before type checking/inference and that makes dealing with things like type aliases
             // correctly practically impossible (as we would need information that is not necessarily part of the
-            // [`syn::DeriveInput`] that this code is operating over).
+            // `syn::DeriveInput` that this code is operating over).
             let mut bounds = syn::punctuated::Punctuated::new();
             bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
                 paren_token: None,
@@ -515,8 +515,8 @@ impl CodeGenerator {
         /// Adds [`Parameterized`] bounds for the provided [`Field`]'s [`syn::Type`], if it references the
         /// [`CodeGenerator::parameter_type`]. If it does not, then this function will not do anything.
         fn add_parameterized_bounds(generator: &CodeGenerator, generics: &mut syn::Generics, field: &Field) {
-            // We do not add [`Parameterized`] bounds for types that do not reference the
-            // [`CodeGenerator::parameter_type`].
+            // We do not add `Parameterized` bounds for types that do not reference the
+            // `CodeGenerator::parameter_type`.
             if field.is_parameter {
                 if let Some(fields) = &field.fields {
                     match fields {
@@ -542,7 +542,7 @@ impl CodeGenerator {
                     let mut ty_using_parameter_placeholder = field.ty.clone();
                     ty_using_parameter_placeholder.replace_ident(&generator.parameter_type, &ryft_placeholder);
 
-                    // We need to construct the full [`ryft::Parameterized`] bound and to do that, we first construct
+                    // We need to construct the full `ryft::Parameterized` bound and to do that, we first construct
                     // its arguments `<P, ParameterStructure = FieldType<ryft::Placeholder>>`.
                     let mut args = syn::punctuated::Punctuated::new();
 
@@ -559,7 +559,7 @@ impl CodeGenerator {
                         ty: ty_using_parameter_placeholder.clone(),
                     }));
 
-                    // Then, we construct the full bound [`syn::Path`].
+                    // Then, we construct the full bound `syn::Path`.
                     let bound = generator.ryft_crate.with_segment(syn::PathSegment {
                         ident: syn::Ident::new("Parameterized", Span::call_site()),
                         arguments: syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
@@ -585,7 +585,7 @@ impl CodeGenerator {
             }
         }
 
-        // Go over all [`Fields`] in the underlying [`Data`] (including fields that may be nested inside [`Variant`]s),
+        // Go over all `Fields` in the underlying `Data` (including fields that may be nested inside `Variant`s),
         // and add any necessary trait bounds for them.
         match &self.data {
             Data::Struct(data) => data.fields.iter().for_each(|f| add_field_bounds(self, &mut generics, f)),
@@ -812,8 +812,8 @@ impl CodeGenerator {
                 Data::Enum(EnumData { ident, variants }) => {
                     let iterator_ident = format_ident!("{}{}", &ident, iter_type.parameters_assoc_type_name());
 
-                    // Refer to the implementation of [`generate_type_and_impl`] for more information on why the
-                    // [`syn::Generics`] here are constructed this way.
+                    // Refer to the implementation of `generate_type_and_impl` for more information on why the
+                    // `syn::Generics` here are constructed this way.
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
                     let generics = generics.with_renamed_param(&generator.parameter_type, macro_parameter_type);
@@ -1116,7 +1116,7 @@ impl CodeGenerator {
         let parameter_type = &self.parameter_type;
         let ident = self.data.ident();
 
-        // For generated `To` associated types we need to rename the parameter type in our [`syn::Generics`].
+        // For generated `To` associated types we need to rename the parameter type in our `syn::Generics`.
         // That is because if we do not rename it, we will end up with something like this:
         // ```
         // impl<P: Parameter> ParameterizedFamily<P> for SomeType<Placeholder> {
@@ -1134,12 +1134,12 @@ impl CodeGenerator {
         // ```
         // where `__P` is a fresh and unique identifier. This generic parameter replacement is what
         // takes place in the following line (the uniqueness check for the name is performed in
-        // [`CodeGenerator::check_for_name_conflicts`]).
+        // `CodeGenerator::check_for_name_conflicts`).
         let to_assoc_ty_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
         let to_assoc_parameter = quote!(#macro_parameter_type: #ryft::Parameter);
 
-        // Generate the [`ParameterizedFamily`] implementation block first.
+        // Generate the `ParameterizedFamily` implementation block first.
         let mut family_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
         self.add_parameter_structure_clone_bound(&mut family_generics);
         let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
@@ -1153,7 +1153,7 @@ impl CodeGenerator {
             }
         };
 
-        // Generate the [`Parameterized`] associated type declarations.
+        // Generate the `Parameterized` associated type declarations.
         let family_assoc_ty = quote!(type Family = #family_type;);
         let to_assoc_ty = quote!(
             type To<#to_assoc_parameter>
@@ -1577,7 +1577,7 @@ impl CodeGenerator {
             let parameter_type = &generator.parameter_type;
 
             // Note that `expected_count`, which is referenced by the generated code here is defined in the beginning
-            // of the implementation of the generated [`Parameterized::from_parameters_with_remainder`] function body.
+            // of the implementation of the generated `Parameterized::from_parameters_with_remainder` function body.
             let missing_parameters_error = quote!(#ryft::ParameterError::MissingParameters { expected_count, paths });
 
             fields

@@ -342,7 +342,7 @@ impl DistributedRuntime {
         // The default client `missed_heartbeat_callback` panics, which causes orderly shutdowns
         // to abort the process when the polling RPC observes the service tearing down before
         // the client's own poll loop has wound up. Swap in a silent callback: callers that want
-        // panic-on-heartbeat-miss can install their own via [`Self::initialize_with_options`].
+        // panic-on-heartbeat-miss can install their own via `Self::initialize_with_options`.
         let client_options = DistributedRuntimeClientOptions {
             node_id,
             missed_heartbeat_callback: Some(Box::new(|_| {})),

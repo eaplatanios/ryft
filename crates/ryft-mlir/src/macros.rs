@@ -353,7 +353,7 @@ macro_rules! mlir_attribute_field {
         }
     };
     // We also special-case array-valued fields because they require separately obtaining their size and allocating
-    // a [`Vec`] before populating that vector with their values.
+    // a `Vec` before populating that vector with their values.
     ($rust_name:ident, $mlir_name:ident, [$ty:ty], mlir_prefix = $mlir_prefix:ident $(,)*) => {
         paste::paste! {
             pub fn $rust_name(&self) -> Vec<$ty> {
@@ -929,7 +929,7 @@ macro_rules! mlir_pass {
             }
 
             pub fn [<register_ $rust_name>]() {
-                // Use [`OnceLock`] to ensure that the pass registration function is called at most once.
+                // Use `OnceLock` to ensure that the pass registration function is called at most once.
                 static INITIALIZED: OnceLock<()> = OnceLock::new();
                 INITIALIZED.get_or_init(|| unsafe {
                     let _guard = $crate::GLOBAL_REGISTRATION_MUTEX.lock();

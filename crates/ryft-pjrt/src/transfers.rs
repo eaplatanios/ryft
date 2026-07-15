@@ -1104,7 +1104,7 @@ mod tests {
             deleter_arg: &deleted_counter as *const AtomicUsize as *mut c_void,
         };
 
-        // Create a [`Chunk`] with a nested scope so that we can verify that its `deleter` was called on `drop`.
+        // Create a `Chunk` with a nested scope so that we can verify that its `deleter` was called on `drop`.
         {
             let chunk = unsafe { Chunk::from_c_api(&mut ffi_chunk as *mut _) }.unwrap();
             assert_eq!(chunk.data(), bytes.as_slice());
@@ -1113,7 +1113,7 @@ mod tests {
 
         assert_eq!(deleted_counter.load(Ordering::SeqCst), 1);
 
-        // Test with an empty [`Chunk`].
+        // Test with an empty `Chunk`.
         let mut value = 1u8;
         assert!(
             unsafe {
@@ -1142,7 +1142,7 @@ mod tests {
             .is_empty()
         );
 
-        // Test creating a [`Chunk`] from a null pointer.
+        // Test creating a `Chunk` from a null pointer.
         assert!(matches!(
             unsafe { Chunk::from_c_api(std::ptr::null_mut()) },
             Err(Error::InvalidArgument { message, .. })

@@ -1284,7 +1284,7 @@ mod tests {
                 assert_ne!(devices[1], devices[2]);
             }
 
-            // Test creating a [`Device`] from a null pointer.
+            // Test creating a `Device` from a null pointer.
             assert!(matches!(
                 unsafe { Device::from_c_api(std::ptr::null_mut(), plugin.api()) },
                 Err(Error::InvalidArgument { message, .. })
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(format!("{description}"), "CpuDevice(id=1)");
         assert_eq!(format!("{description:?}"), "DeviceDescription[cpu:1]");
 
-        // Test creating a [`DeviceDescription`] from a null pointer.
+        // Test creating a `DeviceDescription` from a null pointer.
         assert!(matches!(
             unsafe { DeviceDescription::from_c_api(std::ptr::null_mut(), client.api()) },
             Err(Error::InvalidArgument { message, .. })

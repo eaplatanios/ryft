@@ -141,7 +141,7 @@ pub(crate) mod tests {
     pub(crate) fn test_type_display_and_debug<'c, 't: 'c, T: Type<'c, 't>>(r#type: T, expected: &'static str) {
         assert_eq!(format!("{}", r#type), expected);
 
-        // Extract the type name for `L` to check the [`Debug`] implementation.
+        // Extract the type name for `L` to check the `Debug` implementation.
         let type_name = std::any::type_name::<T>().rsplit("::").next().unwrap_or("").split("<").next().unwrap_or("");
         assert_eq!(format!("{:?}", r#type), format!("{type_name}[{expected}]"));
     }
@@ -198,7 +198,7 @@ pub(crate) mod tests {
         let context = Context::new();
         let index_type = context.index_type();
 
-        // We are just checking that [`Type::dump`] runs successfully without crashing.
+        // We are just checking that `Type::dump` runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
         index_type.dump();
     }

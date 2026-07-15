@@ -75,7 +75,7 @@ pub static GLOBAL_REGISTRATION_MUTEX: Mutex<()> = Mutex::new(());
 /// the need to register with the global registry, since it would already be calling the creation routine of the
 /// individual passes. The global registry is interesting when interacting with the MLIR command-line tools.
 pub fn register_all_passes() {
-    // Use [`OnceLock`] to ensure that [`register_all_passes`] is called at most once.
+    // Use `OnceLock` to ensure that `register_all_passes` is called at most once.
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| unsafe {
         let _guard = GLOBAL_REGISTRATION_MUTEX.lock();

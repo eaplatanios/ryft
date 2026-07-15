@@ -130,7 +130,7 @@ impl Layout<'_> {
 
     /// Serializes this [`Layout`] into a Protobuf message.
     pub fn proto(&self) -> Result<crate::protos::Layout, Error> {
-        // It would be nice to be able to get this directly without having to go through [`Layout::serialize`] first,
+        // It would be nice to be able to get this directly without having to go through `Layout::serialize` first,
         // but unfortunately, the PJRT C API does not provide the necessary hooks for doing that.
         self.serialize()?.proto()
     }
@@ -399,7 +399,7 @@ impl SerializedLayout {
 
     /// Returns the Protobuf message that corresponds to this [`SerializedLayout`].
     pub fn proto(&self) -> Result<crate::protos::Layout, Error> {
-        // This implementation relies on this [`SerializedLayout`] being a string that matches the pattern
+        // This implementation relies on this `SerializedLayout` being a string that matches the pattern
         // `{minor_to_major:properties}` where:
         //
         //   - `minor_to_major` is a comma-separated list of dimension indices.

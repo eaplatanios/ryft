@@ -33,15 +33,12 @@ use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
-use crate::operations::math::Abs;
-use crate::operations::math::Atan2;
-use crate::operations::math::{Add, Cos, Div, Mul, Neg, Sin, Sub};
-use crate::operations::math::{Exp, Log, Sqrt};
+use crate::operations::math::{Abs, Add, Atan2, Cos, Div, Exp, Log, Mul, Neg, Sin, Sqrt, Sub};
 use crate::operations::tag::Tag;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
-use crate::programs::RegionInterface;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
@@ -1317,13 +1314,12 @@ mod differentiation_tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::DifferentiationTracer;
-    use crate::differentiation::LinearizationTracer;
+    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
-        // The unified domain interprets each half-precision [`DataType`] through the matching [`Scalar`] variant, so
+        // The unified domain interprets each half-precision `DataType` through the matching `Scalar` variant, so
         // the former `bf16`- and `f16`-specific domains are now two variants exercised over the one domain.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
@@ -1357,7 +1353,6 @@ mod differentiation_tests {
                     let mut outputs = severed.context().bind(
                         CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
                         Vec::new(),
-                        &[],
                         &[severed.clone()],
                     )?;
                     Ok(x + outputs.remove(0))
@@ -1479,7 +1474,6 @@ mod differentiation_tests {
             let mut outputs = x.context().bind(
                 ArrayOperation::Condition(condition),
                 condition_regions.clone(),
-                &[],
                 &[predicate, x.clone()],
             )?;
             Ok(outputs.remove(0))
@@ -1491,7 +1485,6 @@ mod differentiation_tests {
             let mut outputs = x.context().bind(
                 ArrayOperation::Condition(condition),
                 condition_regions.clone(),
-                &[],
                 &[predicate, x.clone()],
             )?;
             Ok(outputs.remove(0))
@@ -1530,14 +1523,12 @@ mod differentiation_tests {
 
         let while_function = |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let (while_operation, while_regions) = doubling_while_for_linearize();
-            let mut outputs =
-                x.context().bind(ArrayOperation::While(while_operation), while_regions, &[], &[x.clone()])?;
+            let mut outputs = x.context().bind(ArrayOperation::While(while_operation), while_regions, &[x.clone()])?;
             Ok(outputs.remove(0))
         };
         let while_jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let (while_operation, while_regions) = doubling_while_for_linearize();
-            let mut outputs =
-                x.context().bind(ArrayOperation::While(while_operation), while_regions, &[], &[x.clone()])?;
+            let mut outputs = x.context().bind(ArrayOperation::While(while_operation), while_regions, &[x.clone()])?;
             Ok(outputs.remove(0))
         };
 
@@ -1577,8 +1568,7 @@ mod differentiation_tests {
             LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| {
             let (scan, scan_body) = product_scan_for_linearize();
-            let mut outputs =
-                init.context().bind(ArrayOperation::Scan(scan), vec![scan_body], &[], &[init.clone(), xs])?;
+            let mut outputs = init.context().bind(ArrayOperation::Scan(scan), vec![scan_body], &[init.clone(), xs])?;
             Ok(outputs.remove(0))
         };
         let scan_jvp_function = |(init, xs): (
@@ -1586,8 +1576,7 @@ mod differentiation_tests {
             DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| {
             let (scan, scan_body) = product_scan_for_linearize();
-            let mut outputs =
-                init.context().bind(ArrayOperation::Scan(scan), vec![scan_body], &[], &[init.clone(), xs])?;
+            let mut outputs = init.context().bind(ArrayOperation::Scan(scan), vec![scan_body], &[init.clone(), xs])?;
             Ok(outputs.remove(0))
         };
 
@@ -1764,8 +1753,7 @@ mod differentiation_tests {
 
 #[cfg(test)]
 mod linearization_tests {
-    use crate::backends::scalars::Scalar;
-    use crate::backends::scalars::ScalarOperation;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -1976,7 +1964,7 @@ mod linearization_tests {
             .jvp(
                 |inputs: Vec<ScalarJvpTracer>| {
                     let (while_operation, while_regions) = scalar_squaring_while();
-                    inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                    inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
                 },
                 vec![Scalar::from(1.5)],
                 vec![Scalar::from(1.0)],
@@ -1987,7 +1975,7 @@ mod linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = scalar_squaring_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()]).unwrap()
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()]).unwrap()
             },
             vec![Scalar::from(1.5)],
             vec![Scalar::from(1.0)],
@@ -2072,7 +2060,7 @@ mod linearization_tests {
             domain.clone(),
             |inputs| {
                 let (while_operation, while_regions) = scalar_nested_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
             },
             vec![DataType::F64],
         )
@@ -2108,7 +2096,7 @@ mod linearization_tests {
             domain.clone(),
             |inputs| {
                 let (while_operation, while_regions) = scalar_nested_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
             },
             vec![DataType::F64],
         )
@@ -2119,8 +2107,7 @@ mod linearization_tests {
             .jvp(
                 |inputs: Vec<_>| {
                     let (while_operation, while_regions) = scalar_nested_while();
-                    let mut outputs =
-                        inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])?;
+                    let mut outputs = inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])?;
                     Ok(vec![outputs.remove(0)])
                 },
                 vec![Scalar::from(1.5)],
@@ -2147,7 +2134,7 @@ mod linearization_tests {
             .vjp(
                 |inputs| {
                     let (while_operation, while_regions) = scalar_squaring_while();
-                    inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                    inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
                 },
                 vec![Scalar::from(1.5)],
             )
@@ -2161,7 +2148,7 @@ mod linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = scalar_squaring_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
             },
             vec![Scalar::from(1.5)],
         )
@@ -2378,7 +2365,7 @@ mod linearization_tests {
             move |inputs| {
                 let operation = WhileOperation::new();
                 let mut outputs =
-                    inputs[0].context().stage_operation(operation, vec![condition, body], &[], &[inputs[0].clone()])?;
+                    inputs[0].context().stage_operation(operation, vec![condition, body], &[inputs[0].clone()])?;
                 Ok(vec![outputs.remove(0)])
             },
             vec![DataType::F64],
@@ -2773,7 +2760,6 @@ mod linearization_tests {
         inputs[0].dispatch_domain().bind(
             ScalarOperation::CustomJvp(operation),
             vec![scalar_custom_jvp_sin_primal(), scalar_custom_jvp_sin_doubled_rule()],
-            &[],
             &[inputs[0].clone()],
         )
     }
@@ -2790,7 +2776,6 @@ mod linearization_tests {
                 inputs[0].context().bind(
                     ScalarOperation::CustomJvp(operation),
                     vec![scalar_custom_jvp_sin_primal(), scalar_custom_jvp_sin_doubled_rule()],
-                    &[],
                     &[inputs[0].clone()],
                 )
             },
@@ -2833,12 +2818,11 @@ mod linearization_tests {
         let operation_regions = instruction
             .regions()
             .iter()
-            .map(|region| program.region_ref(*region).map(|region| region.into_program()))
+            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
             .collect::<Result<Vec<_>, _>>()?;
         inputs[0].context().stage_operation(
             ScalarOperation::Rematerialize(*operation),
             operation_regions,
-            &[],
             &[&inputs[0]],
         )
     }
@@ -2921,12 +2905,9 @@ mod linearization_tests {
         V::DispatchDomain: Context<Type = DataType, Constant = Scalar, Operation = ScalarOperation<Scalar>>,
     {
         let (operation, operation_regions) = scalar_custom_vjp_operation()?;
-        inputs[0].dispatch_domain().bind(
-            ScalarOperation::CustomVjp(operation),
-            operation_regions,
-            &[],
-            &[inputs[0].clone()],
-        )
+        inputs[0]
+            .dispatch_domain()
+            .bind(ScalarOperation::CustomVjp(operation), operation_regions, &[inputs[0].clone()])
     }
 
     #[test]
@@ -3000,12 +2981,11 @@ mod linearization_tests {
                 .unwrap();
 
             let operation = CustomVjpOperation::new();
-            let a = inputs[0].context().stage_operation(SinOperation, Vec::new(), &[], &[&inputs[0]])?.remove(0);
-            let b = inputs[0].context().stage_operation(CosOperation, Vec::new(), &[], &[&inputs[0]])?.remove(0);
+            let a = inputs[0].context().stage_operation(SinOperation, Vec::new(), &[&inputs[0]])?.remove(0);
+            let b = inputs[0].context().stage_operation(CosOperation, Vec::new(), &[&inputs[0]])?.remove(0);
             inputs[0].context().stage_operation(
                 ScalarOperation::CustomVjp(operation),
                 vec![primal, forward, backward],
-                &[],
                 &[&a, &b],
             )
         }
@@ -3038,12 +3018,9 @@ mod linearization_tests {
         match domain.jvp(
             |inputs: Vec<ScalarJvpTracer>| {
                 let (operation, operation_regions) = scalar_custom_vjp_operation()?;
-                inputs[0].context().bind(
-                    ScalarOperation::CustomVjp(operation),
-                    operation_regions,
-                    &[],
-                    &[inputs[0].clone()],
-                )
+                inputs[0]
+                    .context()
+                    .bind(ScalarOperation::CustomVjp(operation), operation_regions, &[inputs[0].clone()])
             },
             vec![Scalar::from(0.7)],
             vec![Scalar::from(1.5)],
@@ -3135,7 +3112,6 @@ mod linearization_tests {
             let mut outputs = x.context().bind(
                 ArrayOperation::Condition(condition),
                 condition_regions.clone(),
-                &[],
                 &[predicate, x.clone()],
             )?;
             Ok(outputs.remove(0))
@@ -3601,7 +3577,7 @@ mod array_linearization_tests {
             .jvp(
                 |inputs: Vec<ArrayJvpTracer>| {
                     let (while_operation, while_regions) = array_squaring_while();
-                    inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                    inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
                 },
                 vec![TestArray::scalar(1.5)],
                 vec![TestArray::scalar(1.0)],
@@ -3612,7 +3588,7 @@ mod array_linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = array_squaring_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()]).unwrap()
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()]).unwrap()
             },
             vec![TestArray::scalar(1.5)],
             vec![TestArray::scalar(1.0)],
@@ -3635,7 +3611,7 @@ mod array_linearization_tests {
             .vjp(
                 |inputs| {
                     let (while_operation, while_regions) = array_squaring_while();
-                    inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                    inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
                 },
                 vec![TestArray::scalar(1.5)],
             )
@@ -3649,7 +3625,7 @@ mod array_linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = array_squaring_while();
-                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
+                inputs[0].context().bind(while_operation, while_regions, &[inputs[0].clone()])
             },
             vec![TestArray::scalar(1.5)],
         )
@@ -3809,12 +3785,10 @@ mod array_linearization_tests {
         use crate::types::{DataType, Shape, Size};
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut filled = inputs[0].dispatch_domain().bind(
-            FillOperation::new(vector_type, Scalar::from(2.0)),
-            Vec::new(),
-            &[],
-            &[],
-        )?;
+        let mut filled =
+            inputs[0]
+                .dispatch_domain()
+                .bind(FillOperation::new(vector_type, Scalar::from(2.0)), Vec::new(), &[])?;
         Ok(vec![inputs[0].clone() + filled.remove(0)])
     }
 
@@ -3825,7 +3799,7 @@ mod array_linearization_tests {
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let mut filled =
-            inputs[0].context().bind(FillOperation::new(vector_type, Scalar::from(2.0)), Vec::new(), &[], &[])?;
+            inputs[0].context().bind(FillOperation::new(vector_type, Scalar::from(2.0)), Vec::new(), &[])?;
         Ok(vec![inputs[0].clone() + filled.remove(0)])
     }
 
@@ -4131,7 +4105,6 @@ mod array_linearization_tests {
         inputs[0].dispatch_domain().bind(
             ArrayOperation::Condition(condition),
             vec![affine_branch(), sine_branch()],
-            &[],
             &[inputs[0].clone(), inputs[1].clone()],
         )
     }
@@ -4143,7 +4116,6 @@ mod array_linearization_tests {
         inputs[0].context().bind(
             ArrayOperation::Condition(condition),
             vec![affine_branch(), sine_branch()],
-            &[],
             &[inputs[0].clone(), inputs[1].clone()],
         )
     }
@@ -4232,7 +4204,6 @@ mod array_linearization_tests {
         inputs[0].dispatch_domain().bind(
             ArrayOperation::Scan(scan),
             vec![scan_product_body()],
-            &[],
             &[inputs[0].clone(), inputs[1].clone()],
         )
     }
@@ -4244,7 +4215,6 @@ mod array_linearization_tests {
         inputs[0].context().bind(
             ArrayOperation::Scan(scan),
             vec![scan_product_body()],
-            &[],
             &[inputs[0].clone(), inputs[1].clone()],
         )
     }
@@ -4396,12 +4366,9 @@ mod array_linearization_tests {
         V::DispatchDomain: Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
     {
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 5);
-        inputs[0].dispatch_domain().bind(
-            ArrayOperation::While(while_operation),
-            while_regions,
-            &[],
-            &[inputs[0].clone()],
-        )
+        inputs[0]
+            .dispatch_domain()
+            .bind(ArrayOperation::While(while_operation), while_regions, &[inputs[0].clone()])
     }
 
     /// Binds the same bounded squaring `while` through the forward-mode dual context, the `jvp` twin of
@@ -4410,7 +4377,7 @@ mod array_linearization_tests {
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 5);
         inputs[0]
             .context()
-            .bind(ArrayOperation::While(while_operation), while_regions, &[], &[inputs[0].clone()])
+            .bind(ArrayOperation::While(while_operation), while_regions, &[inputs[0].clone()])
     }
 
     #[test]
@@ -4481,7 +4448,6 @@ mod array_linearization_tests {
                 inputs[0].context().stage_operation(
                     ArrayOperation::While(while_operation),
                     vec![condition.clone(), body.clone()],
-                    &[],
                     &[&inputs[0]],
                 )
             },
@@ -4544,7 +4510,6 @@ mod array_linearization_tests {
         inputs[0].dispatch_domain().bind(
             ArrayOperation::CustomJvp(operation),
             vec![custom_jvp_sin_primal(), custom_jvp_sin_doubled_rule()],
-            &[],
             &[inputs[0].clone()],
         )
     }
@@ -4556,7 +4521,6 @@ mod array_linearization_tests {
         inputs[0].context().bind(
             ArrayOperation::CustomJvp(operation),
             vec![custom_jvp_sin_primal(), custom_jvp_sin_doubled_rule()],
-            &[],
             &[inputs[0].clone()],
         )
     }
@@ -4624,14 +4588,11 @@ mod array_linearization_tests {
         let operation_regions = instruction
             .regions()
             .iter()
-            .map(|region| program.region_ref(*region).map(|region| region.into_program()))
+            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
             .collect::<Result<Vec<_>, _>>()?;
-        inputs[0].context().stage_operation(
-            ArrayOperation::Rematerialize(*operation),
-            operation_regions,
-            &[],
-            &[&inputs[0]],
-        )
+        inputs[0]
+            .context()
+            .stage_operation(ArrayOperation::Rematerialize(*operation), operation_regions, &[&inputs[0]])
     }
 
     #[test]
@@ -4723,7 +4684,6 @@ mod array_linearization_tests {
         inputs[0].dispatch_domain().bind(
             ArrayOperation::CustomVjp(operation),
             vec![custom_vjp_sin_primal(), custom_vjp_sin_forward(), custom_vjp_sin_tripled_backward()],
-            &[],
             &[inputs[0].clone()],
         )
     }
@@ -4776,7 +4736,6 @@ mod array_linearization_tests {
                 inputs[0].context().bind(
                     ArrayOperation::CustomVjp(operation),
                     vec![custom_vjp_sin_primal(), custom_vjp_sin_forward(), custom_vjp_sin_tripled_backward()],
-                    &[],
                     &[inputs[0].clone()],
                 )
             },
@@ -4835,8 +4794,7 @@ mod array_linearization_tests {
     /// item's tangent is structurally zero, so partial evaluation prunes that tangent input and the linearization
     /// must restore the canonical `[carry_tangents..., residuals...]` arity the bounded-`while` rule assumes.
     fn batched_bounded_while_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
-        use crate::batching::Batch;
-        use crate::batching::BatchAxis;
+        use crate::batching::{Batch, BatchAxis};
 
         let context = inputs[0].context().clone();
         let mapped = Batch::batch(
@@ -4844,7 +4802,7 @@ mod array_linearization_tests {
             |item| {
                 let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
                 let mut outputs =
-                    item.context().bind(ArrayOperation::While(while_operation), while_regions, &[], &[item.clone()])?;
+                    item.context().bind(ArrayOperation::While(while_operation), while_regions, &[item.clone()])?;
                 Ok(outputs.remove(0))
             },
             inputs[0].clone(),
@@ -5333,7 +5291,7 @@ mod batching_tests {
         .unwrap();
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4, None);
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation)
-            .batch(&context, &crate::RegionlessDriver, &[left, right])
+            .batch(&context, &crate::EmptyRegionDriver, &[left, right])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -5348,7 +5306,7 @@ mod batching_tests {
         let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
-        let outputs = NegOperation.batch(&context, &crate::RegionlessDriver, &[batched]).unwrap();
+        let outputs = NegOperation.batch(&context, &crate::EmptyRegionDriver, &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
@@ -5362,7 +5320,7 @@ mod batching_tests {
         let batched = ArrayBatch::new(batched_value.r#type().into_owned(), batched_value, Some(0)).unwrap();
         let replicated = ArrayBatch::replicated(TestArray::scalar(10.0));
         let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
-        let outputs = AddOperation.batch(&context, &crate::RegionlessDriver, &[batched, replicated]).unwrap();
+        let outputs = AddOperation.batch(&context, &crate::EmptyRegionDriver, &[batched, replicated]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[11.0, 12.0, 13.0]);
@@ -5636,7 +5594,7 @@ mod batching_tests {
                 let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
                 let condition = ConditionOperation::new();
                 let op = ArrayOperation::Condition(condition);
-                let outputs = x.context().bind(op, condition_regions, &[], &[predicate.clone(), x.clone()])?;
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
@@ -5690,7 +5648,7 @@ mod batching_tests {
                 let condition_regions = vec![scalar_scale_branch(2.0), constant_branch];
                 let condition = ConditionOperation::new();
                 let op = ArrayOperation::Condition(condition);
-                let outputs = x.context().bind(op, condition_regions, &[], &[predicate.clone(), x.clone()])?;
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
@@ -5735,7 +5693,6 @@ mod batching_tests {
                     let outputs = pred.context().bind(
                         op,
                         vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
-                        &[],
                         &[pred.clone(), operand.clone()],
                     )?;
                     Ok(outputs.into_iter().next().unwrap())
@@ -5762,7 +5719,7 @@ mod batching_tests {
                     let zero_op = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(
                         ArrayType::scalar(DataType::F64),
                     ));
-                    let zero = x.context().bind(zero_op, Vec::new(), &[], &[])?.into_iter().next().unwrap();
+                    let zero = x.context().bind(zero_op, Vec::new(), &[])?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),

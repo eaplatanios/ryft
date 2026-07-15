@@ -18,6 +18,7 @@ pub mod operations;
 pub mod parameters;
 pub mod partial;
 pub mod programs;
+pub mod regions;
 pub mod sharding;
 pub mod tests;
 pub mod tracing;
@@ -53,7 +54,11 @@ pub use partial::{
 };
 pub use programs::{
     Atom, AtomId, FlatProgram, Instruction, InstructionId, MaybeZero, Program, ProgramBuilder, ProgramError,
-    ProgramLiveSets, Region, RegionId, RegionInterface, RegionRef, Value, ValueId,
+    ProgramLiveSets, Value, ValueId,
+};
+pub use regions::{
+    EmptyRegionDriver, OutputRegionProvenance, Region, RegionAttachments, RegionDriver, RegionId, RegionInterface,
+    RegionRef,
 };
 pub use sharding::*;
 pub use tracing::{

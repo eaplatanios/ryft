@@ -449,12 +449,12 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::RegionlessDriver;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError, RegionId};
+    use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::{EmptyRegionDriver, RegionId};
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
     use crate::types::DataType;
@@ -544,7 +544,7 @@ mod tests {
                 |instruction, inputs| {
                     instruction.operation().interpret(
                         &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
-                        &RegionlessDriver,
+                        &EmptyRegionDriver,
                         inputs,
                     )
                 },
@@ -646,7 +646,7 @@ mod tests {
                 |instruction, inputs| {
                     instruction.operation().interpret(
                         &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
-                        &RegionlessDriver,
+                        &EmptyRegionDriver,
                         inputs,
                     )
                 },
@@ -733,7 +733,6 @@ mod tests {
                 inputs[0].context().bind(
                     CompareOperation::new(ComparisonDirection::LessThan),
                     Vec::new(),
-                    &[],
                     &[inputs[0].clone(), inputs[0].clone()],
                 )
             },
@@ -749,14 +748,14 @@ mod tests {
                 let context = inputs[0].context().clone();
                 let reference = context.capture(Scalar::from(3.0))?;
                 let captured = StagingContext::constant(&context, reference);
-                context.bind(AddOperation, Vec::new(), &[], &[inputs[0].clone(), captured])
+                context.bind(AddOperation, Vec::new(), &[inputs[0].clone(), captured])
             },
             vec![DataType::F64],
         )
         .unwrap();
         let operation = WhileOperation::new();
         let outputs = root
-            .bind(ScalarOperation::While(operation), vec![condition, body], &[], std::slice::from_ref(&state))
+            .bind(ScalarOperation::While(operation), vec![condition, body], std::slice::from_ref(&state))
             .unwrap();
 
         // The top-level program holds no capture-reference atoms. The only reference lives in the while body.

@@ -285,7 +285,7 @@ mod tests {
     fn test_context_load_dialect_by_name() {
         let context = Context::new();
 
-        // Try to load an unregistered dialect by name (should return [`None`]).
+        // Try to load an unregistered dialect by name (should return `None`).
         assert_eq!(context.load_dialect_by_name("gpu").unwrap(), None);
 
         // Register and then load the `gpu` dialect by name.

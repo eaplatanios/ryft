@@ -270,12 +270,12 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
         if node.get_ident() == Some(self.ident) {
             self.referenced = true;
         } else if node.segments.first().iter().any(|segment| &segment.ident == self.ident) {
-            // If the path starts with the [`syn::Ident`] that we are looking for, then we assume that it references
-            // that [`syn::Ident`]. That is because the [`syn::Ident`]s that we are looking for typically correspond to
-            // [`syn::GenericParam`]s.
+            // If the path starts with the `syn::Ident` that we are looking for, then we assume that it references
+            // that `syn::Ident`. That is because the `syn::Ident`s that we are looking for typically correspond to
+            // `syn::GenericParam`s.
             self.referenced = true;
         } else {
-            // Note that the segment [`syn::Ident`]s are not checked. That is because those identifiers would not match
+            // Note that the segment `syn::Ident`s are not checked. That is because those identifiers would not match
             // the identifier we are looking for as they appear in the middle of a path, and we only care about paths
             // fully matching. Note that if we had type information available when our macros get to run, this would
             // all be much easier as we could check for specific types directly.
