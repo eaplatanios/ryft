@@ -76,11 +76,9 @@
 //! Implement [`DifferentiableType`] for type descriptors that possess tangent and cotangent spaces. Implement
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
 //! context and preserve symbolic zeros where possible. Implement [`TransposableOperation`] for linear primitives that
-//! may occur in a pushforward. Finally, implement [`DifferentiableProgramOperation`] and
-//! [`TransposableProgramOperation`] for operation families that recursively contain flat programs.
-//! [`LinearizableProgramOperation`] is the operation-family fixed point used by program linearization. Higher-order
-//! operation logic belongs with the operation that owns the nested program. Wrapper operation enums should provide
-//! family dispatch and forward to those payload rules.
+//! may occur in a pushforward. Higher-order [`Operation`](crate::Operation) logic belongs with the operation whose
+//! instruction attaches to the nested [`Region`](crate::Region). Wrapper operation enums should provide family dispatch
+//! and forward to those payload rules.
 
 pub mod forward;
 pub mod reverse;
@@ -93,14 +91,13 @@ use crate::programs::ProgramError;
 use crate::types::TypeError;
 
 pub use forward::{
-    DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationDual,
-    DifferentiationTracer, ForwardModeDifferentiate, LinearizableProgramOperation, Linearization, LinearizationTracer,
-    Pushforward, jvp, linearize,
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
+    ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, linearize,
 };
 pub use reverse::{
-    Pullback, ReverseModeDifferentiate, TransposableOperation, TransposableProgramOperation, gradient,
-    gradient_holomorphic, gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient,
-    value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
+    Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
+    gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient, value_and_gradient_holomorphic,
+    value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
 pub use types::DifferentiableType;
 

@@ -602,8 +602,6 @@ pub struct OutputRegionProvenance {
     pub output_index: usize,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -618,29 +616,53 @@ mod tests {
 
     type TestProgram = Program<Scalar, TestRegionOperation, Vec<Scalar>, Vec<Scalar>>;
 
+    /// Test fixture containing two distinct root regions that share one descendant.
+    struct SharedDescendantFixture {
+        /// Program that owns the fixture's region graph.
+        program: TestProgram,
+
+        /// First root region in the shared-descendant graph.
+        first_root: RegionId,
+
+        /// Second root region in the shared-descendant graph.
+        second_root: RegionId,
+    }
+
+    /// Builds an identity program with one input and one output of `r#type`.
     fn identity_program(r#type: DataType) -> TestProgram {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type);
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn program_with_nested_identity() -> TestProgram {
+    /// Builds a program whose two instructions attach the same nested identity region.
+    fn program_with_reused_region() -> TestProgram {
         let mut builder = ProgramBuilder::new();
-        let nested = builder.import_program(identity_program(DataType::F64));
+        let region = builder.import_program(identity_program(DataType::F64));
         let input = builder.add_input(DataType::F64);
-        let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["nested"]), vec![input], vec![nested])
+        let first = builder
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![input], vec![region])
             .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        let second = builder
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![first], vec![region])
+            .unwrap()[0];
+        builder.build(vec![second], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn program_with_shared_descendant() -> (TestProgram, RegionId, RegionId) {
-        let root_template = program_with_nested_identity();
-        let root_region = root_template.entry_region().clone();
-        assert_eq!(root_region.instructions()[0].regions(), &[RegionId::new(0)]);
+    /// Builds a program whose two distinct root regions share one identity-region descendant.
+    fn program_with_shared_descendant() -> SharedDescendantFixture {
+        let mut root_builder = ProgramBuilder::new();
+        let descendant = root_builder.import_program(identity_program(DataType::F64));
+        let input = root_builder.add_input(DataType::F64);
+        let output = root_builder
+            .add_instruction(TestRegionOperation::WithRegions(&["nested"]), vec![input], vec![descendant])
+            .unwrap()[0];
+        let root_program: TestProgram = root_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut root_region = root_program.entry_region().clone();
 
         let mut builder = ProgramBuilder::new();
-        assert_eq!(builder.import_program(identity_program(DataType::F64)), RegionId::new(0));
+        let shared_descendant = builder.import_program(identity_program(DataType::F64));
+        root_region.instructions[0].regions_mut()[0] = shared_descendant;
         let first_root = RegionId::new(builder.regions.len());
         builder.regions.push(root_region.clone());
         let second_root = RegionId::new(builder.regions.len());
@@ -655,215 +677,181 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        (program, first_root, second_root)
-    }
-
-    fn import_regions<D: BindingRegionDriver<Scalar, TestRegionOperation>>(
-        driver: D,
-        builder: &Rc<RefCell<ProgramBuilder<Scalar, TestRegionOperation>>>,
-    ) -> Vec<RegionId> {
-        driver.import_into(builder).unwrap()
-    }
-
-    fn attached_input_types<R: RegionDriver<Scalar, TestRegionOperation>>(regions: &R) -> Vec<DataType> {
-        regions.regions().map(|region| region.input_types()[0]).collect()
+        SharedDescendantFixture { program, first_root, second_root }
     }
 
     #[test]
-    fn test_owned_region_drivers_support_empty_arrays_and_vectors() {
-        let empty_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert!(import_regions([], &empty_builder).is_empty());
-        assert!(empty_builder.borrow().regions.is_empty());
-
-        let array = [identity_program(DataType::F32), identity_program(DataType::F64)];
-        assert_eq!(attached_input_types(&array), vec![DataType::F32, DataType::F64]);
-        let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_regions(array, &array_builder), vec![RegionId::new(0), RegionId::new(1)]);
-        assert_eq!(array_builder.borrow().regions.len(), 2);
-
-        let regions = vec![identity_program(DataType::F64), identity_program(DataType::F32)];
-        assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F32]);
-        let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_regions(regions, &vector_builder), vec![RegionId::new(0), RegionId::new(1)]);
-        assert_eq!(vector_builder.borrow().regions.len(), 2);
+    fn test_region_ref() {
+        let program = program_with_reused_region();
+        let region = program.entry_region_ref();
+        assert_eq!(region.id(), program.entry());
+        assert_eq!(region.regions().len(), program.regions().len());
+        assert_eq!(region.atoms().len(), program.atoms().len());
+        assert_eq!(region.input_ids(), program.input_ids());
+        assert_eq!(region.input_types(), vec![DataType::F64]);
+        assert_eq!(region.output_ids(), program.output_ids());
+        assert_eq!(region.output_types(), vec![DataType::F64]);
+        assert_eq!(region.instructions().len(), 2);
+        let interface = region.interface();
+        assert_eq!(interface.input_types(), &[DataType::F64]);
+        assert_eq!(interface.output_types(), &[DataType::F64]);
+        assert_eq!(interface.effects(), Effects::PURE);
     }
 
     #[test]
-    fn test_callee_region_driver_interns_callees() {
-        let callee = Rc::new(identity_program(DataType::F64));
-        let callees = [Rc::clone(&callee), callee];
-        let regions = CalleeRegionDriver::new(&callees);
-        assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F64]);
-
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_regions(regions, &builder), vec![RegionId::new(0), RegionId::new(0)]);
-        assert_eq!(builder.borrow().regions.len(), 1);
-    }
-
-    #[test]
-    fn test_replay_region_driver_iterates_in_application_order() {
-        let (source, first_root, second_root) = program_with_shared_descendant();
-        let mappings = RegionReplayMappings::new();
-        let roots = [second_root, first_root, second_root];
-        let regions = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
-
-        assert_eq!(regions.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
-    }
-
-    #[test]
-    fn test_replay_region_driver_rejects_out_of_range_roots() {
-        let source = identity_program(DataType::F64);
-        let mappings = RegionReplayMappings::new();
-        let roots = [RegionId::new(42)];
-
+    fn test_region_ref_rejects_out_of_range_id() {
+        let program = identity_program(DataType::F64);
         assert!(matches!(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings),
+            RegionRef::new(program.regions(), RegionId::new(42)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
         ));
     }
 
     #[test]
-    fn test_replay_import_preserves_duplicate_roots_and_shared_descendants() {
-        let (source, first_root, second_root) = program_with_shared_descendant();
-        let mappings = RegionReplayMappings::new();
-
-        let duplicate_roots = [first_root, first_root];
-        let duplicate_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let imported = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &duplicate_roots, &mappings).unwrap(),
-            &duplicate_destination,
-        );
-        assert_eq!(imported[0], imported[1]);
-        assert_eq!(duplicate_destination.borrow().regions.len(), 2);
-
-        let roots = [first_root, second_root];
-        let shared_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let imported = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
-            &shared_destination,
-        );
-        let shared_destination = shared_destination.borrow();
-        assert_ne!(imported[0], imported[1]);
-        assert_eq!(shared_destination.regions.len(), 3);
-        assert_eq!(
-            shared_destination.region_ref(imported[0]).unwrap().instructions()[0].regions()[0],
-            shared_destination.region_ref(imported[1]).unwrap().instructions()[0].regions()[0],
-        );
+    fn test_region_ref_to_program() {
+        let program = program_with_reused_region();
+        let materialized = program.entry_region_ref().to_program();
+        assert_eq!(materialized.regions().len(), 2);
+        assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
+        assert_eq!(materialized.input_types(), vec![DataType::F64]);
+        assert_eq!(materialized.output_types(), vec![DataType::F64]);
     }
 
     #[test]
-    fn test_replay_import_preserves_sharing_across_applications() {
-        let (source, first_root, second_root) = program_with_shared_descendant();
+    fn test_binding_region_driver_for_owned_collections() {
+        let empty_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let empty_driver: [TestProgram; 0] = [];
+        assert_eq!(empty_driver.import_into(&empty_builder), Ok(Vec::new()));
+        assert!(empty_builder.borrow().regions.is_empty());
+        let array_driver = [identity_program(DataType::F32), identity_program(DataType::F64)];
+        assert_eq!(
+            array_driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
+            vec![DataType::F32, DataType::F64],
+        );
+        let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        assert_eq!(array_driver.import_into(&array_builder), Ok(vec![RegionId::new(0), RegionId::new(1)]));
+        assert_eq!(array_builder.borrow().regions.len(), 2);
+
+        let vector_driver = vec![identity_program(DataType::F64), identity_program(DataType::F32)];
+        assert_eq!(
+            vector_driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
+            vec![DataType::F64, DataType::F32],
+        );
+        let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        assert_eq!(vector_driver.import_into(&vector_builder), Ok(vec![RegionId::new(0), RegionId::new(1)]));
+        assert_eq!(vector_builder.borrow().regions.len(), 2);
+    }
+
+    #[test]
+    fn test_callee_region_driver() {
+        let callee = Rc::new(identity_program(DataType::F64));
+        let callees = [Rc::clone(&callee), callee];
+        let driver = CalleeRegionDriver::new(&callees);
+        assert_eq!(
+            driver.regions().map(|region| region.input_types()[0]).collect::<Vec<_>>(),
+            vec![DataType::F64, DataType::F64],
+        );
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        assert_eq!(driver.import_into(&builder), Ok(vec![RegionId::new(0), RegionId::new(0)]));
+        assert_eq!(builder.borrow().regions.len(), 1);
+    }
+
+    #[test]
+    fn test_replay_region_driver() {
+        let SharedDescendantFixture { program, first_root, second_root } = program_with_shared_descendant();
+        let mappings = RegionReplayMappings::new();
+        let roots = [second_root, first_root, second_root];
+        let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert_eq!(driver.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
+    }
+
+    #[test]
+    fn test_replay_region_driver_rejects_out_of_range_root() {
+        let program = identity_program(DataType::F64);
+        let mappings = RegionReplayMappings::new();
+        let roots = [RegionId::new(42)];
+        assert!(matches!(
+            ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
+        ));
+    }
+
+    #[test]
+    fn test_replay_region_driver_import_preserves_duplicate_roots() {
+        let SharedDescendantFixture { program, first_root, .. } = program_with_shared_descendant();
+        let mappings = RegionReplayMappings::new();
+        let roots = [first_root, first_root];
+        let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
+        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1), RegionId::new(1)]));
+        assert_eq!(destination.borrow().regions.len(), 2);
+    }
+
+    #[test]
+    fn test_replay_region_driver_import_preserves_shared_descendants() {
+        let SharedDescendantFixture { program, first_root, second_root } = program_with_shared_descendant();
+        let mappings = RegionReplayMappings::new();
+        let roots = [first_root, second_root];
+        let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
+        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1), RegionId::new(2)]));
+        let destination = destination.borrow();
+        assert_eq!(destination.regions.len(), 3);
+        assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
+        assert_eq!(destination.region_ref(RegionId::new(2)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
+    }
+
+    #[test]
+    fn test_replay_region_driver_import_preserves_sharing_across_applications() {
+        let SharedDescendantFixture { program, first_root, second_root } = program_with_shared_descendant();
         let mappings = RegionReplayMappings::new();
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-
         let first_roots = [first_root];
-        let first = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
-            &destination,
-        )[0];
+        let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
+        assert_eq!(first_driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
         let second_roots = [second_root];
-        let second = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &second_roots, &mappings).unwrap(),
-            &destination,
-        )[0];
-        let repeated = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &first_roots, &mappings).unwrap(),
-            &destination,
-        )[0];
-
+        let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &second_roots, &mappings).unwrap();
+        assert_eq!(second_driver.import_into(&destination), Ok(vec![RegionId::new(2)]));
+        let repeated_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
+        assert_eq!(repeated_driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
         let destination = destination.borrow();
-        assert_eq!(first, repeated);
         assert_eq!(destination.regions.len(), 3);
-        assert_eq!(
-            destination.region_ref(first).unwrap().instructions()[0].regions()[0],
-            destination.region_ref(second).unwrap().instructions()[0].regions()[0],
-        );
+        assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
+        assert_eq!(destination.region_ref(RegionId::new(2)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
     }
 
     #[test]
-    fn test_replay_import_uses_independent_destination_mappings() {
-        let (source, first_root, _) = program_with_shared_descendant();
+    fn test_replay_region_driver_import_uses_destination_specific_mappings() {
+        let SharedDescendantFixture { program, first_root, .. } = program_with_shared_descendant();
         let mappings = RegionReplayMappings::new();
         let first_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let second_destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         second_destination.borrow_mut().import_program(identity_program(DataType::F32));
         let roots = [first_root];
-
-        let first = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
-            &first_destination,
-        )[0];
-        let second = import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
-            &second_destination,
-        )[0];
-        assert_ne!(first, second);
+        let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert_eq!(first_driver.import_into(&first_destination), Ok(vec![RegionId::new(1)]));
+        let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert_eq!(second_driver.import_into(&second_destination), Ok(vec![RegionId::new(2)]));
         assert_eq!(first_destination.borrow().regions.len(), 2);
         assert_eq!(second_destination.borrow().regions.len(), 3);
     }
 
     #[test]
-    fn test_replay_mappings_do_not_retain_destinations() {
-        let (source, first_root, _) = program_with_shared_descendant();
+    fn test_region_replay_mappings_do_not_retain_destinations() {
+        let SharedDescendantFixture { program, first_root, .. } = program_with_shared_descendant();
         let mappings = RegionReplayMappings::new();
         let roots = [first_root];
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let weak_destination = Rc::downgrade(&destination);
-
-        import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
-            &destination,
-        );
+        let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
         assert_eq!(Rc::strong_count(&destination), 1);
         assert_eq!(mappings.destinations.borrow().len(), 1);
         drop(destination);
         assert!(weak_destination.upgrade().is_none());
-
         let replacement = Rc::new(RefCell::new(ProgramBuilder::new()));
-        import_regions(
-            ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap(),
-            &replacement,
-        );
+        let replacement_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert_eq!(replacement_driver.import_into(&replacement), Ok(vec![RegionId::new(1)]));
         assert_eq!(mappings.destinations.borrow().len(), 1);
-    }
-
-    #[test]
-    fn test_region_ref_and_to_program() {
-        let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let sealed = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(DataType::F64);
-        let first = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![input], vec![sealed])
-            .unwrap()[0];
-        let second = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![first], vec![sealed])
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let entry = program.entry_region_ref();
-        assert_eq!(entry.id(), program.entry());
-        assert_eq!(entry.input_ids(), program.input_ids());
-        assert_eq!(entry.output_ids(), program.output_ids());
-        assert_eq!(entry.instructions().len(), 2);
-        assert_eq!(program.interface(), entry.interface());
-        assert_eq!(entry.interface().output_types(), &[DataType::F64]);
-        assert!(matches!(
-            program.region_ref(RegionId::new(42)),
-            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
-        ));
-
-        let detached = entry.to_program();
-        assert_eq!(detached.regions().len(), 2);
-        assert_eq!(detached.instructions()[0].regions(), detached.instructions()[1].regions());
-        assert_eq!(detached.input_types(), vec![DataType::F64]);
-        assert_eq!(detached.output_types(), vec![DataType::F64]);
     }
 }
