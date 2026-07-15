@@ -1,16 +1,14 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::contexts::StagingContext;
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::TransposableOperation;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
@@ -21,16 +19,16 @@ use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`SliceOperation`].
-pub const SLICE_OPERATION_NAME: &'static str = "slice";
+pub const SLICE_OPERATION_NAME: &str = "slice";
 
 /// Canonical operation name for [`UpdateSliceOperation`].
-pub const UPDATE_SLICE_OPERATION_NAME: &'static str = "update_slice";
+pub const UPDATE_SLICE_OPERATION_NAME: &str = "update_slice";
 
 /// Canonical operation name for [`DynamicSliceOperation`].
-pub const DYNAMIC_SLICE_OPERATION_NAME: &'static str = "dynamic_slice";
+pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 
 /// Canonical operation name for [`DynamicUpdateSliceOperation`].
-pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &'static str = "dynamic_update_slice";
+pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &str = "dynamic_update_slice";
 
 // TODO(eaplatanios): This should be a function on `DataType` along with other helpers like
 //  `is_boolean`, `is_floating_point`, etc.
@@ -160,7 +158,11 @@ impl Operation<ArrayType> for SliceOperation {
         SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match input_types[0].slice(
             self.start_indices.as_slice(),
@@ -185,8 +187,13 @@ impl Operation<ArrayType> for SliceOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Slice, C> InterpretableOperation<V, C> for SliceOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Slice>> InterpretableOperation<C> for SliceOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().slice(
             self.start_indices.as_slice(),
@@ -424,7 +431,7 @@ where
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let operation =
             SliceOperation::new(start_indices.to_vec(), limit_indices.to_vec()).with_strides(strides.to_vec())?;
-        Ok(self.dispatch_domain().bind(operation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(operation, Vec::new(), &[self.clone()])?.remove(0))
     }
 }
 
@@ -462,7 +469,11 @@ impl Operation<ArrayType> for UpdateSliceOperation {
         UPDATE_SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         match (&input_types[0]).update_slice(&input_types[1], self.start_indices.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -477,8 +488,13 @@ impl Operation<ArrayType> for UpdateSliceOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + UpdateSlice, C> InterpretableOperation<V, C> for UpdateSliceOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: UpdateSlice>> InterpretableOperation<C> for UpdateSliceOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].update_slice(&inputs[1], self.start_indices.as_slice())?])
     }
@@ -612,8 +628,7 @@ where
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
             UpdateSliceOperation::new(start_indices.to_vec()),
-            &[],
-            &[],
+            Vec::new(),
             &[self.clone(), update.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -655,7 +670,11 @@ impl Operation<ArrayType> for DynamicSliceOperation {
         DYNAMIC_SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.is_empty() {
             return Err(TypeError {
                 message: "'dynamic_slice' expects an input operand followed by its start index operands but got no \
@@ -676,8 +695,13 @@ impl Operation<ArrayType> for DynamicSliceOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + DynamicSlice, C> InterpretableOperation<V, C> for DynamicSliceOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C> for DynamicSliceOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes.len(), actual: 0 });
         };
@@ -797,7 +821,7 @@ where
         inputs.extend(start_indices.iter().cloned());
         Ok(self
             .dispatch_domain()
-            .bind(DynamicSliceOperation::new(sizes.to_vec()), &[], &[], &inputs)?
+            .bind(DynamicSliceOperation::new(sizes.to_vec()), Vec::new(), &inputs)?
             .remove(0))
     }
 }
@@ -819,7 +843,11 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
         DYNAMIC_UPDATE_SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() < 2 {
             return Err(TypeError {
                 message: format!(
@@ -841,8 +869,13 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + DynamicUpdateSlice, C> InterpretableOperation<V, C> for DynamicUpdateSliceOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>> InterpretableOperation<C> for DynamicUpdateSliceOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
@@ -986,7 +1019,7 @@ where
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
-        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, &[], &[], &inputs)?;
+        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1042,11 +1075,15 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicSliceOper
         DYNAMIC_SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         let mut full_input_types = input_types.to_vec();
         full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
-        DynamicSliceOperation::new(self.sizes.clone()).infer_output_types(full_input_types.as_slice())
+        DynamicSliceOperation::new(self.sizes.clone()).infer_output_types(full_input_types.as_slice(), &[])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1057,12 +1094,17 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicSliceOper
     }
 }
 
-impl<V, F, C> InterpretableOperation<V, C> for LinearDynamicSliceOperation<F>
+impl<F, C> InterpretableOperation<C> for LinearDynamicSliceOperation<F>
 where
-    V: Value<Type = ArrayType> + DynamicSlice,
-    F: CustomVjpResidual<V>,
+    C: Domain<Type = ArrayType, Value: DynamicSlice>,
+    F: CustomVjpResidual<C::Value>,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let start_indices =
             self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
@@ -1088,9 +1130,10 @@ impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOper
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearDynamicUpdateSliceOperation<F>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1102,6 +1145,7 @@ where
                 let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let outputs = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
+                    Vec::new(),
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -1123,9 +1167,10 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSlice
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1143,7 +1188,7 @@ where
             operands.push(zeros);
             operands.push(cotangent.clone());
             operands.extend(start_indices);
-            let outputs = context.stage_operation(DynamicUpdateSliceOperation, operands.as_slice())?;
+            let outputs = context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), operands.as_slice())?;
             check_count!("output", outputs, 1, ProgramError);
             contributions[0] = MaybeZero::Value(outputs.into_iter().next().unwrap());
         }
@@ -1193,11 +1238,15 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSli
         DYNAMIC_UPDATE_SLICE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         let mut full_input_types = input_types.to_vec();
         full_input_types.extend(self.start_indices.iter().map(|index| index.r#type().into_owned()));
-        DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice())
+        DynamicUpdateSliceOperation.infer_output_types(full_input_types.as_slice(), &[])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1207,12 +1256,17 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSli
     }
 }
 
-impl<V, F, C> InterpretableOperation<V, C> for LinearDynamicUpdateSliceOperation<F>
+impl<F, C> InterpretableOperation<C> for LinearDynamicUpdateSliceOperation<F>
 where
-    V: Value<Type = ArrayType> + DynamicUpdateSlice,
-    F: CustomVjpResidual<V>,
+    C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>,
+    F: CustomVjpResidual<C::Value>,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let start_indices =
             self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
@@ -1243,9 +1297,10 @@ where
         + From<LinearDynamicUpdateSliceOperation<F>>
         + From<LinearDynamicSliceOperation<F>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1261,11 +1316,13 @@ where
                 let zeros = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
+                    Vec::new(),
                     &[cotangent.clone(), zeros],
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
                 let update_cotangents = context.stage_operation(
                     LinearDynamicSliceOperation::new(self.start_indices().to_vec(), update_sizes),
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
@@ -1307,9 +1364,10 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<DynamicSliceOperation>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1330,14 +1388,18 @@ where
             input_operands.push(cotangent.clone());
             input_operands.push(zeros);
             input_operands.extend(start_indices.iter().cloned());
-            let input_cotangents = context.stage_operation(DynamicUpdateSliceOperation, input_operands.as_slice())?;
+            let input_cotangents =
+                context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), input_operands.as_slice())?;
             check_count!("output", input_cotangents, 1, ProgramError);
             // Update cotangent: the dynamic slice of the output cotangent at the update window.
             let mut update_operands = Vec::with_capacity(1 + start_indices.len());
             update_operands.push(cotangent.clone());
             update_operands.extend(start_indices);
-            let update_cotangents =
-                context.stage_operation(DynamicSliceOperation::new(update_sizes), update_operands.as_slice())?;
+            let update_cotangents = context.stage_operation(
+                DynamicSliceOperation::new(update_sizes),
+                Vec::new(),
+                update_operands.as_slice(),
+            )?;
             check_count!("output", update_cotangents, 1, ProgramError);
             contributions[0] = MaybeZero::Value(input_cotangents.into_iter().next().unwrap());
             contributions[1] = MaybeZero::Value(update_cotangents.into_iter().next().unwrap());
@@ -1351,8 +1413,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::Typed;
 
@@ -1377,13 +1441,14 @@ mod tests {
         // capability backs it without consuming the borrowed input type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![output_type.clone()]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
         assert_eq!(input_type.slice(&[1, 1], &[2, 3], &[1, 1]), Ok(output_type.clone()));
 
         // Interpretation copies the selected block out of the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output =
-            operation.interpret(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![5.0, 6.0]);
 
@@ -1402,14 +1467,15 @@ mod tests {
         assert_eq!(format!("{strided}"), "slice [start_indices=[1], limit_indices=[6], strides=[2]]");
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
         assert_eq!(
-            strided.infer_output_types(std::slice::from_ref(&vector_type)),
+            strided.infer_output_types(std::slice::from_ref(&vector_type), &[]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))]),
         );
 
         // Strided interpretation keeps the elements at `start + i * stride`.
         let vector = TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        let strided_output =
-            strided.interpret(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&vector)).unwrap();
+        let strided_output = strided
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&vector))
+            .unwrap();
         assert_eq!(strided_output[0].values, vec![1.0, 3.0, 5.0]);
 
         // A stride larger than the sliced extent keeps a single element, and `start == limit` keeps none.
@@ -1421,23 +1487,23 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
             Err(TypeError { message: "'slice' start_indices has length 2 but input has rank 1".to_string() }),
         );
         assert_eq!(
-            SliceOperation::new(vec![0, 0], vec![2]).infer_output_types(std::slice::from_ref(&input_type)),
+            SliceOperation::new(vec![0, 0], vec![2]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'slice' limit_indices has length 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            SliceOperation::new(vec![2, 0], vec![1, 3]).infer_output_types(std::slice::from_ref(&input_type)),
+            SliceOperation::new(vec![2, 0], vec![1, 3]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'slice' start index 2 is greater than limit index 1 at axis 0".to_string() }),
         );
         assert_eq!(
-            SliceOperation::new(vec![0, 0], vec![2, 4]).infer_output_types(std::slice::from_ref(&input_type)),
+            SliceOperation::new(vec![0, 0], vec![2, 4]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'slice' limit index 4 is out of bounds for axis 1 with size 3".to_string() }),
         );
         assert_eq!(
@@ -1465,10 +1531,10 @@ mod tests {
             })),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Dynamic(None), Size::Static(3)]),
-            )]),
+            operation.infer_output_types(
+                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]),)],
+                &[],
+            ),
             Err(TypeError {
                 message: "'slice' does not support dynamic input axis 0 with size *; slice bounds cannot be \
                     validated against an unknown extent"
@@ -1476,10 +1542,11 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
-                &[]
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
@@ -1487,7 +1554,7 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured indices.
         let mut builder = ProgramBuilder::<TestArray, SliceOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
+        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
@@ -1522,7 +1589,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), update_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
             Ok(vec![input_type.clone()]),
         );
         assert_eq!((&input_type).update_slice(&update_type, &[0, 1]), Ok(input_type.clone()));
@@ -1530,7 +1597,9 @@ mod tests {
         // Interpretation overwrites the selected block of the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
-        let output = operation.interpret(&crate::EagerContext::<TestArray>::new(), &[input, update]).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input, update])
+            .unwrap();
         assert_eq!(*output[0].r#type(), input_type);
         assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
@@ -1540,34 +1609,40 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'update_slice' input data type f64 does not match update data type f32".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-            ]),
+            operation.infer_output_types(
+                &[input_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),],
+                &[],
+            ),
             Err(TypeError { message: "'update_slice' update has rank 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            UpdateSliceOperation::new(vec![0]).infer_output_types(&[input_type.clone(), update_type.clone()]),
+            UpdateSliceOperation::new(vec![0]).infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
             Err(TypeError { message: "'update_slice' start_indices has length 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'update_slice' does not support dynamic update axis 0 with size *; update shapes must be \
                     static"
@@ -1575,27 +1650,31 @@ mod tests {
             }),
         );
         assert_eq!(
-            UpdateSliceOperation::new(vec![0, 2]).infer_output_types(&[input_type.clone(), update_type.clone()]),
+            UpdateSliceOperation::new(vec![0, 2]).infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
             Err(TypeError {
                 message: "'update_slice' update axis 1 with start index 2 and size 2 does not fit in input size 3"
                     .to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(3)])),
-                update_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(3)])),
+                    update_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size <4"
                     .to_string(),
             }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
-                &[]
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
@@ -1604,7 +1683,8 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, UpdateSliceOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_update = builder.add_input(update_type);
-        let program_output = builder.add_instruction(operation, vec![program_input, program_update]).unwrap()[0];
+        let program_output =
+            builder.add_instruction(operation, vec![program_input, program_update], Vec::new()).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -1633,7 +1713,7 @@ mod tests {
         let index_type = ArrayType::scalar(DataType::I32);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone()], &[]),
             Ok(vec![output_type.clone()]),
         );
         assert_eq!(
@@ -1644,7 +1724,7 @@ mod tests {
         // Interpretation extracts the block at the in-band start indices.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[input.clone(), index(1.0), index(1.0)])
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input.clone(), index(1.0), index(1.0)])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![5.0, 6.0]);
@@ -1652,13 +1732,13 @@ mod tests {
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
         let clamped = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[input.clone(), index(5.0), index(-2.0)])
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input.clone(), index(5.0), index(-2.0)])
             .unwrap();
         assert_eq!(clamped[0].values, vec![4.0, 5.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError {
                 message: "'dynamic_slice' expects an input operand followed by its start index operands but got no \
                     inputs"
@@ -1666,65 +1746,70 @@ mod tests {
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), index_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), index_type.clone()], &[]),
             Err(TypeError {
                 message: "'dynamic_slice' expects one start index per input axis (2) but got 1".to_string()
             }),
         );
         assert_eq!(
-            DynamicSliceOperation::new(vec![1]).infer_output_types(&[
-                input_type.clone(),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            DynamicSliceOperation::new(vec![1])
+                .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
             Err(TypeError { message: "'dynamic_slice' sizes has length 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            DynamicSliceOperation::new(vec![1, 4]).infer_output_types(&[
-                input_type.clone(),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            DynamicSliceOperation::new(vec![1, 4])
+                .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
             Err(TypeError { message: "'dynamic_slice' size 4 is out of bounds for axis 1 with size 3".to_string() }),
         );
         // A dynamic input axis is accepted: StableHLO clamping keeps the read in bounds against the unknown extent
         // and the output dimension is still the static `sizes[axis]`. The static axis 1 still validates `2 <= 3`.
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Ok(vec![output_type.clone()]),
         );
         // A bounded-dynamic input axis is likewise accepted (the bound does not need to cover the static size; the
         // clamp keeps the read safe at run time).
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Ok(vec![output_type.clone()]),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()]),
+            operation
+                .infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()], &[]),
             Err(TypeError {
                 message: "'dynamic_slice' start index 0 must be a scalar integer but has type f64[]".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_slice' start index 0 must be a scalar integer but has type i32[2]".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), index_type.clone(), ArrayType::scalar(DataType::I64)]),
+            operation
+                .infer_output_types(&[input_type.clone(), index_type.clone(), ArrayType::scalar(DataType::I64)], &[]),
             Err(TypeError {
                 message: "'dynamic_slice' start indices must share one integer type but index 1 has type i64[] and \
                     index 0 has type i32[]"
@@ -1732,10 +1817,11 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
-                &[]
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
         );
@@ -1745,8 +1831,9 @@ mod tests {
         let program_input = builder.add_input(input_type);
         let program_index_0 = builder.add_input(index_type.clone());
         let program_index_1 = builder.add_input(index_type);
-        let program_output =
-            builder.add_instruction(operation, vec![program_input, program_index_0, program_index_1]).unwrap()[0];
+        let program_output = builder
+            .add_instruction(operation, vec![program_input, program_index_0, program_index_1], Vec::new())
+            .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(
                 vec![program_output],
@@ -1778,12 +1865,10 @@ mod tests {
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         let index_type = ArrayType::scalar(DataType::I32);
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                update_type.clone(),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[input_type.clone(), update_type.clone(), index_type.clone(), index_type.clone(),],
+                &[],
+            ),
             Ok(vec![input_type.clone()]),
         );
         assert_eq!(
@@ -1796,7 +1881,8 @@ mod tests {
         let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
         let output = operation
             .interpret(
-                &crate::EagerContext::<TestArray>::new(),
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[input.clone(), update.clone(), index(0.0), index(1.0)],
             )
             .unwrap();
@@ -1807,7 +1893,8 @@ mod tests {
         // `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`.
         let clamped = operation
             .interpret(
-                &crate::EagerContext::<TestArray>::new(),
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[input.clone(), update.clone(), index(5.0), index(-3.0)],
             )
             .unwrap();
@@ -1815,7 +1902,7 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone()]),
+            operation.infer_output_types(&[input_type.clone()], &[]),
             Err(TypeError {
                 message: "'dynamic_update_slice' expects an input operand and an update operand followed by start \
                     index operands but got 1 inputs"
@@ -1823,38 +1910,47 @@ mod tests {
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_update_slice' input data type f64 does not match update data type f32".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError { message: "'dynamic_update_slice' update has rank 1 but input has rank 2".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), update_type.clone(), index_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), update_type.clone(), index_type.clone()], &[]),
             Err(TypeError {
                 message: "'dynamic_update_slice' expects one start index per input axis (2) but got 1".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_update_slice' does not support dynamic update axis 0 with size *; update shapes \
                     must be static"
@@ -1862,23 +1958,29 @@ mod tests {
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)])),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    input_type.clone(),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_update_slice' update axis 1 has size 4 which exceeds input size 3".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
-                update_type.clone(),
-                index_type.clone(),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                    update_type.clone(),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis 0 with \
                     size *"
@@ -1886,21 +1988,20 @@ mod tests {
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                input_type.clone(),
-                update_type.clone(),
-                ArrayType::scalar(DataType::F64),
-                index_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[input_type.clone(), update_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone(),],
+                &[],
+            ),
             Err(TypeError {
                 message: "'dynamic_update_slice' start index 0 must be a scalar integer but has type f64[]".to_string(),
             }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
-                &[]
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
@@ -1912,7 +2013,11 @@ mod tests {
         let program_index_0 = builder.add_input(index_type.clone());
         let program_index_1 = builder.add_input(index_type);
         let program_output = builder
-            .add_instruction(operation, vec![program_input, program_update, program_index_0, program_index_1])
+            .add_instruction(
+                operation,
+                vec![program_input, program_update, program_index_0, program_index_1],
+                Vec::new(),
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(
@@ -2114,7 +2219,11 @@ mod tests {
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let output = builder
-            .add_instruction(DynamicSliceOperation::new(sizes.clone()), vec![operand_input, row_input, col_input])
+            .add_instruction(
+                DynamicSliceOperation::new(sizes.clone()),
+                vec![operand_input, row_input, col_input],
+                Vec::new(),
+            )
             .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray, TestArray), TestArray>(
@@ -2148,7 +2257,11 @@ mod tests {
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let output = builder
-            .add_instruction(DynamicUpdateSliceOperation, vec![input_input, update_input, row_input, col_input])
+            .add_instruction(
+                DynamicUpdateSliceOperation,
+                vec![input_input, update_input, row_input, col_input],
+                Vec::new(),
+            )
             .unwrap()[0];
         let program = builder
             .build::<(TestArray, TestArray, TestArray, TestArray), TestArray>(

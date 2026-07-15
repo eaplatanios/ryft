@@ -1,19 +1,19 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ReshapeOperation`].
-pub const RESHAPE_OPERATION_NAME: &'static str = "reshape";
+pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 
 /// [`Operation`] that reshapes its input array to a target [`Shape`]. The input shape is not part of the operation
 /// payload; it is recoverable from the staged input types wherever a rule needs it. Refer to the documentation of
@@ -50,7 +50,11 @@ impl Operation<ArrayType> for ReshapeOperation {
         RESHAPE_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match input_types[0].reshape(self.shape.clone()) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -65,8 +69,14 @@ impl Operation<ArrayType> for ReshapeOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Reshape, C> InterpretableOperation<V, C> for ReshapeOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Reshape>> InterpretableOperation<C> for ReshapeOperation {
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].reshape(self.shape.clone())?])
     }
@@ -277,8 +287,7 @@ where
         }
         let mut outputs = self.dispatch_domain().bind(
             ReshapeOperation::new(output_type.shape().clone()),
-            &[],
-            &[],
+            Vec::new(),
             &[self.clone()],
         )?;
         Ok(outputs.remove(0))
@@ -290,8 +299,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::tests::TestArray;
     use crate::types::{DataType, Typed};
@@ -311,7 +322,7 @@ mod tests {
         // Type inference validates the element count and returns the target shape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
         let output_type = ArrayType::new(DataType::F64, shape.clone());
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type)), Ok(vec![output_type.clone()]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
 
         // Type-level (abstract) reshaping validates the target shape and returns the output type without consuming
         // the borrowed input type.
@@ -319,24 +330,26 @@ mod tests {
 
         // Interpretation reinterprets the row-major payload under the target shape.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output =
-            operation.interpret(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[]),
+            operation.infer_output_types(&[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]))]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]))], &[]),
             Err(TypeError { message: "'reshape' changes the number of elements".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
                 &[]
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -345,7 +358,7 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured output shape.
         let mut builder = ProgramBuilder::<TestArray, ReshapeOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
+        let program_output = builder.add_instruction(operation, vec![program_input], Vec::new()).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
@@ -379,7 +392,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type)),
+            ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type), &[]),
             Err(TypeError { message: "'reshape' requires statically known output element counts".to_string() }),
         );
         assert_eq!(

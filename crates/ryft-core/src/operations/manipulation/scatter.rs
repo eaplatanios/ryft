@@ -1,16 +1,14 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::contexts::StagingContext;
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::TransposableOperation;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
@@ -25,7 +23,7 @@ use super::gather::{
 use super::slicing::is_integer;
 
 /// Canonical operation name for [`ScatterOperation`].
-pub const SCATTER_OPERATION_NAME: &'static str = "scatter";
+pub const SCATTER_OPERATION_NAME: &str = "scatter";
 
 /// Combiner applied when a [`scatter`](Scatter) writes an update into the operand. Mirrors JAX's family of scatter
 /// primitives (`scatter`, `scatter_add`, `scatter_mul`, `scatter_min`, `scatter_max`): each kind selects the binary
@@ -305,7 +303,11 @@ impl Operation<ArrayType> for ScatterOperation {
         SCATTER_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
         match input_types[0].scatter(&input_types[1], &input_types[2], self) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -642,8 +644,7 @@ where
     fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
             operation.clone(),
-            &[],
-            &[],
+            Vec::new(),
             &[self.clone(), indices.clone(), updates.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -651,8 +652,13 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayType> + Scatter, C> InterpretableOperation<V, C> for ScatterOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Scatter>> InterpretableOperation<C> for ScatterOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![inputs[0].scatter(&inputs[1], &inputs[2], self)?])
     }
@@ -730,13 +736,16 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearScatterAddOperat
         SCATTER_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        self.operation.infer_output_types(&[
-            input_types[0].clone(),
-            self.indices.r#type().into_owned(),
-            input_types[1].clone(),
-        ])
+        self.operation.infer_output_types(
+            &[input_types[0].clone(), self.indices.r#type().into_owned(), input_types[1].clone()],
+            &[],
+        )
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -745,12 +754,17 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearScatterAddOperat
     }
 }
 
-impl<V, F, C> InterpretableOperation<V, C> for LinearScatterAddOperation<F>
+impl<F, C> InterpretableOperation<C> for LinearScatterAddOperation<F>
 where
-    V: Value<Type = ArrayType> + Scatter,
-    F: CustomVjpResidual<V>,
+    C: Domain<Type = ArrayType, Value: Scatter>,
+    F: CustomVjpResidual<C::Value>,
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].scatter(&self.indices().residual_value()?, &inputs[1], self.operation())?])
     }
@@ -775,9 +789,10 @@ impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOper
 where
     O: Operation<ArrayType> + From<LinearGatherOperation<F>>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -832,6 +847,7 @@ where
             MaybeZero::Value(cotangent) => {
                 let update_cotangents = context.stage_operation(
                     LinearGatherOperation::new(gather_operation, self.indices().clone()),
+                    Vec::new(),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
@@ -873,7 +889,7 @@ mod tests {
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
         let updates = float_type(vec![2, 2]);
-        let output = operation.infer_output_types(&[operand.clone(), indices.clone(), updates.clone()]).unwrap();
+        let output = operation.infer_output_types(&[operand.clone(), indices.clone(), updates.clone()], &[]).unwrap();
         assert_eq!(output, vec![operand.clone()]);
 
         assert_eq!(
@@ -897,15 +913,19 @@ mod tests {
 
         // updates dtype must match operand dtype.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), indices_type(vec![2, 2])]).is_err());
+        assert!(
+            operation
+                .infer_output_types(&[operand.clone(), indices.clone(), indices_type(vec![2, 2])], &[])
+                .is_err()
+        );
 
         // updates rank must equal (indices rank - 1) + update window count.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])]).is_err());
+        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])], &[]).is_err());
 
         // A non-integer index operand is rejected.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand, float_type(vec![2, 1]), updates]).is_err());
+        assert!(operation.infer_output_types(&[operand, float_type(vec![2, 1]), updates], &[]).is_err());
     }
 
     #[test]
@@ -926,7 +946,7 @@ mod tests {
         let indices = indices_type(vec![2, 1]);
         let updates = float_type(vec![2, 2]);
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        let output = operation.infer_output_types(&[operand, indices.clone(), updates.clone()]).unwrap();
+        let output = operation.infer_output_types(&[operand, indices.clone(), updates.clone()], &[]).unwrap();
         assert_eq!(output[0].sharding(), Some(&sharding));
 
         // Sharding the targeted operand axis over an explicit mesh axis is ambiguous without an output sharding.
@@ -937,7 +957,7 @@ mod tests {
             )
             .unwrap();
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand, indices, updates]).is_err());
+        assert!(operation.infer_output_types(&[operand, indices, updates], &[]).is_err());
     }
 
     #[test]

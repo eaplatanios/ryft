@@ -1,12 +1,12 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::contexts::Domain;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
+use crate::regions::RegionInterface;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 use super::slicing::resized_output_sharding;
@@ -14,7 +14,7 @@ use super::slicing::resized_output_sharding;
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`PadOperation`].
-pub const PAD_OPERATION_NAME: &'static str = "pad";
+pub const PAD_OPERATION_NAME: &str = "pad";
 
 /// [`Operation`] that expands its first operand by adding edge and interior padding filled with its second (scalar)
 /// operand. Refer to the documentation of [`Pad`] for more information.
@@ -85,7 +85,11 @@ impl Operation<ArrayType> for PadOperation {
         PAD_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         match input_types[0].pad(
             &input_types[1],
@@ -108,8 +112,13 @@ impl Operation<ArrayType> for PadOperation {
     }
 }
 
-impl<V: Value<Type = ArrayType> + Pad, C> InterpretableOperation<V, C> for PadOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].pad(
             &inputs[1],
@@ -267,8 +276,7 @@ where
     ) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
-            &[],
-            &[],
+            Vec::new(),
             &[self.clone(), padding_value.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -281,8 +289,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{DataType, Typed};
 
@@ -306,7 +316,7 @@ mod tests {
         let padding_value_type = ArrayType::scalar(DataType::F64);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(8)]));
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), padding_value_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
             Ok(vec![output_type.clone()]),
         );
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
@@ -315,7 +325,7 @@ mod tests {
         // every other position with the padding value.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let output = operation
-            .interpret(&crate::EagerContext::<TestArray>::new(), &[input, TestArray::scalar(9.0)])
+            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input, TestArray::scalar(9.0)])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
@@ -342,30 +352,30 @@ mod tests {
             })),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone()]),
+            operation.infer_output_types(&[input_type.clone()], &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F32)]),
+            operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
             Err(TypeError {
                 message: "'pad' input data type f64 does not match padding value data type f32".to_string(),
             }),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), input_type.clone()]),
+            operation.infer_output_types(&[input_type.clone(), input_type.clone()], &[]),
             Err(TypeError { message: "'pad' padding value must be a scalar but has type f64[3]".to_string() }),
         );
         assert_eq!(
             PadOperation::new(vec![1, 0], vec![2, 0], vec![1, 0])
                 .unwrap()
-                .infer_output_types(&[input_type.clone(), padding_value_type.clone()]),
+                .infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
             Err(TypeError { message: "'pad' edge_padding_low has length 2 but input has rank 1".to_string() }),
         );
         assert_eq!(
-            operation.infer_output_types(&[
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
-                padding_value_type.clone(),
-            ]),
+            operation.infer_output_types(
+                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])), padding_value_type.clone(),],
+                &[],
+            ),
             Err(TypeError {
                 message: "'pad' does not support dynamic input axis 0 with size *; the padded extent cannot be \
                     computed from an unknown extent"
@@ -373,10 +383,11 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
-                &[]
+                &EagerContext::<TestArray>::new(),
+                &EmptyRegionDriver,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
@@ -385,7 +396,8 @@ mod tests {
         let mut builder = ProgramBuilder::<TestArray, PadOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
-        let program_output = builder.add_instruction(operation, vec![program_input, program_padding_value]).unwrap()[0];
+        let program_output =
+            builder.add_instruction(operation, vec![program_input, program_padding_value], Vec::new()).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
