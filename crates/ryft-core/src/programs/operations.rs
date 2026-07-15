@@ -108,7 +108,6 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as
 /// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
 /// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
@@ -230,45 +229,45 @@ pub trait Operation<T: Type>: Clone {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
-    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and attached-region
-    /// boundary [`RegionInterface`]s without executing it, validating the complete hypothetical instruction that the
-    /// arguments describe.
+    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and
+    /// attached-region [`RegionInterface`]s without executing it, validating the complete hypothetical
+    /// [`Instruction`](crate::Instruction) that the arguments describe.
     ///
-    /// Program construction never asks its caller to provide region interfaces. [`ProgramBuilder`](crate::ProgramBuilder) receives operand
-    /// atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s, derives the
-    /// interface slice from its own arena, and invokes this method internally. Calling this method directly with
-    /// synthetic interfaces performs a pure hypothetical inference and cannot mutate or create a [`Program`].
+    /// [`ProgramBuilder`](crate::ProgramBuilder)s never ask their callers to provide region interfaces. They receive
+    /// input/operand atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s,
+    /// derive the interface slice from their own [`Region`](crate::Region) arena, and invoke this function internally.
+    /// Calling this function directly with synthetic [`RegionInterface`] performs a pure hypothetical inference and
+    /// cannot mutate or create a [`Program`].
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: Operand [`Type`]s in instruction input order.
-    ///   - `region_interfaces`: Boundary interfaces derived from the instruction's attached regions, in the
-    ///     operation-defined [`region_names`](Self::region_names) region order. Region-free operations receive an empty
-    ///     slice and ignore it.
+    ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
+    ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
+    ///     [`Operation`]-defined [`region_names`](Self::region_names) region order. Region-free operations receive an
+    ///     empty slice and ignore it.
     fn infer_output_types(
         &self,
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError>;
 
-    /// Returns stable names for this [`Operation`]'s attached-region slots, in the operation-defined region order
-    /// (e.g., `["true", "false"]` for a condition). The declared slot count must match the number of regions attached
-    /// to every [`Instruction`](crate::Instruction) applying this operation; [`ProgramBuilder`](crate::ProgramBuilder)
-    /// validates this both when the instruction is added and when the final [`Program`] is built. The names also
-    /// label the region slots when rendering [`Program`]s. The default declares no region slots, which is correct for
-    /// every region-free operation.
+    /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
+    /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
+    /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
+    /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
+    /// [`Program`] is built. The names also label the region slots when rendering [`Program`]s. The default declares
+    /// no region slots, which is correct for region-free operations.
     #[inline]
     fn region_names(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// Returns the attached-region outputs that may produce the instruction result at `output_index`.
-    ///
-    /// An empty vector means that the instruction result is produced by the operation itself. A non-empty vector
-    /// forwards the result to every listed region output, in semantic order. Analyses recursively resolve those
-    /// outputs and may therefore recover no instruction producer when a path ends at a region input or constant.
-    /// Region-forwarding operations such as condition and scan override this method; the empty default is correct
-    /// for every operation whose results are not forwarded region outputs.
+    /// Returns information about which attached-[`Region`](crate::Region) `output_index`-th output can come from.
+    /// An empty vector means that the [`Instruction`](crate::Instruction) result is produced by the [`Operation`]
+    /// itself. A non-empty vector forwards the result to every listed region output, in semantic order. Analyses
+    /// recursively resolve those outputs and may therefore recover no instruction producer when a path ends at a
+    /// region input or constant. Region-forwarding operations such as the condition and scan operations override this
+    /// function. The empty default is correct for every operation whose results are not forwarded region outputs.
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
@@ -282,12 +281,25 @@ pub trait Operation<T: Type>: Clone {
         Effects::PURE
     }
 
-    /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation simply
-    /// renders [`Operation::name`]. Operations carrying semantic metadata should override this function and use
-    /// [`OperationFormatter`] for consistent bracketed and indented formatting. Attached regions are not rendered
-    /// here: the contextual program renderer prints each instruction's attached regions after its operation.
+    /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation
+    /// simply renders [`Operation::name`]. Operations carrying semantic metadata should override this function and
+    /// use [`OperationFormatter`] for consistent bracketed and indented formatting. Attached [`Region`](crate::Region)s
+    /// are not rendered here. The contextual [`Program`] renderer renders each instruction's attached regions after its
+    /// operation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `formatter`: [`Formatter`](std::fmt::Formatter) to which the rendered operation must be appended at its
+    ///     current position.
+    ///   - `indentation`: Indentation of the instruction line containing this operation. Implementations that render
+    ///     additional lines must use this value as the base indentation for those continuation lines, preferably by
+    ///     delegating their layout to [`OperationFormatter`]. They must not add indentation before the first rendered
+    ///     token because the caller has already rendered the instruction line's indentation and prefix.
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // The program renderer has already written the indentation and instruction prefix for this line. The
+        // `indentation` argument is available to overrides that render continuation lines, but this single-line
+        // default only needs to append the operation name.
         let _ = indentation;
         formatter.write_str(self.name())
     }
@@ -313,7 +325,6 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
         self.as_ref().region_names()
     }
 
-    // TODO(eaplatanios): Review this.
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.as_ref().output_region_provenance(output_index)
