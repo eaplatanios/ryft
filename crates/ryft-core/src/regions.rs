@@ -6,7 +6,7 @@
 //! Equal computations built independently remain distinct regions.
 //!
 //! [`RegionRef`] borrows a root together with its complete source arena. It supports inspection without cloning and
-//! can materialize the reachable region graph as an owned [`Program`] through [`RegionRef::into_program`]. Regions are
+//! can materialize the reachable region graph as an owned [`Program`] through [`RegionRef::to_program`]. Regions are
 //! sealed before attachment to an [`Instruction`]/[`Program`], and so borrowed views remain immutable and recursively
 //! derived metadata such as [`Effects`] cannot become stale.
 //!
@@ -156,7 +156,7 @@ impl<V: Typed, O> Region<V, O> {
 /// Borrowed view of a [`Region`]. [`RegionRef`] provides [`Program`]-like access to a rooted, nested computation
 /// without cloning the owning [`Program`]'s region arena. The intended usage is to store [`RegionId`]s in long-lived
 /// Intermediate Representation (IR) objects and recreate [`RegionRef`]s only while inspecting, replaying, importing,
-/// or lowering a source arena. Calling [`RegionRef::into_program`] crosses the explicit ownership boundary as it clones
+/// or lowering a source arena. Calling [`RegionRef::to_program`] crosses the explicit ownership boundary as it clones
 /// the selected region's complete reachable region closure into a detached [`Program`].
 #[derive(Debug)]
 pub struct RegionRef<'r, V: Typed, O> {
@@ -167,20 +167,9 @@ pub struct RegionRef<'r, V: Typed, O> {
     id: RegionId,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V: Typed, O> Copy for RegionRef<'_, V, O> {}
-
-impl<V: Typed, O> Clone for RegionRef<'_, V, O> {
-    #[inline]
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
 impl<'r, V: Typed, O> RegionRef<'r, V, O> {
-    /// Creates a borrowed reference to `id` within `regions`.
-    pub(crate) fn new(regions: &'r [Region<V, O>], id: RegionId) -> Result<Self, ProgramError> {
+    /// Creates a new [`RegionRef`].
+    pub fn new(regions: &'r [Region<V, O>], id: RegionId) -> Result<Self, ProgramError> {
         regions
             .get(id.index())
             .map(|_| Self { regions, id })
@@ -195,14 +184,8 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
 
     /// Returns the borrowed source arena that contains this [`RegionRef`]'s root and descendants.
     #[inline]
-    pub(crate) fn regions(self) -> &'r [Region<V, O>] {
+    pub fn regions(self) -> &'r [Region<V, O>] {
         self.regions
-    }
-
-    /// Returns a borrowed view of another [`Region`] in the same source arena.
-    #[inline]
-    pub fn region_ref(self, id: RegionId) -> Result<RegionRef<'r, V, O>, ProgramError> {
-        RegionRef::new(self.regions, id)
     }
 
     /// Returns the rooted [`Region`].
@@ -247,7 +230,8 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
         self.region().instructions()
     }
 
-    /// Returns a read-only operation-inference interface for the rooted [`Region`].
+    /// Returns the [`RegionInterface`] of the rooted [`Region`].
+    #[inline]
     pub fn interface(self) -> RegionInterface<V::Type>
     where
         O: Operation<V::Type>,
@@ -256,6 +240,7 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
     }
 
     /// Returns the recursively derived [`Effects`] of the rooted [`Region`].
+    #[inline]
     pub fn effects(self) -> Effects
     where
         O: Operation<V::Type>,
@@ -265,18 +250,13 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
 }
 
 impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
-    /// Materializes this borrowed region and its complete reachable region closure as a detached flat [`Program`].
-    ///
-    /// Descendant sharing is preserved within the detached result: if several instructions in the reachable closure
-    /// point at the same source [`RegionId`], the detached program contains one copied descendant and all copied
-    /// instructions point at that one destination region. The selected root becomes the detached program entry with
-    /// vector placeholder input/output structures matching its flat boundary. This operation takes time and space
-    /// proportional to the complete reachable region graph; consuming the reference does not move data from its arena.
-    /// 
-    /// That conversion has cost
-    // /// `O(reachable region graph)` despite the consuming `into_*` name. Consuming the reference only ends the borrow and
-    // /// cannot move data out of the borrowed arena.
-    pub fn into_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
+    /// Materializes this borrowed [`Region`] and its complete reachable region closure as a [`Program`]. Descendant
+    /// sharing is preserved within the resulting [`Program`], meaning that if several [`Instruction`]s in the reachable
+    /// closure point at the same source [`RegionId`], the resulting program contains one copied descendant and all
+    /// copied instructions point at that one destination region. The selected root becomes the resulting program entry
+    /// region with placeholder input/output structures matching its input/output boundary. This operation takes time
+    /// and space proportional to the size of the complete reachable region graph.
+    pub fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         let mut builder = ProgramBuilder::<V, O>::new();
         let mut remapping = HashMap::new();
         let mut region = self.region().clone();
@@ -295,6 +275,17 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
             .unwrap()
     }
 }
+
+impl<V: Typed, O> Copy for RegionRef<'_, V, O> {}
+
+impl<V: Typed, O> Clone for RegionRef<'_, V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Read-only boundary summary of a sealed [`Region`], as seen by [`Operation`] type inference. A [`RegionInterface`]
 /// preserves the exact [`Region::input_ids`] and [`Region::output_ids`] order and carries the region's recursively
@@ -528,7 +519,7 @@ impl<'r, V: Value, O: Operation<V::Type>> ReplayedRegionAttachments<'r, V, O> {
         mappings: &'r RegionReplayMappings<V, O>,
     ) -> Result<Self, ProgramError> {
         for root in roots {
-            source.region_ref(*root)?;
+            RegionRef::new(source.regions(), *root)?;
         }
         Ok(Self { source, roots, mappings })
     }
@@ -541,7 +532,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayedRegionAttac
         V: 'r,
         O: 'r,
     {
-        self.roots.iter().map(|root| self.source.region_ref(*root).unwrap())
+        self.roots.iter().map(|root| RegionRef::new(self.source.regions(), *root).unwrap())
     }
 }
 
@@ -591,7 +582,7 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
         roots
             .iter()
             .map(|root| {
-                let region = source.region_ref(*root)?;
+                let region = RegionRef::new(source.regions(), *root)?;
                 Ok(builder.import_region_with_remapping(region, remapping))
             })
             .collect()
@@ -861,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_ref_and_into_program() {
+    fn test_region_ref_and_to_program() {
         let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
         let mut region_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
         let region_input = region_builder.add_input(DataType::F64);
@@ -892,7 +883,7 @@ mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
         ));
 
-        let detached = entry.into_program();
+        let detached = entry.to_program();
         assert_eq!(detached.regions().len(), 2);
         assert_eq!(detached.instructions()[0].regions(), detached.instructions()[1].regions());
         assert_eq!(detached.input_types(), vec![DataType::F64]);
