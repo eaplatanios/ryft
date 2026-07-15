@@ -334,44 +334,41 @@ impl<T: Type> RegionInterface<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Provides structural access to the nested [`Region`]s of one operation application. A driver is
-/// application-scoped: during program replay it describes exactly one [`Instruction`], while a
-/// direct [`Context::bind`](crate::Context::bind) invocation supplies the equivalent scope without requiring an
-/// existing instruction.
-/// Transform-specific drivers extend this trait with the recursive work they can perform on those regions, while this
-/// shared capability keeps region lookup independent of batching, differentiation, partial evaluation, or
-/// transposition. Drivers must not combine regions from multiple operation applications.
+/// [`RegionDriver`]s provide structural access to the nested [`Region`]s of [`Operation`] applications.
+/// A driver is application-scoped: during program replay it describes exactly one [`Instruction`], while a direct
+/// [`Context::bind`](crate::Context::bind) invocation supplies the equivalent scope without requiring an existing
+/// instruction. Transform-specific drivers extend this trait with the recursive work they can perform on those regions,
+/// while this shared capability keeps region lookup independent of batching, differentiation, partial evaluation, or
+/// transposition. Drivers **must not** combine regions from multiple operation applications.
 pub trait RegionDriver<V: Value, O: Operation<V::Type>> {
-    /// Iterates over borrowed views of every region attached to the current operation application, in
-    /// operation-defined order. Constructing and advancing this iterator cannot fail because the driver represents an
-    /// already-validated application scope.
+    /// Returns an [`Iterator`] over borrowed views of every [`Region`] attached to the current operation application,
+    /// in operation-defined order. Constructing and advancing this iterator cannot fail because the [`RegionDriver`]
+    /// represents an already-validated application scope.
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r;
 
-    /// Returns the number of regions attached to the current operation application.
+    /// Returns the number of [`Region`]s attached to the current operation application.
+    #[inline]
     fn region_count(&self) -> usize {
         self.regions().count()
     }
 
-    /// Returns a borrowed view of the region at `index`, or an error when the current operation application has no
+    /// Returns a borrowed view of the [`Region`] at `index`, or an error when the current operation application has no
     /// region at that index.
+    #[inline]
     fn region(&self, index: usize) -> Result<RegionRef<'_, V, O>, ProgramError> {
-        self.regions().nth(index).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "region index {index} is out of range for the operation application",
-            ))
-        })
+        self.regions()
+            .nth(index)
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("region index {index} is out of range")))
     }
 }
 
-/// Zero-region driver scoped to one operation application outside a staged [`Instruction`].
-/// Normal program and context replay always provide their concrete application driver, including for applications
-/// with no attached regions. Direct region-free rule calls can pass this value; any attempted nested-region request
-/// returns an out-of-range [`ProgramError`].
+/// Zero-region [`RegionDriver`] scoped to one operation application outside a staged [`Instruction`]. Normal program
+/// and context replay always provide their concrete application driver, including for [`Operation`] applications with
+/// no attached [`Region`]s, which is what this driver is intended for. Any attempted nested-region request will result
+/// in a [`ProgramError`].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct EmptyRegionDriver;
 
@@ -385,6 +382,8 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
         std::iter::empty()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source of the owned or borrowed regions attached to one [`Context::bind`](crate::Context::bind) operation
 /// application. This trait refines [`RegionDriver`] so eager and transform contexts can inspect attached regions
