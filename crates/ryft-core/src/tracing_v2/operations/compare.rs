@@ -3,9 +3,9 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
     TranspositionDriver,
 };
-use crate::operations::Operation;
 use crate::operations::compare::CompareOperation;
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 

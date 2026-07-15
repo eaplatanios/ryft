@@ -4,10 +4,12 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
+use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType, TypeError};
 
 // TODO(eaplatanios): Review this module.

@@ -5,10 +5,10 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
-use crate::regions::RegionInterface;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -160,10 +160,11 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 

@@ -7,15 +7,16 @@ use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
+use ryft_core::operations::BooleanLike;
 use ryft_core::operations::constants::{Zero, ZeroOperation};
-use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
+use ryft_core::programs::operations::Operation;
+use ryft_core::programs::regions::{RegionInterface, RegionRef};
 use ryft_core::programs::{MaybeZero, Program, ProgramError, Value};
-use ryft_core::regions::{RegionInterface, RegionRef};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 

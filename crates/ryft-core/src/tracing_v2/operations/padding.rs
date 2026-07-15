@@ -3,13 +3,13 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, Pad, PadOperation, Reshape, Slice, SliceOperation, Transpose, UpdateSlice,
 };
 use crate::operations::math::SubOperation;
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 

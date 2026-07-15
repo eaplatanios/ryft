@@ -12,13 +12,13 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, GatherDimensionNumbers, GatherOperation, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation,
     ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 

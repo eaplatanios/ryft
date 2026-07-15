@@ -5,10 +5,10 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
@@ -160,7 +160,7 @@ mod tests {
         let cotangents = operation
             .transpose(
                 &mut context,
-                &crate::regions::EmptyRegionDriver,
+                &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(scalar_type.clone()), PartialValue::Unknown(scalar_type.clone())],
                 &[MaybeZero::Zero(scalar_type.clone())],
             )

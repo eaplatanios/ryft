@@ -5,6 +5,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::BooleanLike;
 use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{
@@ -15,10 +16,10 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
 use crate::operations::math::{Add, AddOperation};
-use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::payloads::{Captured, Input};
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1270,7 +1271,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::regions::RegionInterface;
+    use crate::programs::regions::RegionInterface;
     use std::borrow::Cow;
 
     use crate::macros::check_types;

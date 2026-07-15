@@ -2,9 +2,9 @@ use crate::batching::BatchAxis;
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
@@ -203,7 +203,7 @@ mod tests {
         let contribution = operation
             .transpose(
                 &mut context,
-                &crate::regions::EmptyRegionDriver,
+                &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type.clone())],
                 &[MaybeZero::Value(cotangent)],
             )
@@ -294,7 +294,7 @@ mod tests {
         let contributions = operation
             .transpose(
                 &mut context,
-                &crate::regions::EmptyRegionDriver,
+                &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Zero(output_type)],
             )

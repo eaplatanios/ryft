@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
+use ryft_core::operations::BooleanLike;
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
@@ -16,10 +17,10 @@ use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
     NegOperation, SinOperation, SqrtOperation, SubOperation,
 };
-use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
+use ryft_core::programs::operations::Operation;
+use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
-use ryft_core::regions::{RegionId, RegionRef};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 #[cfg(any(test, feature = "benchmarking"))]
 use ryft_core::tests::TestArray;

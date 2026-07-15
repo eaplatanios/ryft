@@ -27,10 +27,11 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 

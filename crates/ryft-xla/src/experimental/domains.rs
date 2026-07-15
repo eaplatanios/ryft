@@ -25,7 +25,6 @@ use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::operations::Operation;
 use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
 use ryft_core::operations::constants::{
     Constant, Fill, FillOperation, Iota, IotaOperation, ONE_OPERATION_NAME, One, OneOperation, ZERO_OPERATION_NAME,
@@ -35,7 +34,8 @@ use ryft_core::operations::control_flow::SelectOperation;
 use ryft_core::operations::math::{AddOperation, MulOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
-use ryft_core::regions::BindingRegionDriver;
+use ryft_core::programs::operations::Operation;
+use ryft_core::programs::regions::BindingRegionDriver;
 use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
@@ -2739,7 +2739,7 @@ mod tests {
     use ryft_core::operations::constants::{FillOperation, OneOperation};
     use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
     use ryft_core::operations::math::{AddOperation, MulOperation, NegOperation};
-    use ryft_core::regions::CalleeRegionDriver;
+    use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};

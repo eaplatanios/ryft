@@ -2,7 +2,7 @@
 //!
 //! This file is the self-contained compile model that preceded the production migration. It remains useful as a
 //! focused trait-solver and borrow-soundness test, but it is not the canonical region attachment API. Production region
-//! graph, driver, and owned-versus-borrowed replay contracts live in `ryft_core::regions` and are tested in their owning
+//! graph, driver, and owned-versus-borrowed replay contracts live in `ryft_core::programs::regions` and are tested in their owning
 //! modules.
 //!
 //!   1. An operation enum whose higher-order variant carries NO nested program (regions are instruction

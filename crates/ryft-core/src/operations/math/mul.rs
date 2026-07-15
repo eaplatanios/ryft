@@ -5,10 +5,12 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
-use crate::operations::{ElementwiseOperation, Operation};
+use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::sharding::Sharding;
 use crate::types::{ArrayType, DataType, TypeError};
 
@@ -196,8 +198,9 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{Layout, Shape, Size, StridedLayout};

@@ -27,10 +27,11 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
@@ -46,9 +47,7 @@ mod tests {
         assert_eq!(format!("{operation}"), OR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs])
-            .unwrap();
+        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 1.0, 1.0, 0.0]);
 
         // The `|` operator implementation matches the interpretation, including scalar broadcasting.
@@ -78,7 +77,7 @@ mod tests {
                 &operation,
                 &EagerContext::<TestArray>::new(),
                 &EmptyRegionDriver,
-                &[,
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );

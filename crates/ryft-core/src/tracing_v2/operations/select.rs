@@ -7,10 +7,10 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondition, SelectOperation};
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};

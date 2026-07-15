@@ -3,10 +3,12 @@ use std::fmt::Display;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, Operation};
+use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`OneLikeOperation`].
@@ -88,10 +90,11 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::types::{ArrayType, DataType, TypeError};
 
     use super::*;

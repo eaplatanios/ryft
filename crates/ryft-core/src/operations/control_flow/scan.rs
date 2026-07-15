@@ -5,14 +5,16 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
-use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
-use crate::programs::{ProgramBuilder, ProgramError, Value};
-use crate::regions::{OutputRegionProvenance, RegionInterface, RegionRef};
+use crate::programs::ProgramError;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef};
+use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.

@@ -3,10 +3,10 @@ use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Broadcast, Concatenate, ConcatenateOperation, SliceOperation, Transpose};
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 

@@ -7,10 +7,10 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};

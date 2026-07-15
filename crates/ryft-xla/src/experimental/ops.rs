@@ -14,6 +14,7 @@ use ryft_core::differentiation::{
     DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
 };
 use ryft_core::macros::check_count;
+use ryft_core::operations::BooleanLike;
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
@@ -35,13 +36,13 @@ use ryft_core::operations::math::{
     NegOperation, SinOperation, SqrtOperation, SubOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
+use ryft_core::programs::operations::Operation;
+use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface};
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-use ryft_core::regions::{CalleeRegionDriver, RegionInterface};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::backends::scalars::Scalar;

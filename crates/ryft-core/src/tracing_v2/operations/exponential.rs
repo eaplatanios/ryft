@@ -6,9 +6,9 @@ use crate::differentiation::{
     TranspositionDriver,
 };
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::math::{Exp, ExpOperation, Log, LogOperation, Sqrt, SqrtOperation};
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 

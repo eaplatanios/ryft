@@ -5,14 +5,18 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationTracer;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::{BooleanLike, Operation, OperationFormatter};
+use crate::operations::BooleanLike;
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::{AtomId, ProgramBuilder, ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 use crate::{CaptureReference, Tracer};
 

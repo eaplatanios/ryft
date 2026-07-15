@@ -12,13 +12,13 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::Operation;
 use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::Operation;
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 

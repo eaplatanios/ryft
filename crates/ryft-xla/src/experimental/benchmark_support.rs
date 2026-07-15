@@ -4,7 +4,7 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::benchmarking::{
-    record, summarize_program, BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary,
+    BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
 use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -13,7 +13,7 @@ use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
-use crate::experimental::shard_map::{shard_map, trace, ShardMapTracer, TracedXlaProgram};
+use crate::experimental::shard_map::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {

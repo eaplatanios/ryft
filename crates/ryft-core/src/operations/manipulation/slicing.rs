@@ -5,10 +5,12 @@ use crate::differentiation::{DifferentiationError, TransposableOperation, Transp
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
@@ -1415,8 +1417,9 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::regions::EmptyRegionDriver;
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::tests::TestArray;
     use crate::types::Typed;
 

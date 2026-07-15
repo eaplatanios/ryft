@@ -7,7 +7,6 @@ use crate::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::ScanOperation;
 use crate::operations::control_flow::scan::{ScanTypeSemantics, stacked_scan_type};
@@ -16,6 +15,7 @@ use crate::operations::manipulation::{
 };
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};

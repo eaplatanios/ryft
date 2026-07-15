@@ -5,12 +5,12 @@ use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{
     Constant, ConstantOperation, Fill, FillOperation, Iota, IotaOperation, One, OneLikeOperation, OneOperation, Zero,
     ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
+use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 

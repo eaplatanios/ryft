@@ -4,16 +4,20 @@ use std::marker::PhantomData;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::BooleanLike;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::payloads::{Captured, Input};
-use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
-use crate::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::ProgramError;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::programs::Program;
+use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::values::Value;
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`ConditionOperation`].

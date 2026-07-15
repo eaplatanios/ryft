@@ -7,10 +7,10 @@ use crate::differentiation::{DifferentiableOperation, DifferentiationError, Tran
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::manipulation::Transpose;
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1021,8 +1021,8 @@ mod tests {
     use crate::operations::constants::ZeroOperation;
     use pretty_assertions::assert_eq;
 
-    use crate::operations::Operation;
     use crate::operations::math::AddOperation;
+    use crate::programs::operations::Operation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 

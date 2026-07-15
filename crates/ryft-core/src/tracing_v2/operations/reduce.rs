@@ -12,10 +12,10 @@ use crate::operations::compare::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::FillOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::math::MulOperation;
-use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::regions::RegionInterface;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_output_sharding_requests_unreduced_output() {
-        use crate::operations::Operation;
+        use crate::programs::operations::Operation;
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let mesh = LogicalMesh::new(vec![
@@ -1084,7 +1084,7 @@ mod tests {
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
             .transpose(
                 &mut context,
-                &crate::regions::EmptyRegionDriver,
+                &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Value(output_cotangent)],
             )
