@@ -173,7 +173,7 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         if self.named_axis(name).is_none() {
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into());
         }
-        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), Vec::new(), &[], &[])?;
+        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

@@ -392,7 +392,7 @@ where
         let has_live_output = live_outputs.iter().any(|&live| live);
         let (operation, region_ids) = match instruction.operation() {
             XlaOperation::ShardMap(shard_map_op) if has_dead_output && has_live_output => {
-                let body_program = program.region_ref(instruction.regions()[0])?.into_program();
+                let body_program = program.region_ref(instruction.regions()[0])?.to_program();
                 let body = FlatTracedShardMap::from_parts(
                     shard_map_op.shard_map().clone(),
                     shard_map_op.global_input_types().to_vec(),
@@ -556,7 +556,7 @@ where
         }
         let context = input.context().clone();
         Ok(context
-            .stage_operation(make_operation(sharding), Vec::new(), &[], &[&input])?
+            .stage_operation(make_operation(sharding), Vec::new(), &[&input])?
             .into_iter()
             .next()
             .expect("a sharding-control operation produces one output per input leaf"))
@@ -3637,7 +3637,6 @@ mod tests {
                                 .stage_operation(
                                     XlaOperation::Condition(ConditionOperation::new()),
                                     vec![psum_branch, identity_branch],
-                                    &[],
                                     &[predicate, local_x],
                                 )
                                 .unwrap();

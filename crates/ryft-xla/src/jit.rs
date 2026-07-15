@@ -12,9 +12,9 @@
 use ryft_core::batching::BatchAxis;
 use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
-    call_function, jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
     CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram,
-    JittedFunction as CoreJittedFunction, Specialization, StagedFunction,
+    JittedFunction as CoreJittedFunction, Specialization, StagedFunction, call_function,
+    jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_core::contexts::Context;
 use ryft_core::differentiation::DifferentiationError;
@@ -25,15 +25,13 @@ use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::ArrayType;
-use ryft_core::Batch;
-use ryft_core::LinearizationTracer;
-use ryft_core::Typed;
+use ryft_core::{Batch, LinearizationTracer, Typed};
 use ryft_pjrt::Execution;
 
+use crate::Array;
 use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::profile_guided::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction};
-use crate::Array;
 
 /// Tracer leaf used while tracing an XLA compilation.
 pub type XlaCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
@@ -451,15 +449,15 @@ where
         'c: 'domain,
         In::Family: ParameterizedFamily<XlaCompileTracer<'c>> + ParameterizedFamily<XlaCompileLinearizationTracer<'c>>,
         In::To<XlaCompileTracer<'c>>: Parameterized<
-            XlaCompileTracer<'c>,
-            To<XlaCompileTracer<'c>> = In::To<XlaCompileTracer<'c>>,
-            To<ArrayType> = In,
-            To<XlaConstant> = In::To<XlaConstant>,
-        >,
+                XlaCompileTracer<'c>,
+                To<XlaCompileTracer<'c>> = In::To<XlaCompileTracer<'c>>,
+                To<ArrayType> = In,
+                To<XlaConstant> = In::To<XlaConstant>,
+            >,
         In::To<XlaCompileTracer<'c>>: Parameterized<
-            XlaCompileTracer<'c>,
-            To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
-        >,
+                XlaCompileTracer<'c>,
+                To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
+            >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -519,11 +517,11 @@ where
             Parameterized<XlaCompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
         Out::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = Out::To<XlaCompileTracer<'c>>>,
         Out::To<XlaCompileTracer<'c>>: Parameterized<
-            XlaCompileTracer<'c>,
-            Family = Out::Family,
-            ParameterStructure = Out::ParameterStructure,
-            To<ArrayType> = Out,
-        >,
+                XlaCompileTracer<'c>,
+                Family = Out::Family,
+                ParameterStructure = Out::ParameterStructure,
+                To<ArrayType> = Out,
+            >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -589,12 +587,12 @@ where
             Parameterized<XlaCompileTracer<'c>, Family = In::Family, ParameterStructure = In::ParameterStructure>,
         Out::Family: ParameterizedFamily<XlaCompileTracer<'c>, To = Out::To<XlaCompileTracer<'c>>>,
         Out::To<XlaCompileTracer<'c>>: Parameterized<
-            XlaCompileTracer<'c>,
-            Family = Out::Family,
-            ParameterStructure = Out::ParameterStructure,
-            To<ArrayType> = Out,
-            To<XlaConstant> = Out::To<XlaConstant>,
-        >,
+                XlaCompileTracer<'c>,
+                Family = Out::Family,
+                ParameterStructure = Out::ParameterStructure,
+                To<ArrayType> = Out,
+                To<XlaConstant> = Out::To<XlaConstant>,
+            >,
     {
         let function = self;
         let staged = function.function.staged();
@@ -888,19 +886,20 @@ where
 mod tests {
     use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::math::{Cos, Sin};
+    use ryft_core::regions::RegionAttachments;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
-    use ryft_pjrt::{load_cpu_plugin, ClientOptions, CpuClientOptions};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
     use crate::experimental::ops::XlaOperation;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
-        compile, compile_with_captures, compile_with_options, infer_output_types, jitted, stage, stage_with_captures,
         AdaptiveProfileGuidedOptions, Array, CompiledXlaFunction, ExecutableXlaProgram, FromPjrt, JittedXlaFunction,
-        StagedXlaFunction, XlaCompileTracer,
+        StagedXlaFunction, XlaCompileTracer, compile, compile_with_captures, compile_with_options, infer_output_types,
+        jitted, stage, stage_with_captures,
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -2030,8 +2029,7 @@ mod tests {
                 let mut primal_outputs = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
-                        Vec::new(),
-                        &[primal_half.clone()],
+                        [].with_callees(&[primal_half.clone()]),
                         &[primal_input],
                     )
                     .expect("primal jit_call should stage");
@@ -2043,8 +2041,7 @@ mod tests {
                 let tangent_output = context
                     .stage_operation(
                         XlaOperation::JitCall(JitCallOperation::new()),
-                        Vec::new(),
-                        &[tangent_half.clone()],
+                        [].with_callees(&[tangent_half.clone()]),
                         tangent_inputs.as_slice(),
                     )
                     .expect("tangent jit_call should stage")

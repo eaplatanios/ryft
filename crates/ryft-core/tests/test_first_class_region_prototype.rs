@@ -1,7 +1,9 @@
 //! Phase 0 compile prototype for the first-class-program-regions plan (`.tasks/plan_first_class_program_regions.md`).
 //!
-//! This file is a self-contained model of the FUTURE machinery shape. It exists to prove, before any production
-//! migration, that the post-migration design is solver-sound and borrow-sound:
+//! This file is the self-contained compile model that preceded the production migration. It remains useful as a
+//! focused trait-solver and borrow-soundness test, but it is not the canonical region attachment API. Production region
+//! graph, driver, and owned-versus-borrowed replay contracts live in `ryft_core::regions` and are tested in their owning
+//! modules.
 //!
 //!   1. An operation enum whose higher-order variant carries NO nested program (regions are instruction
 //!      attachments) compiles with ordinary direct per-variant bounds and no recursive-variant where-clause filtering
@@ -9,22 +11,21 @@
 //!      split linearization, and transposition, including the fresh-context driver stacks that diverge today
 //!      (`BatchingContext<TracingContext<..>>`, `DifferentiationContext<PartialEvaluationContext<TracingContext<..>>>`).
 //!   2. Region access is a separate, mandatory, call-scoped driver argument. Rules never see a recursive bound; the
-//!      driver constructs the nested-work callback where the family bound is already established. Interpretation's
-//!      context parameter `C` stays deliberately unbounded.
+//!      driver constructs the nested-work callback where the family bound is already established. Interpretation
+//!      derives its value and operation families from the context.
 //!   3. Immutable instruction/region views coexist with recursive driver work and with a `&mut` destination
 //!      context (transposition) without cloning programs.
-//!   4. The region-carrying `Context::bind` protocol covers freshly authored regional
-//!      operations in eager and staging contexts, delegating to `bind` when attachment-free.
+//!   4. Its simplified region-carrying bind model covers owned regional operations in eager and staging contexts.
 //!   5. Builder imports copy the complete reachable closure with sharing preserved, and callee imports intern by
 //!      live `Rc` identity.
 //!   6. Lazy residual-origin resolution (`OutputRegionProvenance`) recovers producers through region-attached
 //!      instructions with first-occurrence deduplication, empty origins for inputs/constants, and errors for
 //!      malformed rules.
 //!
-//! Semantics here are deliberately minimal (batching/JVP/transposition bodies are stubs); the *generic structure* —
-//! trait shapes, bounds, context stacks, borrow shapes — mirrors the production machinery, because that structure is
-//! what the Phase 0 gate is about. Stored constants (`Stored`) differ from runtime values and include a capture
-//! reference so constant-to-runtime substitution cannot be accidentally erased by the model.
+//! Semantics here are deliberately minimal (batching/JVP/transposition bodies are stubs). The model preserves the
+//! generic constraints it originally proved rather than duplicating every subsequent production API refinement.
+//! Stored constants (`Stored`) differ from runtime values and include a capture reference so constant-to-runtime
+//! substitution cannot be accidentally erased by the model.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ mod model {
 
     impl<C: Clone, O: Clone> RegionRef<'_, C, O> {
         /// Materializes this region and its reachable closure as a standalone program.
-        pub fn into_program(self) -> Program<C, O> {
+        pub fn to_program(self) -> Program<C, O> {
             let mut builder = ProgramBuilder::new();
             let entry = builder.add_region_closure(self.program, self.id, &mut HashMap::new());
             builder.build(entry)
@@ -359,7 +360,7 @@ mod model {
         type Value: Clone;
         type Operation: Operation;
 
-        /// Binds `operation` over `inputs`, together with any freshly authored nested computations (`regions` and
+        /// Binds `operation` over `inputs`, together with any owned nested computations (`regions` and
         /// `callees`, in the operation-defined order); most operations carry neither and pass `&[]` for both.
         fn bind(
             &self,
@@ -398,7 +399,7 @@ mod model {
             callees: &[Rc<Program<Stored, Op>>],
             inputs: &[f64],
         ) -> R<Vec<f64>> {
-            // Eager contexts interpret freshly authored nested computations through the detached access path. The
+            // Eager contexts interpret owned nested computations through the detached access path. The
             // same empty detached driver serves region-free applications, whose rules simply do not invoke it.
             let detached = DetachedInterpret { context: self, regions, callees };
             operation.interpret(self, &detached, inputs)
@@ -456,18 +457,18 @@ mod model {
     // Call-scoped region drivers (invariant 3): public contracts and model-private concrete implementations.
     // ------------------------------------------------------------------------------------------------------------
 
-    pub trait InterpretationDriver<V> {
-        fn interpret_region(&self, index: usize, inputs: Vec<V>) -> R<Vec<V>>;
+    pub trait InterpretationDriver<C: Context> {
+        fn interpret_region(&self, index: usize, inputs: Vec<C::Value>) -> R<Vec<C::Value>>;
     }
 
-    /// Detached access to freshly authored nested computations, used by [`EagerContext::bind`].
+    /// Detached access to owned nested computations, used by [`EagerContext::bind`].
     struct DetachedInterpret<'a> {
         context: &'a EagerContext,
         regions: &'a [Program<Stored, Op>],
         callees: &'a [Rc<Program<Stored, Op>>],
     }
 
-    impl InterpretationDriver<f64> for DetachedInterpret<'_> {
+    impl InterpretationDriver<EagerContext> for DetachedInterpret<'_> {
         fn interpret_region(&self, index: usize, inputs: Vec<f64>) -> R<Vec<f64>> {
             let program = if let Some(region) = self.regions.get(index) {
                 region
@@ -483,33 +484,39 @@ mod model {
 
     /// Replay access: resolves the active instruction's regions against the source arena and recurses through
     /// the driver. Constructed only by [`Program::interpret_in_context`], where the family bound already holds.
-    struct ReplayInterpret<'a, C, V, Ctx, O> {
+    struct ReplayInterpret<'a, C, Ctx: Context, O> {
         program: &'a Program<C, O>,
         instruction: &'a Instruction<O>,
         context: &'a Ctx,
-        lift: &'a dyn Fn(&C) -> R<V>,
+        lift: &'a dyn Fn(&C) -> R<Ctx::Value>,
     }
 
-    impl<C: Clone, V: Clone, Ctx, O> InterpretationDriver<V> for ReplayInterpret<'_, C, V, Ctx, O>
+    impl<C: Clone, Ctx: Context<Operation = O>, O: Operation> InterpretationDriver<Ctx> for ReplayInterpret<'_, C, Ctx, O>
     where
-        O: InterpretableOperation<V, Ctx>,
+        O: InterpretableOperation<Ctx>,
     {
-        fn interpret_region(&self, index: usize, inputs: Vec<V>) -> R<Vec<V>> {
+        fn interpret_region(&self, index: usize, inputs: Vec<Ctx::Value>) -> R<Vec<Ctx::Value>> {
             let region = self.instruction.regions[index];
             self.program.interpret_region_in_context(region, self.context, self.lift, inputs)
         }
     }
 
     // ------------------------------------------------------------------------------------------------------------
-    // Interpretation: single `interpret` method, deliberately unbounded `C`, and direct per-variant bounds.
+    // Interpretation: single `interpret` method, context-owned value and operation families, and direct per-variant
+    // bounds.
     // ------------------------------------------------------------------------------------------------------------
 
-    pub trait InterpretableOperation<V, C>: Operation {
-        fn interpret<D: InterpretationDriver<V>>(&self, context: &C, driver: &D, inputs: &[V]) -> R<Vec<V>>;
+    pub trait InterpretableOperation<C: Context>: Operation {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            context: &C,
+            driver: &D,
+            inputs: &[C::Value],
+        ) -> R<Vec<C::Value>>;
     }
 
-    impl<C> InterpretableOperation<f64, C> for Prim {
-        fn interpret<D: InterpretationDriver<f64>>(&self, _context: &C, _driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
+    impl<C: Context<Value = f64>> InterpretableOperation<C> for Prim {
+        fn interpret<D: InterpretationDriver<C>>(&self, _context: &C, _driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
             match self {
                 Prim::Add => Ok(vec![inputs[0] + inputs[1]]),
                 Prim::Mul => Ok(vec![inputs[0] * inputs[1]]),
@@ -517,8 +524,8 @@ mod model {
         }
     }
 
-    impl<C> InterpretableOperation<f64, C> for Cond {
-        fn interpret<D: InterpretationDriver<f64>>(&self, _context: &C, driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
+    impl<C: Context<Value = f64>> InterpretableOperation<C> for Cond {
+        fn interpret<D: InterpretationDriver<C>>(&self, _context: &C, driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
             // Predicate first, branch operands after; nonzero selects the `true` region.
             let index = if inputs[0] != 0.0 { 0 } else { 1 };
             driver.interpret_region(index, inputs[1..].to_vec())
@@ -526,12 +533,17 @@ mod model {
     }
 
     /// The enum dispatch uses direct, finite per-variant bounds because no variant payload mentions `Op`.
-    impl<V, C> InterpretableOperation<V, C> for Op
+    impl<C: Context> InterpretableOperation<C> for Op
     where
-        Prim: InterpretableOperation<V, C>,
-        Cond: InterpretableOperation<V, C>,
+        Prim: InterpretableOperation<C>,
+        Cond: InterpretableOperation<C>,
     {
-        fn interpret<D: InterpretationDriver<V>>(&self, context: &C, driver: &D, inputs: &[V]) -> R<Vec<V>> {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            context: &C,
+            driver: &D,
+            inputs: &[C::Value],
+        ) -> R<Vec<C::Value>> {
             match self {
                 Op::Prim(operation) => operation.interpret(context, driver, inputs),
                 Op::Cond(operation) => operation.interpret(context, driver, inputs),
@@ -540,30 +552,30 @@ mod model {
     }
 
     impl<C: Clone, O: Operation> Program<C, O> {
-        pub fn interpret_in_context<V: Clone, Ctx>(
+        pub fn interpret_in_context<Ctx: Context<Operation = O>>(
             &self,
             context: &Ctx,
-            lift: &dyn Fn(&C) -> R<V>,
-            inputs: Vec<V>,
-        ) -> R<Vec<V>>
+            lift: &dyn Fn(&C) -> R<Ctx::Value>,
+            inputs: Vec<Ctx::Value>,
+        ) -> R<Vec<Ctx::Value>>
         where
-            O: InterpretableOperation<V, Ctx>,
+            O: InterpretableOperation<Ctx>,
         {
             self.interpret_region_in_context(self.entry, context, lift, inputs)
         }
 
-        fn interpret_region_in_context<V: Clone, Ctx>(
+        fn interpret_region_in_context<Ctx: Context<Operation = O>>(
             &self,
             region: RegionId,
             context: &Ctx,
-            lift: &dyn Fn(&C) -> R<V>,
-            inputs: Vec<V>,
-        ) -> R<Vec<V>>
+            lift: &dyn Fn(&C) -> R<Ctx::Value>,
+            inputs: Vec<Ctx::Value>,
+        ) -> R<Vec<Ctx::Value>>
         where
-            O: InterpretableOperation<V, Ctx>,
+            O: InterpretableOperation<Ctx>,
         {
             let region_data = &self.regions[region.0];
-            let mut values: Vec<Option<V>> = vec![None; region_data.atoms.len()];
+            let mut values: Vec<Option<Ctx::Value>> = vec![None; region_data.atoms.len()];
             for (input, value) in region_data.inputs.iter().zip(inputs) {
                 values[*input] = Some(value);
             }
@@ -899,7 +911,7 @@ mod model {
         fn batch_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
             // Runtime recursion through the driver: the bound is re-established here by the concrete entry point,
             // never by the rule that asked.
-            region.into_program().batched()
+            region.to_program().batched()
         }
     }
 
@@ -1060,7 +1072,7 @@ mod model {
         }
 
         fn jvp_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
-            region.into_program().jvp()
+            region.to_program().jvp()
         }
     }
 
@@ -1077,7 +1089,7 @@ mod model {
         fn jvp_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
             // The linearize driver hands rules linearized regions through the same driver contract: which transform
             // runs is the driver's choice, invisible to the rule.
-            Ok(region.into_program().linearize()?.0)
+            Ok(region.to_program().linearize()?.0)
         }
     }
 
@@ -1274,7 +1286,7 @@ mod model {
         }
 
         fn transpose_program(&self, region: RegionRef<'_, Stored, Op>) -> R<Program<Stored, Op>> {
-            region.into_program().transposed()
+            region.to_program().transposed()
         }
     }
 
@@ -1448,7 +1460,7 @@ fn test_attachment_aware_hook_binds_fresh_regional_operations() {
     let false_program =
         single_region_program(|region, x| region.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new())[0]);
 
-    // Eager contexts interpret freshly authored nested computations through the detached access path.
+    // Eager contexts interpret owned nested computations through the detached access path.
     let context = EagerContext { captures: Rc::new(Vec::new()) };
     assert_eq!(
         context.bind(Op::Cond(Cond), &[], &[], &[1.0, 3.0]),

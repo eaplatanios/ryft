@@ -13,13 +13,13 @@ use ryft_core::operations::manipulation::{
     ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
-    SubOperation,
+    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
+    NegOperation, SinOperation, SqrtOperation, SubOperation,
 };
-use ryft_core::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
-use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, RegionId, RegionRef, Value};
+use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
+use ryft_core::regions::{RegionId, RegionRef};
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 #[cfg(any(test, feature = "benchmarking"))]
 use ryft_core::tests::TestArray;
@@ -3631,11 +3631,9 @@ fn supports_structural_dedup_region<V: MlirLowerableValue>(region: RegionRef<'_,
         region.atoms().iter().all(|atom| !atom.is_constant())
             && region.instructions().iter().all(|instruction| {
                 !matches!(instruction.operation(), XlaOperation::ShardMap(_))
-                    && instruction
-                        .regions()
-                        .iter()
-                        .copied()
-                        .all(|nested| region.region_ref(nested).is_ok_and(|nested| walk(nested, visited)))
+                    && instruction.regions().iter().copied().all(|nested| {
+                        RegionRef::new(region.regions(), nested).is_ok_and(|nested| walk(nested, visited))
+                    })
             })
     }
 
@@ -3656,7 +3654,7 @@ fn jit_call_program_key<V: MlirLowerableValue>(
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
 fn jit_call_region_key<V: MlirLowerableValue>(region: RegionRef<'_, V, XlaOperation<V>>) -> Option<JitCallProgramKey> {
     supports_structural_dedup_region(region).then(|| {
-        let program = region.into_program();
+        let program = region.to_program();
         JitCallProgramKey { rendered: program.to_string(), input_types: program.input_types() }
     })
 }
@@ -3788,7 +3786,7 @@ fn count_jit_calls<Input, Output>(
                         program
                             .region_ref(callee_region)
                             .expect("jit_call callee regions are validated at build time")
-                            .into_program(),
+                            .to_program(),
                     )
                 });
                 entry.0 += 1;
@@ -4046,9 +4044,8 @@ where
                 .regions()
                 .iter()
                 .map(|attached| {
-                    region
-                        .region_ref(*attached)?
-                        .into_program()
+                    RegionRef::new(region.regions(), *attached)?
+                        .to_program()
                         .map_operations(|operation| Ok(XlaOperation::from(operation.clone())))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -4205,7 +4202,7 @@ where
                 .map(|region| {
                     program
                         .region_ref(*region)?
-                        .into_program()
+                        .to_program()
                         .map_operations(|operation| Ok(XlaOperation::from(operation.clone())))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -5050,7 +5047,7 @@ where
     let regions = instruction
         .regions()
         .iter()
-        .map(|region| program.region_ref(*region).map(|region| region.into_program()))
+        .map(|region| program.region_ref(*region).map(|region| region.to_program()))
         .collect::<Result<Vec<_>, _>>()?;
     let outputs = dispatch_lower_shard_map_mlir(
         &instruction.operation(),
@@ -5921,9 +5918,8 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::TestArray;
-    use ryft_core::tracing_v2::ArrayOperation;
-    use ryft_core::tracing_v2::ReverseModeDifferentiate;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+    use ryft_core::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
     use ryft_core::types::{Shape, Size};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};

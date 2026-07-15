@@ -14,7 +14,8 @@ use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::{MaybeZero, Program, ProgramError, RegionInterface, RegionRef, Value};
+use ryft_core::programs::{MaybeZero, Program, ProgramError, Value};
+use ryft_core::regions::{RegionInterface, RegionRef};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
@@ -264,7 +265,7 @@ where
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(
                 XlaOperation::ShardMap(Box::new(self.clone())),
-                driver.regions().map(|region| region.into_program()).collect(),
+                driver.regions().map(|region| region.to_program()).collect(),
                 inputs,
             );
         }
@@ -280,7 +281,7 @@ where
         if partition.known_program().instructions().is_empty() {
             return context.fold_or_residualize(
                 XlaOperation::ShardMap(Box::new(self.clone())),
-                vec![body_program.into_program()],
+                vec![body_program.to_program()],
                 inputs,
             );
         }
@@ -571,7 +572,7 @@ where
         // Bind the primal `shard_map`, recovering the primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_operation = XlaOperation::ShardMap(Box::new(primal_operation));
-        let mut primal_outputs = context.bind(primal_operation, vec![primal_body_program], &[], &primal_operands)?;
+        let mut primal_outputs = context.bind(primal_operation, vec![primal_body_program], &primal_operands)?;
         if primal_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "shard_map primal body produced {} outputs which is fewer than its {output_count} primal \
@@ -602,7 +603,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_operation = XlaOperation::ShardMap(Box::new(tangent_operation));
-        let tangent_outputs = context.bind(tangent_operation, vec![tangent_body_program], &[], &tangent_operands)?;
+        let tangent_outputs = context.bind(tangent_operation, vec![tangent_body_program], &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -689,7 +690,7 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
     let input_cotangents =
-        context.stage_operation(transposed_operation, vec![transposed_body_program], &[], operands.as_slice())?;
+        context.stage_operation(transposed_operation, vec![transposed_body_program], operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -846,7 +847,7 @@ where
 {
     let (operation, body_program) = ShardMapOperation::from_body(traced);
     let staged_outputs =
-        context.bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], &[], traced_inputs.as_slice())?;
+        context.bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], traced_inputs.as_slice())?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 
@@ -1110,7 +1111,7 @@ mod tests {
 
         let (operation, body_program) = ShardMapOperation::from_body(body);
         let outputs = context
-            .bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], &[], std::slice::from_ref(&input))
+            .bind(XlaOperation::ShardMap(Box::new(operation)), vec![body_program], std::slice::from_ref(&input))
             .expect("traced shard_map staging should compose onto the input tracer's trace");
 
         assert_eq!(outputs.len(), 1);
@@ -1173,7 +1174,7 @@ mod tests {
             let XlaOperation::ShardMap(known_side) = known_instruction.operation() else {
                 panic!("expected the outer program to contain the known-side shard_map");
             };
-            let known_body = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().into_program();
+            let known_body = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().to_program();
             assert_eq!(known_body.input_ids().len(), 1);
             assert_eq!(known_body.output_ids().len(), 2);
             assert_eq!(known_body.instructions().len(), 1);
@@ -1189,7 +1190,7 @@ mod tests {
         let XlaOperation::ShardMap(residual_side) = residual_instruction.operation() else {
             panic!("expected the residual program to contain the residual shard_map");
         };
-        let residual_body = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().into_program();
+        let residual_body = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert_eq!(residual_body.input_ids().len(), 2);
         assert_eq!(residual_body.instructions().len(), 2);
         assert_eq!(residual_side.global_input_types().len(), 2);

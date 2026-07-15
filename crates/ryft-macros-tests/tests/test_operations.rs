@@ -14,7 +14,7 @@ use std::marker::PhantomData;
 use self::partial::PartialValue;
 
 /// Stand-in for `ryft_core::Type`.
-trait Type {}
+trait Type: Clone {}
 
 /// Stand-in for `ryft_core::DifferentiableType`.
 trait DifferentiableType: Type {}
@@ -26,6 +26,40 @@ struct TypeError;
 /// Stand-in for `ryft_core::ProgramError`.
 #[derive(Debug, PartialEq, Eq)]
 struct ProgramError;
+
+/// Stand-in for `ryft_core::RegionInterface`.
+struct RegionInterface<T: Type> {
+    marker: PhantomData<T>,
+}
+
+/// Stand-in for `ryft_core::OutputRegionProvenance`.
+struct OutputRegionProvenance {
+    region_index: usize,
+    output_index: usize,
+}
+
+/// Stand-in for `ryft_core::RegionDriver`.
+trait RegionDriver<V: Value, O: Operation<V::Type>> {}
+
+/// Stand-in for `ryft_core::InterpretationDriver`.
+trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {}
+
+/// Stand-in for `ryft_core::DifferentiationDriver`.
+trait DifferentiationDriver<C: Context> {}
+
+/// Stand-in for `ryft_core::TranspositionDriver`.
+trait TranspositionDriver<V: Value, O: Operation<V::Type>> {}
+
+/// Empty region transform driver used when testing operation rules that do not access nested regions.
+struct EmptyRegionDriver;
+
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {}
+
+impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {}
+
+impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {}
+
+impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {}
 
 /// Stand-in for `ryft_core::DifferentiationError`, the error type the differentiation dispatchers return.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,7 +97,11 @@ impl<T: Type> Operation<T> for NoOperation {
         "no_operation"
     }
 
-    fn infer_output_types(&self, _input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        _input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(Vec::new())
     }
 }
@@ -148,10 +186,23 @@ enum Effects {
 }
 
 /// Stand-in for `ryft_core::Operation`.
-trait Operation<T: Type> {
+trait Operation<T: Type>: Clone {
     fn name(&self) -> &'static str;
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError>;
+
+    fn region_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        let _ = output_index;
+        Vec::new()
+    }
 
     fn effects(&self) -> Effects {
         Effects::Pure
@@ -164,12 +215,17 @@ trait Operation<T: Type> {
 }
 
 /// Stand-in for `ryft_core::InterpretableOperation`.
-trait InterpretableOperation<V: Value, C>: Operation<V::Type> {
-    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
+trait InterpretableOperation<C: Domain>: Operation<C::Type> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError>;
 }
 
 /// Stand-in for `ryft_core::TracingContext`. Mirrors the real context's defaulted capture parameter and its
-/// `StagingContext` membership at the capture-pinned form, which the generated program-batching witness names.
+/// `StagingContext` membership at the capture-pinned form used by generated transform dispatch.
 struct TracingContext<V: Value, O: Operation<V::Type>, Capture = V> {
     marker: PhantomData<(V, O, Capture)>,
 }
@@ -237,9 +293,10 @@ impl<V> Eq for MaybeZero<V> {}
 
 /// Stand-in for `ryft_core::TransposableOperation`.
 trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
@@ -254,7 +311,13 @@ struct Program<V: Value, O: Operation<V::Type>, Input, Output> {
     marker: PhantomData<(V, O, Input, Output)>,
 }
 
-/// Stand-in for `ryft_core::Instruction`.
+/// Stand-in for `ryft_core::RegionId`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RegionId(usize);
+
+/// Stand-in for `ryft_core::Instruction`. The stand-in [`Program`] never attaches regions to its single
+/// instruction, so [`regions`](Self::regions) always returns an empty slice and interpretation takes its region-free
+/// replay path.
 struct Instruction<'operation, O> {
     operation: &'operation O,
 }
@@ -262,6 +325,10 @@ struct Instruction<'operation, O> {
 impl<O> Instruction<'_, O> {
     fn operation(&self) -> &O {
         self.operation
+    }
+
+    fn regions(&self) -> &[RegionId] {
+        &[]
     }
 }
 
@@ -307,26 +374,6 @@ where
     }
 }
 
-/// Stand-in for `ryft_core::InterpretableProgramOperation`.
-trait InterpretableProgramOperation<V: Value, C, Constant: Value<Type = V::Type> = V>: Operation<V::Type> + Sized {
-    fn interpret_program(
-        context: &C,
-        program: &Program<Constant, Self, Vec<Constant>, Vec<Constant>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>;
-}
-
-/// Stand-in for `ryft_core::TransposableProgramOperation`.
-trait TransposableProgramOperation<V: Value>: Operation<V::Type> + Sized
-where
-    V::Type: DifferentiableType,
-{
-    fn transpose_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-        input_linearity: &[bool],
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
-}
-
 /// Stand-in for `ryft_core::StagingContext`. Mirrors the real trait's `Meta` associated type, which the generated
 /// batching dispatchers project when naming the staged flowing tracer type.
 trait StagingContext: Context {
@@ -353,9 +400,10 @@ impl<V> std::fmt::Debug for DifferentiationDual<V> {
 
 /// Stand-in for `ryft_core::DifferentiableOperation`.
 trait DifferentiableOperation<C: Context>: Operation<C::Type> {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 }
@@ -366,31 +414,15 @@ struct Linearization<V: Value, O> {
     marker: PhantomData<(V, O)>,
 }
 
-/// Stand-in for `ryft_core::DifferentiableProgramOperation`, mirroring the fused-jvp fixed-body method the generated
-/// witness implements.
-trait DifferentiableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
-    fn jvp_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
-}
-
-/// Stand-in for `ryft_core::LinearizableProgramOperation`, mirroring the split-linearization fixed-body method the
-/// generated witness implements.
-trait LinearizableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
-    fn linearize_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Linearization<V, Self>, DifferentiationError>;
-}
-
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
     V: Value<Type = T> + SpecialTransposableValue,
-    O: Clone + Operation<T> + From<ZeroOperation<T>>,
+    O: Operation<T> + From<ZeroOperation<T>>,
 {
     /// Stand-in for `ryft_core::Program::linearize`. The `SpecialTransposableValue` bound on the value type stands
-    /// in for the extra value leaves the real linearization needs, verifying that the generated witness transports
-    /// the `#[ryft(bounds(differentiation(...)))]` list to this body check.
+    /// in for the extra value leaves the real linearization needs, verifying that generated differentiation dispatch
+    /// transports the `#[ryft(bounds(differentiation(...)))]` list.
     fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         Ok(Linearization { label: "program_linearize", marker: PhantomData })
     }
@@ -404,7 +436,7 @@ where
 /// Stand-in for the `ryft_core::partial` module, mirroring the shapes the `Operation` derive emits against for the
 /// generated `PartiallyEvaluatableOperation` implementation.
 mod partial {
-    use super::{Context, PhantomData, ProgramError, Value};
+    use super::{Context, Operation, PhantomData, Program, ProgramError, Value};
 
     /// Stand-in for `ryft_core::partial::PartialValue`.
     pub(crate) enum PartialValue<V: Value> {
@@ -426,34 +458,53 @@ mod partial {
         pub(crate) fn new(context: C) -> Self {
             Self { context }
         }
+    }
 
-        fn context(&self) -> &C {
-            &self.context
+    /// Stand-in for `ryft_core::RegionRef`.
+    pub(crate) struct RegionRef<V: Value, O: Operation<V::Type>> {
+        marker: PhantomData<(V, O)>,
+    }
+
+    impl<V: Value, O: Operation<V::Type>> RegionRef<V, O> {
+        pub(crate) fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
+            Program { label: "region", constant: None, operation: None, marker: PhantomData }
         }
+    }
 
+    impl<C: Context> PartialEvaluationContext<C> {
         pub(crate) fn fold_or_residualize<P: Into<C::Operation>>(
             &self,
             operation: P,
+            regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
             inputs: &[PartialEvaluationValue<C::Value>],
         ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-            let _ = (operation.into(), inputs);
+            let _ = (operation.into(), regions, inputs);
             Ok(Vec::new())
         }
     }
 
+    /// Stand-in for `ryft_core::partial::PartialEvaluationDriver`.
+    pub(crate) trait PartialEvaluationDriver<C: Context> {
+        fn regions(&self) -> Result<Vec<RegionRef<C::Constant, C::Operation>>, ProgramError>;
+    }
+
     /// Stand-in for `ryft_core::partial::PartiallyEvaluatableOperation`.
     pub(crate) trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
-        fn partially_evaluate(
+        fn partially_evaluate<D: PartialEvaluationDriver<C>>(
             &self,
             context: &PartialEvaluationContext<C>,
+            _driver: &D,
             inputs: &[PartialEvaluationValue<C::Value>],
-        ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
-        where
-            Self: Clone + Into<C::Operation>,
-        {
-            let _ = (context.context(), inputs);
+        ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+            let _ = (&context.context, inputs);
             Ok(Vec::new())
         }
+    }
+}
+
+impl<C: Context> partial::PartialEvaluationDriver<C> for EmptyRegionDriver {
+    fn regions(&self) -> Result<Vec<partial::RegionRef<C::Constant, C::Operation>>, ProgramError> {
+        Ok(Vec::new())
     }
 }
 
@@ -489,6 +540,21 @@ struct ScalarFactor(i64);
 
 impl Value for ScalarFactor {
     type Type = DataType;
+}
+
+/// Alternate scalar flowing value used to verify that a derived operation enum's stored constant type need not be
+/// the interpretation context's value type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InterpretedScalarFactor(i64);
+
+impl Value for InterpretedScalarFactor {
+    type Type = DataType;
+}
+
+impl From<ScalarFactor> for InterpretedScalarFactor {
+    fn from(value: ScalarFactor) -> Self {
+        Self(value.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -529,31 +595,41 @@ struct ZeroOperation<T: Type> {
     r#type: T,
 }
 
-impl<T: Clone + Type> Operation<T> for ZeroOperation<T> {
+impl<T: Type> Operation<T> for ZeroOperation<T> {
     fn name(&self) -> &'static str {
         "zero"
     }
 
-    fn infer_output_types(&self, _input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        _input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(vec![self.r#type.clone()])
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, C> InterpretableOperation<V, C> for ZeroOperation<T> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for ZeroOperation<T> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C> for ZeroOperation<T> where
+impl<T: Type, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C> for ZeroOperation<T> where
     C::Operation: From<ZeroOperation<T>>
 {
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
-    fn transpose(
+impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -569,13 +645,22 @@ impl Operation<DataType> for AddOperation {
         "add"
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = DataType>, C> InterpretableOperation<V, C> for AddOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = DataType>> InterpretableOperation<C> for AddOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -586,9 +671,10 @@ impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for 
 }
 
 impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V, O> for AddOperation {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -606,7 +692,11 @@ impl Operation<DataType> for PrintOperation {
         "print"
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         Ok(input_types.to_vec())
     }
 
@@ -615,8 +705,13 @@ impl Operation<DataType> for PrintOperation {
     }
 }
 
-impl<V: Value<Type = DataType>, C> InterpretableOperation<V, C> for PrintOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = DataType>> InterpretableOperation<C> for PrintOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -632,33 +727,41 @@ struct FactorOperation<T: Type, V> {
     marker: PhantomData<T>,
 }
 
-impl<T: Clone + Type, V> Operation<T> for FactorOperation<T, V> {
+impl<T: Type, V: Clone> Operation<T> for FactorOperation<T, V> {
     fn name(&self) -> &'static str {
         "factor"
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, F, C> InterpretableOperation<V, C> for FactorOperation<T, F> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, F: Clone, C: Domain<Type = T>> InterpretableOperation<C> for FactorOperation<T, F> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, F: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
-    for FactorOperation<T, F>
-where
-    C::Operation: From<FactorOperation<T, F>>,
+impl<T: Type, F: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C> for FactorOperation<T, F> where
+    C::Operation: From<FactorOperation<T, F>>
 {
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, F> TransposableOperation<V, O> for FactorOperation<T, F> {
-    fn transpose(
+impl<T: Type, V: Value<Type = T>, O: Operation<T>, F: Clone> TransposableOperation<V, O> for FactorOperation<T, F> {
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -672,33 +775,43 @@ struct ConstantOperation<T: Type, V> {
     marker: PhantomData<T>,
 }
 
-impl<T: Clone + Type, V> Operation<T> for ConstantOperation<T, V> {
+impl<T: Type, V: Clone> Operation<T> for ConstantOperation<T, V> {
     fn name(&self) -> &'static str {
         "constant"
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, Constant, C> InterpretableOperation<V, C> for ConstantOperation<T, Constant> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, Constant: Clone, C: Domain<Type = T>> InterpretableOperation<C> for ConstantOperation<T, Constant> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, Constant: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
+impl<T: Type, Constant: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
     for ConstantOperation<T, Constant>
 where
     C::Operation: From<ConstantOperation<T, Constant>>,
 {
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, F> TransposableOperation<V, O> for ConstantOperation<T, F> {
-    fn transpose(
+impl<T: Type, V: Value<Type = T>, O: Operation<T>, F: Clone> TransposableOperation<V, O> for ConstantOperation<T, F> {
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -712,25 +825,32 @@ struct CustomJvpOperation<T: Type, V> {
     marker: PhantomData<(T, V)>,
 }
 
-impl<T: Clone + Type, V> Operation<T> for CustomJvpOperation<T, V> {
+impl<T: Type, V: Clone> Operation<T> for CustomJvpOperation<T, V> {
     fn name(&self) -> &'static str {
         "custom_jvp"
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, Constant, C> InterpretableOperation<V, C>
-    for CustomJvpOperation<T, Constant>
-{
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, Constant: Clone, C: Domain<Type = T>> InterpretableOperation<C> for CustomJvpOperation<T, Constant> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, Constant: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
+impl<T: Type, Constant: Clone, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
     for CustomJvpOperation<T, Constant>
 where
     C::Operation: From<CustomJvpOperation<T, Constant>>,
@@ -769,7 +889,7 @@ fn test_scalar_operation() {
     assert_eq!(factor.name(), "factor");
     assert_eq!(custom_jvp.name(), "custom_jvp");
 
-    assert_eq!(add.infer_output_types(&[DataType]), Ok(vec![DataType]));
+    assert_eq!(add.infer_output_types(&[DataType], &[]), Ok(vec![DataType]));
     assert_eq!(zero.to_string(), "zero");
     assert_eq!(custom_jvp.to_string(), "custom_jvp");
 
@@ -824,13 +944,22 @@ impl Operation<ArrayType> for DotOperation {
         "dot"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for DotOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for DotOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -848,13 +977,22 @@ impl Operation<ArrayType> for BackendPayload {
         match *self {}
     }
 
-    fn infer_output_types(&self, _input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        _input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         match *self {}
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for BackendPayload {
-    fn interpret(&self, _context: &C, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for BackendPayload {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         match *self {}
     }
 }
@@ -865,9 +1003,10 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 }
 
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for BackendPayload {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -883,13 +1022,22 @@ impl Operation<ArrayType> for SpecialOperation {
         "special"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for SpecialOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for SpecialOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -904,9 +1052,10 @@ where
     V: Value<Type = ArrayType> + SpecialTransposableValue,
     O: Operation<ArrayType>,
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -948,7 +1097,7 @@ fn test_array_operation_type_inference() {
     assert_eq!(zero.name(), "zero");
     assert_eq!(constant.name(), "constant");
     assert_eq!(factor.name(), "factor");
-    assert_eq!(zero.infer_output_types(&[]), Ok(vec![ArrayType]));
+    assert_eq!(zero.infer_output_types(&[], &[]), Ok(vec![ArrayType]));
     assert_eq!(
         <&FactorOperation<ArrayType, Factor>>::try_from(&factor),
         Ok(&FactorOperation { factor: Factor(17), marker: PhantomData }),
@@ -969,35 +1118,45 @@ struct WhileOperation<T: Type, V, O> {
     marker: PhantomData<(T, V, O)>,
 }
 
-impl<T: Clone + Type, V, O> Operation<T> for WhileOperation<T, V, O> {
+impl<T: Type, V: Clone, O: Clone> Operation<T> for WhileOperation<T, V, O> {
     fn name(&self) -> &'static str {
         "while"
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, W, O, C> InterpretableOperation<V, C> for WhileOperation<T, W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<T: Type, W: Clone, O: Clone, C: Domain<Type = T>> InterpretableOperation<C> for WhileOperation<T, W, O> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, W: Clone, O: Clone + Operation<T>, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
+impl<T: Type, W: Clone, O: Operation<T>, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C>
     for WhileOperation<T, W, O>
 where
     C::Operation: From<WhileOperation<T, W, O>>,
 {
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, W, P> TransposableOperation<V, O>
+impl<T: Type, V: Value<Type = T>, O: Operation<T>, W: Clone, P: Clone> TransposableOperation<V, O>
     for WhileOperation<T, W, P>
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1015,19 +1174,28 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
         self.operation.name()
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        self.operation.infer_output_types(input_types)
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        self.operation.infer_output_types(input_types, region_interfaces)
     }
 }
 
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>, C> InterpretableOperation<V, C> for RecomputeOperation<O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<O: Operation<ArrayType>, C: Domain<Type = ArrayType>> InterpretableOperation<C> for RecomputeOperation<O> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<RecomputedOperation: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>>
-    partial::PartiallyEvaluatableOperation<C> for RecomputeOperation<RecomputedOperation>
+impl<RecomputedOperation: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+    for RecomputeOperation<RecomputedOperation>
 where
     C::Operation: From<RecomputeOperation<RecomputedOperation>>,
 {
@@ -1036,9 +1204,10 @@ where
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>, P: Operation<ArrayType>> TransposableOperation<V, O>
     for RecomputeOperation<P>
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1051,37 +1220,47 @@ struct CustomVjpCallOperation<T: Type, C, O, F> {
     marker: PhantomData<(T, C, O, F)>,
 }
 
-impl<T: Clone + Type, C, O, F> Operation<T> for CustomVjpCallOperation<T, C, O, F> {
+impl<T: Type, C: Clone, O: Clone, F: Clone> Operation<T> for CustomVjpCallOperation<T, C, O, F> {
     fn name(&self) -> &'static str {
         "custom_vjp_call"
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, Constant, O, F, C> InterpretableOperation<V, C>
+impl<T: Type, Constant: Clone, O: Clone, F: Clone, C: Domain<Type = T>> InterpretableOperation<C>
     for CustomVjpCallOperation<T, Constant, O, F>
 {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<T: Clone + Type, Constant: Clone, CallOperation: Clone, F: Clone, C: Context<Type = T>>
+impl<T: Type, Constant: Clone, CallOperation: Clone, F: Clone, C: Context<Type = T>>
     partial::PartiallyEvaluatableOperation<C> for CustomVjpCallOperation<T, Constant, CallOperation, F>
 where
     C::Operation: From<CustomVjpCallOperation<T, Constant, CallOperation, F>>,
 {
 }
 
-impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, C, P, F> TransposableOperation<V, O>
+impl<T: Type, V: Value<Type = T>, O: Operation<T>, C: Clone, P: Clone, F: Clone> TransposableOperation<V, O>
     for CustomVjpCallOperation<T, C, P, F>
 {
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1115,7 +1294,7 @@ fn test_array_operation_generic_payload_conversion_skip() {
     assert_eq!(zero.name(), "zero");
     assert_eq!(dot.name(), "dot");
     assert_eq!(factor.name(), "factor");
-    assert_eq!(dot.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
+    assert_eq!(dot.infer_output_types(&[ArrayType], &[]), Ok(vec![ArrayType]));
     assert_eq!(dot.to_string(), "dot");
 
     assert_eq!(<&DotOperation>::try_from(&dot), Ok(&DotOperation));
@@ -1147,8 +1326,8 @@ fn test_linear_array_operation_shape() {
     assert_eq!(recompute.name(), "dot");
     assert_eq!(while_operation.name(), "while");
     assert_eq!(custom_vjp_call.name(), "custom_vjp_call");
-    assert_eq!(while_operation.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
-    assert_eq!(recompute.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
+    assert_eq!(while_operation.infer_output_types(&[ArrayType], &[]), Ok(vec![ArrayType]));
+    assert_eq!(recompute.infer_output_types(&[ArrayType], &[]), Ok(vec![ArrayType]));
 
     assert_eq!(recompute, Linear::Recompute(RecomputeOperation { operation: ArrayOperation::from(DotOperation) }));
     assert_eq!(
@@ -1172,61 +1351,34 @@ fn test_linear_array_operation_shape() {
 }
 
 #[test]
+fn test_transposable_operation_dispatches_to_payloads() {
+    type Operation = LinearScalarOperation<ScalarFactor>;
+
+    let operation = Operation::from(ZeroOperation { r#type: DataType });
+    let mut context = TracingContext::<ScalarFactor, Operation> { marker: PhantomData };
+
+    assert_eq!(operation.transpose(&mut context, &EmptyRegionDriver, &[], &[]).unwrap(), vec![transposed("zero")],);
+}
+
+#[test]
 fn test_operation_generates_interpretation_forwarding() {
-    let context = TestContext::<ScalarFactor> { marker: PhantomData };
+    let context = TestContext::<InterpretedScalarFactor> { marker: PhantomData };
     let operation = ScalarOperation::<ScalarFactor>::from(AddOperation);
 
     assert_eq!(
-        operation.interpret(&context, &[ScalarFactor(1), ScalarFactor(2)]),
-        Ok(vec![ScalarFactor(1), ScalarFactor(2)]),
+        operation.interpret(&context, &EmptyRegionDriver, &[InterpretedScalarFactor(1), InterpretedScalarFactor(2)],),
+        Ok(vec![InterpretedScalarFactor(1), InterpretedScalarFactor(2)]),
     );
 }
 
 #[test]
-fn test_operation_generates_captured_program_interpretation_witness() {
-    type Operation = ScalarOperation<ScalarFactor>;
-
-    let context = TestContext::<ScalarFactor> { marker: PhantomData };
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "scalar",
-        constant: Some(ScalarFactor(3)),
-        operation: Some(Operation::from(AddOperation)),
-        marker: PhantomData,
-    };
-    let outputs = <Operation as InterpretableProgramOperation<
-        ScalarFactor,
-        TestContext<ScalarFactor>,
-        ScalarFactor,
-    >>::interpret_program(&context, &program, vec![ScalarFactor(1)])
-    .unwrap();
-
-    assert_eq!(outputs, vec![ScalarFactor(1), ScalarFactor(3)]);
-}
-
-#[test]
-fn test_operation_generates_direct_program_interpretation_witness() {
+fn test_operation_generates_direct_interpretation_dispatch() {
     type Operation = LinearScalarOperation<ScalarFactor>;
 
     let context = TestContext::<ScalarFactor> { marker: PhantomData };
     let operation = Operation::from(FactorOperation { factor: ScalarFactor(5), marker: PhantomData });
 
-    assert_eq!(operation.interpret(&context, &[ScalarFactor(8)]), Ok(vec![ScalarFactor(8)]));
-
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: Some(ScalarFactor(13)),
-        operation: Some(Operation::from(AddOperation)),
-        marker: PhantomData,
-    };
-    let outputs =
-        <Operation as InterpretableProgramOperation<ScalarFactor, TestContext<ScalarFactor>>>::interpret_program(
-            &context,
-            &program,
-            vec![ScalarFactor(8)],
-        )
-        .unwrap();
-
-    assert_eq!(outputs, vec![ScalarFactor(8), ScalarFactor(13)]);
+    assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[ScalarFactor(8)]), Ok(vec![ScalarFactor(8)]),);
 }
 
 #[test]
@@ -1236,22 +1388,7 @@ fn test_operation_generates_interpretation_value_bounds() {
     let context = TestContext::<Factor> { marker: PhantomData };
     let operation = Operation::from(ZeroOperation { r#type: ArrayType });
 
-    assert_eq!(operation.interpret(&context, &[Factor(1)]), Ok(vec![Factor(1)]));
-
-    let program = Program::<Factor, Operation, Vec<Factor>, Vec<Factor>> {
-        label: "array",
-        constant: Some(Factor(3)),
-        operation: Some(Operation::from(ConstantOperation { value: Factor(5), marker: PhantomData })),
-        marker: PhantomData,
-    };
-    let outputs = <Operation as InterpretableProgramOperation<Factor, TestContext<Factor>, Factor>>::interpret_program(
-        &context,
-        &program,
-        vec![Factor(1)],
-    )
-    .unwrap();
-
-    assert_eq!(outputs, vec![Factor(1), Factor(3)]);
+    assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[Factor(1)]), Ok(vec![Factor(1)]));
 }
 
 /// Recursive payload whose partial-evaluation rule requires an extra [`SpecialPartiallyEvaluatableValue`] bound on the
@@ -1262,23 +1399,34 @@ struct PartialEvaluationRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V, O> Operation<ArrayType> for PartialEvaluationRecursiveOperation<V, O> {
+impl<V: Clone, O: Clone> Operation<ArrayType> for PartialEvaluationRecursiveOperation<V, O> {
     fn name(&self) -> &'static str {
         "partial_evaluation_recursive"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for PartialEvaluationRecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<W: Clone, O: Clone, C: Domain<Type = ArrayType>> InterpretableOperation<C>
+    for PartialEvaluationRecursiveOperation<W, O>
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+impl<W: Clone, O: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
     for PartialEvaluationRecursiveOperation<W, O>
 where
     C::Value: SpecialPartiallyEvaluatableValue,
@@ -1295,7 +1443,7 @@ enum PartialEvaluationBoundOperation<V: Value<Type = ArrayType>> {
 }
 
 #[test]
-fn test_operation_generates_partial_evaluation_witness() {
+fn test_operation_generates_partial_evaluation_dispatch() {
     fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
 
     // The derive now forwards partial evaluation for every variant, so each enum must satisfy the per-operation
@@ -1320,8 +1468,8 @@ fn test_operation_generates_partial_evaluation_witness() {
 #[test]
 fn test_operation_generates_partial_evaluation_value_bounds() {
     // The `Recursive` payload's partial-evaluation rule requires `SpecialPartiallyEvaluatableValue`, supplied to the
-    // generated implementation by `#[ryft(bounds(partial_evaluation(...)))]`. Proving the witness for the enum
-    // discharges that recursive arm's body obligation, which only resolves when the extra bound is injected.
+    // generated implementation by `#[ryft(bounds(partial_evaluation(...)))]`. The enum's direct per-variant
+    // obligation only resolves when the extra bound is injected.
     use partial::PartiallyEvaluatableOperation as _;
 
     fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
@@ -1333,7 +1481,7 @@ fn test_operation_generates_partial_evaluation_value_bounds() {
     let context = TestContext::<Factor, PartialEvaluationBoundOperation<Factor>> { marker: PhantomData };
     let context = partial::PartialEvaluationContext::new(context);
     let operation = PartialEvaluationBoundOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
-    let evaluation = operation.partially_evaluate(&context, &[]).unwrap();
+    let evaluation = operation.partially_evaluate(&context, &EmptyRegionDriver, &[]).unwrap();
     assert!(evaluation.is_empty());
 }
 
@@ -1350,12 +1498,13 @@ impl<V> ArrayBatch<V> {
     }
 }
 
-/// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] while the
-/// packed physical values remain values owned by the parent context `C`.
+/// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
+/// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
 trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
@@ -1398,6 +1547,11 @@ impl<C> BatchingContext<C> {
     }
 }
 
+/// Stand-in for `ryft_core::BatchingDriver`.
+trait BatchingDriver<C: Context<Type = ArrayType>> {}
+
+impl<C: Context<Type = ArrayType>> BatchingDriver<C> for EmptyRegionDriver {}
+
 /// Stand-in for `ryft_core::BatchAxis`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BatchAxis(Option<usize>);
@@ -1408,20 +1562,10 @@ enum ProgramBatchingOutputAxesPolicy {
     Natural,
 }
 
-/// Stand-in for `ryft_core::BatchableProgramOperation`.
-trait BatchableProgramOperation<V: Value<Type = ArrayType>>: Operation<ArrayType> + Sized {
-    fn batch_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-        axis_size: usize,
-        input_batch_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
-}
-
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     /// Stand-in for `ryft_core::Program::batched`.
     fn batched(
@@ -1445,9 +1589,10 @@ impl<C, Meta> SpecialBatchValue for Tracer<C, Meta> {}
 /// Ordinary leaf rule: it neither needs the active frame nor any value capability, and its physical work runs
 /// through the parent context (observed here through the parent-lifted constant in its output label).
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<ArrayType> {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // Ordinary rules execute their lifted work through the parent context.
@@ -1462,9 +1607,10 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for DotOperation
 where
     C::Value: SpecialBatchValue,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("dot")])
@@ -1481,13 +1627,22 @@ impl Operation<ArrayType> for CollectiveLikeOperation {
         "collective_like"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = ArrayType>, C> InterpretableOperation<V, C> for CollectiveLikeOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for CollectiveLikeOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
@@ -1498,9 +1653,10 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 }
 
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CollectiveLikeOperation {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         // The rule observes the active frame's axis metadata directly.
@@ -1513,31 +1669,39 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CollectiveLikeOpera
 }
 
 /// Stand-in recursive higher-order payload whose batching rule mirrors the leaf obligations the real control-flow
-/// rules carry: an operation-shaped `From` conversion (discharged structurally from the closed enum), the
-/// `BatchableProgramOperation` fixed-point witness, the parent context's `Zero`, and the author-declared value
-/// leaves supplied through `#[ryft(bounds(batching(...)))]`.
+/// rules carry: an operation-shaped `From` conversion (discharged structurally from the closed enum), the parent
+/// context's `Zero`, and the author-declared value leaves supplied through `#[ryft(bounds(batching(...)))]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BatchRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
 }
 
-impl<V, O> Operation<ArrayType> for BatchRecursiveOperation<V, O> {
+impl<V: Clone, O: Clone> Operation<ArrayType> for BatchRecursiveOperation<V, O> {
     fn name(&self) -> &'static str {
         "batch_recursive"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
     }
 }
 
-impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for BatchRecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+impl<W: Clone, O: Clone, C: Domain<Type = ArrayType>> InterpretableOperation<C> for BatchRecursiveOperation<W, O> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         Ok(inputs.to_vec())
     }
 }
 
-impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+impl<W: Clone, O: Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
     for BatchRecursiveOperation<W, O>
 where
     C::Operation: From<BatchRecursiveOperation<W, O>>,
@@ -1548,11 +1712,12 @@ impl<C> BatchableOperation<C> for BatchRecursiveOperation<C::Constant, C::Operat
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: BooleanLike + SpecialBatchValue,
-    C::Operation: BatchableProgramOperation<C::Constant> + From<ZeroOperation<ArrayType>>,
+    C::Operation: From<ZeroOperation<ArrayType>>,
 {
-    fn batch(
+    fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
+        _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("batch_recursive")])
@@ -1579,19 +1744,25 @@ fn test_batchable_operation_dispatches_batching_to_payloads() {
     let context = BatchingContext::<Staging> { parent: TestContext { marker: PhantomData }, axis_name: Some("batch") };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(zero.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
+    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
 
     // The `Dot` rule requires `SpecialBatchValue` on the flowing value, transported to this use site by the
     // generated per-variant `BatchableOperation` predicate.
     let dot = Operation::from(DotOperation);
-    assert_eq!(dot.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("dot")]);
+    assert_eq!(dot.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("dot")]);
 
     // The collective-like rule observes the active frame's axis metadata without any variant-level marker.
     let collective = Operation::from(CollectiveLikeOperation);
-    assert_eq!(collective.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("collective_like_named")]);
+    assert_eq!(
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ArrayBatch::labeled("collective_like_named")],
+    );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
-    assert_eq!(recursive.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("batch_recursive")]);
+    assert_eq!(
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ArrayBatch::labeled("batch_recursive")],
+    );
 }
 
 #[test]
@@ -1606,35 +1777,19 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(zero.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
+    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
 
     let collective = Operation::from(CollectiveLikeOperation);
-    assert_eq!(collective.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("collective_like_unnamed")]);
+    assert_eq!(
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ArrayBatch::labeled("collective_like_unnamed")],
+    );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
-    assert_eq!(recursive.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("batch_recursive")]);
-}
-
-#[test]
-fn test_batchable_operation_generates_program_batching_witness() {
-    type Operation = BatchableArrayOperation<Factor>;
-
-    let program = Program::<Factor, Operation, Vec<Factor>, Vec<Factor>> {
-        label: "batchable",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let (batched, output_axes) = <Operation as BatchableProgramOperation<Factor>>::batch_program(
-        &program,
-        3,
-        &[BatchAxis(Some(0))],
-        ProgramBatchingOutputAxesPolicy::Natural,
-    )
-    .unwrap();
-
-    assert_eq!(batched.label, "batchable");
-    assert_eq!(output_axes, vec![BatchAxis(Some(0))]);
+    assert_eq!(
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ArrayBatch::labeled("batch_recursive")],
+    );
 }
 
 #[test]

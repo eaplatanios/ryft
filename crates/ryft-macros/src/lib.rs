@@ -32,24 +32,23 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
 }
 
 /// Generates the batching (vectorization) dispatchers for an operation enum: one `BatchableOperation<C>` impl that
-/// is generic over the parent context `C` plus the `BatchableProgramOperation` witness for nested-program batching.
+/// is generic over the parent context `C`; nested programs batch structurally through `Program::batched`.
 ///
 /// The dispatcher forwards the active `BatchingContext<C>` to every variant's own rule, so the parent/active
 /// distinction lives in each rule's body rather than in dispatch: ordinary rules run their lifted physical work
 /// through `context.parent()` (eagerly under an eager parent, staged under a staging parent), while rules keyed on
 /// the active frame's axis metadata (e.g., named-axis collectives) inspect the batching context directly. Each
-/// non-recursive payload's batching obligation is transported as a per-variant `BatchableOperation<C>` predicate,
-/// while recursive payloads (those mentioning `Self`) are discharged against the witness and the leaf bounds the
-/// enum declares via `#[ryft(bounds(batching(...)))]`, which attach to the parent context's value type.
+/// payload's batching obligation is transported as a direct per-variant `BatchableOperation<C>` predicate. Leaf bounds
+/// declared via `#[ryft(bounds(batching(...)))]` attach to the parent context's value type, while higher-order rules
+/// request nested batching through their instruction-scoped driver.
 #[proc_macro_derive(BatchableOperation, attributes(ryft))]
 pub fn derive_batchable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_batchable_operation_impl(input)
 }
 
-/// Generates the forward-mode (JVP) differentiation dispatcher for an operation enum, together with the
-/// `DifferentiableProgramOperation` and `LinearizableProgramOperation` witnesses that back the recursive higher-order
-/// rules (their fixed bodies forward to `Program::jvp_program` / `Program::linearize`, and extra value bounds those
-/// body checks need are supplied via `#[ryft(bounds(differentiation(...)))]`).
+/// Generates the forward-mode (JVP) differentiation dispatcher for an operation enum. Recursive higher-order rules
+/// request nested work through their call-scoped differentiation driver, and extra value bounds those body checks
+/// need are supplied via `#[ryft(bounds(differentiation(...)))]`.
 ///
 /// See the `ryft-core` documentation for the `Operation` trait for the full derive contract. This derive enables
 /// forward-mode differentiation only; enums that also need reverse-mode differentiation additionally derive
@@ -63,8 +62,7 @@ pub fn derive_differentiable_operation(input: TokenStream) -> TokenStream {
 /// programs staged in that operation family.
 ///
 /// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
-/// operation-type inference, generated payload bounds, and when the macro can generate the
-/// `TransposableProgramOperation` witness for nested linear programs.
+/// operation-type inference, generated payload bounds, and call-scoped driver forwarding for nested linear programs.
 #[proc_macro_derive(TransposableOperation, attributes(ryft))]
 pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_transposable_operation_impl(input)

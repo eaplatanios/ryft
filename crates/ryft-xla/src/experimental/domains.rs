@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
@@ -33,7 +34,8 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::control_flow::SelectOperation;
 use ryft_core::operations::math::{AddOperation, MulOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
-use ryft_core::programs::{FlatProgram, ProgramError};
+use ryft_core::programs::ProgramError;
+use ryft_core::regions::RegionAttachments;
 use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
@@ -357,14 +359,13 @@ impl<'c> Context for XlaDomain<'c> {
 
     /// Eagerly executes `operation` on concrete input [`Array`]s, mirroring JAX's op-by-op dispatch: the operation
     /// is traced into a single-instruction program over the inputs' physical [`ArrayType`]s (shardings included),
-    /// compiled through this domain's compile cache, and executed on this domain's PJRT client via
-    /// the crate-private `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the
-    /// constant directly through the runtime client without compiling a program.
-    fn bind<P, R: AsRef<[FlatProgram<Self>]> + IntoIterator<Item = FlatProgram<Self>>>(
+    /// compiled through this domain's compile cache, and executed on this domain's PJRT client via the crate-private
+    /// `eager_bind` path. The nullary additive/multiplicative identities keep a fast path that materializes the constant
+    /// directly through the runtime client without compiling a program.
+    fn bind<P, R: RegionAttachments<Self::Constant, Self::Operation>>(
         &self,
         operation: P,
         regions: R,
-        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>
     where
@@ -384,7 +385,7 @@ impl<'c> Context for XlaDomain<'c> {
                 return Ok(vec![value]);
             }
         }
-        self.eager_bind(operation, regions, callees, inputs)
+        self.eager_bind(operation, regions, inputs)
     }
 
     /// A client-backed domain executes every bound operation for real and its concrete [`Array`]s support host
@@ -405,7 +406,7 @@ impl<'c> Context for XlaDomain<'c> {
 /// compiled eager dispatch path (over a derived default mesh) otherwise.
 impl<'c> Zero<Array<'c>> for XlaDomain<'c> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[], &[])?;
+        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -414,7 +415,7 @@ impl<'c> Zero<Array<'c>> for XlaDomain<'c> {
 /// Refer to the documentation of this domain's [`Zero`] implementation for more information.
 impl<'c> One<Array<'c>> for XlaDomain<'c> {
     fn one(&self, r#type: &ArrayType) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), &[], &[])?;
+        let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -423,7 +424,7 @@ impl<'c> One<Array<'c>> for XlaDomain<'c> {
 /// Refer to the documentation of this domain's [`Zero`] implementation for more information.
 impl<'c> Fill<Scalar, Array<'c>> for XlaDomain<'c> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), Vec::new(), &[], &[])?;
+        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -432,7 +433,7 @@ impl<'c> Fill<Scalar, Array<'c>> for XlaDomain<'c> {
 /// Refer to the documentation of this domain's [`Zero`] implementation for more information.
 impl<'c> Iota<Array<'c>> for XlaDomain<'c> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array<'c>, ProgramError> {
-        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[], &[])?;
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -657,11 +658,10 @@ impl<'c> XlaDomain<'c> {
     /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) receive their
     /// nested programs as attached regions and flow through this same path — the compiler handles the control flow, so
     /// no host interpreter loops are needed.
-    fn eager_bind<R: AsRef<[FlatXlaProgram]> + IntoIterator<Item = FlatXlaProgram>>(
+    fn eager_bind<R: RegionAttachments<XlaConstant, XlaOperation>>(
         &self,
         operation: XlaOperation,
         regions: R,
-        callees: &[Rc<FlatXlaProgram>],
         inputs: &[Array<'c>],
     ) -> Result<Vec<Array<'c>>, ProgramError> {
         let Some(client) = self.client else {
@@ -677,13 +677,15 @@ impl<'c> XlaDomain<'c> {
         // Trace the single-instruction program over the inputs' physical types, shardings included, attaching the
         // provided region bodies to that instruction.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let mut builder = XlaProgramBuilder::new();
-        let mut region_ids = Vec::with_capacity(regions.as_ref().len() + callees.len());
-        region_ids.extend(regions.into_iter().map(|region| builder.import_program(region)));
-        region_ids.extend(callees.iter().map(|callee| builder.intern_callee(callee)));
-        let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let output_atoms = builder.add_instruction(operation, input_atoms, region_ids)?.to_vec();
+        let builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
+        let region_ids = regions.import_into(&builder)?;
+        let output_atoms = {
+            let mut builder = builder.borrow_mut();
+            let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            builder.add_instruction(operation, input_atoms, region_ids)?.to_vec()
+        };
         let output_count = output_atoms.len();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program: FlatXlaProgram =
             builder.build(output_atoms, vec![Placeholder; input_types.len()], vec![Placeholder; output_count])?;
 
@@ -2914,7 +2916,7 @@ mod tests {
         let array_type = ArrayType::scalar(DataType::Token);
 
         assert!(matches!(
-            XlaDomain::token().bind(OneOperation::new(array_type.clone()), Vec::new(), &[], &[]),
+            XlaDomain::token().bind(OneOperation::new(array_type.clone()), Vec::new(), &[]),
             Err(ProgramError::Type(error))
                 if error.message == "xla domain cannot synthesize one value for element type token"
         ));
@@ -3185,7 +3187,7 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let right = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
-        let outputs = domain.bind(AddOperation, Vec::new(), &[], &[left, right]).unwrap();
+        let outputs = domain.bind(AddOperation, Vec::new(), &[left, right]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
@@ -3199,7 +3201,7 @@ mod tests {
         let domain = XlaDomain::new(&client);
 
         let input = f32_vector(&client, &mesh, &[1.0, -2.0, 3.5, 0.0]);
-        let outputs = domain.bind(NegOperation, Vec::new(), &[], &[input]).unwrap();
+        let outputs = domain.bind(NegOperation, Vec::new(), &[input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![-1.0, 2.0, -3.5, 0.0]);
@@ -3212,7 +3214,7 @@ mod tests {
         let domain = XlaDomain::new(&client);
 
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]));
-        let outputs = domain.bind(FillOperation::new(r#type, Scalar::from(2.5f64)), Vec::new(), &[], &[]).unwrap();
+        let outputs = domain.bind(FillOperation::new(r#type, Scalar::from(2.5f64)), Vec::new(), &[]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape(), StaticShape::new(vec![3]));
@@ -3222,7 +3224,7 @@ mod tests {
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
         let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]));
         let value = Scalar::from(num_complex::Complex::new(1.5f32, -2.0f32));
-        let outputs = domain.bind(FillOperation::new(r#type, value), Vec::new(), &[], &[]).unwrap();
+        let outputs = domain.bind(FillOperation::new(r#type, value), Vec::new(), &[]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape(), StaticShape::new(vec![2]));
@@ -3239,17 +3241,17 @@ mod tests {
 
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[3.0, 4.0]);
-        let first = domain.bind(AddOperation, Vec::new(), &[], &[left.clone(), right.clone()]).unwrap();
+        let first = domain.bind(AddOperation, Vec::new(), &[left.clone(), right.clone()]).unwrap();
         assert_eq!(domain.cache_size(), 1);
 
-        let second = domain.bind(AddOperation, Vec::new(), &[], &[left, right]).unwrap();
+        let second = domain.bind(AddOperation, Vec::new(), &[left, right]).unwrap();
         assert_eq!(domain.cache_size(), 1, "a repeated eager operation must be a compile-cache hit");
         assert_eq!(read_f32s(&client, &first[0]), read_f32s(&client, &second[0]));
 
         // A different input signature compiles (and caches) a distinct executable.
         let wider_left = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let wider_right = f32_vector(&client, &mesh, &[4.0, 5.0, 6.0]);
-        domain.bind(AddOperation, Vec::new(), &[], &[wider_left, wider_right]).unwrap();
+        domain.bind(AddOperation, Vec::new(), &[wider_left, wider_right]).unwrap();
         assert_eq!(domain.cache_size(), 2);
     }
 
@@ -3264,7 +3266,7 @@ mod tests {
         // An input that carries an attached client is rejected by client identity.
         let input = f32_vector(&foreign_client, &foreign_mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(NegOperation, Vec::new(), &[], &[input.clone()]),
+            domain.bind(NegOperation, Vec::new(), &[input.clone()]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
                     different PJRT client than this domain's client",
@@ -3274,7 +3276,7 @@ mod tests {
         let mut clientless_input = input;
         clientless_input.detach_client_for_tests();
         assert!(matches!(
-            domain.bind(NegOperation, Vec::new(), &[], &[clientless_input]),
+            domain.bind(NegOperation, Vec::new(), &[clientless_input]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is placed on device \
                     1, which does not belong to this domain's PJRT client",
@@ -3312,15 +3314,13 @@ mod tests {
             .bind(
                 operation.clone(),
                 [doubled.clone(), squared.clone()],
-                &[],
                 &[boolean_scalar(&client, &mesh, true), input.clone()],
             )
             .unwrap();
         assert_eq!(read_f32s(&client, &true_outputs[0]), vec![2.0, 4.0, 6.0, 8.0]);
 
-        let false_outputs = domain
-            .bind(operation, [doubled, squared], &[], &[boolean_scalar(&client, &mesh, false), input])
-            .unwrap();
+        let false_outputs =
+            domain.bind(operation, [doubled, squared], &[boolean_scalar(&client, &mesh, false), input]).unwrap();
         assert_eq!(read_f32s(&client, &false_outputs[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "both predicate values must share one compiled executable");
     }
@@ -3362,7 +3362,7 @@ mod tests {
         };
         let operation = XlaOperation::While(WhileOperation::new());
 
-        let outputs = domain.bind(operation, vec![condition, body], &[], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
+        let outputs = domain.bind(operation, vec![condition, body], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![3.0]);
     }
@@ -3387,7 +3387,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(AddOperation, Vec::new(), &[], &[input.clone(), input]).unwrap();
+        let outputs = domain.bind(AddOperation, Vec::new(), &[input.clone(), input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
@@ -3432,7 +3432,7 @@ mod tests {
         };
         let scan = ScanOperation::<XlaConstant>::new(1, 4);
 
-        let outputs = domain.bind(XlaOperation::Scan(scan), [body], &[], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
+        let outputs = domain.bind(XlaOperation::Scan(scan), [body], &[f32_scalar(&client, &mesh, 0.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![4.0]);
         assert_eq!(outputs[1].shape(), StaticShape::new(vec![4]));
@@ -3466,7 +3466,7 @@ mod tests {
 
         let carry = f32_scalar(&client, &mesh, 0.0);
         let xs = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
-        let outputs = domain.bind(XlaOperation::Scan(scan), vec![body], &[], &[carry, xs]).unwrap();
+        let outputs = domain.bind(XlaOperation::Scan(scan), vec![body], &[carry, xs]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![10.0]);
         assert_eq!(outputs[1].shape(), StaticShape::new(vec![4]));
@@ -3507,7 +3507,7 @@ mod tests {
         )
         .unwrap();
         let carry = f32_scalar(&client, &mesh, 0.0);
-        let outputs = domain.bind(XlaOperation::Scan(scan), vec![body], &[], &[carry, xs]).unwrap();
+        let outputs = domain.bind(XlaOperation::Scan(scan), vec![body], &[carry, xs]).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![10.0]);
         assert_eq!(outputs[1].shape(), StaticShape::new(vec![4]));
@@ -3539,13 +3539,13 @@ mod tests {
         let callee = Rc::new(callee);
 
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
-        let first = domain.bind(operation.clone(), Vec::new(), &[callee.clone()], &[input.clone()]).unwrap();
+        let first = domain.bind(operation.clone(), [].with_callees(&[callee.clone()]), &[input.clone()]).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, &first[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1);
 
         // A repeated eager `jit_call` at the same input signature is a dispatch-cache hit.
-        let second = domain.bind(operation, Vec::new(), &[callee], &[input]).unwrap();
+        let second = domain.bind(operation, [].with_callees(&[callee]), &[input]).unwrap();
         assert_eq!(read_f32s(&client, &second[0]), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(domain.cache_size(), 1, "a repeated eager jit_call must be a compile-cache hit");
     }
@@ -3606,7 +3606,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.bind(operation, vec![body_region], &[], &[input]).unwrap();
+        let outputs = domain.bind(operation, vec![body_region], &[input]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
@@ -3637,7 +3637,7 @@ mod tests {
         // the operation directly and asserts the axis-resolution failure surfaced at compile time.
         let input = f32_vector(&client, &mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(CollectiveOperation::new("i".to_string(), CollectiveKind::PSum), Vec::new(), &[], &[input]),
+            domain.bind(CollectiveOperation::new("i".to_string(), CollectiveKind::PSum), Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "collective over axis 'i' can only be lowered inside a shard_map manual region",
         ));
@@ -3664,7 +3664,7 @@ mod tests {
             Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes::<f64>(&[1.5, 2.5]).as_slice())
                 .unwrap();
         let (outputs, lines) =
-            with_captured_prints(|| domain.bind(PrintOperation::new("x"), Vec::new(), &[], &[input]).unwrap());
+            with_captured_prints(|| domain.bind(PrintOperation::new("x"), Vec::new(), &[input]).unwrap());
 
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string()]);
         assert_eq!(outputs.len(), 1);
@@ -3693,7 +3693,7 @@ mod tests {
         let left = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let right = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         assert!(matches!(
-            domain.bind(AddOperation, Vec::new(), &[], &[left, right]),
+            domain.bind(AddOperation, Vec::new(), &[left, right]),
             Err(ProgramError::Type(error)) if error.message == "'add' input types are not broadcast-compatible",
         ));
     }

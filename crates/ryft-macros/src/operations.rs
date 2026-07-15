@@ -60,15 +60,15 @@ pub(crate) struct CodeGenerator {
     /// Whether `#[ryft(bounds(batching(...)))]` was already specified.
     batching_bounds_set: bool,
 
-    /// Extra bounds to attach to the generated `DifferentiableProgramOperation` and `LinearizableProgramOperation`
-    /// witnesses' program constant type, from `#[ryft(bounds(differentiation(...)))]`.
+    /// Extra bounds to attach to the generated differentiation dispatcher's program constant type, from
+    /// `#[ryft(bounds(differentiation(...)))]`.
     differentiation_value_bounds: Vec<syn::TypeParamBound>,
 
     /// Whether `#[ryft(bounds(differentiation(...)))]` was already specified.
     differentiation_value_bounds_set: bool,
 
     /// Extra bounds to attach to the generated `TransposableOperation` dispatcher's and
-    /// `TransposableProgramOperation` witness's transposition value type, from
+    /// transposition dispatcher's transposition value type, from
     /// `#[ryft(bounds(transposition(...)))]`. These serve the same role as bounds declared on the enum's own value
     /// parameter (which the generated implementations inherit) without forcing the enum's stored constant type to
     /// carry transposition-only capabilities.
@@ -139,31 +139,30 @@ impl CodeGenerator {
     }
 
     /// Generates an implementation of [`Operation`] (together with its [`InterpretableOperation`],
-    /// [`InterpretableProgramOperation`], [`PartiallyEvaluatableOperation`], [`Display`], and conversion companions)
+    /// [`PartiallyEvaluatableOperation`], [`Display`], and conversion companions)
     /// for the provided input. Refer to the documentation of the [`Operation`] trait for information on how to use
     /// this macro and on the shape of the generated code.
     pub(crate) fn generate_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Self::generate_derive_impl(input, DeriveKind::Operation, Self::generate_operation)
     }
 
-    /// Generates an implementation of [`BatchableOperation`] (together with its [`BatchableProgramOperation`]
-    /// companion) for the provided input. Refer to the documentation of the [`BatchableOperation`] trait for
-    /// information on how to use this macro and on the shape of the generated code.
+    /// Generates an implementation of [`BatchableOperation`] for the provided input. Refer to the documentation of
+    /// the [`BatchableOperation`] trait for information on how to use this macro and on the shape of the generated
+    /// code.
     pub(crate) fn generate_batchable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Self::generate_derive_impl(input, DeriveKind::BatchableOperation, Self::generate_batchable_operation)
     }
 
-    /// Generates an implementation of [`DifferentiableOperation`] (together with its
-    /// [`DifferentiableProgramOperation`] and [`LinearizableProgramOperation`] companions) for the provided input.
-    /// Refer to the documentation of the [`DifferentiableOperation`] trait for information on how to use this macro
-    /// and on the shape of the generated code.
+    /// Generates an implementation of [`DifferentiableOperation`] whose dispatcher forwards region-access-driven
+    /// nested differentiation through the active driver. Refer to the documentation of the [`DifferentiableOperation`]
+    /// trait for information on how to use this macro and on the shape of the generated code.
     pub(crate) fn generate_differentiable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Self::generate_derive_impl(input, DeriveKind::DifferentiableOperation, Self::generate_differentiable_operation)
     }
 
-    /// Generates an implementation of [`TransposableOperation`] (together with its [`TransposableProgramOperation`]
-    /// companion) for the provided input. Refer to the documentation of the [`TransposableOperation`] trait for
-    /// information on how to use this macro and on the shape of the generated code.
+    /// Generates an implementation of [`TransposableOperation`] that dispatches each variant to its payload rule.
+    /// Refer to the documentation of the [`TransposableOperation`] trait for information on how to use this macro and
+    /// on the shape of the generated code.
     pub(crate) fn generate_transposable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Self::generate_derive_impl(input, DeriveKind::TransposableOperation, Self::generate_transposable_operation)
     }
@@ -329,10 +328,7 @@ impl CodeGenerator {
             return Vec::new();
         };
 
-        data.variants
-            .iter()
-            .filter_map(|variant| self.extract_variant(&input.ident, &input.generics, variant))
-            .collect()
+        data.variants.iter().filter_map(|variant| self.extract_variant(&input.generics, variant)).collect()
     }
 
     /// Extracts one [`OperationVariant`] from the provided [`syn::Variant`]. This function also checks that the
@@ -344,12 +340,7 @@ impl CodeGenerator {
     ///   * `enum_name` - [`syn::Ident`] of the enum being derived, used to detect recursive payloads.
     ///   * `generics` - [`syn::Generics`] of the enum being derived, used to detect bare generic payloads.
     ///   * `variant` - [`syn::Variant`] from which to extract an [`OperationVariant`].
-    fn extract_variant(
-        &mut self,
-        enum_name: &syn::Ident,
-        generics: &syn::Generics,
-        variant: &syn::Variant,
-    ) -> Option<OperationVariant> {
+    fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
         self.reject_nested_attributes(&variant.attrs);
         let syn::Fields::Unnamed(fields) = &variant.fields else {
             self.add_error(&variant.ident, "operation enum variants must be tuple variants with one payload field");
@@ -367,15 +358,8 @@ impl CodeGenerator {
             .map(|operation_type| (operation_type, true))
             .unwrap_or_else(|| (payload_type.clone(), false));
         let skip_conversions = bare_generic_parameter(&payload_type, generics).is_some();
-        let is_recursive_payload = type_mentions_ident(&operation_type, enum_name);
 
-        Some(OperationVariant {
-            ident: variant.ident.clone(),
-            operation_type,
-            is_boxed,
-            skip_conversions,
-            is_recursive_payload,
-        })
+        Some(OperationVariant { ident: variant.ident.clone(), operation_type, is_boxed, skip_conversions })
     }
 
     /// Rejects nested `#[ryft(...)]` attributes, which are only supported at the top level for operation enums and
@@ -388,7 +372,7 @@ impl CodeGenerator {
     }
 
     /// Generates the `Operation` derive output: the [`Operation`] dispatcher, the [`InterpretableOperation`]
-    /// dispatcher, the [`InterpretableProgramOperation`] witness for nested flat programs, the
+    /// dispatcher, the
     /// [`PartiallyEvaluatableOperation`] dispatcher, the [`Display`] implementation, and the `From` and borrowed
     /// `TryFrom` payload conversions. Refer to the documentation of the [`Operation`] trait for information on the
     /// shape of the generated code and on how the interpretation value types are inferred from the enum's
@@ -418,54 +402,24 @@ impl CodeGenerator {
             return TokenStream::new();
         };
         let has_separate_interpretation_value_type = value_type_parameters.len() == 1;
-        let interpretation_value_type: syn::Type = if has_separate_interpretation_value_type {
-            syn::parse_quote!(__InterpretationValue)
-        } else {
-            syn::parse_quote!(#program_constant_type)
-        };
+        let interpretation_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
         let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
         let program_operation_self_type =
             substitute_type_idents(&operation_self_type, program_value_substitutions.as_slice());
         let interpretation_self_type = program_operation_self_type.clone();
 
-        // The `InterpretableOperation` dispatcher shares its generics with the `InterpretableProgramOperation`
-        // witness below and additionally requires the witness itself so that higher-order payload rules can
-        // recursively interpret their nested programs.
-        let mut interpretation_generics = self.interpretation_generics(
+        // The `InterpretableOperation` dispatcher forwards each variant to its payload's own interpretation rule;
+        // higher-order payload rules request nested replay through the interpretation driver, keeping the generated
+        // obligations direct and finite.
+        let interpretation_generics = self.interpretation_generics(
             input,
             &variants,
             program_value_substitutions.as_slice(),
             &program_constant_type,
             &interpretation_value_type,
-            &interpretation_self_type,
             has_separate_interpretation_value_type,
         );
-        interpretation_generics.make_where_clause().predicates.push(syn::parse_quote! {
-            #interpretation_self_type:
-                #ryft::InterpretableProgramOperation<
-                    #interpretation_value_type,
-                    __InterpretationContext,
-                    #program_constant_type,
-                >
-        });
         let (interpretation_impl_generics, _, interpretation_where_clause) = interpretation_generics.split_for_impl();
-
-        let program_interpretation_generics = self.interpretation_generics(
-            input,
-            &variants,
-            program_value_substitutions.as_slice(),
-            &program_constant_type,
-            &interpretation_value_type,
-            &program_operation_self_type,
-            has_separate_interpretation_value_type,
-        );
-        let program_constant_lift = if has_separate_interpretation_value_type {
-            quote!(context.constant(constant.clone()))
-        } else {
-            quote!(Ok(constant.clone()))
-        };
-        let (program_interpretation_impl_generics, _, program_interpretation_where_clause) =
-            program_interpretation_generics.split_for_impl();
 
         // Partial evaluation is generic over the known-side context `__Context`, pinned to the program's constant
         // value type and to this enum as its operation family, so one generated implementation serves both eager
@@ -487,12 +441,6 @@ impl CodeGenerator {
                 Operation = #partial_evaluation_self_type,
             >
         });
-        partial_evaluation_where_clause
-            .predicates
-            .push(syn::parse_quote!(#partial_evaluation_self_type: #ryft::Operation<#primary_type>));
-        partial_evaluation_where_clause
-            .predicates
-            .push(syn::parse_quote!(#partial_evaluation_self_type: ::std::clone::Clone));
         // Extra partial-evaluation-only bounds requested via `#[ryft(bounds(partial_evaluation(...)))]`. These apply
         // to *both* partial-evaluation value spaces, because a recursive payload's rule may need them on either side:
         // the scan/while invariance fixed points compare known values, which flow as `__Context::Value` (tracers
@@ -517,25 +465,34 @@ impl CodeGenerator {
         // Skip recursive payload variants (those that mention this enum) from the where-clause, exactly like the
         // interpretation and transposition impls: a `where ConditionOperation<.., Self, ..>:
         // PartiallyEvaluatableOperation` edge would form a genuine trait-solver cycle with the condition payload's own
-        // `O: PartiallyEvaluatableProgramOperation` recursion bound (E0275). The match arm for each recursive variant
+        // recursion bound (E0275). The match arm for each variant
         // still calls that variant's rule, which is discharged as a body obligation against this very impl.
         partial_evaluation_where_clause.predicates.extend(
-            variants.iter().filter(|variant| !variant.is_recursive_payload && !variant.skip_conversions).map(
-                |variant| {
-                    let operation_type =
-                        substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                    let predicate: syn::WherePredicate = syn::parse_quote! {
-                        #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
-                    };
-                    predicate
-                },
-            ),
+            variants.iter().filter(|variant| !variant.skip_conversions).map(|variant| {
+                let operation_type =
+                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+                let predicate: syn::WherePredicate = syn::parse_quote! {
+                    #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
+                };
+                predicate
+            }),
         );
         let partial_evaluation_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             if variant.skip_conversions {
                 quote! {
-                    Self::#variant_ident(_) => context.fold_or_residualize(self.clone(), inputs),
+                    Self::#variant_ident(_) => {
+                        let regions = driver
+                            .regions()?
+                            .into_iter()
+                            .map(|region| region.to_program())
+                            .collect();
+                        context.fold_or_residualize(
+                            self.clone(),
+                            regions,
+                            inputs,
+                        )
+                    },
                 }
             } else {
                 let operation_type =
@@ -544,7 +501,7 @@ impl CodeGenerator {
                 quote! {
                     Self::#variant_ident(operation) => {
                         <#operation_type as #ryft::partial::PartiallyEvaluatableOperation<__Context>>::
-                            partially_evaluate(#receiver, context, inputs)
+                            partially_evaluate(#receiver, context, driver, inputs)
                     },
                 }
             }
@@ -576,6 +533,30 @@ impl CodeGenerator {
                     <#payload_operation_type as #ryft::Operation<#primary_type>>::infer_output_types(
                         #receiver,
                         input_types,
+                        region_interfaces,
+                    )
+                },
+            }
+        });
+        let region_name_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_operation_type = &variant.operation_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_operation_type as #ryft::Operation<#primary_type>>::region_names(#receiver)
+                },
+            }
+        });
+        let output_region_provenance_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_operation_type = &variant.operation_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_operation_type as #ryft::Operation<#primary_type>>::output_region_provenance(
+                        #receiver,
+                        output_index,
                     )
                 },
             }
@@ -604,9 +585,7 @@ impl CodeGenerator {
                 },
             }
         });
-        // The same arms serve both the `InterpretableOperation` dispatcher (where `inputs` is the method
-        // argument) and the `InterpretableProgramOperation` witness (where `inputs` is bound by the program-walk
-        // closure below), so they are collected once.
+        // The dispatcher arms forward each variant to its payload's own interpretation rule.
         let interpretation_arms = variants
             .iter()
             .map(|variant| {
@@ -616,25 +595,16 @@ impl CodeGenerator {
                 let receiver = variant.receiver();
                 quote! {
                     Self::#variant_ident(operation) => {
-                        <#payload_operation_type as #ryft::InterpretableOperation<
-                            #interpretation_value_type,
-                            __InterpretationContext,
-                        >>::interpret(#receiver, context, inputs)
+                        <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
+                            #receiver,
+                            context,
+                            driver,
+                            inputs,
+                        )
                     },
                 }
             })
             .collect::<Vec<_>>();
-        let program_interpretation_body = quote! {
-            program.interpret_with(
-                input,
-                |_, constant| #program_constant_lift,
-                |instruction, inputs| {
-                    match instruction.operation() {
-                        #(#interpretation_arms)*
-                    }
-                },
-            )
-        };
         let conversion_impls = variants
             .iter()
             .filter(|variant| !variant.skip_conversions)
@@ -654,9 +624,25 @@ impl CodeGenerator {
                 fn infer_output_types(
                     &self,
                     input_types: &[#primary_type],
+                    region_interfaces: &[#ryft::RegionInterface<#primary_type>],
                 ) -> ::std::result::Result<::std::vec::Vec<#primary_type>, #ryft::TypeError> {
                     match self {
                         #(#infer_output_type_arms)*
+                    }
+                }
+
+                fn region_names(&self) -> &'static [&'static str] {
+                    match self {
+                        #(#region_name_arms)*
+                    }
+                }
+
+                fn output_region_provenance(
+                    &self,
+                    output_index: usize,
+                ) -> ::std::vec::Vec<#ryft::OutputRegionProvenance> {
+                    match self {
+                        #(#output_region_provenance_arms)*
                     }
                 }
 
@@ -679,16 +665,17 @@ impl CodeGenerator {
 
             #[automatically_derived]
             impl #interpretation_impl_generics
-                #ryft::InterpretableOperation<#interpretation_value_type, __InterpretationContext>
+                #ryft::InterpretableOperation<__Context>
                 for #interpretation_self_type
             #interpretation_where_clause
             {
-                fn interpret(
+                fn interpret<__D: #ryft::InterpretationDriver<__Context>>(
                     &self,
-                    context: &__InterpretationContext,
-                    inputs: &[#interpretation_value_type],
+                    context: &__Context,
+                    driver: &__D,
+                    inputs: &[<__Context as #ryft::Domain>::Value],
                 ) -> ::std::result::Result<
-                    ::std::vec::Vec<#interpretation_value_type>,
+                    ::std::vec::Vec<<__Context as #ryft::Domain>::Value>,
                     #ryft::ProgramError,
                 > {
                     match self {
@@ -698,41 +685,15 @@ impl CodeGenerator {
             }
 
             #[automatically_derived]
-            impl #program_interpretation_impl_generics
-                #ryft::InterpretableProgramOperation<
-                    #interpretation_value_type,
-                    __InterpretationContext,
-                    #program_constant_type,
-                >
-                for #program_operation_self_type
-            #program_interpretation_where_clause
-            {
-                fn interpret_program(
-                    context: &__InterpretationContext,
-                    program: &#ryft::Program<
-                        #program_constant_type,
-                        Self,
-                        ::std::vec::Vec<#program_constant_type>,
-                        ::std::vec::Vec<#program_constant_type>,
-                    >,
-                    input: ::std::vec::Vec<#interpretation_value_type>,
-                ) -> ::std::result::Result<
-                    ::std::vec::Vec<#interpretation_value_type>,
-                    #ryft::ProgramError,
-                > {
-                    #program_interpretation_body
-                }
-            }
-
-            #[automatically_derived]
             impl #partial_evaluation_impl_generics
                 #ryft::partial::PartiallyEvaluatableOperation<__Context>
                 for #partial_evaluation_self_type
             #partial_evaluation_where_clause
             {
-                fn partially_evaluate(
+                fn partially_evaluate<__D: #ryft::partial::PartialEvaluationDriver<__Context>>(
                     &self,
                     context: &#ryft::partial::PartialEvaluationContext<__Context>,
+                    driver: &__D,
                     inputs: &[#ryft::partial::PartialEvaluationValue<
                         <__Context as #ryft::Domain>::Value,
                     >],
@@ -759,21 +720,19 @@ impl CodeGenerator {
         })
     }
 
-    /// Generates the `BatchableOperation` derive output: one fixed-active-context `BatchableOperation` dispatcher
-    /// plus the `BatchableProgramOperation` witness for nested-program batching.
+    /// Generates the `BatchableOperation` derive output: one fixed-active-context `BatchableOperation` dispatcher.
     ///
     /// The generated dispatcher is generic over a `__ParentContext` parent context pinned to the enum's primary
     /// type, program constant type, and the enum itself as its operation family. Every variant forwards the active
-    /// `BatchingContext<__ParentContext>` to its payload's own rule: ordinary rules execute their lifted work
+    /// `BatchingContext<__ParentContext>` and instruction-scoped `BatchingDriver` to its payload's own rule:
+    /// ordinary rules execute their lifted work
     /// through `context.parent()`, while rules keyed on the active frame (e.g., named-axis collectives) inspect its
-    /// axis metadata directly. The generated where clauses follow the same structure as the differentiation derive:
-    /// each non-recursive payload carries its batching obligation as a per-variant
+    /// axis metadata directly. Each payload carries its batching obligation as a per-variant
     /// `BatchableOperation<__ParentContext>` predicate that transports the rule's own capability requirements to
-    /// the use site, while recursive payloads (those mentioning `Self`) are discharged as definition-time body
-    /// checks against the author-supplied leaf capability bounds (`#[ryft(bounds(batching(...)))]`), the parent
-    /// `Zero` leaf that backs accumulator seeding, and the `BatchableProgramOperation` fixed-point witness. The
-    /// witness impl itself spells only the per-variant leaves that its concrete tracing-context replay cannot
-    /// resolve concretely.
+    /// the use site, together with the author-supplied leaf capability bounds (`#[ryft(bounds(batching(...)))]`) and
+    /// the parent `Zero` leaf that backs accumulator seeding. Nested programs batch structurally through
+    /// `Program::batched`, requested by higher-order rules through their active driver, whose implementation
+    /// establishes the finite program-level bounds at its construction site.
     fn generate_batchable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
         let variants = self.extract_variants(input);
         if self.compile_error().is_some() {
@@ -798,8 +757,8 @@ impl CodeGenerator {
         let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
         let batching_self_type = substitute_type_idents(&conversion_self_type, program_value_substitutions.as_slice());
 
-        // Fixed-active-context dispatcher: every arm receives the active `BatchingContext<__ParentContext>` and
-        // flows the parent context's own value.
+        // Fixed-active-context dispatcher: every arm receives the active `BatchingContext<__ParentContext>`, the
+        // current instruction's `BatchingDriver`, and the parent context's own value.
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
         let mut batching_generics = substitute_generics(
             &self.operation_generics(&input.generics, &variants),
@@ -814,18 +773,14 @@ impl CodeGenerator {
                 Operation = #batching_self_type,
             >
         });
-        batching_where_clause
-            .predicates
-            .extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate =
-                    syn::parse_quote!(#operation_type: #ryft::BatchableOperation<__ParentContext>);
-                predicate
-            }));
-        batching_where_clause
-            .predicates
-            .push(syn::parse_quote!(#batching_self_type: #ryft::BatchableProgramOperation<#program_constant_type>));
+        batching_where_clause.predicates.extend(variants.iter().map(|variant| {
+            let operation_type =
+                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let predicate: syn::WherePredicate =
+                syn::parse_quote!(#operation_type: #ryft::BatchableOperation<__ParentContext>);
+            predicate
+        }));
+
         // Recursive higher-order rules compute over the flowing parent value, so they need the author-declared
         // batching value capabilities on that value plus the parent context's `Zero` leaf for accumulator seeding.
         // The declared bounds are written against the enum's value parameter, but the dispatcher flows the parent
@@ -856,6 +811,7 @@ impl CodeGenerator {
                     <#operation_type as #ryft::BatchableOperation<__ParentContext>>::batch(
                         #receiver,
                         context,
+                        driver,
                         inputs,
                     )
                 },
@@ -867,9 +823,10 @@ impl CodeGenerator {
             impl #batching_impl_generics #ryft::BatchableOperation<__ParentContext> for #batching_self_type
             #batching_where_clause
             {
-                fn batch(
+                fn batch<__D: #ryft::BatchingDriver<__ParentContext>>(
                     &self,
                     context: &#ryft::BatchingContext<__ParentContext>,
+                    driver: &__D,
                     inputs: &[#ryft::ArrayBatch<#parent_value_type>],
                 ) -> ::std::result::Result<
                     ::std::vec::Vec<#ryft::ArrayBatch<#parent_value_type>>,
@@ -882,68 +839,8 @@ impl CodeGenerator {
             }
         };
 
-        // Program-level witness: the `batch_program` replay runs over the concrete tracing context
-        // `TracingContext<Constant, Self, Constant>`, so the dispatcher's obligations are spelled here instantiated
-        // at that context — per-variant predicates that a payload rule pinned to a concrete constant type (e.g., a
-        // backend `jit_call`) cannot resolve at a generic constant parameter stay transported, while everything
-        // context-shaped (the author-declared leaves at the staged tracer value and the staging `Zero` blanket)
-        // resolves concretely. Keeping the enum's own batching obligation out of the where clause is what lets the
-        // dispatcher require `Self: BatchableProgramOperation<..>` without unbounded recursion.
-        let program_trace_context: syn::Type = syn::parse_quote! {
-            #ryft::TracingContext<#program_constant_type, #batching_self_type, #program_constant_type>
-        };
-        let mut program_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
-        let program_where_clause = program_generics.make_where_clause();
-        program_where_clause.predicates.push(syn::parse_quote!(#program_constant_type: 'static));
-        program_where_clause
-            .predicates
-            .extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate =
-                    syn::parse_quote!(#operation_type: #ryft::BatchableOperation<#program_trace_context>);
-                predicate
-            }));
-        let (program_impl_generics, _, program_where_clause) = program_generics.split_for_impl();
-        let program_impl = quote! {
-            #[automatically_derived]
-            impl #program_impl_generics #ryft::BatchableProgramOperation<#program_constant_type>
-                for #batching_self_type
-            #program_where_clause
-            {
-                fn batch_program(
-                    program: &#ryft::Program<
-                        #program_constant_type,
-                        Self,
-                        ::std::vec::Vec<#program_constant_type>,
-                        ::std::vec::Vec<#program_constant_type>,
-                    >,
-                    axis_size: usize,
-                    input_batch_axes: &[#ryft::BatchAxis],
-                    output_axes_policy: #ryft::ProgramBatchingOutputAxesPolicy,
-                ) -> ::std::result::Result<
-                    (
-                        #ryft::Program<
-                            #program_constant_type,
-                            Self,
-                            ::std::vec::Vec<#program_constant_type>,
-                            ::std::vec::Vec<#program_constant_type>,
-                        >,
-                        ::std::vec::Vec<#ryft::BatchAxis>,
-                    ),
-                    #ryft::BatchingError,
-                > {
-                    program.batched(axis_size, input_batch_axes, output_axes_policy)
-                }
-            }
-        };
-
         const_block(quote! {
             #batching_impl
-            #program_impl
         })
     }
 
@@ -951,11 +848,10 @@ impl CodeGenerator {
     ///
     /// The generated implementation is generic over a `__DifferentiationContext` staging context pinned to the enum's
     /// primary type, program constant type, and the enum itself as its operation family. Every variant forwards to its
-    /// payload's own `DifferentiableOperation` rule. Non-recursive payloads carry per-variant
-    /// `DifferentiableOperation` predicates that transport each rule's own capability requirements, while recursive
-    /// payloads are discharged as definition-time body obligations against the operation `From` conversions and the
-    /// `MaybeZeroOperation` / `DifferentiableProgramOperation` / `LinearizableProgramOperation` fixed-point witnesses
-    /// (a per-variant predicate for them would form a genuine trait-solver cycle).
+    /// payload's own `DifferentiableOperation` rule. Every payload carries a direct per-variant predicate that
+    /// transports the rule's own capability requirements. Higher-order rules request nested differentiation through
+    /// their instruction-scoped driver, whose concrete implementation establishes the finite `Program::jvp` and
+    /// `Program::linearize` bounds at its construction site.
     fn generate_differentiable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
         let variants = self.extract_variants(input);
         if self.compile_error().is_some() {
@@ -993,10 +889,9 @@ impl CodeGenerator {
                 Operation = #differentiation_self_type,
             >
         });
-        // The recursive higher-order payload rules materialize structural zero tangents at sub-program boundaries
-        // through the context's `Zero` capability, so the dispatcher transports that requirement explicitly (the
-        // per-variant predicates only cover non-recursive payloads). Staging contexts satisfy it through the blanket
-        // staging `Zero` implementation and eager domains implement it directly.
+        // Higher-order payload rules materialize structural zero tangents at sub-program boundaries through the
+        // context's `Zero` capability, so the dispatcher transports that requirement explicitly. Staging contexts
+        // satisfy it through the blanket staging `Zero` implementation and eager domains implement it directly.
         where_clause.predicates.push(syn::parse_quote! {
             __DifferentiationContext: #ryft::Zero<<__DifferentiationContext as #ryft::Domain>::Value>
         });
@@ -1007,10 +902,6 @@ impl CodeGenerator {
         where_clause.predicates.push(syn::parse_quote! {
             <__DifferentiationContext as #ryft::Domain>::Value: #ryft::BooleanLike
         });
-        where_clause
-            .predicates
-            .push(syn::parse_quote!(#differentiation_self_type: #ryft::Operation<#primary_type>));
-        where_clause.predicates.push(syn::parse_quote!(#differentiation_self_type: ::std::clone::Clone));
         // The per-variant rules stage ordinary primal-enum operations for both the primal and the tangent side, so the
         // enum must offer the `From` conversion for every concrete payload. Bare generic payloads have no conversion
         // and instead carry their own forward-mode obligation directly.
@@ -1023,37 +914,22 @@ impl CodeGenerator {
                     syn::parse_quote!(#differentiation_self_type: ::std::convert::From<#operation_type>);
                 predicate
             }));
-        // Non-recursive payloads carry their forward-mode obligation as a per-variant predicate, exactly like the
-        // interpretation and partial-evaluation impls: the predicate transports each rule's own capability
+        // Every payload carries its forward-mode obligation as a per-variant predicate, exactly like the
+        // interpretation and partial-evaluation impls. The predicate transports each rule's own capability
         // requirements (e.g., `C::Value: Sin` for the sine rule) to the use site without the enum spelling them.
-        // Recursive payloads (those mentioning `Self`) are skipped — a `ScanOperation<.., Self, ..>:
-        // DifferentiableOperation<..>` predicate would re-enter the enum's own obligation and overflow the trait
-        // solver — and are discharged as definition-time body checks against the fixed-point witnesses below.
-        where_clause.predicates.extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(
-            |variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate =
-                    syn::parse_quote!(#operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>);
-                predicate
-            },
-        ));
-        // The `From<ZeroOperation>`, `DifferentiableProgramOperation`, and `LinearizableProgramOperation` fixed-point
-        // witnesses let higher-order payload rules (condition/while/scan) forward-differentiate and linearize their
-        // nested programs in this same operation family without re-entering the enum's own `DifferentiableOperation`
-        // obligation. Both program witnesses are required because the fused rules (`scan`/`condition`) stage through
-        // `jvp_program` while the bounded `while` rule linearizes its body through `linearize_program`.
+        where_clause.predicates.extend(variants.iter().map(|variant| {
+            let operation_type =
+                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let predicate: syn::WherePredicate =
+                syn::parse_quote!(#operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>);
+            predicate
+        }));
+        // Higher-order payload rules (condition/while/scan) forward-differentiate and linearize their nested
+        // programs through the call-scoped `DifferentiationDriver`, whose implementations carry the direct
+        // `Program::jvp`/`Program::linearize` bounds at their construction sites, so the dispatcher itself only
+        // supplies the `From<ZeroOperation>` conversion those rules stage structural zeros through.
         where_clause.predicates.push(syn::parse_quote! {
-            #differentiation_self_type:
-                ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
-                + #ryft::DifferentiableProgramOperation<
-                    #program_constant_type,
-                    #differentiation_self_type,
-                >
-                + #ryft::LinearizableProgramOperation<
-                    #program_constant_type,
-                    #differentiation_self_type,
-                >
+            #differentiation_self_type: ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
         });
 
         let jvp_arms = variants.iter().map(|variant| {
@@ -1066,6 +942,7 @@ impl CodeGenerator {
                     <#operation_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::jvp(
                         #receiver,
                         context,
+                        driver,
                         inputs,
                     )
                 },
@@ -1074,72 +951,6 @@ impl CodeGenerator {
         let (differentiation_impl_generics, _, differentiation_where_clause) =
             differentiation_generics.split_for_impl();
 
-        // Program-level witnesses backing the recursive higher-order rules: the fixed bodies discharge the enum's
-        // full forward-mode obligation once, as a definition-time body check over the concrete linearization trace,
-        // so the where clause spells only the constant-side leaves (`#[ryft(bounds(differentiation(...)))]`) and the
-        // `From<ZeroOperation>` conversion the traits themselves require. Keeping the recursive
-        // `Self: DifferentiableOperation<..>` bound out of the where clause is what lets the dispatcher above
-        // require `Self: DifferentiableProgramOperation<..>` and `Self: LinearizableProgramOperation<..>` without
-        // unbounded recursion.
-        let program_type = quote! {
-            #ryft::Program<
-                #program_constant_type,
-                Self,
-                ::std::vec::Vec<#program_constant_type>,
-                ::std::vec::Vec<#program_constant_type>,
-            >
-        };
-        let mut witness_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
-        let witness_where_clause = witness_generics.make_where_clause();
-        add_value_bounds(
-            witness_where_clause,
-            &syn::parse_quote!(#program_constant_type),
-            self.differentiation_value_bounds.as_slice(),
-        );
-        witness_where_clause.predicates.push(syn::parse_quote! {
-            #differentiation_self_type: ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
-        });
-        let (witness_impl_generics, _, witness_where_clause) = witness_generics.split_for_impl();
-        let witness_impl = quote! {
-            #[automatically_derived]
-            impl #witness_impl_generics
-                #ryft::DifferentiableProgramOperation<
-                    #program_constant_type,
-                    #differentiation_self_type,
-                >
-                for #differentiation_self_type
-            #witness_where_clause
-            {
-                fn jvp_program(
-                    program: &#program_type,
-                ) -> ::std::result::Result<#program_type, #ryft::DifferentiationError> {
-                    program.jvp()
-                }
-            }
-
-            #[automatically_derived]
-            impl #witness_impl_generics
-                #ryft::LinearizableProgramOperation<
-                    #program_constant_type,
-                    #differentiation_self_type,
-                >
-                for #differentiation_self_type
-            #witness_where_clause
-            {
-                fn linearize_program(
-                    program: &#program_type,
-                ) -> ::std::result::Result<
-                    #ryft::Linearization<#program_constant_type, Self>,
-                    #ryft::DifferentiationError,
-                > {
-                    program.linearize()
-                }
-            }
-        };
-
         const_block(quote! {
             #[automatically_derived]
             impl #differentiation_impl_generics
@@ -1147,9 +958,10 @@ impl CodeGenerator {
                 for #differentiation_self_type
             #differentiation_where_clause
             {
-                fn jvp(
+                fn jvp<__D: #ryft::DifferentiationDriver<__DifferentiationContext>>(
                     &self,
                     context: &__DifferentiationContext,
+                    driver: &__D,
                     inputs: &[#ryft::DifferentiationDual<
                         <__DifferentiationContext as #ryft::Domain>::Value,
                     >],
@@ -1164,19 +976,14 @@ impl CodeGenerator {
                     }
                 }
             }
-
-            #witness_impl
         })
     }
 
-    /// Generates the `TransposableOperation` derive output: the `TransposableOperation` dispatcher and the
-    /// `TransposableProgramOperation` witness for nested linear programs. Single-value-parameter enums without
-    /// recursive payloads transpose over a separate generated `__TranspositionValue` parameter. Enums with two or
-    /// more value parameters pin the transposition value to the first (tangent/cotangent) value parameter, and so
-    /// do enums with recursive payloads (those mentioning `Self`): recursive higher-order payload rules name the
-    /// operation-family fixed point through `TransposableProgramOperation` and pin their transposition value to the
-    /// program constant type, so the witness's `Program::transpose_with_respect_to` call is only provable at that
-    /// instantiation.
+    /// Generates the `TransposableOperation` dispatcher. Single-value-parameter enums transpose over a separate
+    /// generated `__TranspositionValue` parameter. Enums with two or more value parameters pin the transposition value
+    /// to the first (tangent/cotangent) value parameter. Higher-order rules request nested-program transposition through
+    /// their instruction-scoped driver, whose concrete implementation establishes the corresponding
+    /// `Program::transpose_with_respect_to` bounds.
     fn generate_transposable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
         let variants = self.extract_variants(input);
         if self.compile_error().is_some() {
@@ -1199,8 +1006,7 @@ impl CodeGenerator {
             );
             return TokenStream::new();
         };
-        let has_separate_transposition_value_type =
-            value_type_parameters.len() == 1 && variants.iter().all(|variant| !variant.is_recursive_payload);
+        let has_separate_transposition_value_type = value_type_parameters.len() == 1;
         let transposed_value_type: syn::Type = if has_separate_transposition_value_type {
             syn::parse_quote!(__TranspositionValue)
         } else {
@@ -1224,16 +1030,6 @@ impl CodeGenerator {
                 predicate
             })
             .collect::<Vec<_>>();
-        let program_transpose_bounds = variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
-            let operation_type = &variant.operation_type;
-            let predicate: syn::WherePredicate = syn::parse_quote! {
-                #operation_type: #ryft::TransposableOperation<
-                    #transposed_value_type,
-                    #operation_self_type,
-                >
-            };
-            predicate
-        });
         let where_clause = transposition_generics.make_where_clause();
         if has_separate_transposition_value_type {
             where_clause
@@ -1254,69 +1050,7 @@ impl CodeGenerator {
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
         where_clause.predicates.extend(transpose_bounds.iter().cloned());
 
-        let mut program_transposition_generics = self.operation_generics(&input.generics, &variants);
-        if has_separate_transposition_value_type {
-            program_transposition_generics.params.push(syn::parse_quote!(__TranspositionValue));
-        }
-        let program_where_clause = program_transposition_generics.make_where_clause();
-        if has_separate_transposition_value_type {
-            program_where_clause
-                .predicates
-                .push(syn::parse_quote!(#transposed_value_type: #ryft::Value<Type = #primary_type>));
-            program_where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
-                &input.generics,
-                &program_constant_type,
-                &transposed_value_type,
-            ));
-        }
-        add_value_bounds(program_where_clause, &transposed_value_type, self.transposition_value_bounds.as_slice());
-        program_where_clause
-            .predicates
-            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        program_where_clause.predicates.extend(program_transpose_bounds);
-        program_where_clause.predicates.push(syn::parse_quote!(#primary_type: #ryft::DifferentiableType));
-        program_where_clause.predicates.push(syn::parse_quote! {
-            #operation_self_type:
-                ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
-                + ::std::convert::From<#ryft::AddOperation>
-        });
-
         let (transposition_impl_generics, _, transposition_where_clause) = transposition_generics.split_for_impl();
-        let (program_transposition_impl_generics, _, program_transposition_where_clause) =
-            program_transposition_generics.split_for_impl();
-        let program_transposition_impl = quote! {
-            #[automatically_derived]
-            impl #program_transposition_impl_generics
-                #ryft::TransposableProgramOperation<#transposed_value_type>
-                for #operation_self_type
-            #program_transposition_where_clause
-            {
-                fn transpose_program(
-                    program: &#ryft::Program<
-                        #transposed_value_type,
-                        Self,
-                        ::std::vec::Vec<#transposed_value_type>,
-                        ::std::vec::Vec<#transposed_value_type>,
-                    >,
-                    input_linearity: &[bool],
-                ) -> ::std::result::Result<
-                    #ryft::Program<
-                        #transposed_value_type,
-                        Self,
-                        ::std::vec::Vec<#transposed_value_type>,
-                        ::std::vec::Vec<#transposed_value_type>,
-                    >,
-                    #ryft::DifferentiationError,
-                > {
-                    let with_respect_to = input_linearity
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, &linear)| if linear { ::std::option::Option::Some(index) } else { ::std::option::Option::None })
-                        .collect::<::std::vec::Vec<usize>>();
-                    program.transpose_with_respect_to(with_respect_to.as_slice())
-                }
-            }
-        };
         let transpose_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let operation_type = &variant.operation_type;
@@ -1326,7 +1060,7 @@ impl CodeGenerator {
                     <#operation_type as #ryft::TransposableOperation<
                         #transposed_value_type,
                         #operation_self_type,
-                    >>::transpose(#receiver, context, inputs, outputs)
+                    >>::transpose(#receiver, context, driver, inputs, outputs)
                 },
             }
         });
@@ -1338,12 +1072,16 @@ impl CodeGenerator {
                 for #operation_self_type
             #transposition_where_clause
             {
-                fn transpose(
+                fn transpose<__D: #ryft::TranspositionDriver<
+                    #transposed_value_type,
+                    #operation_self_type,
+                >>(
                     &self,
                     context: &mut #ryft::TracingContext<
                         #transposed_value_type,
                         #operation_self_type,
                     >,
+                    driver: &__D,
                     inputs: &[#ryft::partial::PartialValue<
                         #ryft::Tracer<#ryft::TracingContext<
                             #transposed_value_type,
@@ -1370,8 +1108,6 @@ impl CodeGenerator {
                     }
                 }
             }
-
-            #program_transposition_impl
         })
     }
 
@@ -1432,26 +1168,21 @@ impl CodeGenerator {
             }
         }
     }
-    /// Builds the generics shared by the generated [`InterpretableOperation`] dispatcher and the generated
-    /// [`InterpretableProgramOperation`] witness: the enum generics with program-shaped value substitutions applied,
-    /// one generated `__InterpretationValue` parameter when the enum declares a single value parameter (which is then
-    /// treated as the nested program's captured constant type), one generated `__InterpretationContext` parameter,
-    /// the constant-lifting `Constant` context bound, the author-declared `#[ryft(bounds(interpretation(...)))]`
-    /// value bounds, and one `InterpretableOperation` predicate per non-recursive payload (recursive payloads are
-    /// skipped because such a predicate would re-enter the enum's own obligation and overflow the trait solver;
-    /// their arms are discharged as body obligations against the generated implementations themselves).
+    /// Builds the generics for the generated [`InterpretableOperation`] dispatcher: the enum generics with
+    /// program-shaped value substitutions applied, one generated `__Context` parameter, the context's [`Domain`]
+    /// equalities, the constant-lifting `Constant` context bound, the author-declared
+    /// `#[ryft(bounds(interpretation(...)))]` value bounds, and one `InterpretableOperation` predicate per payload.
     ///
     /// # Parameters
     ///
-    ///   * `input` - Derive macro input.
-    ///   * `variants` - Extracted operation variants.
-    ///   * `program_value_substitutions` - Program-shaped value substitutions (refer to
+    ///   - `input`: Derive macro input.
+    ///   - `variants`: Extracted operation variants.
+    ///   - `program_value_substitutions`: Program-shaped value substitutions (refer to
     ///     [`program_value_substitutions`]).
-    ///   * `program_constant_type` - Program constant value type parameter.
-    ///   * `interpretation_value_type` - Value type that the generated implementation interprets over.
-    ///   * `interpretation_self_type` - Self type of the generated implementation.
-    ///   * `has_separate_interpretation_value_type` - Whether interpretation is generic over a generated
-    ///     `__InterpretationValue` parameter instead of reusing the program constant type.
+    ///   - `program_constant_type`: Program constant value type parameter.
+    ///   - `interpretation_value_type`: Projection of the value type that the generated context interprets over.
+    ///   - `has_separate_interpretation_value_type`: Whether the context's flowing value may differ from the program
+    ///     constant type instead of being pinned to it.
     #[allow(clippy::too_many_arguments)]
     fn interpretation_generics(
         &self,
@@ -1460,38 +1191,38 @@ impl CodeGenerator {
         program_value_substitutions: &[(syn::Ident, syn::Type)],
         program_constant_type: &syn::Ident,
         interpretation_value_type: &syn::Type,
-        interpretation_self_type: &syn::Type,
         has_separate_interpretation_value_type: bool,
     ) -> syn::Generics {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
         let mut generics =
             substitute_generics(&self.operation_generics(&input.generics, variants), program_value_substitutions);
-        if has_separate_interpretation_value_type {
-            generics.params.push(syn::parse_quote!(__InterpretationValue));
-        }
-        generics.params.push(syn::parse_quote!(__InterpretationContext));
+        generics.params.push(syn::parse_quote!(__Context));
         let where_clause = generics.make_where_clause();
+        let mut domain_bound: syn::TypeParamBound = syn::parse_quote!(#ryft::Domain<Type = #primary_type>);
+        if !has_separate_interpretation_value_type {
+            domain_bound = syn::parse_quote! {
+                #ryft::Domain<
+                    Type = #primary_type,
+                    Value = #program_constant_type,
+                >
+            };
+        }
+        where_clause.predicates.push(syn::parse_quote!(__Context: #domain_bound));
         if has_separate_interpretation_value_type {
-            where_clause
-                .predicates
-                .push(syn::parse_quote!(#interpretation_value_type: #ryft::Value<Type = #primary_type>));
             where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
                 &input.generics,
                 program_constant_type,
                 interpretation_value_type,
             ));
             where_clause.predicates.push(syn::parse_quote! {
-                __InterpretationContext: #ryft::Constant<
+                __Context: #ryft::Constant<
                     #interpretation_value_type,
                     #program_constant_type,
                     #ryft::payloads::Captured,
                 >
             });
         }
-        where_clause
-            .predicates
-            .push(syn::parse_quote!(#interpretation_self_type: #ryft::Operation<#primary_type>));
         if !self.interpretation_value_bounds.is_empty() {
             add_interpretation_value_bounds(
                 where_clause,
@@ -1500,18 +1231,13 @@ impl CodeGenerator {
                 self.interpretation_value_bounds.as_slice(),
             );
         }
-        where_clause.predicates.extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(
-            |variant| {
-                let operation_type = substitute_type_idents(&variant.operation_type, program_value_substitutions);
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::InterpretableOperation<
-                        #interpretation_value_type,
-                        __InterpretationContext,
-                    >
-                };
-                predicate
-            },
-        ));
+        where_clause.predicates.extend(variants.iter().map(|variant| {
+            let operation_type = substitute_type_idents(&variant.operation_type, program_value_substitutions);
+            let predicate: syn::WherePredicate = syn::parse_quote! {
+                #operation_type: #ryft::InterpretableOperation<__Context>
+            };
+            predicate
+        }));
         generics
     }
 
@@ -1547,9 +1273,6 @@ struct OperationVariant {
 
     /// Whether conversion impls should be skipped for this variant.
     skip_conversions: bool,
-
-    /// Whether this payload recursively contains the enum type being derived.
-    is_recursive_payload: bool,
 }
 
 impl OperationVariant {
@@ -1610,7 +1333,8 @@ fn type_is_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
     matches!(ty, syn::Type::Path(syn::TypePath { qself: None, path }) if path.is_ident(ident))
 }
 
-/// Returns whether `ty` mentions a path segment named `ident`.
+/// Returns whether `ty` mentions the provided identifier anywhere in its structure (as a bare path segment or nested
+/// inside array, function, group, parenthesized, pointer, reference, slice, tuple, or generic-argument positions).
 fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
     match ty {
         syn::Type::Array(ty) => type_mentions_ident(&ty.elem, ident),
@@ -1622,12 +1346,32 @@ fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
                 }
         }
         syn::Type::Group(ty) => type_mentions_ident(&ty.elem, ident),
-        syn::Type::ImplTrait(ty) => ty.bounds.iter().any(|bound| type_param_bound_mentions_ident(bound, ident)),
-        syn::Type::TraitObject(ty) => ty.bounds.iter().any(|bound| type_param_bound_mentions_ident(bound, ident)),
         syn::Type::Paren(ty) => type_mentions_ident(&ty.elem, ident),
         syn::Type::Path(ty) => {
             ty.qself.as_ref().is_some_and(|qself| type_mentions_ident(&qself.ty, ident))
-                || path_mentions_ident(&ty.path, ident)
+                || ty.path.segments.iter().any(|segment| {
+                    segment.ident == *ident
+                        || match &segment.arguments {
+                            syn::PathArguments::None => false,
+                            syn::PathArguments::AngleBracketed(arguments) => arguments.args.iter().any(|argument| {
+                                matches!(
+                                    argument,
+                                    syn::GenericArgument::Type(ty) if type_mentions_ident(ty, ident)
+                                ) || matches!(
+                                    argument,
+                                    syn::GenericArgument::AssocType(argument)
+                                        if type_mentions_ident(&argument.ty, ident)
+                                )
+                            }),
+                            syn::PathArguments::Parenthesized(arguments) => {
+                                arguments.inputs.iter().any(|ty| type_mentions_ident(ty, ident))
+                                    || match &arguments.output {
+                                        syn::ReturnType::Default => false,
+                                        syn::ReturnType::Type(_, ty) => type_mentions_ident(ty, ident),
+                                    }
+                            }
+                        }
+                })
         }
         syn::Type::Ptr(ty) => type_mentions_ident(&ty.elem, ident),
         syn::Type::Reference(ty) => type_mentions_ident(&ty.elem, ident),
@@ -1635,39 +1379,6 @@ fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
         syn::Type::Tuple(ty) => ty.elems.iter().any(|ty| type_mentions_ident(ty, ident)),
         _ => false,
     }
-}
-
-/// Returns whether `bound` mentions a path segment named `ident`.
-fn type_param_bound_mentions_ident(bound: &syn::TypeParamBound, ident: &syn::Ident) -> bool {
-    match bound {
-        syn::TypeParamBound::Trait(bound) => path_mentions_ident(&bound.path, ident),
-        _ => false,
-    }
-}
-
-/// Returns whether `path` mentions a segment named `ident`.
-fn path_mentions_ident(path: &syn::Path, ident: &syn::Ident) -> bool {
-    path.segments.iter().any(|segment| {
-        segment.ident == *ident
-            || match &segment.arguments {
-                syn::PathArguments::None => false,
-                syn::PathArguments::AngleBracketed(arguments) => arguments.args.iter().any(|argument| {
-                    matches!(argument, syn::GenericArgument::Type(ty) if type_mentions_ident(ty, ident))
-                        || matches!(
-                            argument,
-                            syn::GenericArgument::AssocType(argument)
-                                if type_mentions_ident(&argument.ty, ident)
-                        )
-                }),
-                syn::PathArguments::Parenthesized(arguments) => {
-                    arguments.inputs.iter().any(|ty| type_mentions_ident(ty, ident))
-                        || match &arguments.output {
-                            syn::ReturnType::Default => false,
-                            syn::ReturnType::Type(_, ty) => type_mentions_ident(ty, ident),
-                        }
-                }
-            }
-    })
 }
 
 /// Extracts the leading identifier from an enum self type.
@@ -1770,7 +1481,7 @@ fn add_value_bounds(where_clause: &mut syn::WhereClause, value_type: &syn::Type,
 }
 
 /// Adds the caller-provided `#[ryft(bounds(interpretation(...)))]` value bounds to the provided where clause,
-/// together with the standard companion requirement `__InterpretationContext: Zero<V>` that recursive higher-order
+/// together with the standard companion requirement `__Context: Zero<V>` that recursive higher-order
 /// payload interpretation rules need whenever interpretation bounds are declared.
 fn add_interpretation_value_bounds(
     where_clause: &mut syn::WhereClause,
@@ -1780,7 +1491,7 @@ fn add_interpretation_value_bounds(
 ) {
     add_value_bounds(where_clause, interpretation_value_type, interpretation_value_bounds);
     where_clause.predicates.push(syn::parse_quote! {
-        __InterpretationContext: #ryft::Zero<#interpretation_value_type>
+        __Context: #ryft::Zero<#interpretation_value_type>
     });
 }
 
@@ -1998,16 +1709,16 @@ mod tests {
             }
         })
         .expect("failed to parse derive input");
-        // Recursive payloads are detected by their mention of the enum name, so `Self` mentions must be replaced
-        // with their fully-qualified path first, exactly like the derive entry points do.
+        // `Self` mentions must be replaced with their fully-qualified path first, exactly like the derive entry
+        // points do.
         replace_self_type(&mut input);
         let variants = generator.extract_variants(&input);
         assert!(generator.errors.is_empty());
         assert_eq!(variants.len(), 4);
-        assert!(!variants[0].is_boxed && !variants[0].skip_conversions && !variants[0].is_recursive_payload);
-        assert!(variants[1].is_boxed && !variants[1].skip_conversions && !variants[1].is_recursive_payload);
-        assert!(!variants[2].is_boxed && !variants[2].skip_conversions && variants[2].is_recursive_payload);
-        assert!(!variants[3].is_boxed && variants[3].skip_conversions && !variants[3].is_recursive_payload);
+        assert!(!variants[0].is_boxed && !variants[0].skip_conversions);
+        assert!(variants[1].is_boxed && !variants[1].skip_conversions);
+        assert!(!variants[2].is_boxed && !variants[2].skip_conversions);
+        assert!(!variants[3].is_boxed && variants[3].skip_conversions);
 
         // Non-enum inputs and variants that are not single-payload tuple variants are rejected.
         let mut generator = CodeGenerator::new(DeriveKind::Operation);

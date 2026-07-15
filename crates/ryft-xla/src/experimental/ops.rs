@@ -3,12 +3,10 @@ use std::rc::Rc;
 
 use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
 
-use ryft_core::batching::ArrayBatch;
-use ryft_core::batching::BatchAxis;
-use ryft_core::batching::BatchableOperation;
-use ryft_core::batching::BatchingError;
-use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
-use ryft_core::batching::{BatchingContext, BatchingDriver};
+use ryft_core::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
+};
 use ryft_core::captures::CaptureReference;
 use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
@@ -33,17 +31,17 @@ use ryft_core::operations::manipulation::{
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
-    SubOperation,
+    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
+    NegOperation, SinOperation, SqrtOperation, SubOperation,
 };
-use ryft_core::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, RegionInterface, Value};
+use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::regions::{RegionAttachments, RegionInterface};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::backends::scalars::Scalar;
@@ -234,21 +232,20 @@ pub type XlaProgram<Input, Output> = Program<XlaConstant, XlaOperation, Input, O
 /// Program builder specialized to the backend-owned XLA op universe.
 pub type XlaProgramBuilder = ProgramBuilder<XlaConstant, XlaOperation>;
 
-/// Flat XLA program over the backend-owned op universe — the shape of materialized regions and of the callees
-/// handed to [`Context::bind`]'s `callees` argument.
+/// Flat XLA program over the backend-owned operation universe, used for materialized regions and shared callees.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
 /// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
 /// operation (the single `["callee"]` slot), interned by [`Rc`] identity when the call is staged through the
-/// `callees` argument of [`Context::bind`], so repeated calls staged from one function handle share one callee
-/// root and remain identity-comparable for call-site deduplication at lowering.
+/// [`RegionAttachments`] passed to [`Context::bind`], so repeated calls staged from one function handle share one
+/// callee root and remain identity-comparable for call-site deduplication at lowering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation;
 
 impl JitCallOperation {
-    /// Creates a staged jitted-call operation. The flat callee program is supplied separately through the
-    /// `callees` argument of [`Context::bind`].
+    /// Creates a staged jitted-call operation. The flat callee program is supplied as a shared region attachment to
+    /// [`Context::bind`].
     #[inline]
     pub(crate) fn new() -> Self {
         Self
@@ -356,7 +353,7 @@ where
         if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
             return context.fold_or_residualize(
                 XlaOperation::JitCall(*self),
-                driver.regions().map(|region| region.into_program()).collect(),
+                driver.regions().map(|region| region.to_program()).collect(),
                 inputs,
             );
         }
@@ -371,7 +368,7 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.into_program()], inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
         }
         context.inline_partitioned_program(
             partition,
@@ -420,10 +417,10 @@ where
             None => {
                 let callee = driver.region(0)?;
                 let output_axes = vec![None; callee.output_types().len()];
-                (callee.into_program(), output_axes)
+                (callee.to_program(), output_axes)
             }
         };
-        let outputs = context.parent().bind(*self, Vec::new(), &[Rc::new(batched_callee)], &physical_inputs)?;
+        let outputs = context.parent().bind(*self, [].with_callees(&[Rc::new(batched_callee)]), &physical_inputs)?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -489,7 +486,7 @@ where
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_call = XlaOperation::JitCall(JitCallOperation::new());
         let mut primal_call_outputs =
-            context.bind(primal_call, Vec::new(), &[Rc::new(primal_program)], &primal_operands)?;
+            context.bind(primal_call, [].with_callees(&[Rc::new(primal_program)]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -511,7 +508,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
-        let tangent_outputs = context.bind(tangent_call, Vec::new(), &[Rc::new(tangent_program)], &tangent_operands)?;
+        let tangent_outputs =
+            context.bind(tangent_call, [].with_callees(&[Rc::new(tangent_program)]), &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -610,7 +608,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
     operands.extend(known_values);
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
     let input_cotangents =
-        context.bind(transposed_call, Vec::new(), &[Rc::new(transposed_callee)], operands.as_slice())?;
+        context.bind(transposed_call, [].with_callees(&[Rc::new(transposed_callee)]), operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -622,11 +620,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
         .zip(inputs)
         .map(
             |(&linear, input)| {
-                if linear {
-                    input_cotangents.next().unwrap()
-                } else {
-                    MaybeZero::Zero(input.r#type().into_owned())
-                }
+                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().into_owned()) }
             },
         )
         .collect();
@@ -726,7 +720,7 @@ mod tests {
                 matches!(known_instruction.operation(), XlaOperation::JitCall(_)),
                 "expected the outer program to contain the known-side jit_call",
             );
-            let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().into_program();
+            let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().to_program();
             assert_eq!(known_callee.input_ids().len(), 1);
             assert_eq!(known_callee.output_ids().len(), 2);
             assert_eq!(known_callee.instructions().len(), 1);
@@ -743,7 +737,7 @@ mod tests {
             "expected the residual program to contain the residual jit_call",
         );
         let residual_callee =
-            evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().into_program();
+            evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert_eq!(residual_callee.input_ids().len(), 2);
         assert_eq!(residual_callee.instructions().len(), 2);
         assert!(residual_callee.atoms().iter().any(|atom| atom.is_constant()));
