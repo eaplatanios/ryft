@@ -257,22 +257,18 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
     /// region with placeholder input/output structures matching its input/output boundary. This operation takes time
     /// and space proportional to the size of the complete reachable region graph.
     pub fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
+        // Importing appends the root after all of its descendants. Removing that final region leaves the complete
+        // descendant arena in place, and `build` assigns the promoted entry the same identifier the imported root had.
         let mut builder = ProgramBuilder::<V, O>::new();
-        let mut remapping = HashMap::new();
-        let mut region = self.region().clone();
-        for instruction in &mut region.instructions {
-            for attached in &mut instruction.regions {
-                *attached = builder.clone_region_closure_into_arena(self.regions, *attached, &mut remapping);
-            }
-        }
-        let input_count = region.input_ids.len();
-        let output_count = region.output_ids.len();
-        builder.atoms = region.atoms;
-        builder.input_ids = region.input_ids;
-        builder.instructions = region.instructions;
-        builder
-            .build(region.output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])
-            .unwrap()
+        let root = builder.import_region(self);
+        let Region { atoms, input_ids, output_ids, instructions } = builder.regions.pop().unwrap();
+        debug_assert_eq!(root.index(), builder.regions.len());
+        let input_count = input_ids.len();
+        let output_count = output_ids.len();
+        builder.atoms = atoms;
+        builder.input_ids = input_ids;
+        builder.instructions = instructions;
+        builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 }
 
@@ -641,10 +637,10 @@ mod tests {
         let region = builder.import_program(identity_program(DataType::F64));
         let input = builder.add_input(DataType::F64);
         let first = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![input], vec![region])
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![region], vec![input])
             .unwrap()[0];
         let second = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![first], vec![region])
+            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![region], vec![first])
             .unwrap()[0];
         builder.build(vec![second], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -655,7 +651,7 @@ mod tests {
         let descendant = root_builder.import_program(identity_program(DataType::F64));
         let input = root_builder.add_input(DataType::F64);
         let output = root_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["nested"]), vec![input], vec![descendant])
+            .add_instruction(TestRegionOperation::WithRegions(&["nested"]), vec![descendant], vec![input])
             .unwrap()[0];
         let root_program: TestProgram = root_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let mut root_region = root_program.entry_region().clone();
@@ -672,8 +668,8 @@ mod tests {
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(&["first", "second"]),
-                vec![input],
                 vec![first_root, second_root],
+                vec![input],
             )
             .unwrap()[0];
         let program = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();

@@ -2080,14 +2080,12 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Copies the [`Atom`] that corresponds to `atom_id` in `region` (and its transitive producers) into
-/// `new_atoms`/`new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already
-/// present in the mapping (e.g., rebuilt region inputs) are reused, [`Atom::Constant`]s are cloned directly, and
-/// [`Atom::Variable`]s are reconstructed from their producing [`Instruction`], whose attached-region references are
-/// preserved verbatim (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterwards).
-/// A reachable variable that is neither mapped nor produced by an instruction is reported as a
-/// [`ProgramError::MalformedProgram`].
+/// Copies the [`Atom`] that corresponds to `atom_id` in `region` (and its transitive producers) into `new_atoms` and
+/// `new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already present in the
+/// mapping (e.g., rebuilt region inputs) are reused, [`Atom::Constant`]s are cloned directly, and [`Atom::Variable`]s
+/// are reconstructed from their producing [`Instruction`], whose attached-region references are preserved verbatim
+/// (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterward). A reachable variable
+/// that is neither mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
 fn clone_atom_subgraph_into_region<V: Value, O: Operation<V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
@@ -2157,12 +2155,11 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<V::Type>>(
     Ok(atom)
 }
 
-// TODO(eaplatanios): Review this.
-/// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following instruction attached-region
+/// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following [`Instruction`] attached-region
 /// references), compacts the surviving regions' identifiers while preserving their relative order, and rewrites every
 /// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
-/// identifier. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena remains
-/// valid for ascending-order recursive derivations such as [`Region::effects`].
+/// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
+/// remains valid for ascending-order recursive derivations such as [`Region::effects`].
 fn compact_regions<V: Typed, O>(regions: Vec<Region<V, O>>, entry: RegionId) -> (Vec<Region<V, O>>, RegionId) {
     let mut reachable = vec![false; regions.len()];
     let mut pending = vec![entry];

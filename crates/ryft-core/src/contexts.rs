@@ -456,7 +456,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             let region_ids = driver.import_into(self.builder()).map_err(|error| self.error(error))?;
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, inputs, region_ids) {
+                match builder.add_instruction(operation, region_ids, inputs) {
                     Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
@@ -698,7 +698,7 @@ mod tests {
             let carry = builder.add_input(DataType::F64);
             let eight = builder.add_constant(Scalar::from(8.0));
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight], Vec::new())
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![carry, eight])
                 .unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -707,7 +707,7 @@ mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
-            let doubled = builder.add_instruction(AddOperation, vec![carry, carry], Vec::new()).unwrap()[0];
+            let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
