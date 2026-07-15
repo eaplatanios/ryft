@@ -462,23 +462,23 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegion
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// [`BindingRegionDriver`] for the borrowed regions attached to one replayed [`Instruction`]. The roots remain in their
-/// source region arena and are exposed in instruction order through [`RegionDriver`]. When a staging context imports
-/// them, `mappings` preserves their source identities across every instruction in the surrounding replay. Construction
-/// validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain non-fallible
-/// without trusting callers to preserve that relationship.
+/// [`BindingRegionDriver`] for the borrowed [`Region`]s attached to one replayed [`Instruction`]. The roots remain
+/// in their source region arena and are exposed in instruction order through [`RegionDriver`]. When a staging context
+/// imports them, `mappings` preserves their source identities across every instruction in the surrounding replay.
+/// Construction validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain
+/// non-fallible without trusting callers to preserve that relationship.
 pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
-    /// Borrowed view used to access every root's shared source arena.
+    /// Borrowed [`Region`] view used to access every root's shared source arena.
     source: RegionRef<'r, V, O>,
 
     /// Source [`RegionId`]s attached to the replayed instruction, in application order.
     roots: &'r [RegionId],
 
-    /// Replay-wide source-to-destination region mappings.
+    /// Replay-wide source-to-destination [`RegionReplayMappings`].
     mappings: &'r RegionReplayMappings<V, O>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
     /// Creates a driver for one instruction in an active replay, returning an error if any root does not belong to
