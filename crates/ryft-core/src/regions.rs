@@ -385,15 +385,15 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Source of the owned or borrowed regions attached to one [`Context::bind`](crate::Context::bind) operation
-/// application. This trait refines [`RegionDriver`] so eager and transform contexts can inspect attached regions
-/// without caring whether they are supplied as owned [`Program`]s, borrowed from a program being replayed, or appended
-/// as shared callees. Staging contexts consume the same value through [`import_into`](Self::import_into), preserving
-/// the source's region sharing while importing its roots into the destination [`ProgramBuilder`].
+/// Represents the source of owned or borrowed [`Region`]s attached to one [`Context::bind`](crate::Context::bind)
+/// [`Operation`] application. This trait refines [`RegionDriver`] so that eager and transform contexts can inspect
+/// attached regions without caring whether they are supplied as owned [`Program`]s, borrowed from a program being
+/// replayed, or appended as shared callees. [`StagingContext`](crate::StagingContext)s consume the same value through
+/// [`import_into`](Self::import_into), preserving the source's region sharing while importing its roots into the
+/// destination [`ProgramBuilder`].
 ///
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
-/// Consequently, fixed-size arrays and [`Vec`]s remain direct binding arguments: arrays are consumed in place and are
-/// not canonicalized through an intermediate heap allocation.
+/// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
 pub trait RegionAttachments<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
     /// Appends shared callee programs to these attachments without materializing an intermediate collection. The
     /// resulting attachment source exposes the owned or borrowed roots first and the callees afterward. Staging
