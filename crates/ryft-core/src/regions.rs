@@ -383,76 +383,55 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the source of owned or borrowed [`Region`]s attached to one [`Context::bind`](crate::Context::bind)
 /// [`Operation`] application. This trait refines [`RegionDriver`] so that eager and transform contexts can inspect
 /// attached regions without caring whether they are supplied as owned [`Program`]s, borrowed from a program being
-/// replayed, or appended as shared callees. [`StagingContext`](crate::StagingContext)s consume the same value through
+/// replayed, or supplied as shared callees. [`StagingContext`](crate::StagingContext)s consume the same value through
 /// [`import_into`](Self::import_into), preserving the source's region sharing while importing its roots into the
 /// destination [`ProgramBuilder`].
 ///
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
 pub trait RegionAttachments<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
-    /// Appends shared callee programs to these attachments without materializing an intermediate collection. The
-    /// resulting attachment source exposes the owned or borrowed roots first and the callees afterward. Staging
-    /// imports the first sequence according to its existing ownership policy and interns each callee by [`Rc`]
-    /// identity.
-    ///
-    /// # Parameters
-    ///
-    ///   - `callees`: Shared nested computations appended in operation-defined region order.
-    #[inline]
-    fn with_callees<'r>(self, callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>]) -> impl RegionAttachments<V, O> + 'r
-    where
-        Self: 'r,
-        V: 'r,
-        O: 'r,
-    {
-        RegionAttachmentsWithCallees { attachments: self, callees }
-    }
-
-    /// Imports these attached region roots into `builder` in application order and returns their destination
-    /// [`RegionId`]s in the same order.
-    ///
-    /// # Parameters
-    ///
-    ///   - `builder`: Shared destination builder into which the attached roots are imported.
+    /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order
+    /// and returns their [`RegionId`]s in the same order.
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError>;
 }
 
-/// Composite attachment source that appends shared callees to another owned or borrowed attachment source.
-struct RegionAttachmentsWithCallees<'r, V: Value, O: Operation<V::Type>, R: RegionAttachments<V, O>> {
-    /// Existing attachment source occupying the leading region positions.
-    attachments: R,
-
-    /// Shared callee programs occupying the trailing region positions.
+/// Shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind) [`Operation`] application.
+/// Callees are exposed in the order provided at construction and are interned by [`Rc`] identity when imported into
+/// a [`StagingContext`](crate::StagingContext), preserving sharing between repeated references to the same program.
+pub struct CalleeRegionAttachments<'r, V: Value, O: Operation<V::Type>> {
+    /// Shared callee [`Program`]s in [`Operation`]-defined region order.
     callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>],
 }
 
-impl<V: Value, O: Operation<V::Type>, R: RegionAttachments<V, O>> RegionDriver<V, O>
-    for RegionAttachmentsWithCallees<'_, V, O, R>
-{
+impl<'r, V: Value, O: Operation<V::Type>> CalleeRegionAttachments<'r, V, O> {
+    /// Creates a new [`CalleeRegionAttachments`].
+    #[inline]
+    pub fn new(callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>]) -> Self {
+        Self { callees }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionAttachments<'_, V, O> {
     #[inline]
     fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
     where
         V: 'r,
         O: 'r,
     {
-        self.attachments.regions().chain(self.callees.iter().map(|callee| callee.entry_region_ref()))
+        self.callees.iter().map(|callee| callee.entry_region_ref())
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, R: RegionAttachments<V, O>> RegionAttachments<V, O>
-    for RegionAttachmentsWithCallees<'_, V, O, R>
-{
+impl<V: Value, O: Operation<V::Type>> RegionAttachments<V, O> for CalleeRegionAttachments<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        let mut region_ids = self.attachments.import_into(builder)?;
         let mut builder = builder.borrow_mut();
-        region_ids.extend(self.callees.iter().map(|callee| builder.intern_callee(callee)));
-        Ok(region_ids)
+        Ok(self.callees.iter().map(|callee| builder.intern_callee(callee)).collect())
     }
 }
 
@@ -698,26 +677,14 @@ mod tests {
     }
 
     #[test]
-    fn test_region_attachments_append_and_intern_callees() {
+    fn test_callee_region_attachments_intern_callees() {
         let callee = Rc::new(identity_program(DataType::F64));
         let callees = [Rc::clone(&callee), callee];
-        let regions = [identity_program(DataType::F32)].with_callees(&callees);
-        assert_eq!(attached_input_types(&regions), vec![DataType::F32, DataType::F64, DataType::F64]);
+        let regions = CalleeRegionAttachments::new(&callees);
+        assert_eq!(attached_input_types(&regions), vec![DataType::F64, DataType::F64]);
 
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_attachments(regions, &builder), vec![RegionId::new(0), RegionId::new(1), RegionId::new(1)]);
-        assert_eq!(builder.borrow().regions.len(), 2);
-    }
-
-    #[test]
-    fn test_empty_region_attachments_append_callees() {
-        let callee = Rc::new(identity_program(DataType::F64));
-        let callees = [callee];
-        let regions = [].with_callees(&callees);
-        assert_eq!(attached_input_types(&regions), vec![DataType::F64]);
-
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(import_attachments(regions, &builder), vec![RegionId::new(0)]);
+        assert_eq!(import_attachments(regions, &builder), vec![RegionId::new(0), RegionId::new(0)]);
         assert_eq!(builder.borrow().regions.len(), 1);
     }
 
