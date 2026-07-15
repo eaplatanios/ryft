@@ -15,7 +15,7 @@
 //! output originates from an attached-region output (as opposed to it originating directly from that [`Instruction`]).
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
-//! Binding applications obtain their complete ordered region sequence from [`RegionAttachments`], which can combine
+//! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
 //! owned programs, borrowed regions, and shared callees (e.g., a JIT-compiled function). Replay and transforms provide
 //! borrowed views of the regions attached to the current instruction. [`EmptyRegionDriver`] supplies the same contract
 //! for applications with no attached regions.
@@ -383,16 +383,15 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
     }
 }
 
-/// Represents the source of owned or borrowed [`Region`]s attached to one [`Context::bind`](crate::Context::bind)
-/// [`Operation`] application. This trait refines [`RegionDriver`] so that eager and transform contexts can inspect
-/// attached regions without caring whether they are supplied as owned [`Program`]s, borrowed from a program being
-/// replayed, or supplied as shared callees. [`StagingContext`](crate::StagingContext)s consume the same value through
-/// [`import_into`](Self::import_into), preserving the source's region sharing while importing its roots into the
-/// destination [`ProgramBuilder`].
+/// [`RegionDriver`] for the regions supplied to one [`Context::bind`](crate::Context::bind) [`Operation`] application.
+/// In addition to providing application-scoped structural access through [`RegionDriver`], a binding region driver can
+/// be consumed through [`import_into`](Self::import_into) to import its regions into a staging context's destination
+/// [`ProgramBuilder`]. Implementations determine whether those regions are moved from owned [`Program`]s, borrowed from
+/// a replayed program while preserving source-region sharing, or interned as shared callees.
 ///
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
-pub trait RegionAttachments<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
+pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order
     /// and returns their [`RegionId`]s in the same order.
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError>;
@@ -427,7 +426,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionAttachm
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionAttachments<V, O> for CalleeRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegionAttachments<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         let mut builder = builder.borrow_mut();
@@ -451,7 +450,7 @@ where
     }
 }
 
-impl<V, O, R> RegionAttachments<V, O> for R
+impl<V, O, R> BindingRegionDriver<V, O> for R
 where
     V: Value,
     O: Operation<V::Type>,
@@ -513,7 +512,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayedRegionAttac
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionAttachments<V, O> for ReplayedRegionAttachments<'_, V, O> {
+impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayedRegionAttachments<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         self.mappings.import_into(builder, self.source, self.roots)
@@ -646,7 +645,7 @@ mod tests {
         (program, first_root, second_root)
     }
 
-    fn import_attachments<R: RegionAttachments<Scalar, TestRegionOperation>>(
+    fn import_attachments<R: BindingRegionDriver<Scalar, TestRegionOperation>>(
         regions: R,
         builder: &Rc<RefCell<ProgramBuilder<Scalar, TestRegionOperation>>>,
     ) -> Vec<RegionId> {
