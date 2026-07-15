@@ -285,19 +285,16 @@ impl<V: Typed, O> Clone for RegionRef<'_, V, O> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Read-only boundary summary of a sealed [`Region`], as seen by [`Operation`] type inference. A [`RegionInterface`]
 /// preserves the exact [`Region::input_ids`] and [`Region::output_ids`] order and carries the region's recursively
 /// derived [`Effects`], so that region-carrying operations can validate and consume the boundary contracts of their
-/// attached regions (e.g., a condition checking that its branches agree, or a while rejecting an effectful body when
-/// its predicate is batched) without ever receiving region *contents*.
-///
-/// [`ProgramBuilder`] derives [`RegionInterface`]s from its own region arena immediately before invoking
-/// [`Operation::infer_output_types`] and never stores them, and final [`Program`] validation independently derives
-/// them again, so callers cannot inject stale interface metadata into an [`Instruction`]. Constructing an interface
-/// directly is still allowed as passing synthetic interfaces to [`Operation::infer_output_types`] performs a pure
-/// hypothetical inference and cannot mutate or create a [`Program`].
+/// attached regions (e.g., a condition operation checking that its branches agree, or a while operation rejecting an
+/// effectful body when its predicate is batched) without ever seeing the region contents. [`ProgramBuilder`]s derive
+/// [`RegionInterface`]s from their own region arenas immediately before invoking [`Operation::infer_output_types`] and
+/// never store them. Final [`Program`] validation independently derives them again so that callers cannot inject stale
+/// interface metadata into an [`Instruction`]. Note, though, that constructing a [`RegionInterface`] directly is still
+/// allowed as passing synthetic interfaces to [`Operation::infer_output_types`] performs a pure hypothetical inference
+/// and cannot mutate or create a [`Program`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionInterface<T: Type> {
     /// [`Type`]s derived from the [`Region`]'s input [`Atom`]s, in [`Region::input_ids`] order.
@@ -336,6 +333,8 @@ impl<T: Type> RegionInterface<T> {
         self.effects
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Provides structural access to the nested [`Region`]s of one operation application. A driver is
 /// application-scoped: during program replay it describes exactly one [`Instruction`], while a
