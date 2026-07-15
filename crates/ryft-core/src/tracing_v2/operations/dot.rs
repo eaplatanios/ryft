@@ -1019,9 +1019,11 @@ fn for_each_multi_index(extents: &[usize], mut action: impl FnMut(&[usize])) {
 
 #[cfg(test)]
 mod tests {
-    use crate::operations::constants::ZeroOperation;
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::Operation;
+
+    use crate::operations::constants::ZeroOperation;
     use crate::operations::math::AddOperation;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
@@ -1526,7 +1528,8 @@ mod tests {
     /// adjoint dot) plus the structural `zero` and `add` operations the transpose pass needs. It lets the
     /// partition-aware [`DotOperation`] transpose run on a program whose known operand is a program input. The
     /// `Constant` variant carries the value parameter `V` so the [`Operation`] derive can infer the primary type.
-    #[derive(Clone, Debug, ryft_macros::Operation, ryft_macros::TransposableOperation)]
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(dispatch(transposition))]
     enum TestDotOperation<V: Value<Type = ArrayType>> {
         Zero(ZeroOperation<ArrayType>),
         Constant(crate::operations::constants::ConstantOperation<V>),

@@ -1,5 +1,4 @@
-//! Tests for the `#[derive(Operation)]`, `#[derive(BatchableOperation)]`, `#[derive(DifferentiableOperation)]`, and
-//! `#[derive(TransposableOperation)]` procedural macros.
+//! Tests for the `#[derive(Operation)]` procedural macro and its optional transform dispatchers.
 //!
 //! These tests define local stand-in traits and types that mirror the shapes the derives emit against. That keeps the
 //! macro tests focused on generated code rather than on the current `ryft-core` implementation details. The fixtures
@@ -33,6 +32,7 @@ struct RegionInterface<T: Type> {
 }
 
 /// Stand-in for `ryft_core::OutputRegionProvenance`.
+#[derive(Debug, PartialEq, Eq)]
 struct OutputRegionProvenance {
     region_index: usize,
     output_index: usize,
@@ -417,10 +417,10 @@ struct Linearization<V: Value, O> {
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
-    V: Value<Type = T> + SpecialTransposableValue,
+    V: Value<Type = T> + SpecialDifferentiableValue,
     O: Operation<T> + From<ZeroOperation<T>>,
 {
-    /// Stand-in for `ryft_core::Program::linearize`. The `SpecialTransposableValue` bound on the value type stands
+    /// Stand-in for `ryft_core::Program::linearize`. The `SpecialDifferentiableValue` bound on the value type stands
     /// in for the extra value leaves the real linearization needs, verifying that generated differentiation dispatch
     /// transports the `#[ryft(bounds(differentiation(...)))]` list.
     fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
@@ -582,6 +582,12 @@ impl SpecialTransposableValue for ScalarFactor {}
 
 impl SpecialTransposableValue for TranspositionFactor {}
 
+/// Extra program-constant capability supplied to generated differentiation implementations through
+/// `#[ryft(bounds(differentiation(...)))]`.
+trait SpecialDifferentiableValue {}
+
+impl SpecialDifferentiableValue for Factor {}
+
 /// Extra value bound a recursive payload's partial-evaluation rule requires, used to exercise
 /// `#[ryft(bounds(partial_evaluation(...)))]`.
 trait SpecialPartiallyEvaluatableValue {}
@@ -623,6 +629,17 @@ impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for ZeroOperation<T
 impl<T: Type, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C> for ZeroOperation<T> where
     C::Operation: From<ZeroOperation<T>>
 {
+}
+
+impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation<T> {
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
+    }
 }
 
 impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
@@ -682,8 +699,8 @@ impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V,
     }
 }
 
-/// Stand-in for an operation with observable effects (e.g., `ryft_core`'s `PrintOperation`), overriding the
-/// defaulted `Operation::effects` so the generated enum forwarding is observable.
+/// Stand-in for an operation that overrides the optional [`Operation`] metadata and rendering methods so generated
+/// enum forwarding through every base operation method is observable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PrintOperation;
 
@@ -702,6 +719,18 @@ impl Operation<DataType> for PrintOperation {
 
     fn effects(&self) -> Effects {
         Effects::Ordered
+    }
+
+    fn region_names(&self) -> &'static [&'static str] {
+        &["body"]
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        write!(formatter, "{:indentation$}rendered print", "")
     }
 }
 
@@ -807,6 +836,17 @@ where
 {
 }
 
+impl<T: Type, Constant: Clone, C: Context<Type = T>> DifferentiableOperation<C> for ConstantOperation<T, Constant> {
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "constant", marker: PhantomData }])
+    }
+}
+
 impl<T: Type, V: Value<Type = T>, O: Operation<T>, F: Clone> TransposableOperation<V, O> for ConstantOperation<T, F> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -867,8 +907,19 @@ enum ScalarOperation<V: Value<Type = DataType>> {
     CustomJvp(Box<CustomJvpOperation<DataType, V>>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
+enum WhereBoundOperation<V>
+where
+    V: Value<Type = DataType>,
+{
+    Zero(ZeroOperation<DataType>),
+    Factor(FactorOperation<DataType, V>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(dispatch(transposition))]
 enum LinearScalarOperation<V: Value<Type = DataType>, C: Value<Type = DataType> = V> {
     Zero(ZeroOperation<DataType>),
     Constant(ConstantOperation<DataType, V>),
@@ -907,12 +958,23 @@ fn test_scalar_operation() {
 }
 
 #[test]
-fn test_operation_generates_effects_forwarding() {
+fn test_operation_generates_operation_forwarding() {
     let add = ScalarOperation::<ScalarFactor>::from(AddOperation);
     let print = ScalarOperation::<ScalarFactor>::from(PrintOperation);
 
     assert_eq!(add.effects(), Effects::Pure);
     assert_eq!(print.effects(), Effects::Ordered);
+    assert_eq!(print.region_names(), &["body"]);
+    assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
+    assert_eq!(print.to_string(), "rendered print");
+}
+
+#[test]
+fn test_operation_infers_value_type_from_where_clause() {
+    let operation = WhereBoundOperation::<ScalarFactor>::from(ZeroOperation { r#type: DataType });
+
+    assert_eq!(operation.name(), "zero");
+    assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType]));
 }
 
 #[derive(Clone, Debug, ryft::Operation)]
@@ -921,7 +983,8 @@ enum DefaultPathOperation<V: ryft::Value<Type = ryft::DataType>> {
     Constant(ryft::ConstantOperation<V>),
 }
 
-#[derive(Clone, Debug, ryft::Operation, ryft::TransposableOperation)]
+#[derive(Clone, Debug, ryft::Operation)]
+#[ryft(dispatch(transposition))]
 enum DefaultPathLinearOperation<V: ryft::Value<Type = ryft::DataType>> {
     Zero(ryft::ZeroOperation<ryft::DataType>),
     Constant(ryft::ConstantOperation<V>),
@@ -1047,6 +1110,21 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 {
 }
 
+impl<C> DifferentiableOperation<C> for SpecialOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Constant: SpecialDifferentiableValue,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "special", marker: PhantomData }])
+    }
+}
+
 impl<V, O> TransposableOperation<V, O> for SpecialOperation
 where
     V: Value<Type = ArrayType> + SpecialTransposableValue,
@@ -1063,11 +1141,34 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
+#[ryft(dispatch(transposition))]
 enum SpecialLinearOperation<V: Value<Type = ArrayType>> {
     Special(SpecialOperation),
     Constant(ConstantOperation<ArrayType, V>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(dispatch(differentiation))]
+#[ryft(bounds(differentiation(SpecialDifferentiableValue)))]
+enum DifferentiableArrayOperation<V: Value<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Special(SpecialOperation),
+    Constant(ConstantOperation<ArrayType, V>),
+}
+
+#[test]
+fn test_operation_generates_differentiation_dispatch() {
+    type Operation = DifferentiableArrayOperation<Factor>;
+
+    let context = TestContext::<Factor, Operation> { marker: PhantomData };
+    let operation = Operation::from(SpecialOperation);
+    let outputs = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].label, "special");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
@@ -1268,8 +1369,9 @@ impl<T: Type, V: Value<Type = T>, O: Operation<T>, C: Clone, P: Clone, F: Clone>
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
+#[ryft(dispatch(transposition))]
 enum LinearArrayOperation<
     V: Value<Type = ArrayType>,
     C: Value<Type = ArrayType>,
@@ -1601,6 +1703,17 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<Array
     }
 }
 
+impl<Constant: Clone, C: Context<Type = ArrayType>> BatchableOperation<C> for ConstantOperation<ArrayType, Constant> {
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        _context: &BatchingContext<C>,
+        _driver: &D,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("constant")])
+    }
+}
+
 /// Batching rule requiring a value capability that the generated per-variant predicate transports to the owning
 /// enum's use sites without the enum spelling it.
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for DotOperation
@@ -1724,8 +1837,9 @@ where
     }
 }
 
-#[derive(Clone, Debug, ryft::Operation, ryft::BatchableOperation)]
+#[derive(Clone, Debug, ryft::Operation)]
 #[ryft(crate = "crate")]
+#[ryft(dispatch(batching))]
 #[ryft(bounds(batching(BooleanLike + SpecialBatchValue)))]
 enum BatchableArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
@@ -1792,14 +1906,49 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     );
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(dispatch(batching, differentiation, transposition))]
+enum AllDispatcherOperation<V: Value<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Constant(ConstantOperation<ArrayType, V>),
+}
+
+#[test]
+fn test_operation_generates_all_selected_dispatchers() {
+    type Operation = AllDispatcherOperation<Factor>;
+    type Context = TestContext<Factor, Operation>;
+
+    let operation = Operation::from(ZeroOperation { r#type: ArrayType });
+    let context = Context { marker: PhantomData };
+    let batching_context = BatchingContext { parent: Context { marker: PhantomData }, axis_name: None };
+    assert_eq!(operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")],);
+
+    let differentiated = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+    assert_eq!(differentiated.len(), 1);
+    assert_eq!(differentiated[0].label, "zero");
+
+    let mut transposition_context = TracingContext::<Factor, Operation> { marker: PhantomData };
+    assert_eq!(
+        operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]).unwrap(),
+        vec![transposed("zero")],
+    );
+}
+
 #[test]
 fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
+    test_cases.compile_fail("tests/operations/error_batching_bounds_without_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_bounds_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_differentiation_bounds_without_dispatch.rs");
+    test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
+    test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
+    test_cases.compile_fail("tests/operations/error_transposition_bounds_without_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_unknown_bounds_attribute.rs");
-    test_cases.compile_fail("tests/operations/error_unknown_transposition_bounds_attribute.rs");
 }

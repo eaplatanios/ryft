@@ -2199,7 +2199,8 @@ mod tests {
     /// both a forward operation and the other's staged adjoint) plus the structural `zero` and `add` operations the
     /// transpose pass needs. The `Constant` variant carries the value parameter `V` so the [`Operation`] derive can
     /// infer the primary type.
-    #[derive(Clone, Debug, ryft_macros::Operation, ryft_macros::TransposableOperation)]
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(dispatch(transposition))]
     enum TestSlicingOperation<V: Value<Type = ArrayType>> {
         Zero(ZeroOperation<ArrayType>),
         Constant(crate::operations::constants::ConstantOperation<V>),

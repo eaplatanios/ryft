@@ -117,8 +117,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// # Deriving Operation Enums
 ///
 /// Ryft provides a `#[derive(Operation)]` procedural macro via the `ryft-macros` crate for [`Operation`] sum types.
-/// It is meant for enums such as [`ScalarOperation`](crate::backends::scalars::ScalarOperation), where every variant wraps one concrete operation payload and
-/// the enum should behave exactly like whichever payload it contains. The derived implementation generates:
+/// It is meant for enums such as [`ScalarOperation`](crate::ScalarOperation), where every variant wraps one concrete
+/// operation payload and the enum should behave exactly like whichever payload it contains. The derived implementation
+/// generates:
 ///
 ///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
 ///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
@@ -126,6 +127,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards
 ///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
 ///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
+///   - A [`PartiallyEvaluatableOperation<C>`](crate::PartiallyEvaluatableOperation) implementation that likewise
+///     forwards to each concrete payload's partial-evaluation rule.
+///   - Optional [`BatchableOperation`](crate::BatchableOperation),
+///     [`DifferentiableOperation`](crate::DifferentiableOperation), and
+///     [`TransposableOperation`](crate::TransposableOperation) dispatchers selected independently through
+///     `#[ryft(dispatch(batching, differentiation, transposition))]`.
 ///   - A [`Display`] implementation that renders through [`Operation::render`] with zero indentation, so that the enum
 ///     display matches the canonical program rendering format.
 ///   - `From<Payload> for Enum` conversions for concrete payload variants.
@@ -160,6 +167,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     values that flow through the known-side context (e.g., `PartialEq` for the scan and while invariance fixed
 ///     points) and the program-constant space (e.g., [`BooleanLike`] for concretized condition predicates). Under an
 ///     eager known-side context the two spaces coincide anyway.
+///   - Bounds for batching, differentiation, or transposition require selecting the corresponding dispatcher.
+///     Interpretation and partial evaluation are always generated and therefore do not appear in the `dispatch(...)`
+///     attribute.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -196,9 +206,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
-/// `ryft` crate normally do not need this attribute. It also supports `#[ryft(bounds(interpretation(...)))]` and
-/// `#[ryft(bounds(partial_evaluation(...)))]` for the interpretation and partial-evaluation value bounds described
-/// above.
+/// `ryft` crate normally do not need this attribute. The `#[ryft(dispatch(...))]` attribute selects optional transform
+/// dispatchers, and `#[ryft(bounds(...))]` supplies the transform-specific value bounds described above.
 ///
 /// ## Example
 ///

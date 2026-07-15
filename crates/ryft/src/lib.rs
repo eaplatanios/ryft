@@ -10,6 +10,4 @@ pub use ryft_pjrt as pjrt;
 pub use ryft_xla as xla;
 
 pub use ryft_core::*;
-pub use ryft_macros::{
-    BatchableOperation, DifferentiableOperation, Operation, Parameter, Parameterized, TransposableOperation,
-};
+pub use ryft_macros::{Operation, Parameter, Parameterized};

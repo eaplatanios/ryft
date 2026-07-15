@@ -1,0 +1,5 @@
+error: unexpected end of input, '#[ryft(dispatch(...))]' must select at least one dispatcher
+  --> tests/operations/error_empty_dispatch.rs:10:17
+   |
+10 | #[ryft(dispatch())]
+   |                 ^

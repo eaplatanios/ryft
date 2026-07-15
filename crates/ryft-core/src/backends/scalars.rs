@@ -16,7 +16,7 @@ use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 
-use ryft_macros::{DifferentiableOperation, Operation, Parameter, TransposableOperation};
+use ryft_macros::{Operation, Parameter};
 
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
@@ -57,7 +57,8 @@ use crate::types::DataType;
 /// through array-based backends, but they are not variants of this enum. Each variant simply wraps the same-named
 /// operation payload, and the program-valued payloads (e.g., the custom-derivative calls) are boxed because they are
 /// recursively parameterized by this enum itself.
-#[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
+#[derive(Clone, Debug, Operation)]
+#[ryft(dispatch(differentiation, transposition))]
 #[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {
     Zero(ZeroOperation<DataType>),

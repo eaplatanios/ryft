@@ -1,7 +1,7 @@
 use std::ops::BitAnd;
 use std::rc::Rc;
 
-use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
+use ryft_macros::Operation;
 
 use ryft_core::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
@@ -70,8 +70,9 @@ pub type XlaConstant = CaptureReference<ArrayType>;
 /// instructions attach their nested computations as regions of the containing XLA program, so those regions can
 /// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
 /// [`shard_map`](ShardMapOperation).
-#[derive(Clone, Debug, Operation, TransposableOperation, DifferentiableOperation, BatchableOperation)]
+#[derive(Clone, Debug, Operation)]
 #[ryft(crate = "ryft_core")]
+#[ryft(dispatch(batching, differentiation, transposition))]
 #[ryft(bounds(
     interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),
     partial_evaluation(PartialEq + BooleanLike),

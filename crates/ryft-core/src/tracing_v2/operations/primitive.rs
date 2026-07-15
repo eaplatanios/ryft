@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::ops::BitAnd;
 
-use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
+use ryft_macros::Operation;
 
 use crate::backends::scalars::Scalar;
 use crate::operations::BooleanLike;
@@ -47,7 +47,8 @@ use crate::types::ArrayType;
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and
 /// [`Dot`](Self::Dot) a [`DotOperation`].
-#[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation, BatchableOperation)]
+#[derive(Clone, Debug, Operation)]
+#[ryft(dispatch(batching, differentiation, transposition))]
 // TODO(eaplatanios): Verify that we need all of these bounds / that they cannot be simplified.
 #[ryft(bounds(
     interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),

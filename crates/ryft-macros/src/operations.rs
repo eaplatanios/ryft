@@ -12,40 +12,33 @@ use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
+const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
 const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
 const INTERPRETATION_ATTRIBUTE: Symbol = Symbol::new("interpretation");
 const PARTIAL_EVALUATION_ATTRIBUTE: Symbol = Symbol::new("partial_evaluation");
 const BATCHING_ATTRIBUTE: Symbol = Symbol::new("batching");
 const DIFFERENTIATION_ATTRIBUTE: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, BOUNDS_ATTRIBUTE];
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 3] = [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE, BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
-const DEFAULT_MACRO_OPERATION_TYPE: Symbol = Symbol::new("__O");
-
 const NESTED_ATTRIBUTE_ERROR: &str = "\
   the '#[ryft(...)]' attribute is only supported at the top level for operation enums. It is not supported for \
   variants or fields";
 
-/// Code generator for `#[derive(Operation)]`.
-pub(crate) struct CodeGenerator {
+/// Mutable parser and diagnostic accumulator for `#[derive(Operation)]`.
+struct OperationParser {
     /// Path to the `ryft` crate or facade used by generated code.
     ryft_crate: syn::Path,
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
-    operation_type: syn::Type,
+    operation_type: Option<syn::Type>,
 
     /// Extra bounds to attach to the generated interpretation value type.
-    interpretation_value_bounds: Vec<syn::TypeParamBound>,
+    interpretation_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
     /// Extra bounds to attach to the generated partial-evaluation value type.
-    partial_evaluation_value_bounds: Vec<syn::TypeParamBound>,
-
-    /// Whether `#[ryft(bounds(interpretation(...)))]` was already specified.
-    interpretation_value_bounds_set: bool,
-
-    /// Whether `#[ryft(bounds(partial_evaluation(...)))]` was already specified.
-    partial_evaluation_value_bounds_set: bool,
+    partial_evaluation_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
     /// Extra bounds to attach to the eager batching impl's flowing value type, from
     /// `#[ryft(bounds(batching(...)))]`.
@@ -55,35 +48,23 @@ pub(crate) struct CodeGenerator {
     /// `C::Operation: From<XOperation>` conversions (so the staged recursive rules spell operation-shaped `From`
     /// bounds that the closed enum discharges structurally), and the program-constant space carries no batching
     /// capabilities at all (backend constants are symbolic capture references).
-    batching_value_bounds: Vec<syn::TypeParamBound>,
-
-    /// Whether `#[ryft(bounds(batching(...)))]` was already specified.
-    batching_bounds_set: bool,
+    batching_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
     /// Extra bounds to attach to the generated differentiation dispatcher's program constant type, from
     /// `#[ryft(bounds(differentiation(...)))]`.
-    differentiation_value_bounds: Vec<syn::TypeParamBound>,
-
-    /// Whether `#[ryft(bounds(differentiation(...)))]` was already specified.
-    differentiation_value_bounds_set: bool,
+    differentiation_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
     /// Extra bounds to attach to the generated `TransposableOperation` dispatcher's and
     /// transposition dispatcher's transposition value type, from
     /// `#[ryft(bounds(transposition(...)))]`. These serve the same role as bounds declared on the enum's own value
     /// parameter (which the generated implementations inherit) without forcing the enum's stored constant type to
     /// carry transposition-only capabilities.
-    transposition_value_bounds: Vec<syn::TypeParamBound>,
+    transposition_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
-    /// Whether `#[ryft(bounds(transposition(...)))]` was already specified.
-    transposition_value_bounds_set: bool,
+    /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
+    dispatchers: Option<Dispatchers>,
 
-    /// [`DeriveKind`] identifying which operation derive this [`CodeGenerator`] serves. The four operation derives
-    /// share the same `#[ryft(...)]` attribute namespace so combined derives compile: each `#[ryft(bounds(...))]`
-    /// kind is *owned* (documented and consumed) by exactly one derive and *tolerated* (parsed and discarded) by
-    /// the others, and this field selects the owned kinds.
-    kind: DeriveKind,
-
-    /// Errors accumulated in this [`CodeGenerator`]. The way error handling works in this code generator is that we
+    /// Errors accumulated in this [`OperationParser`]. The way error handling works in this parser is that we
     /// collect errors as we encounter them, and keep going as far as we can with the information that is available,
     /// before raising them. That is meant to enable a smoother development experience when working with `ryft` by
     /// reducing the amount of trial and error required to get something work (i.e., users do not need to keep trying,
@@ -91,114 +72,116 @@ pub(crate) struct CodeGenerator {
     errors: Vec<syn::Error>,
 }
 
-/// Operation derive that a [`CodeGenerator`] generates code for. Refer to the documentation of
-/// [`CodeGenerator::kind`] for information on how the four derives share the `#[ryft(...)]` attribute namespace.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum DeriveKind {
-    /// The `#[derive(Operation)]` macro, which owns the `#[ryft(bounds(interpretation(...)))]` and
-    /// `#[ryft(bounds(partial_evaluation(...)))]` bound kinds.
-    Operation,
+/// Optional dispatchers generated by `#[derive(Operation)]`.
+#[derive(Copy, Clone, Default)]
+struct Dispatchers {
+    /// Whether to generate the batching dispatcher.
+    batching: bool,
 
-    /// The `#[derive(BatchableOperation)]` macro, which owns the `#[ryft(bounds(batching(...)))]` bound kind.
-    BatchableOperation,
+    /// Whether to generate the differentiation dispatcher.
+    differentiation: bool,
 
-    /// The `#[derive(DifferentiableOperation)]` macro, which owns the `#[ryft(bounds(differentiation(...)))]`
-    /// bound kind.
-    DifferentiableOperation,
-
-    /// The `#[derive(TransposableOperation)]` macro, which owns the `#[ryft(bounds(transposition(...)))]`
-    /// bound kind.
-    TransposableOperation,
+    /// Whether to generate the transposition dispatcher.
+    transposition: bool,
 }
 
-impl CodeGenerator {
-    /// Creates a new [`CodeGenerator`] for the provided [`DeriveKind`], using inconsequential default values for
-    /// fields whose values need to be extracted from the derive input. These values are inconsequential because if we
-    /// fail to extract them from the provided input, then we will accumulate all relevant [`syn::Error`]s in
-    /// [`CodeGenerator::errors`] and return a compiler error before we get to use them.
-    fn new(kind: DeriveKind) -> Self {
-        CodeGenerator {
+/// Normalized value bounds used by the generated semantic implementations.
+struct OperationBounds {
+    /// Extra bounds on the generated interpretation value type.
+    interpretation: Vec<syn::TypeParamBound>,
+
+    /// Extra bounds on the generated partial-evaluation value types.
+    partial_evaluation: Vec<syn::TypeParamBound>,
+
+    /// Extra bounds on the eager batching value type.
+    batching: Vec<syn::TypeParamBound>,
+
+    /// Extra bounds on the differentiation program constant type.
+    differentiation: Vec<syn::TypeParamBound>,
+
+    /// Extra bounds on the generated transposition value type.
+    transposition: Vec<syn::TypeParamBound>,
+}
+
+/// Normalized operation enum shared by every generated dispatcher.
+struct OperationEnum {
+    /// Path to the `ryft` crate or facade used by generated code.
+    ryft_crate: syn::Path,
+
+    /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
+    operation_type: syn::Type,
+
+    /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
+    dispatchers: Dispatchers,
+
+    /// Value bounds used by the generated semantic implementations.
+    bounds: OperationBounds,
+
+    /// Enum identifier.
+    ident: syn::Ident,
+
+    /// Original enum generics after recursive `Self` replacement.
+    generics: syn::Generics,
+
+    /// Enum generics without defaults, used by conversion implementations.
+    conversion_generics: syn::Generics,
+
+    /// Enum generics with generic-extension operation bounds, used by semantic implementations.
+    operation_generics: syn::Generics,
+
+    /// Enum self type using all declared generic arguments.
+    self_type: syn::Type,
+
+    /// Whether the enum has exactly one parameter bounded by `Value<Type = T>`.
+    has_single_value_parameter: bool,
+
+    /// First value parameter, which represents program constants.
+    program_constant_type: syn::Ident,
+
+    /// Program-shaped generics after reducing payload-specific value parameters to the program constant space.
+    program_generics: syn::Generics,
+
+    /// Program-shaped enum self type after reducing payload-specific value parameters to the program constant space.
+    program_self_type: syn::Type,
+
+    /// Normalized operation variants.
+    variants: Vec<OperationVariant>,
+}
+
+/// Generates the `#[derive(Operation)]` expansion for `input`.
+pub(crate) fn generate_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
+    replace_self_type(&mut input);
+
+    let mut parser = OperationParser::new();
+    parser.extract_attributes(&input);
+    if parser.has_errors() {
+        return parser.into_compile_error().into();
+    }
+
+    let Some(operation_enum) = parser.normalize_input(&input) else {
+        return parser.into_compile_error().into();
+    };
+    operation_enum.generate().into()
+}
+
+impl OperationParser {
+    /// Creates a new [`OperationParser`] with default parser state.
+    fn new() -> Self {
+        OperationParser {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
-            operation_type: syn::Type::Path(syn::TypePath {
-                qself: None,
-                path: syn::Path::from(syn::Ident::from(DEFAULT_MACRO_OPERATION_TYPE)),
-            }),
-            interpretation_value_bounds: Vec::new(),
-            partial_evaluation_value_bounds: Vec::new(),
-            interpretation_value_bounds_set: false,
-            partial_evaluation_value_bounds_set: false,
-            batching_value_bounds: Vec::new(),
-            batching_bounds_set: false,
-            differentiation_value_bounds: Vec::new(),
-            differentiation_value_bounds_set: false,
-            transposition_value_bounds: Vec::new(),
-            transposition_value_bounds_set: false,
-            kind,
+            operation_type: None,
+            interpretation_value_bounds: None,
+            partial_evaluation_value_bounds: None,
+            batching_value_bounds: None,
+            differentiation_value_bounds: None,
+            transposition_value_bounds: None,
+            dispatchers: None,
             errors: Vec::new(),
         }
     }
 
-    /// Generates an implementation of [`Operation`] (together with its [`InterpretableOperation`],
-    /// [`PartiallyEvaluatableOperation`], [`Display`], and conversion companions)
-    /// for the provided input. Refer to the documentation of the [`Operation`] trait for information on how to use
-    /// this macro and on the shape of the generated code.
-    pub(crate) fn generate_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-        Self::generate_derive_impl(input, DeriveKind::Operation, Self::generate_operation)
-    }
-
-    /// Generates an implementation of [`BatchableOperation`] for the provided input. Refer to the documentation of
-    /// the [`BatchableOperation`] trait for information on how to use this macro and on the shape of the generated
-    /// code.
-    pub(crate) fn generate_batchable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-        Self::generate_derive_impl(input, DeriveKind::BatchableOperation, Self::generate_batchable_operation)
-    }
-
-    /// Generates an implementation of [`DifferentiableOperation`] whose dispatcher forwards region-access-driven
-    /// nested differentiation through the active driver. Refer to the documentation of the [`DifferentiableOperation`]
-    /// trait for information on how to use this macro and on the shape of the generated code.
-    pub(crate) fn generate_differentiable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-        Self::generate_derive_impl(input, DeriveKind::DifferentiableOperation, Self::generate_differentiable_operation)
-    }
-
-    /// Generates an implementation of [`TransposableOperation`] that dispatches each variant to its payload rule.
-    /// Refer to the documentation of the [`TransposableOperation`] trait for information on how to use this macro and
-    /// on the shape of the generated code.
-    pub(crate) fn generate_transposable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-        Self::generate_derive_impl(input, DeriveKind::TransposableOperation, Self::generate_transposable_operation)
-    }
-
-    /// Drives one operation derive: parses the input, replaces any instances of [`Self`] with its fully-qualified
-    /// path (which is necessary in order to be able to handle recursive operation enums), extracts the shared
-    /// `#[ryft(...)]` attributes, invokes the derive-specific `generate` function, and raises any errors that were
-    /// accumulated along the way as a combined compile-time error.
-    ///
-    /// # Parameters
-    ///
-    ///   * `input` - Derive macro input.
-    ///   * `kind` - [`DeriveKind`] identifying the operation derive being generated.
-    ///   * `generate` - Derive-specific code generation function.
-    fn generate_derive_impl(
-        input: proc_macro::TokenStream,
-        kind: DeriveKind,
-        generate: fn(&mut CodeGenerator, &syn::DeriveInput) -> TokenStream,
-    ) -> proc_macro::TokenStream {
-        let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
-        replace_self_type(&mut input);
-
-        let mut generator = CodeGenerator::new(kind);
-        generator.extract_attributes(&input);
-        if let Some(error) = generator.compile_error() {
-            return error.into();
-        }
-
-        let code = generate(&mut generator, &input);
-        if let Some(error) = generator.compile_error() {
-            return error.into();
-        }
-        code.into()
-    }
-
-    /// Adds an error to this [`CodeGenerator`] with the specified message spanning the provided tokens. This is only
+    /// Adds an error to this [`OperationParser`] with the specified message spanning the provided tokens. This is only
     /// meant to be used internally by this class as a convenient helper for collecting errors.
     ///
     /// # Parameters
@@ -209,24 +192,28 @@ impl CodeGenerator {
         self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
 
-    /// Returns a [`TokenStream`] that represents a [`compile_error!`] invocation that contain information about
-    /// [`syn::Error`]s that have been collected by this [`CodeGenerator`] so far. If there are no errors, then this
-    /// function returns [`None`].
-    fn compile_error(&self) -> Option<TokenStream> {
-        self.errors
-            .iter()
-            .flatten()
-            .reduce(|mut combined_error, error| {
-                combined_error.combine(error);
-                combined_error
-            })
-            .map(|error| error.into_compile_error())
+    /// Returns whether any diagnostics have been accumulated.
+    fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Combines all accumulated diagnostics into one `compile_error!` token stream.
+    ///
+    /// This method is called only after [`OperationParser::has_errors`] returns `true` or normalization returns
+    /// [`None`], which always adds at least one diagnostic.
+    fn into_compile_error(self) -> TokenStream {
+        let mut errors = self.errors.into_iter();
+        let mut error = errors.next().unwrap();
+        for next_error in errors {
+            error.combine(next_error);
+        }
+        error.into_compile_error()
     }
 
     /// Extracts any `#[ryft(...)]` attributes that are attached to the provided [`syn::DeriveInput`] and checks for
     /// unknown top-level (i.e., not field or variant) `#[ryft(...)]` attributes. This function will set
-    /// [`CodeGenerator::ryft_crate`] and the owned `#[ryft(bounds(...))]` bound kinds, if it is able to successfully
-    /// extract the attribute values, and it also infers [`CodeGenerator::operation_type`] from the enum's
+    /// [`OperationParser::ryft_crate`], [`OperationParser::dispatchers`], and `#[ryft(bounds(...))]` values, if it is
+    /// able to successfully extract them, and it also infers [`OperationParser::operation_type`] from the enum's
     /// `Value<Type = T>` generic bounds (there must be exactly one distinct such bound argument and an error is
     /// generated if there are zero or more than one).
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
@@ -234,6 +221,7 @@ impl CodeGenerator {
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
+                path if path == &DISPATCH_ATTRIBUTE => self.extract_dispatch_attribute(&meta),
                 path if path == &BOUNDS_ATTRIBUTE => self.extract_bounds_attribute(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
@@ -249,7 +237,7 @@ impl CodeGenerator {
         }
         let inferred_types = unique_value_bound_arguments(&input.generics);
         match inferred_types.as_slice() {
-            [operation_type] => self.operation_type = operation_type.clone(),
+            [operation_type] => self.operation_type = Some(operation_type.clone()),
             [] => self.add_error(
                 &input.ident,
                 "could not infer an operation type because no generic parameter is bounded by 'Value<Type = T>'",
@@ -259,46 +247,66 @@ impl CodeGenerator {
                 "could not infer a unique operation type because multiple distinct 'Value<Type = T>' bounds are present",
             ),
         }
+        self.validate_dispatch_bounds(input);
     }
 
-    /// Extracts a `#[ryft(bounds(...))]` attribute. Each bound kind is stored only when this [`CodeGenerator`]'s
-    /// [`DeriveKind`] owns it and is otherwise parsed and discarded, so that the four operation derives can share
-    /// the same `#[ryft(...)]` attribute namespace on one enum (refer to the documentation of
-    /// [`CodeGenerator::kind`] for more information).
+    /// Extracts the optional dispatchers selected by a `#[ryft(dispatch(...))]` attribute.
+    fn extract_dispatch_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+        if self.dispatchers.is_some() {
+            return Err(meta.error("duplicate ryft attribute 'dispatch(...)'"));
+        }
+
+        let content;
+        syn::parenthesized!(content in meta.input);
+        if content.is_empty() {
+            return Err(content.error("'#[ryft(dispatch(...))]' must select at least one dispatcher"));
+        }
+        let dispatchers = syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated(&content)?;
+        let mut selected_dispatchers = Dispatchers::default();
+        for dispatcher in dispatchers {
+            let selected = match &dispatcher {
+                path if path == &BATCHING_ATTRIBUTE => &mut selected_dispatchers.batching,
+                path if path == &DIFFERENTIATION_ATTRIBUTE => &mut selected_dispatchers.differentiation,
+                path if path == &TRANSPOSITION_ATTRIBUTE => &mut selected_dispatchers.transposition,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &dispatcher,
+                        format_args!(
+                            "invalid '#[ryft(dispatch(...))]' dispatcher: '{}'; only 'batching', 'differentiation', and \
+                         'transposition' are supported here",
+                            dispatcher.to_token_stream().to_string().replace(' ', ""),
+                        ),
+                    ));
+                }
+            };
+            if *selected {
+                return Err(syn::Error::new_spanned(
+                    &dispatcher,
+                    format_args!(
+                        "duplicate ryft dispatcher '{}'",
+                        dispatcher.to_token_stream().to_string().replace(' ', ""),
+                    ),
+                ));
+            }
+            *selected = true;
+        }
+        self.dispatchers = Some(selected_dispatchers);
+        Ok(())
+    }
+
+    /// Extracts a `#[ryft(bounds(...))]` attribute.
     fn extract_bounds_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
         meta.parse_nested_meta(|meta| {
-            // Identify the bound kind and destructure the owning derive's storage for it.
-            let (kind, owner, bounds, bounds_set) = match &meta.path {
-                path if path == &INTERPRETATION_ATTRIBUTE => (
-                    "interpretation",
-                    DeriveKind::Operation,
-                    &mut self.interpretation_value_bounds,
-                    &mut self.interpretation_value_bounds_set,
-                ),
-                path if path == &PARTIAL_EVALUATION_ATTRIBUTE => (
-                    "partial_evaluation",
-                    DeriveKind::Operation,
-                    &mut self.partial_evaluation_value_bounds,
-                    &mut self.partial_evaluation_value_bounds_set,
-                ),
-                path if path == &BATCHING_ATTRIBUTE => (
-                    "batching",
-                    DeriveKind::BatchableOperation,
-                    &mut self.batching_value_bounds,
-                    &mut self.batching_bounds_set,
-                ),
-                path if path == &DIFFERENTIATION_ATTRIBUTE => (
-                    "differentiation",
-                    DeriveKind::DifferentiableOperation,
-                    &mut self.differentiation_value_bounds,
-                    &mut self.differentiation_value_bounds_set,
-                ),
-                path if path == &TRANSPOSITION_ATTRIBUTE => (
-                    "transposition",
-                    DeriveKind::TransposableOperation,
-                    &mut self.transposition_value_bounds,
-                    &mut self.transposition_value_bounds_set,
-                ),
+            let (kind, bounds) = match &meta.path {
+                path if path == &INTERPRETATION_ATTRIBUTE => ("interpretation", &mut self.interpretation_value_bounds),
+                path if path == &PARTIAL_EVALUATION_ATTRIBUTE => {
+                    ("partial_evaluation", &mut self.partial_evaluation_value_bounds)
+                }
+                path if path == &BATCHING_ATTRIBUTE => ("batching", &mut self.batching_value_bounds),
+                path if path == &DIFFERENTIATION_ATTRIBUTE => {
+                    ("differentiation", &mut self.differentiation_value_bounds)
+                }
+                path if path == &TRANSPOSITION_ATTRIBUTE => ("transposition", &mut self.transposition_value_bounds),
                 _ => {
                     return Err(meta.error(format_args!(
                         "invalid '#[ryft(bounds(...))]' attribute: '{}'; only 'interpretation(...)', \
@@ -309,15 +317,31 @@ impl CodeGenerator {
                 }
             };
             let parsed_bounds = parse_bounds(&meta, kind)?;
-            if self.kind == owner {
-                if *bounds_set {
-                    return Err(meta.error(format_args!("duplicate ryft attribute 'bounds({kind}(...))'")));
-                }
-                *bounds_set = true;
-                *bounds = parsed_bounds;
+            if bounds.is_some() {
+                return Err(meta.error(format_args!("duplicate ryft attribute 'bounds({kind}(...))'")));
             }
+            *bounds = Some(parsed_bounds);
             Ok(())
         })
+    }
+
+    /// Rejects bounds for optional dispatchers that were not selected.
+    fn validate_dispatch_bounds(&mut self, input: &syn::DeriveInput) {
+        let dispatchers = self.dispatchers.unwrap_or_default();
+        let invalid_bounds = [
+            (self.batching_value_bounds.is_some() && !dispatchers.batching, "batching"),
+            (self.differentiation_value_bounds.is_some() && !dispatchers.differentiation, "differentiation"),
+            (self.transposition_value_bounds.is_some() && !dispatchers.transposition, "transposition"),
+        ];
+        invalid_bounds.into_iter().filter(|(invalid, _)| *invalid).for_each(|(_, dispatcher)| {
+            self.add_error(
+                &input.ident,
+                format_args!(
+                    "'#[ryft(bounds({dispatcher}(...)))]' requires selecting '{dispatcher}' in \
+                     '#[ryft(dispatch(...))]'",
+                ),
+            );
+        });
     }
 
     /// Extracts the [`OperationVariant`]s that are contained in the provided [`syn::DeriveInput`]. This function
@@ -329,6 +353,62 @@ impl CodeGenerator {
         };
 
         data.variants.iter().filter_map(|variant| self.extract_variant(&input.generics, variant)).collect()
+    }
+
+    /// Normalizes the enum metadata shared by all generated implementations.
+    fn normalize_input(&mut self, input: &syn::DeriveInput) -> Option<OperationEnum> {
+        let variants = self.extract_variants(input);
+        if self.has_errors() {
+            return None;
+        }
+
+        let operation_type = self.operation_type.clone()?;
+
+        let ident = input.ident.clone();
+        let generics = input.generics.clone();
+        let conversion_generics = generics.without_defaults();
+        let (_, type_generics, _) = conversion_generics.split_for_impl();
+        let self_type: syn::Type = syn::parse_quote!(#ident #type_generics);
+        let value_type_parameters = value_type_parameters(&generics, &operation_type);
+        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
+            self.add_error(&generics, "could not infer the program constant value type for '#[derive(Operation)]'");
+            return None;
+        };
+        let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
+        let program_self_type = substitute_type_idents(&self_type, &program_value_substitutions);
+        let operation_generics = operation_generics(&generics, &variants, &self.ryft_crate, &operation_type);
+        let program_generics = substitute_generics(&operation_generics, &program_value_substitutions);
+        let variants = variants
+            .into_iter()
+            .map(|mut variant| {
+                variant.program_payload_type =
+                    substitute_type_idents(&variant.payload_type, &program_value_substitutions);
+                variant
+            })
+            .collect();
+
+        Some(OperationEnum {
+            ryft_crate: self.ryft_crate.clone(),
+            operation_type,
+            dispatchers: self.dispatchers.unwrap_or_default(),
+            bounds: OperationBounds {
+                interpretation: self.interpretation_value_bounds.clone().unwrap_or_default(),
+                partial_evaluation: self.partial_evaluation_value_bounds.clone().unwrap_or_default(),
+                batching: self.batching_value_bounds.clone().unwrap_or_default(),
+                differentiation: self.differentiation_value_bounds.clone().unwrap_or_default(),
+                transposition: self.transposition_value_bounds.clone().unwrap_or_default(),
+            },
+            ident,
+            generics,
+            conversion_generics,
+            operation_generics,
+            self_type,
+            has_single_value_parameter: value_type_parameters.len() == 1,
+            program_constant_type,
+            program_generics,
+            program_self_type,
+            variants,
+        })
     }
 
     /// Extracts one [`OperationVariant`] from the provided [`syn::Variant`]. This function also checks that the
@@ -357,9 +437,15 @@ impl CodeGenerator {
         let (operation_type, is_boxed) = boxed_inner_type(&payload_type)
             .map(|operation_type| (operation_type, true))
             .unwrap_or_else(|| (payload_type.clone(), false));
-        let skip_conversions = bare_generic_parameter(&payload_type, generics).is_some();
+        let is_generic_extension = is_bare_generic_parameter(&payload_type, generics);
 
-        Some(OperationVariant { ident: variant.ident.clone(), operation_type, is_boxed, skip_conversions })
+        Some(OperationVariant {
+            ident: variant.ident.clone(),
+            program_payload_type: operation_type.clone(),
+            payload_type: operation_type,
+            is_boxed,
+            is_generic_extension,
+        })
     }
 
     /// Rejects nested `#[ryft(...)]` attributes, which are only supported at the top level for operation enums and
@@ -370,6 +456,17 @@ impl CodeGenerator {
             .filter(|attr| attr.path() == &RYFT_ATTRIBUTE)
             .for_each(|attr| self.add_error(attr, NESTED_ATTRIBUTE_ERROR));
     }
+}
+
+impl OperationEnum {
+    /// Generates every semantic implementation selected for this operation enum.
+    fn generate(&self) -> TokenStream {
+        let operation = self.generate_operation();
+        let batching = self.dispatchers.batching.then(|| self.generate_batchable_operation());
+        let differentiation = self.dispatchers.differentiation.then(|| self.generate_differentiable_operation());
+        let transposition = self.dispatchers.transposition.then(|| self.generate_transposable_operation());
+        quote!(#operation #batching #differentiation #transposition)
+    }
 
     /// Generates the `Operation` derive output: the [`Operation`] dispatcher, the [`InterpretableOperation`]
     /// dispatcher, the
@@ -377,160 +474,65 @@ impl CodeGenerator {
     /// `TryFrom` payload conversions. Refer to the documentation of the [`Operation`] trait for information on the
     /// shape of the generated code and on how the interpretation value types are inferred from the enum's
     /// `Value<Type = T>` generic parameters.
-    fn generate_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
-        let variants = self.extract_variants(input);
-        if self.compile_error().is_some() {
-            return TokenStream::new();
-        }
-
-        let enum_name = &input.ident;
-        let conversion_generics = input.generics.without_defaults();
-        let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
-        let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
+    fn generate_operation(&self) -> TokenStream {
+        let variants = &self.variants;
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
 
-        let operation_self_type = conversion_self_type.clone();
-        let operation_generics = self.operation_generics(&input.generics, &variants);
+        let operation_self_type = &self.self_type;
+        let operation_generics = &self.operation_generics;
         let (operation_impl_generics, _, operation_where_clause) = operation_generics.split_for_impl();
-        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
-        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
-            self.add_error(
-                &input.generics,
-                "could not infer the program constant value type for '#[derive(Operation)]'",
-            );
-            return TokenStream::new();
-        };
-        let has_separate_interpretation_value_type = value_type_parameters.len() == 1;
-        let interpretation_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
-        let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
-        let program_operation_self_type =
-            substitute_type_idents(&operation_self_type, program_value_substitutions.as_slice());
-        let interpretation_self_type = program_operation_self_type.clone();
+        let operation = self.generate_operation_dispatcher();
+        let interpretation = self.generate_interpretable_operation();
+        let partial_evaluation = self.generate_partially_evaluatable_operation();
+        let conversion_impls = variants
+            .iter()
+            .filter(|variant| !variant.is_generic_extension)
+            .map(|variant| self.generate_conversion_impl(variant));
 
-        // The `InterpretableOperation` dispatcher forwards each variant to its payload's own interpretation rule;
-        // higher-order payload rules request nested replay through the interpretation driver, keeping the generated
-        // obligations direct and finite.
-        let interpretation_generics = self.interpretation_generics(
-            input,
-            &variants,
-            program_value_substitutions.as_slice(),
-            &program_constant_type,
-            &interpretation_value_type,
-            has_separate_interpretation_value_type,
-        );
-        let (interpretation_impl_generics, _, interpretation_where_clause) = interpretation_generics.split_for_impl();
+        const_block(quote! {
+            #operation
 
-        // Partial evaluation is generic over the known-side context `__Context`, pinned to the program's constant
-        // value type and to this enum as its operation family, so one generated implementation serves both eager
-        // known-side contexts (values equal to the program constants) and staging ones (values that are tracers into
-        // an outer program). Every variant forwards to its payload's per-operation rule, exactly like interpretation;
-        // most payloads use the default rule and only nested-program payloads override it.
-        let partial_evaluation_self_type = program_operation_self_type.clone();
-        let partial_evaluation_value_type = program_constant_type.clone();
-        let mut partial_evaluation_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
-        partial_evaluation_generics.params.push(syn::parse_quote!(__Context));
-        let partial_evaluation_where_clause = partial_evaluation_generics.make_where_clause();
-        partial_evaluation_where_clause.predicates.push(syn::parse_quote! {
-            __Context: #ryft::Context<
-                Type = #primary_type,
-                Constant = #partial_evaluation_value_type,
-                Operation = #partial_evaluation_self_type,
-            >
-        });
-        // Extra partial-evaluation-only bounds requested via `#[ryft(bounds(partial_evaluation(...)))]`. These apply
-        // to *both* partial-evaluation value spaces, because a recursive payload's rule may need them on either side:
-        // the scan/while invariance fixed points compare known values, which flow as `__Context::Value` (tracers
-        // under a staging known-side context, hence e.g. `PartialEq`), while the condition rule inspects its
-        // concretized predicate in the program-constant space (hence e.g. `BooleanLike`). Applying one declared bound
-        // list to both spaces keeps the attribute surface small; under an eager known-side context the two spaces
-        // coincide anyway.
-        {
-            let partial_evaluation_value_type: syn::Type = syn::parse_quote!(#partial_evaluation_value_type);
-            add_value_bounds(
-                partial_evaluation_where_clause,
-                &partial_evaluation_value_type,
-                self.partial_evaluation_value_bounds.as_slice(),
-            );
-            let partial_evaluation_flow_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
-            add_value_bounds(
-                partial_evaluation_where_clause,
-                &partial_evaluation_flow_type,
-                self.partial_evaluation_value_bounds.as_slice(),
-            );
-        }
-        // Skip recursive payload variants (those that mention this enum) from the where-clause, exactly like the
-        // interpretation and transposition impls: a `where ConditionOperation<.., Self, ..>:
-        // PartiallyEvaluatableOperation` edge would form a genuine trait-solver cycle with the condition payload's own
-        // recursion bound (E0275). The match arm for each variant
-        // still calls that variant's rule, which is discharged as a body obligation against this very impl.
-        partial_evaluation_where_clause.predicates.extend(
-            variants.iter().filter(|variant| !variant.skip_conversions).map(|variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
-                };
-                predicate
-            }),
-        );
-        let partial_evaluation_arms = variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            if variant.skip_conversions {
-                quote! {
-                    Self::#variant_ident(_) => {
-                        let regions = driver
-                            .regions()?
-                            .into_iter()
-                            .map(|region| region.to_program())
-                            .collect();
-                        context.fold_or_residualize(
-                            self.clone(),
-                            regions,
-                            inputs,
-                        )
-                    },
-                }
-            } else {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let receiver = variant.receiver();
-                quote! {
-                    Self::#variant_ident(operation) => {
-                        <#operation_type as #ryft::partial::PartiallyEvaluatableOperation<__Context>>::
-                            partially_evaluate(#receiver, context, driver, inputs)
-                    },
+            #interpretation
+
+            #partial_evaluation
+
+            #[automatically_derived]
+            impl #operation_impl_generics ::std::fmt::Display for #operation_self_type
+            #operation_where_clause
+            {
+                fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    <Self as #ryft::Operation<#primary_type>>::render(self, formatter, 0)
                 }
             }
-        });
-        let partial_evaluation_body = quote! {
-            match self {
-                #(#partial_evaluation_arms)*
-            }
-        };
-        let (partial_evaluation_impl_generics, _, partial_evaluation_where_clause) =
-            partial_evaluation_generics.split_for_impl();
 
-        let name_arms = variants.iter().map(|variant| {
+            #(#conversion_impls)*
+        })
+    }
+
+    /// Generates the base [`Operation`] dispatcher.
+    fn generate_operation_dispatcher(&self) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let primary_type = &self.operation_type;
+        let operation_self_type = &self.self_type;
+        let (impl_generics, _, where_clause) = self.operation_generics.split_for_impl();
+        let name_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::name(#receiver)
+                    <#payload_type as #ryft::Operation<#primary_type>>::name(#receiver)
                 },
             }
         });
-        let infer_output_type_arms = variants.iter().map(|variant| {
+        let infer_output_type_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::infer_output_types(
+                    <#payload_type as #ryft::Operation<#primary_type>>::infer_output_types(
                         #receiver,
                         input_types,
                         region_interfaces,
@@ -538,87 +540,57 @@ impl CodeGenerator {
                 },
             }
         });
-        let region_name_arms = variants.iter().map(|variant| {
+        let region_name_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::region_names(#receiver)
+                    <#payload_type as #ryft::Operation<#primary_type>>::region_names(#receiver)
                 },
             }
         });
-        let output_region_provenance_arms = variants.iter().map(|variant| {
+        let provenance_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::output_region_provenance(
+                    <#payload_type as #ryft::Operation<#primary_type>>::output_region_provenance(
                         #receiver,
                         output_index,
                     )
                 },
             }
         });
-        let effects_arms = variants.iter().map(|variant| {
+        let effects_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::effects(#receiver)
+                    <#payload_type as #ryft::Operation<#primary_type>>::effects(#receiver)
                 },
             }
         });
-        let render_arms = variants.iter().map(|variant| {
+        let render_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_operation_type as #ryft::Operation<#primary_type>>::render(
-                        #receiver,
-                        formatter,
-                        indentation,
-                    )
+                    <#payload_type as #ryft::Operation<#primary_type>>::render(#receiver, formatter, indentation)
                 },
             }
         });
-        // The dispatcher arms forward each variant to its payload's own interpretation rule.
-        let interpretation_arms = variants
-            .iter()
-            .map(|variant| {
-                let variant_ident = &variant.ident;
-                let payload_operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let receiver = variant.receiver();
-                quote! {
-                    Self::#variant_ident(operation) => {
-                        <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
-                            #receiver,
-                            context,
-                            driver,
-                            inputs,
-                        )
-                    },
-                }
-            })
-            .collect::<Vec<_>>();
-        let conversion_impls = variants
-            .iter()
-            .filter(|variant| !variant.skip_conversions)
-            .map(|variant| self.generate_conversion_impl(&conversion_generics, &conversion_self_type, variant));
 
-        const_block(quote! {
+        quote! {
             #[automatically_derived]
-            impl #operation_impl_generics #ryft::Operation<#primary_type> for #operation_self_type
-            #operation_where_clause
+            impl #impl_generics #ryft::Operation<#primary_type> for #operation_self_type
+            #where_clause
             {
                 fn name(&self) -> &'static str {
-                    match self {
-                        #(#name_arms)*
-                    }
+                    match self { #(#name_arms)* }
                 }
 
                 fn infer_output_types(
@@ -626,30 +598,22 @@ impl CodeGenerator {
                     input_types: &[#primary_type],
                     region_interfaces: &[#ryft::RegionInterface<#primary_type>],
                 ) -> ::std::result::Result<::std::vec::Vec<#primary_type>, #ryft::TypeError> {
-                    match self {
-                        #(#infer_output_type_arms)*
-                    }
+                    match self { #(#infer_output_type_arms)* }
                 }
 
                 fn region_names(&self) -> &'static [&'static str] {
-                    match self {
-                        #(#region_name_arms)*
-                    }
+                    match self { #(#region_name_arms)* }
                 }
 
                 fn output_region_provenance(
                     &self,
                     output_index: usize,
                 ) -> ::std::vec::Vec<#ryft::OutputRegionProvenance> {
-                    match self {
-                        #(#output_region_provenance_arms)*
-                    }
+                    match self { #(#provenance_arms)* }
                 }
 
                 fn effects(&self) -> #ryft::Effects {
-                    match self {
-                        #(#effects_arms)*
-                    }
+                    match self { #(#effects_arms)* }
                 }
 
                 fn render(
@@ -657,12 +621,35 @@ impl CodeGenerator {
                     formatter: &mut ::std::fmt::Formatter<'_>,
                     indentation: usize,
                 ) -> ::std::fmt::Result {
-                    match self {
-                        #(#render_arms)*
-                    }
+                    match self { #(#render_arms)* }
                 }
             }
+        }
+    }
 
+    /// Generates the always-present [`InterpretableOperation`] dispatcher.
+    fn generate_interpretable_operation(&self) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let interpretation_self_type = &self.program_self_type;
+        let interpretation_generics = self.interpretation_generics();
+        let (interpretation_impl_generics, _, interpretation_where_clause) = interpretation_generics.split_for_impl();
+        let interpretation_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_operation_type = &variant.program_payload_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_operation_type as #ryft::InterpretableOperation<__Context>>::interpret(
+                        #receiver,
+                        context,
+                        driver,
+                        inputs,
+                    )
+                },
+            }
+        });
+
+        quote! {
             #[automatically_derived]
             impl #interpretation_impl_generics
                 #ryft::InterpretableOperation<__Context>
@@ -683,12 +670,75 @@ impl CodeGenerator {
                     }
                 }
             }
+        }
+    }
 
+    /// Generates the always-present [`PartiallyEvaluatableOperation`] dispatcher.
+    fn generate_partially_evaluatable_operation(&self) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let primary_type = &self.operation_type;
+        let partial_evaluation_self_type = &self.program_self_type;
+        let partial_evaluation_value_type = &self.program_constant_type;
+        let mut generics = self.program_generics.clone();
+        generics.params.push(syn::parse_quote!(__Context));
+        let where_clause = generics.make_where_clause();
+        where_clause.predicates.push(syn::parse_quote! {
+            __Context: #ryft::Context<
+                Type = #primary_type,
+                Constant = #partial_evaluation_value_type,
+                Operation = #partial_evaluation_self_type,
+            >
+        });
+
+        // Extra partial-evaluation-only bounds apply to both value spaces because recursive payload rules may use
+        // either the program constants or values flowing through the known-side context.
+        let constant_type: syn::Type = syn::parse_quote!(#partial_evaluation_value_type);
+        add_value_bounds(where_clause, &constant_type, &self.bounds.partial_evaluation);
+        let flow_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
+        add_value_bounds(where_clause, &flow_type, &self.bounds.partial_evaluation);
+
+        // Bare generic extension payloads residualize the complete enum operation instead of naming a payload rule.
+        where_clause
+            .predicates
+            .extend(self.variants.iter().filter(|variant| !variant.is_generic_extension).map(|variant| {
+                let operation_type = &variant.program_payload_type;
+                let predicate: syn::WherePredicate = syn::parse_quote! {
+                    #operation_type: #ryft::partial::PartiallyEvaluatableOperation<__Context>
+                };
+                predicate
+            }));
+        let arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            if variant.is_generic_extension {
+                quote! {
+                    Self::#variant_ident(_) => {
+                        let regions = driver
+                            .regions()?
+                            .into_iter()
+                            .map(|region| region.to_program())
+                            .collect();
+                        context.fold_or_residualize(self.clone(), regions, inputs)
+                    },
+                }
+            } else {
+                let operation_type = &variant.program_payload_type;
+                let receiver = variant.receiver();
+                quote! {
+                    Self::#variant_ident(operation) => {
+                        <#operation_type as #ryft::partial::PartiallyEvaluatableOperation<__Context>>::
+                            partially_evaluate(#receiver, context, driver, inputs)
+                    },
+                }
+            }
+        });
+        let (impl_generics, _, where_clause) = generics.split_for_impl();
+
+        quote! {
             #[automatically_derived]
-            impl #partial_evaluation_impl_generics
+            impl #impl_generics
                 #ryft::partial::PartiallyEvaluatableOperation<__Context>
                 for #partial_evaluation_self_type
-            #partial_evaluation_where_clause
+            #where_clause
             {
                 fn partially_evaluate<__D: #ryft::partial::PartialEvaluationDriver<__Context>>(
                     &self,
@@ -703,21 +753,12 @@ impl CodeGenerator {
                     >>,
                     #ryft::ProgramError,
                 > {
-                    #partial_evaluation_body
+                    match self {
+                        #(#arms)*
+                    }
                 }
             }
-
-            #[automatically_derived]
-            impl #operation_impl_generics ::std::fmt::Display for #operation_self_type
-            #operation_where_clause
-            {
-                fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                    <Self as #ryft::Operation<#primary_type>>::render(self, formatter, 0)
-                }
-            }
-
-            #(#conversion_impls)*
-        })
+        }
     }
 
     /// Generates the `BatchableOperation` derive output: one fixed-active-context `BatchableOperation` dispatcher.
@@ -733,37 +774,17 @@ impl CodeGenerator {
     /// the parent `Zero` leaf that backs accumulator seeding. Nested programs batch structurally through
     /// `Program::batched`, requested by higher-order rules through their active driver, whose implementation
     /// establishes the finite program-level bounds at its construction site.
-    fn generate_batchable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
-        let variants = self.extract_variants(input);
-        if self.compile_error().is_some() {
-            return TokenStream::new();
-        }
-
-        let enum_name = &input.ident;
-        let conversion_generics = input.generics.without_defaults();
-        let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
-        let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
+    fn generate_batchable_operation(&self) -> TokenStream {
+        let variants = &self.variants;
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
-
-        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
-        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
-            self.add_error(
-                &input.generics,
-                "could not infer the program constant value type for '#[derive(BatchableOperation)]'",
-            );
-            return TokenStream::new();
-        };
-        let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
-        let batching_self_type = substitute_type_idents(&conversion_self_type, program_value_substitutions.as_slice());
+        let program_constant_type = &self.program_constant_type;
+        let batching_self_type = &self.program_self_type;
 
         // Fixed-active-context dispatcher: every arm receives the active `BatchingContext<__ParentContext>`, the
         // current instruction's `BatchingDriver`, and the parent context's own value.
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
-        let mut batching_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
+        let mut batching_generics = self.program_generics.clone();
         batching_generics.params.push(syn::parse_quote!(__ParentContext));
         let batching_where_clause = batching_generics.make_where_clause();
         batching_where_clause.predicates.push(syn::parse_quote! {
@@ -774,8 +795,7 @@ impl CodeGenerator {
             >
         });
         batching_where_clause.predicates.extend(variants.iter().map(|variant| {
-            let operation_type =
-                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let operation_type = &variant.program_payload_type;
             let predicate: syn::WherePredicate =
                 syn::parse_quote!(#operation_type: #ryft::BatchableOperation<__ParentContext>);
             predicate
@@ -789,7 +809,8 @@ impl CodeGenerator {
         let batching_value_substitutions = [(program_constant_type.clone(), parent_value_type.clone())];
         let mut batching_value_substituter = TypeIdentSubstituter { substitutions: &batching_value_substitutions };
         let batching_value_bounds = self
-            .batching_value_bounds
+            .bounds
+            .batching
             .iter()
             .map(|bound| {
                 let mut bound = bound.clone();
@@ -803,8 +824,7 @@ impl CodeGenerator {
             .push(syn::parse_quote!(__ParentContext: #ryft::Zero<#parent_value_type>));
         let batching_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let operation_type =
-                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let operation_type = &variant.program_payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -818,7 +838,7 @@ impl CodeGenerator {
             }
         });
         let (batching_impl_generics, _, batching_where_clause) = batching_generics.split_for_impl();
-        let batching_impl = quote! {
+        const_block(quote! {
             #[automatically_derived]
             impl #batching_impl_generics #ryft::BatchableOperation<__ParentContext> for #batching_self_type
             #batching_where_clause
@@ -837,10 +857,6 @@ impl CodeGenerator {
                     }
                 }
             }
-        };
-
-        const_block(quote! {
-            #batching_impl
         })
     }
 
@@ -852,34 +868,13 @@ impl CodeGenerator {
     /// transports the rule's own capability requirements. Higher-order rules request nested differentiation through
     /// their instruction-scoped driver, whose concrete implementation establishes the finite `Program::jvp` and
     /// `Program::linearize` bounds at its construction site.
-    fn generate_differentiable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
-        let variants = self.extract_variants(input);
-        if self.compile_error().is_some() {
-            return TokenStream::new();
-        }
-
-        let enum_name = &input.ident;
-        let conversion_generics = input.generics.without_defaults();
-        let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
-        let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
+    fn generate_differentiable_operation(&self) -> TokenStream {
+        let variants = &self.variants;
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
-
-        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
-        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
-            self.add_error(
-                &input.generics,
-                "could not infer the program constant value type for '#[derive(DifferentiableOperation)]'",
-            );
-            return TokenStream::new();
-        };
-        let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
-        let differentiation_self_type =
-            substitute_type_idents(&conversion_self_type, program_value_substitutions.as_slice());
-        let mut differentiation_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
+        let program_constant_type = &self.program_constant_type;
+        let differentiation_self_type = &self.program_self_type;
+        let mut differentiation_generics = self.program_generics.clone();
         differentiation_generics.params.push(syn::parse_quote!(__DifferentiationContext));
         let where_clause = differentiation_generics.make_where_clause();
         where_clause.predicates.push(syn::parse_quote! {
@@ -905,25 +900,27 @@ impl CodeGenerator {
         // The per-variant rules stage ordinary primal-enum operations for both the primal and the tangent side, so the
         // enum must offer the `From` conversion for every concrete payload. Bare generic payloads have no conversion
         // and instead carry their own forward-mode obligation directly.
-        where_clause
-            .predicates
-            .extend(variants.iter().filter(|variant| !variant.skip_conversions).map(|variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+        where_clause.predicates.extend(variants.iter().filter(|variant| !variant.is_generic_extension).map(
+            |variant| {
+                let operation_type = &variant.program_payload_type;
                 let predicate: syn::WherePredicate =
                     syn::parse_quote!(#differentiation_self_type: ::std::convert::From<#operation_type>);
                 predicate
-            }));
+            },
+        ));
         // Every payload carries its forward-mode obligation as a per-variant predicate, exactly like the
         // interpretation and partial-evaluation impls. The predicate transports each rule's own capability
         // requirements (e.g., `C::Value: Sin` for the sine rule) to the use site without the enum spelling them.
         where_clause.predicates.extend(variants.iter().map(|variant| {
-            let operation_type =
-                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let operation_type = &variant.program_payload_type;
             let predicate: syn::WherePredicate =
                 syn::parse_quote!(#operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>);
             predicate
         }));
+        // Differentiation-only bounds describe capabilities of constants captured by the differentiated program.
+        // They therefore apply to the enum's program constant type rather than to the context's flowing value type.
+        let program_constant_type: syn::Type = syn::parse_quote!(#program_constant_type);
+        add_value_bounds(where_clause, &program_constant_type, &self.bounds.differentiation);
         // Higher-order payload rules (condition/while/scan) forward-differentiate and linearize their nested
         // programs through the call-scoped `DifferentiationDriver`, whose implementations carry the direct
         // `Program::jvp`/`Program::linearize` bounds at their construction sites, so the dispatcher itself only
@@ -934,8 +931,7 @@ impl CodeGenerator {
 
         let jvp_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let operation_type =
-                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let operation_type = &variant.program_payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -984,76 +980,57 @@ impl CodeGenerator {
     /// to the first (tangent/cotangent) value parameter. Higher-order rules request nested-program transposition through
     /// their instruction-scoped driver, whose concrete implementation establishes the corresponding
     /// `Program::transpose_with_respect_to` bounds.
-    fn generate_transposable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
-        let variants = self.extract_variants(input);
-        if self.compile_error().is_some() {
-            return TokenStream::new();
-        }
-
-        let enum_name = &input.ident;
-        let conversion_generics = input.generics.without_defaults();
-        let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
-        let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
+    fn generate_transposable_operation(&self) -> TokenStream {
+        let variants = &self.variants;
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
 
-        let operation_self_type = conversion_self_type.clone();
-        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
-        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
-            self.add_error(
-                &input.generics,
-                "could not infer the program constant value type for '#[derive(TransposableOperation)]'",
-            );
-            return TokenStream::new();
-        };
-        let has_separate_transposition_value_type = value_type_parameters.len() == 1;
+        let operation_self_type = &self.self_type;
+        let program_constant_type = &self.program_constant_type;
+        let has_separate_transposition_value_type = self.has_single_value_parameter;
         let transposed_value_type: syn::Type = if has_separate_transposition_value_type {
             syn::parse_quote!(__TranspositionValue)
         } else {
             syn::parse_quote!(#program_constant_type)
         };
-        let mut transposition_generics = self.operation_generics(&input.generics, &variants);
+        let mut transposition_generics = self.operation_generics.clone();
         if has_separate_transposition_value_type {
             transposition_generics.params.push(syn::parse_quote!(__TranspositionValue));
         }
 
-        let transpose_bounds = variants
-            .iter()
-            .map(|variant| {
-                let operation_type = &variant.operation_type;
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::TransposableOperation<
-                        #transposed_value_type,
-                        #operation_self_type,
-                    >
-                };
-                predicate
-            })
-            .collect::<Vec<_>>();
         let where_clause = transposition_generics.make_where_clause();
         if has_separate_transposition_value_type {
             where_clause
                 .predicates
                 .push(syn::parse_quote!(#transposed_value_type: #ryft::Value<Type = #primary_type>));
             where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
-                &input.generics,
-                &program_constant_type,
+                &self.generics,
+                program_constant_type,
                 &transposed_value_type,
             ));
         }
         // Extra transposition-only bounds requested via `#[ryft(bounds(transposition(...)))]`. These serve the same
         // role as bounds declared on the enum's own value parameter (which the generated implementations inherit)
         // without forcing the enum's stored constant type to carry transposition-only capabilities.
-        add_value_bounds(where_clause, &transposed_value_type, self.transposition_value_bounds.as_slice());
+        add_value_bounds(where_clause, &transposed_value_type, &self.bounds.transposition);
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        where_clause.predicates.extend(transpose_bounds.iter().cloned());
+        where_clause.predicates.extend(variants.iter().map(|variant| {
+            let operation_type = &variant.payload_type;
+            let predicate: syn::WherePredicate = syn::parse_quote! {
+                #operation_type: #ryft::TransposableOperation<
+                    #transposed_value_type,
+                    #operation_self_type,
+                >
+            };
+            predicate
+        }));
 
         let (transposition_impl_generics, _, transposition_where_clause) = transposition_generics.split_for_impl();
         let transpose_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let operation_type = &variant.operation_type;
+            let operation_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -1114,21 +1091,13 @@ impl CodeGenerator {
     /// Generates the `From<Payload>` and borrowed `TryFrom<&Enum>` conversion implementations for one
     /// conversion-enabled variant. Boxed payloads box the payload in `From` and deref through the box in `TryFrom`.
     ///
-    /// # Parameters
-    ///
-    ///   * `generics` - Enum generics (without defaults) used by the generated implementations.
-    ///   * `enum_type` - Enum self type that the conversions convert to and from.
-    ///   * `variant` - [`OperationVariant`] to generate the conversions for.
-    fn generate_conversion_impl(
-        &self,
-        generics: &syn::Generics,
-        enum_type: &syn::Type,
-        variant: &OperationVariant,
-    ) -> TokenStream {
+    fn generate_conversion_impl(&self, variant: &OperationVariant) -> TokenStream {
+        let generics = &self.conversion_generics;
+        let enum_ident = &self.ident;
+        let enum_type = &self.self_type;
         let (impl_generics, _, where_clause) = generics.split_for_impl();
         let variant_ident = &variant.ident;
-        let operation_type = &variant.operation_type;
-        let enum_ident = enum_type_ident(enum_type).expect("expected enum self type to start with an identifier");
+        let operation_type = &variant.payload_type;
         let mut try_from_generics = generics.clone();
         try_from_generics
             .params
@@ -1172,31 +1141,13 @@ impl CodeGenerator {
     /// program-shaped value substitutions applied, one generated `__Context` parameter, the context's [`Domain`]
     /// equalities, the constant-lifting `Constant` context bound, the author-declared
     /// `#[ryft(bounds(interpretation(...)))]` value bounds, and one `InterpretableOperation` predicate per payload.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input`: Derive macro input.
-    ///   - `variants`: Extracted operation variants.
-    ///   - `program_value_substitutions`: Program-shaped value substitutions (refer to
-    ///     [`program_value_substitutions`]).
-    ///   - `program_constant_type`: Program constant value type parameter.
-    ///   - `interpretation_value_type`: Projection of the value type that the generated context interprets over.
-    ///   - `has_separate_interpretation_value_type`: Whether the context's flowing value may differ from the program
-    ///     constant type instead of being pinned to it.
-    #[allow(clippy::too_many_arguments)]
-    fn interpretation_generics(
-        &self,
-        input: &syn::DeriveInput,
-        variants: &[OperationVariant],
-        program_value_substitutions: &[(syn::Ident, syn::Type)],
-        program_constant_type: &syn::Ident,
-        interpretation_value_type: &syn::Type,
-        has_separate_interpretation_value_type: bool,
-    ) -> syn::Generics {
+    fn interpretation_generics(&self) -> syn::Generics {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
-        let mut generics =
-            substitute_generics(&self.operation_generics(&input.generics, variants), program_value_substitutions);
+        let program_constant_type = &self.program_constant_type;
+        let has_separate_interpretation_value_type = self.has_single_value_parameter;
+        let interpretation_value_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
+        let mut generics = self.program_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
         let where_clause = generics.make_where_clause();
         let mut domain_bound: syn::TypeParamBound = syn::parse_quote!(#ryft::Domain<Type = #primary_type>);
@@ -1211,9 +1162,9 @@ impl CodeGenerator {
         where_clause.predicates.push(syn::parse_quote!(__Context: #domain_bound));
         if has_separate_interpretation_value_type {
             where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
-                &input.generics,
+                &self.generics,
                 program_constant_type,
-                interpretation_value_type,
+                &interpretation_value_type,
             ));
             where_clause.predicates.push(syn::parse_quote! {
                 __Context: #ryft::Constant<
@@ -1223,38 +1174,21 @@ impl CodeGenerator {
                 >
             });
         }
-        if !self.interpretation_value_bounds.is_empty() {
+        if !self.bounds.interpretation.is_empty() {
             add_interpretation_value_bounds(
                 where_clause,
                 ryft,
-                interpretation_value_type,
-                self.interpretation_value_bounds.as_slice(),
+                &interpretation_value_type,
+                &self.bounds.interpretation,
             );
         }
-        where_clause.predicates.extend(variants.iter().map(|variant| {
-            let operation_type = substitute_type_idents(&variant.operation_type, program_value_substitutions);
+        where_clause.predicates.extend(self.variants.iter().map(|variant| {
+            let operation_type = &variant.program_payload_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
                 #operation_type: #ryft::InterpretableOperation<__Context>
             };
             predicate
         }));
-        generics
-    }
-
-    /// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
-    /// without defaults, plus one `Payload: Operation<T>` predicate per bare generic payload (concrete payloads
-    /// already implement [`Operation`] on their own).
-    fn operation_generics(&self, generics: &syn::Generics, variants: &[OperationVariant]) -> syn::Generics {
-        let mut generics = generics.without_defaults();
-
-        let ryft = &self.ryft_crate;
-        let primary_type = &self.operation_type;
-        let generic_operation_bounds = variants.iter().filter(|variant| variant.skip_conversions).map(|variant| {
-            let operation_type = &variant.operation_type;
-            let predicate: syn::WherePredicate = syn::parse_quote!(#operation_type: #ryft::Operation<#primary_type>);
-            predicate
-        });
-        generics.make_where_clause().predicates.extend(generic_operation_bounds);
         generics
     }
 }
@@ -1266,13 +1200,16 @@ struct OperationVariant {
     ident: syn::Ident,
 
     /// Operation type exposed by generated conversions.
-    operation_type: syn::Type,
+    payload_type: syn::Type,
+
+    /// Operation type used by generated program-shaped semantic implementations.
+    program_payload_type: syn::Type,
 
     /// Whether the stored payload is `Box<operation_type>`.
     is_boxed: bool,
 
-    /// Whether conversion impls should be skipped for this variant.
-    skip_conversions: bool,
+    /// Whether this variant stores a bare generic extension payload.
+    is_generic_extension: bool,
 }
 
 impl OperationVariant {
@@ -1280,6 +1217,25 @@ impl OperationVariant {
     fn receiver(&self) -> TokenStream {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
     }
+}
+
+/// Builds the generics used by the generated [`Operation`] and [`Display`] implementations: the enum generics
+/// without defaults, plus one `Payload: Operation<T>` predicate per bare generic payload (concrete payloads already
+/// implement [`Operation`] on their own).
+fn operation_generics(
+    generics: &syn::Generics,
+    variants: &[OperationVariant],
+    ryft: &syn::Path,
+    operation_type: &syn::Type,
+) -> syn::Generics {
+    let mut generics = generics.without_defaults();
+    let generic_operation_bounds = variants.iter().filter(|variant| variant.is_generic_extension).map(|variant| {
+        let payload_type = &variant.payload_type;
+        let predicate: syn::WherePredicate = syn::parse_quote!(#payload_type: #ryft::Operation<#operation_type>);
+        predicate
+    });
+    generics.make_where_clause().predicates.extend(generic_operation_bounds);
+    generics
 }
 
 /// Returns the inner type of a `Box<T>` type expression. This recognizes any type-path whose final path segment is
@@ -1307,25 +1263,24 @@ fn boxed_inner_type(ty: &syn::Type) -> Option<syn::Type> {
     }
 }
 
-/// Returns the matching generic parameter if `ty` is exactly a bare enum type parameter (e.g., the `Extension`
-/// payload of an `Extension(Extension)` variant), and [`None`] otherwise. Bare generic payloads are the ones whose
-/// generated conversions must be skipped, because a `From<Extension>` implementation would overlap with the concrete
-/// payload conversions whenever `Extension` is instantiated as one of the concrete payload types.
-fn bare_generic_parameter(ty: &syn::Type, generics: &syn::Generics) -> Option<syn::Ident> {
+/// Returns whether `ty` is exactly a bare enum type parameter (e.g., the `Extension` payload of an
+/// `Extension(Extension)` variant). Bare generic payloads are the ones whose generated conversions must be skipped,
+/// because a `From<Extension>` implementation would overlap with the concrete payload conversions whenever
+/// `Extension` is instantiated as one of the concrete payload types.
+fn is_bare_generic_parameter(ty: &syn::Type, generics: &syn::Generics) -> bool {
     let syn::Type::Path(type_path) = ty else {
-        return None;
+        return false;
     };
     if type_path.qself.is_some() || type_path.path.segments.len() != 1 {
-        return None;
+        return false;
     }
-    let segment = type_path.path.segments.first()?;
+    let Some(segment) = type_path.path.segments.first() else {
+        return false;
+    };
     if !matches!(segment.arguments, syn::PathArguments::None) {
-        return None;
+        return false;
     }
-    generics
-        .type_params()
-        .find(|parameter| parameter.ident == segment.ident)
-        .map(|parameter| parameter.ident.clone())
+    generics.type_params().any(|parameter| parameter.ident == segment.ident)
 }
 
 /// Returns whether `ty` is exactly the provided identifier.
@@ -1379,17 +1334,6 @@ fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
         syn::Type::Tuple(ty) => ty.elems.iter().any(|ty| type_mentions_ident(ty, ident)),
         _ => false,
     }
-}
-
-/// Extracts the leading identifier from an enum self type.
-fn enum_type_ident(ty: &syn::Type) -> Option<&syn::Ident> {
-    let syn::Type::Path(type_path) = ty else {
-        return None;
-    };
-    if type_path.qself.is_some() {
-        return None;
-    }
-    type_path.path.segments.first().map(|segment| &segment.ident)
 }
 
 /// Substitutes bare type identifiers in `ty` according to the provided substitutions, returning the substituted
@@ -1635,71 +1579,154 @@ mod tests {
 
     use super::*;
 
+    /// Parses a derive input and extracts its operation attributes.
+    fn extract_attributes(tokens: TokenStream) -> OperationParser {
+        let input = syn::parse2(tokens).expect("failed to parse derive input");
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        parser
+    }
+
     #[test]
-    fn test_code_generator_add_error_and_compile_error() {
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
-        generator.add_error(quote!(variant_a), "first error");
-        generator.add_error(quote!(variant_b), "second error");
-        let error = generator.compile_error().expect("expected combined compile error").to_string();
+    fn test_operation_parser_add_error_and_compile_error() {
+        let mut parser = OperationParser::new();
+        parser.add_error(quote!(variant_a), "first error");
+        parser.add_error(quote!(variant_b), "second error");
+        assert!(parser.has_errors());
+        let error = parser.into_compile_error().to_string();
         assert!(error.contains("compile_error"));
         assert!(error.contains("first error"));
         assert!(error.contains("second error"));
     }
 
     #[test]
-    fn test_code_generator_extract_attributes() {
-        // Test using valid attributes: the crate path and the owned interpretation bound kind are stored, while the
-        // batching bound kind (owned by `#[derive(BatchableOperation)]`) is parsed and discarded.
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
-        let input = syn::parse2(quote! {
+    fn test_operation_parser_extract_attributes() {
+        let generator = extract_attributes(quote! {
             #[ryft(crate = "wrapped::ryft")]
-            #[ryft(bounds(interpretation(BooleanLike + Slice)))]
             #[ryft(bounds(batching(BooleanLike)))]
+            #[ryft(dispatch(batching, differentiation, transposition))]
+            #[ryft(bounds(interpretation(BooleanLike + Slice)))]
+            #[ryft(bounds(partial_evaluation(PartialEq)))]
+            #[ryft(bounds(differentiation(BooleanLike)))]
+            #[ryft(bounds(transposition(Clone)))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
-        })
-        .expect("failed to parse derive input");
-        generator.extract_attributes(&input);
+        });
         assert!(generator.errors.is_empty());
         assert_eq!(generator.ryft_crate.to_token_stream().to_string(), "wrapped :: ryft");
-        assert_eq!(generator.operation_type.to_token_stream().to_string(), "DataType");
-        assert_eq!(generator.interpretation_value_bounds.len(), 2);
-        assert!(generator.batching_value_bounds.is_empty());
+        assert_eq!(generator.operation_type.as_ref().unwrap().to_token_stream().to_string(), "DataType");
+        let dispatchers = generator.dispatchers.unwrap_or_default();
+        assert!(dispatchers.batching);
+        assert!(dispatchers.differentiation);
+        assert!(dispatchers.transposition);
+        assert_eq!(generator.interpretation_value_bounds.unwrap().len(), 2);
+        assert_eq!(generator.partial_evaluation_value_bounds.unwrap().len(), 1);
+        assert_eq!(generator.batching_value_bounds.unwrap().len(), 1);
+        assert_eq!(generator.differentiation_value_bounds.unwrap().len(), 1);
+        assert_eq!(generator.transposition_value_bounds.unwrap().len(), 1);
 
-        // Test using invalid attributes.
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
-        let input = syn::parse2(quote! {
-            #[ryft(crate = "ryft", unknown = "value")]
-            enum Operation<V: Value<Type = DataType>> {
-                Zero(ZeroOperation<DataType>),
-            }
-        })
-        .expect("failed to parse derive input");
-        generator.extract_attributes(&input);
-        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("invalid '#[ryft(...)]' attribute: 'unknown'"));
-
-        // Test using duplicate owned bound kinds.
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
-        let input = syn::parse2(quote! {
+        let generator = extract_attributes(quote! {
             #[ryft(bounds(interpretation(BooleanLike)))]
-            #[ryft(bounds(interpretation(Slice)))]
+            #[ryft(bounds(partial_evaluation(PartialEq)))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
-        })
-        .expect("failed to parse derive input");
-        generator.extract_attributes(&input);
-        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("duplicate ryft attribute 'bounds(interpretation(...))'"));
+        });
+        assert!(generator.errors.is_empty());
+        let dispatchers = generator.dispatchers.unwrap_or_default();
+        assert!(!dispatchers.batching);
+        assert!(!dispatchers.differentiation);
+        assert!(!dispatchers.transposition);
+        assert_eq!(generator.interpretation_value_bounds.unwrap().len(), 1);
+        assert_eq!(generator.partial_evaluation_value_bounds.unwrap().len(), 1);
     }
 
     #[test]
-    fn test_code_generator_extract_variants() {
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
+    fn test_operation_parser_extract_dispatchers() {
+        for (dispatcher, batching, differentiation, transposition) in [
+            (quote!(batching), true, false, false),
+            (quote!(differentiation), false, true, false),
+            (quote!(transposition), false, false, true),
+        ] {
+            let generator = extract_attributes(quote! {
+                #[ryft(dispatch(#dispatcher))]
+                enum Operation<V: Value<Type = DataType>> {
+                    Zero(ZeroOperation<DataType>),
+                }
+            });
+            assert!(generator.errors.is_empty());
+            let dispatchers = generator.dispatchers.unwrap_or_default();
+            assert_eq!(dispatchers.batching, batching);
+            assert_eq!(dispatchers.differentiation, differentiation);
+            assert_eq!(dispatchers.transposition, transposition);
+        }
+    }
+
+    #[test]
+    fn test_operation_parser_applies_differentiation_bounds() {
+        let mut input: syn::DeriveInput = syn::parse2(quote! {
+            #[ryft(dispatch(differentiation))]
+            #[ryft(bounds(differentiation(SpecialDifferentiableValue)))]
+            enum Operation<V: Value<Type = DataType>> {
+                Zero(ZeroOperation<DataType>),
+            }
+        })
+        .expect("failed to parse derive input");
+        replace_self_type(&mut input);
+
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let operation_enum = parser.normalize_input(&input).expect("failed to normalize operation enum");
+        let generated = operation_enum.generate_differentiable_operation().to_string();
+
+        assert!(generated.contains("V : SpecialDifferentiableValue"));
+    }
+
+    #[test]
+    fn test_operation_parser_rejects_invalid_attributes() {
+        let cases = [
+            (quote!(#[ryft(crate = "ryft", unknown = "value")]), "invalid '#[ryft(...)]' attribute: 'unknown'"),
+            (quote!(#[ryft(dispatch())]), "must select at least one dispatcher"),
+            (quote!(#[ryft(bounds(interpretation()))]), "unexpected end of input"),
+            (quote!(#[ryft(dispatch(lowering))]), "invalid '#[ryft(dispatch(...))]' dispatcher: 'lowering'"),
+            (quote!(#[ryft(dispatch(batching, batching))]), "duplicate ryft dispatcher 'batching'"),
+            (
+                quote!(#[ryft(dispatch(batching))] #[ryft(dispatch(transposition))]),
+                "duplicate ryft attribute 'dispatch(...)'",
+            ),
+            (
+                quote!(#[ryft(bounds(interpretation(BooleanLike)))] #[ryft(bounds(interpretation(Slice)))]),
+                "duplicate ryft attribute 'bounds(interpretation(...))'",
+            ),
+            (
+                quote!(#[ryft(bounds(batching(BooleanLike)))]),
+                "'#[ryft(bounds(batching(...)))]' requires selecting 'batching'",
+            ),
+            (
+                quote!(#[ryft(bounds(differentiation(BooleanLike)))]),
+                "'#[ryft(bounds(differentiation(...)))]' requires selecting 'differentiation'",
+            ),
+            (
+                quote!(#[ryft(bounds(transposition(BooleanLike)))]),
+                "'#[ryft(bounds(transposition(...)))]' requires selecting 'transposition'",
+            ),
+        ];
+        for (attributes, expected_error) in cases {
+            let generator = extract_attributes(quote! {
+                #attributes
+                enum Operation<V: Value<Type = DataType>> {
+                    Zero(ZeroOperation<DataType>),
+                }
+            });
+            let errors = generator.errors.iter().map(syn::Error::to_string).collect::<Vec<_>>();
+            assert!(errors.iter().any(|error| error.contains(expected_error)), "errors: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn test_operation_parser_extract_variants() {
+        let mut generator = OperationParser::new();
         let mut input = syn::parse2(quote! {
             enum Operation<V: Value<Type = DataType>, Extension> {
                 Zero(ZeroOperation<DataType>),
@@ -1715,13 +1742,13 @@ mod tests {
         let variants = generator.extract_variants(&input);
         assert!(generator.errors.is_empty());
         assert_eq!(variants.len(), 4);
-        assert!(!variants[0].is_boxed && !variants[0].skip_conversions);
-        assert!(variants[1].is_boxed && !variants[1].skip_conversions);
-        assert!(!variants[2].is_boxed && !variants[2].skip_conversions);
-        assert!(!variants[3].is_boxed && variants[3].skip_conversions);
+        assert!(!variants[0].is_boxed && !variants[0].is_generic_extension);
+        assert!(variants[1].is_boxed && !variants[1].is_generic_extension);
+        assert!(!variants[2].is_boxed && !variants[2].is_generic_extension);
+        assert!(!variants[3].is_boxed && variants[3].is_generic_extension);
 
         // Non-enum inputs and variants that are not single-payload tuple variants are rejected.
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
+        let mut generator = OperationParser::new();
         let input = syn::parse2(quote! {
             struct Operation<V: Value<Type = DataType>> {
                 value: V,
@@ -1731,7 +1758,7 @@ mod tests {
         assert!(generator.extract_variants(&input).is_empty());
         assert_eq!(generator.errors.len(), 1);
 
-        let mut generator = CodeGenerator::new(DeriveKind::Operation);
+        let mut generator = OperationParser::new();
         let input = syn::parse2(quote! {
             enum Operation<V: Value<Type = DataType>> {
                 Unit,
@@ -1741,6 +1768,59 @@ mod tests {
         .expect("failed to parse derive input");
         assert!(generator.extract_variants(&input).is_empty());
         assert_eq!(generator.errors.len(), 2);
+
+        let mut generator = OperationParser::new();
+        let input = syn::parse2(quote! {
+            enum Operation<V: Value<Type = DataType>> {
+                #[ryft(unsupported)]
+                Zero(#[ryft(unsupported)] ZeroOperation<DataType>),
+            }
+        })
+        .expect("failed to parse derive input");
+        assert_eq!(generator.extract_variants(&input).len(), 1);
+        assert_eq!(generator.errors.len(), 2);
+        assert!(generator.errors.iter().all(|error| error.to_string() == NESTED_ATTRIBUTE_ERROR));
+    }
+
+    #[test]
+    fn test_operation_parser_normalizes_operation_enum() {
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V, C, Extension, F = V>
+            where
+                V: Value<Type = DataType>,
+                C: Value<Type = DataType>,
+                F: Value<Type = DataType>,
+            {
+                Recursive(Box<WhileOperation<DataType, F, Self>>),
+                Extension(Extension),
+            }
+        };
+        replace_self_type(&mut input);
+
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let operation = parser.normalize_input(&input).expect("failed to normalize operation enum");
+
+        assert_eq!(operation.operation_type.to_token_stream().to_string(), "DataType");
+        assert_eq!(operation.program_constant_type, "V");
+        assert!(!operation.has_single_value_parameter);
+        assert!(!operation.program_generics.type_params().any(|parameter| parameter.ident == "F"));
+        assert!(
+            operation
+                .program_self_type
+                .to_token_stream()
+                .to_string()
+                .contains("Operation < V , C , Extension , V >")
+        );
+        assert!(operation.variants[0].is_boxed);
+        assert!(
+            operation.variants[0]
+                .program_payload_type
+                .to_token_stream()
+                .to_string()
+                .contains("WhileOperation < DataType , V"),
+        );
+        assert!(operation.variants[1].is_generic_extension);
     }
 
     #[test]
@@ -1751,20 +1831,87 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_generic_parameter() {
+    fn test_is_bare_generic_parameter() {
         let input: syn::DeriveInput = syn::parse_quote! {
             enum Operation<T, Extension> {
                 Extension(Extension),
             }
         };
-        assert_eq!(
-            bare_generic_parameter(&syn::parse_quote!(Extension), &input.generics)
-                .expect("expected generic parameter")
-                .to_string(),
-            "Extension",
+        assert!(is_bare_generic_parameter(&syn::parse_quote!(Extension), &input.generics));
+        assert!(!is_bare_generic_parameter(&syn::parse_quote!(Box<Extension>), &input.generics));
+        assert!(!is_bare_generic_parameter(&syn::parse_quote!(Other), &input.generics));
+    }
+
+    #[test]
+    fn test_program_value_substitutions() {
+        let value: syn::Ident = syn::parse_quote!(V);
+        assert!(program_value_substitutions(std::slice::from_ref(&value), &value).is_empty());
+        assert!(program_value_substitutions(&[value.clone(), syn::parse_quote!(C)], &value).is_empty());
+
+        let substitutions = program_value_substitutions(
+            &[value.clone(), syn::parse_quote!(C), syn::parse_quote!(F), syn::parse_quote!(P)],
+            &value,
         );
-        assert!(bare_generic_parameter(&syn::parse_quote!(Box<Extension>), &input.generics).is_none());
-        assert!(bare_generic_parameter(&syn::parse_quote!(Other), &input.generics).is_none());
+        assert_eq!(substitutions.len(), 2);
+        assert_eq!(substitutions[0].0, "F");
+        assert!(type_tokens_equal(&substitutions[0].1, &syn::parse_quote!(V)));
+        assert_eq!(substitutions[1].0, "P");
+        assert!(type_tokens_equal(&substitutions[1].1, &syn::parse_quote!(V)));
+    }
+
+    #[test]
+    fn test_substitute_type_idents() {
+        let r#type: syn::Type = syn::parse_quote!((F, Wrapper<F>, F::Item, fn(F) -> Other));
+        let substituted = substitute_type_idents(&r#type, &[(syn::parse_quote!(F), syn::parse_quote!(V))]);
+        let expected: syn::Type = syn::parse_quote!((V, Wrapper<V>, V::Item, fn(V) -> Other));
+        assert!(type_tokens_equal(&substituted, &expected));
+    }
+
+    #[test]
+    fn test_substitute_generics() {
+        let input: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V, F: Trait<V>, X = F>
+            where
+                Wrapper<F>: Bound,
+                F::Item: Other
+            {}
+        };
+        let expected: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V, X = V>
+            where
+                Wrapper<V>: Bound,
+                V::Item: Other
+            {}
+        };
+        let substituted = substitute_generics(&input.generics, &[(syn::parse_quote!(F), syn::parse_quote!(V))]);
+        assert_eq!(
+            substituted.to_token_stream().to_string().replace(' ', ""),
+            expected.generics.to_token_stream().to_string().replace(' ', ""),
+        );
+    }
+
+    #[test]
+    fn test_generic_parameter_bounds_as_predicates() {
+        let input: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V: Value<Type = ArrayType> + Clone, U>
+            where
+                Wrapper<V>: Bound,
+                U: Unrelated
+            {}
+        };
+        let predicates = generic_parameter_bounds_as_predicates(
+            &input.generics,
+            &syn::parse_quote!(V),
+            &syn::parse_quote!(RuntimeValue),
+        )
+        .into_iter()
+        .map(|predicate| predicate.to_token_stream().to_string().replace(' ', ""))
+        .collect::<Vec<_>>();
+
+        assert!(predicates.contains(&"RuntimeValue:Value<Type=ArrayType>".to_string()));
+        assert!(predicates.contains(&"RuntimeValue:Clone".to_string()));
+        assert!(predicates.contains(&"Wrapper<RuntimeValue>:Bound".to_string()));
+        assert!(predicates.iter().all(|predicate| !predicate.contains("Unrelated")));
     }
 
     #[test]

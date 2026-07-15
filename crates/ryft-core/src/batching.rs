@@ -712,9 +712,8 @@ where
 ///
 /// # Deriving Batchable Operation Enums
 ///
-/// Ryft provides a `#[derive(BatchableOperation)]` procedural macro via the `ryft-macros` crate for
-/// [`BatchableOperation`] sum types whose variants already own their batching rules. It follows the same enum-shape
-/// and type-inference rules as `#[derive(Operation)]` and generates:
+/// `#[derive(Operation)]` generates a [`BatchableOperation`] dispatcher when the enum specifies
+/// `#[ryft(dispatch(batching))]`. It follows the operation derive's enum-shape and type-inference rules and generates:
 ///
 ///   - A dispatcher at `BatchableOperation<C>`, generic over the parent [`Context`] `C`, that forwards the active
 ///     [`BatchingContext`] to every variant's own rule. One dispatcher covers eager and staging parents alike, because
@@ -724,9 +723,7 @@ where
 ///     rules through their active [`BatchingDriver`], whose concrete implementation establishes the finite
 ///     program-level bounds at its construction site.
 ///
-/// `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's value
-/// type. The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]`
-/// macro.
+/// `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's value type.
 pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
@@ -750,10 +747,10 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
     ///     `context.parent()` and return parent-owned values; only rules keyed on the active frame's axis metadata
     ///     inspect the [`BatchingContext`] itself.
     ///
-    /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that are
-    /// derived using our `#[derive(BatchableOperation)]` macro, it is a common convention for operations that can be
-    /// part of such operation families to implement this trait even if they do not support batching and to have this
-    /// function simply return a [`BatchingError::UnsupportedOperation`] error.
+    /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that
+    /// select the generated batching dispatcher, it is a common convention for operations that can be part of such
+    /// operation families to implement this trait even if they do not support batching and to have this  function
+    /// simply return a [`BatchingError::UnsupportedOperation`] error.
     fn batch<D: BatchingDriver<C>>(
         &self,
         context: &BatchingContext<C>,

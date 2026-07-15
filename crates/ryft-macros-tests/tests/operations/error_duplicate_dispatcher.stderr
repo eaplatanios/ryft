@@ -1,0 +1,5 @@
+error: duplicate ryft dispatcher 'batching'
+  --> tests/operations/error_duplicate_dispatcher.rs:10:27
+   |
+10 | #[ryft(dispatch(batching, batching))]
+   |                           ^^^^^^^^
