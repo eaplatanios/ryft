@@ -535,7 +535,25 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<
 impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     #[inline]
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        self.mappings.import_into(builder, self.source, self.roots)
+        let builder_identity = Rc::downgrade(builder);
+        let mut destinations = self.mappings.destinations.borrow_mut();
+        destinations.retain(|mapping| mapping.builder.strong_count() > 0);
+        let destination_index = destinations
+            .iter()
+            .position(|mapping| Weak::ptr_eq(&mapping.builder, &builder_identity))
+            .unwrap_or_else(|| {
+                destinations.push(DestinationRegionMapping { builder: builder_identity, remapping: HashMap::new() });
+                destinations.len() - 1
+            });
+        let remapping = &mut destinations[destination_index].remapping;
+        let mut builder = builder.borrow_mut();
+        self.roots
+            .iter()
+            .map(|root| {
+                let region = RegionRef::new(self.source.regions(), *root)?;
+                Ok(builder.import_region_with_remapping(region, remapping))
+            })
+            .collect()
     }
 }
 
@@ -544,7 +562,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
 /// [`DestinationRegionMapping`] for every live destination [`ProgramBuilder`] so repeated roots and shared
 /// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
 /// spaces of different builders. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is
-/// used and why it is needed.
+/// used and why it is necessary.
 pub(crate) struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
@@ -556,64 +574,35 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
     pub(crate) fn new() -> Self {
         Self { destinations: RefCell::new(Vec::new()) }
     }
-
-    /// Imports `roots` into `builder`, reusing the mapping previously established for that exact builder allocation.
-    fn import_into(
-        &self,
-        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        source: RegionRef<'_, V, O>,
-        roots: &[RegionId],
-    ) -> Result<Vec<RegionId>, ProgramError> {
-        let builder_identity = Rc::downgrade(builder);
-        let mut destinations = self.destinations.borrow_mut();
-        destinations.retain(|mapping| mapping.builder.strong_count() > 0);
-        let destination_index = destinations
-            .iter()
-            .position(|mapping| Weak::ptr_eq(&mapping.builder, &builder_identity))
-            .unwrap_or_else(|| {
-                destinations.push(DestinationRegionMapping { builder: builder_identity, remapping: HashMap::new() });
-                destinations.len() - 1
-            });
-        let remapping = &mut destinations[destination_index].remapping;
-        let mut builder = builder.borrow_mut();
-        roots
-            .iter()
-            .map(|root| {
-                let region = RegionRef::new(source.regions(), *root)?;
-                Ok(builder.import_region_with_remapping(region, remapping))
-            })
-            .collect()
-    }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Source-to-destination [`RegionId`] mapping for one live destination builder participating in a region replay.
-///
-/// [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local to their owning
-/// arenas. See [`ReplayRegionDriver::mappings`] for how replay-wide sharing and destination-local identifiers interact.
+/// Source-to-destination [`RegionId`] mapping for one live destination [`ProgramBuilder`] participating in a
+/// [`Region`] replay. [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local
+/// to their owning arenas. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is used and why
+/// it is necessary.
 pub(crate) struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
-    /// Weak identity of the destination builder. Weak ownership prevents replay bookkeeping from keeping a completed
-    /// builder alive or interfering with trace finalization through `Rc::try_unwrap`.
+    /// Weak identity of the destination [`ProgramBuilder`]. Weak ownership prevents replay bookkeeping from keeping
+    /// a completed builder alive or interfering with trace finalization through `Rc::try_unwrap`.
     builder: Weak<RefCell<ProgramBuilder<V, O>>>,
 
-    /// Source-to-destination region identifier remapping for this builder.
+    /// Source-to-destination [`RegionId`] remapping for the destination [`ProgramBuilder`].
     remapping: HashMap<RegionId, RegionId>,
 }
 
-/// Identifies one attached-region output that may produce an [`Operation`] output.
-///
-/// Provenance is relative to an operation application: [`region_index`](Self::region_index) selects an entry from
-/// [`Instruction::regions`](crate::Instruction::regions), and [`output_index`](Self::output_index) selects an output
-/// of that attached region. Refer to [`Operation::output_region_provenance`] for how operations declare these values.
+/// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
+/// [`Operation`] application: [`region_index`](Self::region_index) selects an entry from [`Instruction::regions`],
+/// and [`output_index`](Self::output_index) selects an output of that attached region. Refer to
+/// [`Operation::output_region_provenance`] for how operations provide this kind of provenance information.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OutputRegionProvenance {
-    /// Index of the attached region in the operation-defined region order.
+    /// Index of the attached [`Region`] in the [`Operation`]-defined region order.
     pub region_index: usize,
 
-    /// Index of the output in the attached region's output boundary.
+    /// Index of the output in the attached [`Region`]'s output boundary.
     pub output_index: usize,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
