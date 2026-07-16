@@ -3,8 +3,8 @@ use std::ops::{Div, Mul};
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -114,6 +114,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Oper
 // TODO(eaplatanios): Review this implementation.
 impl<C: Context> DifferentiableOperation<C> for AbsOperation
 where
+    C::Type: DifferentiableType,
     C::Value: Abs + Conjugate + Real + Mul<Output = C::Value> + Div<Output = C::Value>,
     AbsOperation: Operation<C::Type>,
 {
@@ -131,7 +132,7 @@ where
         let input = &inputs[0];
         let primal = input.primal().abs()?;
         let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent().unwrap()),
             MaybeZero::Value(tangent) => {
                 let numerator = if input.primal().r#type().is_complex() {
                     (input.primal().conjugate()? * tangent.clone()).real()?

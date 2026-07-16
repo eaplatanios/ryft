@@ -885,7 +885,7 @@ where
 #[cfg(test)]
 mod tests {
     use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::math::{Cos, Mul, Sin};
+    use ryft_core::operations::math::{Atan2, Cos, Mul, Sin};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::{
@@ -939,6 +939,20 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f32>(shard_bytes.as_slice())
+    }
+
+    fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f64>(shard_bytes.as_slice())
     }
 
     #[test]
@@ -1081,6 +1095,56 @@ mod tests {
         let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
             domain.interpret(&second.executable_program(), input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
+    }
+
+    #[test]
+    fn test_promoted_broadcast_dense_differentiation_compiles_as_part_of_the_enclosing_program() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+
+        let forward: CompiledXlaFunction<
+            '_,
+            (ArrayType, ArrayType),
+            Jacobian<ArrayType, ArrayType, (ArrayType, ArrayType), ArrayType>,
+        > = compile(
+            |inputs| {
+                inputs
+                    .0
+                    .context()
+                    .clone()
+                    .jacfwd(|(scalar, vector)| scalar.atan2(&vector), inputs)
+                    .expect("forward Jacobian should stage")
+            },
+            (scalar_type.clone(), vector_type.clone()),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let scalar =
+            Array::from_host_buffer(&client, scalar_type, mesh.clone(), values_to_bytes::<f32>(&[2.0]).as_slice())
+                .unwrap();
+        let vector =
+            Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
+                .unwrap();
+        let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
+            domain.interpret(&forward.executable_program(), (scalar, vector)).unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        for (actual, expected) in read_f64_array(&client, blocks[0].value()).into_iter().zip([0.2, 0.2]) {
+            assert!((actual - expected).abs() < 1e-12, "got {actual}, expected {expected}");
+        }
+        for (actual, expected) in read_f64_array(&client, blocks[1].value()).into_iter().zip([-0.4, 0.0, 0.0, -0.1]) {
+            assert!((actual - expected).abs() < 1e-12, "got {actual}, expected {expected}");
+        }
     }
 
     #[test]

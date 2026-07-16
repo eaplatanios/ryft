@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
@@ -126,7 +127,7 @@ impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C>> for Ba
     }
 }
 
-impl<C: Context + One<C::Value>> One<DifferentiationTracer<C>> for DifferentiationContext<C> {
+impl<C: Context<Type: DifferentiableType> + One<C::Value>> One<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().one(r#type)?);

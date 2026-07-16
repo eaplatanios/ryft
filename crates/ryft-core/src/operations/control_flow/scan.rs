@@ -117,26 +117,26 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), T
 }
 
 /// Returns the stacked variant of a scan body slice type, prepending a static `length` dimension to its shape. The
-/// stacked type carries no optional layout or sharding metadata, so it is a declared type whose optional components
-/// are unspecified and scan input validation compares it against actual input types with
-/// [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
+/// stacked type preserves the slice's memory placement but carries no optional layout or sharding metadata, so it is
+/// a declared type whose optional components are unspecified. Scan input validation compares it against actual input
+/// types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
 pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
     dimensions.push(Size::Static(length));
     dimensions.extend(slice_type.shape().dimensions().iter().cloned());
-    ArrayType::new(slice_type.data_type(), Shape::new(dimensions))
+    ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory())
 }
 
 /// Validates `[carry..., stacked_xs...]` input types against a scan body signature and returns the
 /// `[carry..., stacked_ys...]` output types. This backs type inference for [`ScanOperation`].
 ///
 /// The expected input types are declared types derived from the body signature (with stacked types built by
-/// [`stacked_scan_type`], which carries no optional metadata), while the provided `input_types` may be actual runtime
-/// value types carrying more precise optional metadata, such as the normalized [`Sharding`](crate::Sharding)s that
-/// every concrete backend array type carries. Validation therefore uses the directional declared-vs-actual
-/// [`Type::is_refined_by`] relation instead of strict type equality. The returned output types are declared types
-/// built the same way and thus leave optional metadata unspecified for downstream consumers (e.g., sharding
-/// propagation) to resolve.
+/// [`stacked_scan_type`], which carries no optional layout or sharding metadata), while the provided `input_types` may
+/// be actual runtime value types carrying more precise optional metadata, such as the normalized
+/// [`Sharding`](crate::Sharding)s that every concrete backend array type carries. Validation therefore uses the
+/// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The returned output
+/// types are declared types built the same way and thus leave optional metadata unspecified for downstream consumers
+/// (e.g., sharding propagation) to resolve.
 pub(crate) fn scan_output_types(
     body_input_types: &[ArrayType],
     body_output_types: &[ArrayType],
@@ -1260,7 +1260,7 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::ArrayOperation;
-    use crate::types::DataType;
+    use crate::types::{DataType, Memory};
 
     use super::*;
 
@@ -1291,6 +1291,18 @@ mod tests {
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    #[test]
+    fn test_stacked_scan_type_preserves_memory() {
+        let slice_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).with_memory(Memory::Host { pinned: true });
+
+        assert_eq!(
+            stacked_scan_type(&slice_type, 2),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_memory(Memory::Host { pinned: true }),
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@ use std::marker::PhantomData;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
-use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_builders, check_count};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -171,7 +172,9 @@ impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored, Payload>, Stored,
     }
 }
 
-impl<C: Context> Constant<DifferentiationTracer<C>, C::Constant> for DifferentiationContext<C> {
+impl<C: Context<Type: DifferentiableType>> Constant<DifferentiationTracer<C>, C::Constant>
+    for DifferentiationContext<C>
+{
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().lift(value)?);

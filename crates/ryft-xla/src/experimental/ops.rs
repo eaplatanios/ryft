@@ -10,7 +10,8 @@ use ryft_core::captures::CaptureReference;
 use ryft_core::compilation::function::CompiledCallOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
@@ -24,9 +25,9 @@ use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Sel
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-    PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice,
-    UpdateSliceOperation,
+    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice,
+    SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
@@ -76,6 +77,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
+    ConvertElementType(ConvertElementTypeOperation),
     Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     CoordinateBasis(CoordinateBasisOperation<ArrayType>),
@@ -139,7 +141,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
 
     /// Backend-owned opaque custom-VJP tangent carrier, staged by the capture-free forward of a
     /// [`CustomVjp`](Self::CustomVjp) call. Its attached backward region can contain XLA operations.
-    CustomVjpTangent(CustomVjpTangentOperation),
+    CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
     Rematerialize(RematerializeOperation),
@@ -162,6 +164,7 @@ where
             ArrayOperation::One(operation) => Self::One(operation),
             ArrayOperation::OneLike(operation) => Self::OneLike(operation),
             ArrayOperation::Constant(operation) => Self::Constant(operation),
+            ArrayOperation::ConvertElementType(operation) => Self::ConvertElementType(operation),
             ArrayOperation::Fill(operation) => Self::Fill(operation),
             ArrayOperation::Iota(operation) => Self::Iota(operation),
             ArrayOperation::CoordinateBasis(operation) => Self::CoordinateBasis(operation),
@@ -565,7 +568,17 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+        return Ok(inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(if input.is_unknown() {
+                    input_type.cotangent().unwrap()
+                } else {
+                    input_type.into_owned()
+                })
+            })
+            .collect());
     }
 
     // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
@@ -595,7 +608,8 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
         match cotangent {
             MaybeZero::Value(cotangent) => operands.push(cotangent.clone()),
             MaybeZero::Zero(_) => {
-                let mut zeros = context.stage_nullary_operation(ZeroOperation::new(output_type.clone()))?;
+                let mut zeros =
+                    context.stage_nullary_operation(ZeroOperation::new(output_type.cotangent().unwrap()))?;
                 check_count!("output", zeros, 1, ProgramError);
                 operands.push(zeros.remove(0));
             }
@@ -643,16 +657,40 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
 mod tests {
     use std::rc::Rc;
 
+    use ryft_core::differentiation::DifferentiableType;
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
+    use ryft_core::programs::MaybeZero;
     use ryft_core::programs::ProgramBuilder;
+    use ryft_core::programs::regions::EmptyRegionDriver;
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::tracing::TracingContext;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{JitCallOperation, XlaConstant, XlaOperation};
+    use super::{JitCallOperation, XlaConstant, XlaOperation, transpose_primal_jit_call};
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))
+    }
+
+    #[test]
+    fn test_jit_call_zero_transpose_uses_cotangent_descriptors() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap())
+            .unwrap();
+        let expected = tangent_type.cotangent().unwrap();
+        let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let cotangents = transpose_primal_jit_call(
+            &JitCallOperation::new(),
+            &mut context,
+            &EmptyRegionDriver,
+            &[PartialValue::Unknown(tangent_type.clone())],
+            &[MaybeZero::Zero(tangent_type)],
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
     }
 
     /// Online partial evaluation of a mixed `jit_call` against a live outer trace — the second recorded consumer of

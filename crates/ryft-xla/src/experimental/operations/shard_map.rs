@@ -4,7 +4,8 @@ use std::marker::PhantomData;
 use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationError, TransposableOperation, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
@@ -630,8 +631,9 @@ where
 ///      to the same linear operands,
 ///      so the transposed body maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`,
 ///      in body-input order on each side. It re-wraps the transposed program in a fresh [`FlatTracedShardMap`] whose
-///      boundary shardings are permuted to match — its inputs carry the original output shardings (for the cotangents)
-///      followed by the known operands' input shardings, and its outputs carry the linear operands' input shardings.
+///      boundary shardings are permuted and dualized to match — its inputs carry the cotangent duals of the original
+///      output shardings followed by the known operands' input shardings, and its outputs carry the cotangent duals of
+///      the linear operands' input shardings.
 ///   3. Re-wraps the transposed body in a fresh [`ShardMapOperation`] and stages it over
 ///      `[outputs..., known_input_values...]`, keeping the manual region intact so both forward and reverse
 ///      mode over a `shard_map` stay manual rather than inlined.
@@ -662,7 +664,17 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
 
     // A shard_map with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+        return Ok(inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(if input.is_unknown() {
+                    input_type.cotangent().unwrap()
+                } else {
+                    input_type.into_owned()
+                })
+            })
+            .collect());
     }
 
     // Each operand maps to one body global input, independently linear (an input tangent) or known (a residual value).
@@ -687,7 +699,7 @@ pub fn transpose_primal_shard_map<V: Value<Type = ArrayType>, D: TranspositionDr
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        operands.push(materialize_cotangent(context, cotangent, output_type));
+        operands.push(materialize_cotangent(context, cotangent, &output_type.cotangent().unwrap()));
     }
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
@@ -732,9 +744,9 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for S
 ///
 /// The tangent body's flat program is transposed with [`TranspositionDriver::transpose_program`] under
 /// `input_linearity`, producing a program mapping `[outputs..., known_input_values...]` to
-/// `[linear_input_cotangents...]`. The transposed boundary permutes the original one to match: its global inputs are
-/// the original global outputs (for the output cotangents) followed by the known operands' original global inputs,
-/// and its global outputs are the linear operands' original global inputs.
+/// `[linear_input_cotangents...]`. The transposed boundary permutes and dualizes the original one to match: its global
+/// inputs are the cotangent descriptors of the original global outputs followed by the known operands' original
+/// global inputs, and its global outputs are the cotangent descriptors of the linear operands' original global inputs.
 ///
 /// # Parameters
 ///
@@ -754,7 +766,7 @@ fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V
         .shard_map()
         .out_shardings()
         .iter()
-        .cloned()
+        .map(Sharding::cotangent)
         .chain(
             input_linearity
                 .iter()
@@ -767,7 +779,7 @@ fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V
         .iter()
         .zip(operation.shard_map().in_shardings().iter())
         .filter(|&(&linear, _)| linear)
-        .map(|(_, sharding)| sharding.clone())
+        .map(|(_, sharding)| sharding.cotangent())
         .collect::<Vec<_>>();
     let shard_map = ShardMap::from_shardings(
         operation.shard_map().mesh().clone(),
@@ -780,7 +792,7 @@ fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V
     let global_input_types = operation
         .global_output_types()
         .iter()
-        .cloned()
+        .map(|global_type| global_type.cotangent().unwrap())
         .chain(
             input_linearity
                 .iter()
@@ -793,7 +805,7 @@ fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V
         .iter()
         .zip(operation.global_input_types().iter())
         .filter(|&(&linear, _)| linear)
-        .map(|(_, global_type)| global_type.clone())
+        .map(|(_, global_type)| global_type.cotangent().unwrap())
         .collect::<Vec<_>>();
 
     Ok((ShardMapOperation::from_boundary(shard_map, global_input_types, global_output_types), transposed_program))
@@ -1022,19 +1034,52 @@ implement_shard_map_invocation_leaf!(ryft_core::DifferentiationTracer<C>, [C], [
 #[cfg(test)]
 mod tests {
     use ryft_core::contexts::{Context, StagingContext};
+    use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
+    use ryft_core::programs::Program;
+    use ryft_core::programs::regions::{RegionDriver, RegionRef};
     use ryft_core::programs::types::Typed;
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::DomainTracingContext;
-    use ryft_core::types::{ArrayType, DataType};
+    use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use crate::experimental::domains::XlaDomain;
-    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgramBuilder};
+    use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
     use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
 
-    use super::ShardMapOperation;
+    use super::{ShardMapOperation, transpose_shard_map_body};
+
+    /// Test-only driver that returns a predetermined transpose for its one attached source region.
+    struct TestTranspositionDriver {
+        /// Source region exposed to the operation rule.
+        source: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+
+        /// Predetermined transposed program returned by the recursive request.
+        transposed: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+    }
+
+    impl RegionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, XlaConstant, XlaOperation>>
+        where
+            XlaConstant: 'r,
+            XlaOperation: 'r,
+        {
+            std::iter::once(self.source.entry_region_ref())
+        }
+    }
+
+    impl TranspositionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
+        fn transpose_program(
+            &self,
+            _region: RegionRef<'_, XlaConstant, XlaOperation>,
+            _input_linearity: &[bool],
+        ) -> Result<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>, DifferentiationError>
+        {
+            Ok(self.transposed.clone())
+        }
+    }
 
     fn test_array_type() -> ArrayType {
         ArrayType::scalar(DataType::F32)
@@ -1049,6 +1094,47 @@ mod tests {
             vec!["x".to_string()],
             true,
         )
+    }
+
+    #[test]
+    fn test_shard_map_transpose_dualizes_boundary_descriptors() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_sharding =
+            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(tangent_sharding.clone())
+            .unwrap();
+        let cotangent_type = tangent_type.cotangent().unwrap();
+
+        let source = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(tangent_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let transposed = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(cotangent_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let driver = TestTranspositionDriver { source, transposed };
+        let shard_map = ShardMap::from_shardings(
+            mesh,
+            vec![tangent_sharding.clone()],
+            vec![tangent_sharding.clone()],
+            Vec::new(),
+            true,
+        );
+        let operation = ShardMapOperation::from_boundary(shard_map, vec![tangent_type.clone()], vec![tangent_type]);
+
+        let (transposed, _) = transpose_shard_map_body(&operation, &driver, &[true]).unwrap();
+        assert_eq!(transposed.global_input_types(), std::slice::from_ref(&cotangent_type));
+        assert_eq!(transposed.global_output_types(), std::slice::from_ref(&cotangent_type));
+        assert_eq!(transposed.shard_map().in_shardings(), &[tangent_sharding.cotangent()]);
+        assert_eq!(transposed.shard_map().out_shardings(), &[tangent_sharding.cotangent()]);
     }
 
     /// Builds a one-input, one-output identity shard-map body whose global boundary carries no sharding, so its

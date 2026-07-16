@@ -168,6 +168,9 @@ impl Shape {
     /// dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, Error> {
+        if self.dimensions.contains(&Size::Static(0)) {
+            return Ok(Some(0));
+        }
         let mut count = 1usize;
         for size in &self.dimensions {
             match size {
@@ -901,8 +904,19 @@ mod tests {
         assert_eq!(Shape::scalar().element_count(), Ok(Some(1)));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Ok(Some(336)),);
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Ok(Some(0)));
+        assert_eq!(Shape::new(vec![Size::Static(0), Size::Static(usize::MAX)]).element_count(), Ok(Some(0)));
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(0), Size::Static(usize::MAX)]).element_count(),
+            Ok(Some(0)),
+        );
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]).element_count(),
+            Ok(Some(0)),
+        );
+        assert_eq!(Shape::new(vec![Size::Static(usize::MAX), Size::Static(0)]).element_count(), Ok(Some(0)));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), Ok(None));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), Ok(None));
+        assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(None));
         assert_eq!(
             Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
             Err(Error::from(TypeError {
@@ -1266,7 +1280,7 @@ mod tests {
         assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
-        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying_manual={'x'}}]");
+        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}], varying_manual={'x'}}]");
     }
 
     #[test]

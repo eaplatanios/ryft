@@ -2617,8 +2617,9 @@ mod tests {
     use ryft_core::compilation::stage_function;
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
     use ryft_core::operations::constants::{FillOperation, OneOperation};
-    use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
-    use ryft_core::operations::math::{AddOperation, MulOperation, NegOperation};
+    use ryft_core::operations::control_flow::{ConditionOperation, SelectOperation, WhileOperation};
+    use ryft_core::operations::logical::AndOperation;
+    use ryft_core::operations::math::{AddOperation, Atan2Operation, DivOperation, MulOperation, NegOperation};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
@@ -2661,6 +2662,21 @@ mod tests {
         Array::from_host_buffer(client, r#type, mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
     }
 
+    fn f64_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
+    }
+
+    fn boolean_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
+        let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(values.len())]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
+        Array::from_host_buffer(client, r#type, mesh.clone(), values.as_slice()).unwrap()
+    }
+
     fn boolean_scalar<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
         Array::from_host_buffer(client, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
@@ -2678,6 +2694,36 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f32>(bytes.as_slice())
+    }
+
+    fn read_f64s(client: &Client<'_>, array: &Array<'_>) -> Vec<f64> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<f64>(bytes.as_slice())
+    }
+
+    fn read_booleans(client: &Client<'_>, array: &Array<'_>) -> Vec<bool> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap()
+            .into_iter()
+            .map(|value| value != 0)
+            .collect()
     }
 
     #[test]
@@ -3075,6 +3121,46 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_executes_promoted_and_broadcast_elementwise_operations() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+
+        let scalar = f32_scalar(&client, &mesh, 2.0);
+        let vector = f64_vector(&client, &mesh, &[1.0, 2.0, 4.0, 8.0]);
+
+        let divide = domain.bind(DivOperation, Vec::new(), &[scalar.clone(), vector.clone()]).unwrap();
+        assert_eq!(read_f64s(&client, &divide[0]), vec![2.0, 1.0, 0.5, 0.25]);
+
+        let atan2 = domain.bind(Atan2Operation, Vec::new(), &[vector.clone(), scalar.clone()]).unwrap();
+        for (actual, expected) in read_f64s(&client, &atan2[0]).into_iter().zip([
+            1.0f64.atan2(2.0),
+            2.0f64.atan2(2.0),
+            4.0f64.atan2(2.0),
+            8.0f64.atan2(2.0),
+        ]) {
+            assert!((actual - expected).abs() < 1e-12, "got {actual}, expected {expected}");
+        }
+
+        let compare = domain
+            .bind(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), &[scalar.clone(), vector.clone()])
+            .unwrap();
+        assert_eq!(read_booleans(&client, &compare[0]), vec![false, false, true, true]);
+
+        let select = domain
+            .bind(SelectOperation, Vec::new(), &[boolean_scalar(&client, &mesh, true), scalar, vector])
+            .unwrap();
+        assert_eq!(read_f64s(&client, &select[0]), vec![2.0, 2.0, 2.0, 2.0]);
+
+        let boolean_vector = boolean_vector(&client, &mesh, &[true, false, true, false]);
+        let and = domain
+            .bind(AndOperation, Vec::new(), &[boolean_scalar(&client, &mesh, true), boolean_vector])
+            .unwrap();
+        assert_eq!(read_booleans(&client, &and[0]), vec![true, false, true, false]);
     }
 
     #[test]
