@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::DifferentiationContext;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, ForwardModeDifferentiate, LinearizationTracer,
@@ -2544,19 +2543,7 @@ mod tests {
         // through the trait solver, with every inner transform run through an explicitly recovered context receiver.
         // The outer gradient is the analytic third derivative `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
         let (value, third_derivative) = domain
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    context.gradient(
-                        |y| {
-                            let context = y.context().clone();
-                            context.gradient(|z| (z.clone() * z).sin(), y)
-                        },
-                        x,
-                    )
-                },
-                Scalar::from(x),
-            )
+            .value_and_gradient(|x| gradient(|y| gradient(|z| (z.clone() * z).sin(), y), x), Scalar::from(x))
             .unwrap();
         assert_abs_diff_eq!(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(
