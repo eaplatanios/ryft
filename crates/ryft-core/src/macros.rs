@@ -111,7 +111,6 @@ macro_rules! check_builders {
     }};
 }
 
-// TODO(eaplatanios): Review this macro.
 /// Defines one elementwise [`Operation`](crate::Operation) together with the structural implementations that every
 /// elementwise operation shares: the unit operation struct with a [`Display`](std::fmt::Display) implementation that
 /// writes the operation name, type-preserving [`Operation`](crate::Operation) implementations over both
@@ -120,35 +119,37 @@ macro_rules! check_builders {
 /// [`InterpretableOperation`](crate::InterpretableOperation) dispatch through the paired value-level capability trait,
 /// the [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) fold-or-residualize default, and the
 /// capability trait itself with its dispatch-domain staging blanket. The operation's actual semantics stay with its
-/// module: concrete value capability implementations, derivative rules, and tests are written by hand next to the
+/// module. Concrete value capability implementations, derivative rules, and tests must be written by hand next to the
 /// macro invocation.
 ///
 /// # Parameters
 ///
-///   - `@unary` / `@binary`: Selects the operation arity to stamp out. `@unary` produces a one-input,
-///     type-preserving operation whose generated capability method has the shape
-///     `fn(&self) -> Result<Self, ProgramError>`, while `@binary` produces a two-input operation whose
-///     [`DataType`](crate::DataType) inference broadcasts/promotes the two operand types and whose generated
-///     capability method has the shape `fn(&self, rhs: &Self) -> Result<Self, ProgramError>`.
-///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
+///   - `@unary` / `@binary`: Selects the operation arity to stamp out. `@unary` produces a one-input, type-preserving
+///     operation whose generated capability method has the shape `fn(&self) -> Result<Self, ProgramError>`, while
+///     `@binary` produces a two-input operation whose [`DataType`](crate::DataType) inference broadcasts/promotes the
+///     two operand types and whose generated capability method has the shape
+///     `fn(&self, rhs: &Self) -> Result<Self, ProgramError>`.
+///   - `$(#[$operation_documentation])*`: Documentation attributes attached to the generated operation struct.
 ///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
+///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
 ///   - `$method`: Identifier of the generated capability trait method (e.g., `sin`).
-///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 #[macro_export]
 macro_rules! define_elementwise_operation {
     (
         @unary
-        $(#[$documentation:meta])*
-        $operation:ident, $name:ident, $capability:ident, $method:ident,
-        $(#[$capability_documentation:meta])* $(,)?
+        $(#[$operation_documentation:meta])*
+        $operation:ident, $name:ident,
+        $(#[$capability_documentation:meta])*
+        $capability:ident, $method:ident $(,)?
     ) => {
-        $(#[$documentation])*
+        $(#[$operation_documentation])*
         #[derive(Clone, Debug, Default)]
         pub struct $operation;
 
         impl ::std::fmt::Display for $operation {
+            #[inline]
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 formatter.write_str($name)
             }
@@ -160,6 +161,7 @@ macro_rules! define_elementwise_operation {
                 $name
             }
 
+            #[inline]
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::DataType],
@@ -216,9 +218,9 @@ macro_rules! define_elementwise_operation {
 
         $(#[$capability_documentation])*
         pub trait $capability: Sized {
-            /// Computes this operation elementwise for this value, returning a
-            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
-            /// support the value's data type).
+            /// Computes this operation elementwise for this value, returning a [`ProgramError`](crate::ProgramError)
+            /// if something goes wrong (e.g., when this operation does not support the value's
+            /// [`DataType`](crate::DataType)).
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
@@ -227,24 +229,27 @@ macro_rules! define_elementwise_operation {
         {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
-                // Fully qualified calls are required here because the `Value` and `Context` traits are not
-                // necessarily imported at the macro expansion site.
-                let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+                Ok($crate::Context::bind(
+                    &$crate::Value::dispatch_domain(self),
+                    $operation, Vec::new(),
+                    std::slice::from_ref(self),
+                )?.remove(0))
             }
         }
     };
     (
         @binary
-        $(#[$documentation:meta])*
-        $operation:ident, $name:ident, $capability:ident, $method:ident,
-        $(#[$capability_documentation:meta])* $(,)?
+        $(#[$operation_documentation:meta])*
+        $operation:ident, $name:ident,
+        $(#[$capability_documentation:meta])*
+        $capability:ident, $method:ident $(,)?
     ) => {
-        $(#[$documentation])*
+        $(#[$operation_documentation])*
         #[derive(Clone, Debug, Default)]
         pub struct $operation;
 
         impl ::std::fmt::Display for $operation {
+            #[inline]
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 formatter.write_str($name)
             }
@@ -256,14 +261,13 @@ macro_rules! define_elementwise_operation {
                 $name
             }
 
+            #[inline]
             fn infer_output_types(
                 &self,
                 input_types: &[$crate::DataType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
-                // The fully qualified call is required here because the `Broadcastable` trait is not necessarily
-                // imported at the macro expansion site.
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
                     .map_err(|_| $crate::TypeError {
@@ -320,7 +324,7 @@ macro_rules! define_elementwise_operation {
         pub trait $capability: Sized {
             /// Computes this operation elementwise for this value and `rhs`, returning a
             /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
-            /// support the values' data types).
+            /// support the values' [`DataType`](crate::DataType)s).
             fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
@@ -329,10 +333,12 @@ macro_rules! define_elementwise_operation {
         {
             #[inline]
             fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError> {
-                // Fully qualified calls are required here because the `Value` and `Context` traits are not
-                // necessarily imported at the macro expansion site.
-                let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, Vec::new(), &[self.clone(), rhs.clone()])?.remove(0))
+                Ok($crate::Context::bind(
+                    &$crate::Value::dispatch_domain(self),
+                    $operation,
+                    Vec::new(),
+                    &[self.clone(), rhs.clone()],
+                )?.remove(0))
             }
         }
     };

@@ -7,11 +7,12 @@ pub const ADD_OPERATION_NAME: &str = "add";
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that adds two values and typically supports broadcasting semantics for arrays.
-    AddOperation, ADD_OPERATION_NAME, Add, add,
+    AddOperation, ADD_OPERATION_NAME,
     /// Value-level elementwise addition capability. [`Add`] is the fallible Ryft counterpart to [`std::ops::Add`] that
     /// [`AddOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something goes
     /// wrong, instead of panicking. Value types additionally provide [`std::ops::Add`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
+    Add, add,
 );
 
 define_tracer_operator!(@binary std::ops::Add, add, AddOperation, "`add` operation failed");

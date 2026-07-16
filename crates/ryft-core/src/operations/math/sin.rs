@@ -8,10 +8,11 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise sine of one value while preserving its type
     /// metadata.
-    SinOperation, SIN_OPERATION_NAME, Sin, sin,
+    SinOperation, SIN_OPERATION_NAME,
     /// Value-level elementwise sine capability. [`Sin`] fills the same role for [`SinOperation`] that
     /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic
     /// [`Operation`](crate::Operation)s.
+    Sin, sin,
 );
 
 #[cfg(test)]

@@ -9,9 +9,10 @@ define_elementwise_operation!(
     /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one value (i.e.,
     /// `x ↦ ln(x)`, the principal branch `ln(z)` on complex operands) while preserving its type metadata. Only
     /// floating-point and complex operands are supported.
-    LogOperation, LOG_OPERATION_NAME, Log, log,
+    LogOperation, LOG_OPERATION_NAME,
     /// Value-level elementwise natural-logarithm capability. [`Log`] fills the same role for
     /// [`LogOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Log, log,
 );
 
 // TODO(eaplatanios): Add tests.

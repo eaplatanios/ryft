@@ -7,11 +7,12 @@ pub const SUB_OPERATION_NAME: &str = "sub";
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that subtracts two values and typically supports broadcasting semantics for arrays.
-    SubOperation, SUB_OPERATION_NAME, Sub, sub,
+    SubOperation, SUB_OPERATION_NAME,
     /// Value-level elementwise subtraction capability. [`Sub`] is the fallible Ryft counterpart to [`std::ops::Sub`]
     /// that [`SubOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
     /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Sub`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
+    Sub, sub,
 );
 
 define_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");

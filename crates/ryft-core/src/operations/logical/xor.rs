@@ -10,12 +10,13 @@ define_elementwise_operation!(
     /// two values and typically supports broadcasting semantics for arrays. This operation covers both logical (i.e.,
     /// Boolean) and bitwise exclusive disjunction: the two semantics coincide on Boolean element types, and
     /// StableHLO's [`xor`](https://openxla.org/stablehlo/spec#xor) operation likewise serves both.
-    XorOperation, XOR_OPERATION_NAME, Xor, xor,
+    XorOperation, XOR_OPERATION_NAME,
     /// Value-level elementwise exclusive-disjunction capability. [`Xor`] is the fallible Ryft counterpart to
     /// [`std::ops::BitXor`] that [`XorOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support exclusive disjunction), instead of panicking. Value types additionally provide [`std::ops::BitXor`]
     /// as ergonomic (albeit panicking) sugar layered on top of this capability.
+    Xor, xor,
 );
 
 define_tracer_operator!(@binary std::ops::BitXor, bitxor, XorOperation, "`xor` operation failed");

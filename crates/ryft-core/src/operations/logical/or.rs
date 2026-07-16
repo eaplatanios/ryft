@@ -10,12 +10,13 @@ define_elementwise_operation!(
     /// values and typically supports broadcasting semantics for arrays. This operation covers both logical (i.e.,
     /// Boolean) and bitwise disjunction: the two semantics coincide on Boolean element types, and StableHLO's
     /// [`or`](https://openxla.org/stablehlo/spec#or) operation likewise serves both.
-    OrOperation, OR_OPERATION_NAME, Or, or,
+    OrOperation, OR_OPERATION_NAME,
     /// Value-level elementwise disjunction capability. [`Or`] is the fallible Ryft counterpart to
     /// [`std::ops::BitOr`] that [`OrOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support disjunction), instead of panicking. Value types additionally provide [`std::ops::BitOr`] as
     /// ergonomic (albeit panicking) sugar layered on top of this capability.
+    Or, or,
 );
 
 define_tracer_operator!(@binary std::ops::BitOr, bitor, OrOperation, "`or` operation failed");

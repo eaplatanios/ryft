@@ -7,11 +7,12 @@ pub const DIV_OPERATION_NAME: &str = "div";
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that divides two values and typically supports broadcasting semantics for arrays.
-    DivOperation, DIV_OPERATION_NAME, Div, div,
+    DivOperation, DIV_OPERATION_NAME,
     /// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
     /// that [`DivOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
     /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Div`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
+    Div, div,
 );
 
 define_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operation failed");

@@ -9,9 +9,10 @@ define_elementwise_operation!(
     /// [`Operation`](crate::Operation) that computes the elementwise natural exponential of one value (i.e.,
     /// `x ↦ eˣ`, the analytic continuation `e^z` on complex operands) while preserving its type metadata. Only
     /// floating-point and complex operands are supported.
-    ExpOperation, EXP_OPERATION_NAME, Exp, exp,
+    ExpOperation, EXP_OPERATION_NAME,
     /// Value-level elementwise natural-exponential capability. [`Exp`] fills the same role for
     /// [`ExpOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Exp, exp,
 );
 
 // TODO(eaplatanios): Add tests.

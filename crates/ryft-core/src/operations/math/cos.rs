@@ -8,10 +8,11 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise cosine of one value while preserving its type
     /// metadata.
-    CosOperation, COS_OPERATION_NAME, Cos, cos,
+    CosOperation, COS_OPERATION_NAME,
     /// Value-level elementwise cosine capability. [`Cos`] fills the same role for [`CosOperation`] that
     /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic
     /// [`Operation`](crate::Operation)s.
+    Cos, cos,
 );
 
 #[cfg(test)]

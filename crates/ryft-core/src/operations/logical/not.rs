@@ -10,12 +10,13 @@ define_elementwise_operation!(
     /// preserving its type metadata. This operation covers both logical (i.e., Boolean) and bitwise negation: the
     /// two semantics coincide on Boolean element types, and StableHLO's
     /// [`not`](https://openxla.org/stablehlo/spec#not) operation likewise serves both.
-    NotOperation, NOT_OPERATION_NAME, Not, not,
+    NotOperation, NOT_OPERATION_NAME,
     /// Value-level elementwise negation capability. [`Not`] is the fallible Ryft counterpart to [`std::ops::Not`]
     /// that [`NotOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
     /// goes wrong (e.g., when a value's data type does not support negation), instead of panicking. Value types
     /// additionally provide [`std::ops::Not`] as ergonomic (albeit panicking) sugar layered on top of this
     /// capability.
+    Not, not,
 );
 
 define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");
