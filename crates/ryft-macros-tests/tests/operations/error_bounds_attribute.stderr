@@ -1,5 +1,0 @@
-error: expected parentheses
-  --> tests/operations/error_bounds_attribute.rs:10:15
-   |
-10 | #[ryft(bounds = "T: Operation<DataType>")]
-   |               ^

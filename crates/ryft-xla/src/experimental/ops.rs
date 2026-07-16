@@ -1,4 +1,3 @@
-use std::ops::BitAnd;
 use std::rc::Rc;
 
 use ryft_macros::Operation;
@@ -21,15 +20,13 @@ use ryft_core::operations::constants::{
     ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation,
     ZeroOperation,
 };
-use ryft_core::operations::control_flow::{
-    ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation, WhilePredicate,
-};
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
+    PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
@@ -54,7 +51,7 @@ use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
 use ryft_core::tracing_v2::operations::memory::TransferToMemoryOperation;
-use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
+use ryft_core::tracing_v2::operations::reduce::ReduceOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::tracing_v2::{ArrayOperation, AxisIndexOperation, CollectiveOperation, DotOperation};
 use ryft_core::types::ArrayType;
@@ -73,15 +70,6 @@ pub type XlaConstant = CaptureReference<ArrayType>;
 #[derive(Clone, Debug, Operation)]
 #[ryft(crate = "ryft_core")]
 #[ryft(dispatch(batching, differentiation, transposition))]
-#[ryft(bounds(
-    interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),
-    partial_evaluation(PartialEq + BooleanLike),
-    differentiation(PartialEq + BooleanLike),
-    batching(
-        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + Transpose + ReduceValue + Slice
-            + UpdateSlice + Reshape
-    ),
-))]
 pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),

@@ -1,4 +1,4 @@
-error: invalid '#[ryft(...)]' attribute: 'type'; these are the attributes that are supported here: [Symbol("crate"), Symbol("dispatch"), Symbol("bounds")]
+error: invalid '#[ryft(...)]' attribute: 'type'; these are the attributes that are supported here: [Symbol("crate"), Symbol("dispatch")]
   --> tests/operations/error_type_attribute.rs:10:8
    |
 10 | #[ryft(type = "DataType")]

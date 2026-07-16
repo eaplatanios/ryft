@@ -144,15 +144,6 @@ impl<V> Parameterized<V> for Vec<V> {
     type ParameterStructure = ();
 }
 
-/// Stand-in for `ryft_core::Slice`.
-trait Slice {}
-
-/// Stand-in for `ryft_core::UpdateSlice`.
-trait UpdateSlice {}
-
-/// Stand-in for `ryft_core::Reshape`.
-trait Reshape {}
-
 /// Stand-in for `ryft_core::Zero`.
 trait Zero<V: Value> {}
 
@@ -421,8 +412,7 @@ where
     O: Operation<T> + From<ZeroOperation<T>>,
 {
     /// Stand-in for `ryft_core::Program::linearize`. The `SpecialDifferentiableValue` bound on the value type stands
-    /// in for the extra value leaves the real linearization needs, verifying that generated differentiation dispatch
-    /// transports the `#[ryft(bounds(differentiation(...)))]` list.
+    /// in for the extra value capabilities a concrete differentiation implementation can require.
     fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         Ok(Linearization { label: "program_linearize", marker: PhantomData })
     }
@@ -568,12 +558,6 @@ impl BooleanLike for Factor {}
 
 impl BooleanLike for ScalarFactor {}
 
-impl Slice for Factor {}
-
-impl UpdateSlice for Factor {}
-
-impl Reshape for Factor {}
-
 trait SpecialTransposableValue {}
 
 impl SpecialTransposableValue for Factor {}
@@ -582,14 +566,12 @@ impl SpecialTransposableValue for ScalarFactor {}
 
 impl SpecialTransposableValue for TranspositionFactor {}
 
-/// Extra program-constant capability supplied to generated differentiation implementations through
-/// `#[ryft(bounds(differentiation(...)))]`.
+/// Extra program-constant capability required by one payload's differentiation implementation.
 trait SpecialDifferentiableValue {}
 
 impl SpecialDifferentiableValue for Factor {}
 
-/// Extra value bound a recursive payload's partial-evaluation rule requires, used to exercise
-/// `#[ryft(bounds(partial_evaluation(...)))]`.
+/// Extra value capability required by a recursive payload's partial-evaluation implementation.
 trait SpecialPartiallyEvaluatableValue {}
 
 impl SpecialPartiallyEvaluatableValue for Factor {}
@@ -1152,7 +1134,6 @@ enum SpecialLinearOperation<V: Value<Type = ArrayType>> {
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
 #[ryft(dispatch(differentiation))]
-#[ryft(bounds(differentiation(SpecialDifferentiableValue)))]
 enum DifferentiableArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Special(SpecialOperation),
@@ -1160,7 +1141,7 @@ enum DifferentiableArrayOperation<V: Value<Type = ArrayType>> {
 }
 
 #[test]
-fn test_operation_generates_differentiation_dispatch() {
+fn test_operation_propagates_differentiation_payload_bounds() {
     type Operation = DifferentiableArrayOperation<Factor>;
 
     let context = TestContext::<Factor, Operation> { marker: PhantomData };
@@ -1177,14 +1158,6 @@ enum InferredArrayOperation<V: Value<Type = ArrayType>, C: Value<Type = ArrayTyp
     Zero(ZeroOperation<ArrayType>),
     Constant(ConstantOperation<ArrayType, V>),
     Factor(FactorOperation<ArrayType, C>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
-#[ryft(crate = "crate")]
-#[ryft(bounds(interpretation(Slice + UpdateSlice + Reshape)))]
-enum InterpretationBoundOperation<C: Value<Type = ArrayType> + BooleanLike> {
-    Zero(ZeroOperation<ArrayType>),
-    Constant(ConstantOperation<ArrayType, C>),
 }
 
 #[test]
@@ -1483,19 +1456,8 @@ fn test_operation_generates_direct_interpretation_dispatch() {
     assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[ScalarFactor(8)]), Ok(vec![ScalarFactor(8)]),);
 }
 
-#[test]
-fn test_operation_generates_interpretation_value_bounds() {
-    type Operation = InterpretationBoundOperation<Factor>;
-
-    let context = TestContext::<Factor> { marker: PhantomData };
-    let operation = Operation::from(ZeroOperation { r#type: ArrayType });
-
-    assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[Factor(1)]), Ok(vec![Factor(1)]));
-}
-
-/// Recursive payload whose partial-evaluation rule requires an extra [`SpecialPartiallyEvaluatableValue`] bound on the
-/// value type, mirroring how the array scan's carry-folding rule requires `PartialEq`. The owning enum supplies that
-/// bound to the generated partial-evaluation implementation through `#[ryft(bounds(partial_evaluation(...)))]`.
+/// Recursive payload whose partial-evaluation rule requires [`SpecialPartiallyEvaluatableValue`] on the flowing value
+/// type, verifying that the generated per-payload predicate transports that requirement to the enum's use site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PartialEvaluationRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
@@ -1538,8 +1500,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
-#[ryft(bounds(partial_evaluation(SpecialPartiallyEvaluatableValue)))]
-enum PartialEvaluationBoundOperation<V: Value<Type = ArrayType>> {
+enum PartialEvaluationPayloadOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Recursive(PartialEvaluationRecursiveOperation<V, Self>),
 }
@@ -1568,21 +1529,20 @@ fn test_operation_generates_partial_evaluation_dispatch() {
 }
 
 #[test]
-fn test_operation_generates_partial_evaluation_value_bounds() {
-    // The `Recursive` payload's partial-evaluation rule requires `SpecialPartiallyEvaluatableValue`, supplied to the
-    // generated implementation by `#[ryft(bounds(partial_evaluation(...)))]`. The enum's direct per-variant
-    // obligation only resolves when the extra bound is injected.
+fn test_operation_propagates_partial_evaluation_payload_bounds() {
+    // The `Recursive` payload's partial-evaluation rule requires `SpecialPartiallyEvaluatableValue`. The generated
+    // per-variant obligation transports that requirement without repeating it on the enum.
     use partial::PartiallyEvaluatableOperation as _;
 
     fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
     assert_partially_evaluatable::<
-        TestContext<Factor, PartialEvaluationBoundOperation<Factor>>,
-        PartialEvaluationBoundOperation<Factor>,
+        TestContext<Factor, PartialEvaluationPayloadOperation<Factor>>,
+        PartialEvaluationPayloadOperation<Factor>,
     >();
 
-    let context = TestContext::<Factor, PartialEvaluationBoundOperation<Factor>> { marker: PhantomData };
+    let context = TestContext::<Factor, PartialEvaluationPayloadOperation<Factor>> { marker: PhantomData };
     let context = partial::PartialEvaluationContext::new(context);
-    let operation = PartialEvaluationBoundOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
+    let operation = PartialEvaluationPayloadOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
     let evaluation = operation.partially_evaluate(&context, &EmptyRegionDriver, &[]).unwrap();
     assert!(evaluation.is_empty());
 }
@@ -1680,8 +1640,7 @@ where
     }
 }
 
-/// Stand-in value capability required by one payload's batching rule and by the recursive payload's leaf bounds,
-/// verifying both per-variant predicate transport and the `#[ryft(bounds(batching(...)))]` leaf injection.
+/// Stand-in value capability required by payload batching rules, verifying per-variant predicate transport.
 trait SpecialBatchValue {}
 
 impl SpecialBatchValue for Factor {}
@@ -1783,7 +1742,7 @@ impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CollectiveLikeOpera
 
 /// Stand-in recursive higher-order payload whose batching rule mirrors the leaf obligations the real control-flow
 /// rules carry: an operation-shaped `From` conversion (discharged structurally from the closed enum), the parent
-/// context's `Zero`, and the author-declared value leaves supplied through `#[ryft(bounds(batching(...)))]`.
+/// context's `Zero`, and value capabilities carried by its own batching implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BatchRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
@@ -1840,7 +1799,6 @@ where
 #[derive(Clone, Debug, ryft::Operation)]
 #[ryft(crate = "crate")]
 #[ryft(dispatch(batching))]
-#[ryft(bounds(batching(BooleanLike + SpecialBatchValue)))]
 enum BatchableArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Dot(DotOperation),
@@ -1940,15 +1898,10 @@ fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
-    test_cases.compile_fail("tests/operations/error_batching_bounds_without_dispatch.rs");
-    test_cases.compile_fail("tests/operations/error_bounds_attribute.rs");
-    test_cases.compile_fail("tests/operations/error_differentiation_bounds_without_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
-    test_cases.compile_fail("tests/operations/error_transposition_bounds_without_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
     test_cases.compile_fail("tests/operations/error_unknown_dispatcher.rs");
-    test_cases.compile_fail("tests/operations/error_unknown_bounds_attribute.rs");
 }

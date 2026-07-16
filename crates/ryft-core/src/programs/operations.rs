@@ -149,26 +149,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<T>` bound.
-///   - Each payload receives a generated `Payload: InterpretableOperation<C>` bound for the interpretation dispatcher.
-///     Payload-specific value or context requirements should live on the payload's own
-///     [`InterpretableOperation`](crate::InterpretableOperation) implementation; the enum derivation carries them
-///     through this generated payload bound.
-///   - `#[ryft(bounds(interpretation(Bound1 + Bound2 + ...)))]` adds extra trait bounds to `C::Value` for the generated
-///     [`InterpretableOperation`](crate::InterpretableOperation) dispatcher. This is useful when recursive higher-order
-///     payloads require capabilities on the value being interpreted, while the enum's stored constant or capture type
-///     should not be forced to implement those capabilities.
-///     For example, an array operation enum that owns condition, while, and scan payloads can write
-///     `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while keeping its enum parameter
-///     declaration at `V: Value<Type = ArrayType>`.
-///   - `#[ryft(bounds(partial_evaluation(Bound1 + Bound2 + ...)))]` likewise adds extra trait bounds to the generated
-///     [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementation, applied to both
-///     partial-evaluation value spaces, because a recursive payload's rule may need them on either side: the known
-///     values that flow through the known-side context (e.g., `PartialEq` for the scan and while invariance fixed
-///     points) and the program-constant space (e.g., [`BooleanLike`] for concretized condition predicates). Under an
-///     eager known-side context the two spaces coincide anyway.
-///   - Bounds for batching, differentiation, or transposition require selecting the corresponding dispatcher.
-///     Interpretation and partial evaluation are always generated and therefore do not appear in the `dispatch(...)`
-///     attribute.
+///   - Each generated semantic dispatcher receives a corresponding bound on every payload, such as
+///     `Payload: InterpretableOperation<C>` or `Payload: BatchableOperation<C>`. Payload-specific value and context
+///     requirements belong on the payload's own semantic-trait implementation; Rust resolves those requirements through
+///     the generated payload bound without requiring the enum to repeat them.
+///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation
+///     and partial evaluation are always generated and therefore do not appear in the `dispatch(...)` attribute.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -187,26 +173,19 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
 ///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
 ///     require that context to be a [`Constant`] provider that can lift captured constants from `C` into `V`.
-///     Interpretation-only capabilities should be provided with `#[ryft(bounds(interpretation(...)))]` instead of being
-///     placed on the enum's stored constant type.
 ///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
 ///     runtime value type and the nested program constant type for direct program interpretation. Later value
 ///     parameters remain payload-specific metadata; when a dispatcher needs to instantiate a direct-linear operation
 ///     family, extra value parameters after the first two are substituted with the first value parameter.
-///   - The generated dispatcher inherits value capabilities from payload-owned
-///     [`InterpretableOperation`](crate::InterpretableOperation) implementations and from
-///     `#[ryft(bounds(interpretation(...)))]`. If a higher-order payload needs a capability such as [`BooleanLike`] for
-///     predicate extraction, prefer the attribute when that capability belongs to interpretation rather than to the
-///     enum's stored payload shape.
-///   - Bounds provided through `#[ryft(bounds(interpretation(...)))]` are applied to the same generated interpretation
-///     value type. For example, one-value-parameter enums apply them to the generated runtime value parameter, while
-///     direct linear enums apply them to their first value parameter. When any interpretation bounds are provided, the
-///     macro also adds the standard companion requirement `C: Zero<V>` for the generated implementation value type.
+///   - The generated dispatcher inherits value capabilities from the payload-owned
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementations. For example, a payload that extracts
+///     a predicate states its [`BooleanLike`] requirement on its own implementation, and the generated payload bound
+///     transports that requirement to the enum's use site.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
 /// `ryft` crate normally do not need this attribute. The `#[ryft(dispatch(...))]` attribute selects optional transform
-/// dispatchers, and `#[ryft(bounds(...))]` supplies the transform-specific value bounds described above.
+/// dispatchers.
 ///
 /// ## Example
 ///

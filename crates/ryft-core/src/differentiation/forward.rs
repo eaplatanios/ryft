@@ -500,9 +500,6 @@ where
 ///     [`DifferentiationDriver`], whose concrete implementation establishes the finite program-level bounds at its
 ///     construction site. Rules that additionally need `Self: MaybeZeroOperation<T>` get it through that trait's
 ///     blanket implementation over the borrowed `TryFrom` conversion that `#[derive(Operation)]` generates.
-///
-/// `#[ryft(bounds(differentiation(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's
-/// value type.
 pub trait DifferentiableOperation<C: Context>: Operation<C::Type> {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector

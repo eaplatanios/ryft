@@ -248,10 +248,8 @@ impl<
 /// Higher-order payloads that need to transpose nested linear programs request that work through their
 /// [`TranspositionDriver`] (whose implementation calls [`Program::transpose_with_respect_to`] directly) instead of
 /// carrying a direct `Enum: TransposableOperation<V, Enum>` bound, which keeps the enum's bound graph finite. When
-/// payload rules need value capabilities, express those requirements on the enum's generic parameters or on the payload
-/// implementations themselves, so the generated dispatcher inherits them through normal Rust bounds, or supply them
-/// with `#[ryft(bounds(transposition(Bound1 + Bound2 + ...)))]`, which adds them to the generated dispatcher's
-/// transposition value type without forcing the enum's stored constant type to carry transposition-only capabilities.
+/// payload rules need value capabilities, those requirements belong on the payload implementations themselves, and
+/// the generated dispatcher inherits them through its per-payload trait bounds.
 ///
 /// ## Example
 ///

@@ -1,5 +1,0 @@
-error: '#[ryft(bounds(differentiation(...)))]' requires selecting 'differentiation' in '#[ryft(dispatch(...))]'
-  --> tests/operations/error_differentiation_bounds_without_dispatch.rs:11:6
-   |
-11 | enum BadOperation<V: Value<Type = DataType>> {
-   |      ^^^^^^^^^^^^

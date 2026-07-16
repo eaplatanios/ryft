@@ -1,25 +1,20 @@
 use std::fmt::Debug;
-use std::ops::BitAnd;
 
 use ryft_macros::Operation;
 
 use crate::backends::scalars::Scalar;
-use crate::operations::BooleanLike;
 use crate::operations::compare::CompareOperation;
 use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use crate::operations::constants::{
     ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{
-    ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation, WhilePredicate,
-};
+use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
+    PadOperation, ReshapeOperation, ScatterOperation, SliceOperation, TransposeOperation, UpdateSliceOperation,
 };
 use crate::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
@@ -29,13 +24,13 @@ use crate::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::TagOperation;
 use crate::programs::Value;
+use crate::tracing_v2::operations::DotOperation;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
-use crate::tracing_v2::operations::{DotOperation, Reduce};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::ArrayType;
 
@@ -49,16 +44,6 @@ use crate::types::ArrayType;
 /// [`Dot`](Self::Dot) a [`DotOperation`].
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(batching, differentiation, transposition))]
-// TODO(eaplatanios): Verify that we need all of these bounds / that they cannot be simplified.
-#[ryft(bounds(
-    interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),
-    partial_evaluation(PartialEq + BooleanLike),
-    differentiation(PartialEq + BooleanLike),
-    batching(
-        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + Transpose + Reduce + Slice + UpdateSlice
-            + Reshape
-    ),
-))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),

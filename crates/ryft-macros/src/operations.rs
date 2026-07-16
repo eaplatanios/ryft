@@ -13,13 +13,10 @@ use crate::helpers::symbols::Symbol;
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
-const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
-const INTERPRETATION_ATTRIBUTE: Symbol = Symbol::new("interpretation");
-const PARTIAL_EVALUATION_ATTRIBUTE: Symbol = Symbol::new("partial_evaluation");
 const BATCHING_ATTRIBUTE: Symbol = Symbol::new("batching");
 const DIFFERENTIATION_ATTRIBUTE: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 3] = [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE, BOUNDS_ATTRIBUTE];
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, DISPATCH_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const NESTED_ATTRIBUTE_ERROR: &str = "\
@@ -33,33 +30,6 @@ struct OperationParser {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: Option<syn::Type>,
-
-    /// Extra bounds to attach to the generated interpretation value type.
-    interpretation_value_bounds: Option<Vec<syn::TypeParamBound>>,
-
-    /// Extra bounds to attach to the generated partial-evaluation value type.
-    partial_evaluation_value_bounds: Option<Vec<syn::TypeParamBound>>,
-
-    /// Extra bounds to attach to the eager batching impl's flowing value type, from
-    /// `#[ryft(bounds(batching(...)))]`.
-    ///
-    /// The eager flowing value is the only position that needs author-supplied batching leaves: the staged flowing
-    /// value is the unified tracer, whose capability impls are staging sugar conditioned only on
-    /// `C::Operation: From<XOperation>` conversions (so the staged recursive rules spell operation-shaped `From`
-    /// bounds that the closed enum discharges structurally), and the program-constant space carries no batching
-    /// capabilities at all (backend constants are symbolic capture references).
-    batching_value_bounds: Option<Vec<syn::TypeParamBound>>,
-
-    /// Extra bounds to attach to the generated differentiation dispatcher's program constant type, from
-    /// `#[ryft(bounds(differentiation(...)))]`.
-    differentiation_value_bounds: Option<Vec<syn::TypeParamBound>>,
-
-    /// Extra bounds to attach to the generated `TransposableOperation` dispatcher's and
-    /// transposition dispatcher's transposition value type, from
-    /// `#[ryft(bounds(transposition(...)))]`. These serve the same role as bounds declared on the enum's own value
-    /// parameter (which the generated implementations inherit) without forcing the enum's stored constant type to
-    /// carry transposition-only capabilities.
-    transposition_value_bounds: Option<Vec<syn::TypeParamBound>>,
 
     /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
     dispatchers: Option<Dispatchers>,
@@ -85,24 +55,6 @@ struct Dispatchers {
     transposition: bool,
 }
 
-/// Normalized value bounds used by the generated semantic implementations.
-struct OperationBounds {
-    /// Extra bounds on the generated interpretation value type.
-    interpretation: Vec<syn::TypeParamBound>,
-
-    /// Extra bounds on the generated partial-evaluation value types.
-    partial_evaluation: Vec<syn::TypeParamBound>,
-
-    /// Extra bounds on the eager batching value type.
-    batching: Vec<syn::TypeParamBound>,
-
-    /// Extra bounds on the differentiation program constant type.
-    differentiation: Vec<syn::TypeParamBound>,
-
-    /// Extra bounds on the generated transposition value type.
-    transposition: Vec<syn::TypeParamBound>,
-}
-
 /// Normalized operation enum shared by every generated dispatcher.
 struct OperationEnum {
     /// Path to the `ryft` crate or facade used by generated code.
@@ -113,9 +65,6 @@ struct OperationEnum {
 
     /// Optional operation dispatchers selected through `#[ryft(dispatch(...))]`.
     dispatchers: Dispatchers,
-
-    /// Value bounds used by the generated semantic implementations.
-    bounds: OperationBounds,
 
     /// Enum identifier.
     ident: syn::Ident,
@@ -171,11 +120,6 @@ impl OperationParser {
         OperationParser {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             operation_type: None,
-            interpretation_value_bounds: None,
-            partial_evaluation_value_bounds: None,
-            batching_value_bounds: None,
-            differentiation_value_bounds: None,
-            transposition_value_bounds: None,
             dispatchers: None,
             errors: Vec::new(),
         }
@@ -212,17 +156,15 @@ impl OperationParser {
 
     /// Extracts any `#[ryft(...)]` attributes that are attached to the provided [`syn::DeriveInput`] and checks for
     /// unknown top-level (i.e., not field or variant) `#[ryft(...)]` attributes. This function will set
-    /// [`OperationParser::ryft_crate`], [`OperationParser::dispatchers`], and `#[ryft(bounds(...))]` values, if it is
-    /// able to successfully extract them, and it also infers [`OperationParser::operation_type`] from the enum's
-    /// `Value<Type = T>` generic bounds (there must be exactly one distinct such bound argument and an error is
-    /// generated if there are zero or more than one).
+    /// [`OperationParser::ryft_crate`] and [`OperationParser::dispatchers`] if it is able to successfully extract them,
+    /// and it also infers [`OperationParser::operation_type`] from the enum's `Value<Type = T>` generic bounds (there
+    /// must be exactly one distinct such bound argument and an error is generated if there are zero or more than one).
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
         let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
                 path if path == &DISPATCH_ATTRIBUTE => self.extract_dispatch_attribute(&meta),
-                path if path == &BOUNDS_ATTRIBUTE => self.extract_bounds_attribute(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
@@ -247,7 +189,6 @@ impl OperationParser {
                 "could not infer a unique operation type because multiple distinct 'Value<Type = T>' bounds are present",
             ),
         }
-        self.validate_dispatch_bounds(input);
     }
 
     /// Extracts the optional dispatchers selected by a `#[ryft(dispatch(...))]` attribute.
@@ -292,56 +233,6 @@ impl OperationParser {
         }
         self.dispatchers = Some(selected_dispatchers);
         Ok(())
-    }
-
-    /// Extracts a `#[ryft(bounds(...))]` attribute.
-    fn extract_bounds_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
-        meta.parse_nested_meta(|meta| {
-            let (kind, bounds) = match &meta.path {
-                path if path == &INTERPRETATION_ATTRIBUTE => ("interpretation", &mut self.interpretation_value_bounds),
-                path if path == &PARTIAL_EVALUATION_ATTRIBUTE => {
-                    ("partial_evaluation", &mut self.partial_evaluation_value_bounds)
-                }
-                path if path == &BATCHING_ATTRIBUTE => ("batching", &mut self.batching_value_bounds),
-                path if path == &DIFFERENTIATION_ATTRIBUTE => {
-                    ("differentiation", &mut self.differentiation_value_bounds)
-                }
-                path if path == &TRANSPOSITION_ATTRIBUTE => ("transposition", &mut self.transposition_value_bounds),
-                _ => {
-                    return Err(meta.error(format_args!(
-                        "invalid '#[ryft(bounds(...))]' attribute: '{}'; only 'interpretation(...)', \
-                         'partial_evaluation(...)', 'batching(...)', 'differentiation(...)', and \
-                         'transposition(...)' are supported here",
-                        meta.path.to_token_stream().to_string().replace(' ', ""),
-                    )));
-                }
-            };
-            let parsed_bounds = parse_bounds(&meta, kind)?;
-            if bounds.is_some() {
-                return Err(meta.error(format_args!("duplicate ryft attribute 'bounds({kind}(...))'")));
-            }
-            *bounds = Some(parsed_bounds);
-            Ok(())
-        })
-    }
-
-    /// Rejects bounds for optional dispatchers that were not selected.
-    fn validate_dispatch_bounds(&mut self, input: &syn::DeriveInput) {
-        let dispatchers = self.dispatchers.unwrap_or_default();
-        let invalid_bounds = [
-            (self.batching_value_bounds.is_some() && !dispatchers.batching, "batching"),
-            (self.differentiation_value_bounds.is_some() && !dispatchers.differentiation, "differentiation"),
-            (self.transposition_value_bounds.is_some() && !dispatchers.transposition, "transposition"),
-        ];
-        invalid_bounds.into_iter().filter(|(invalid, _)| *invalid).for_each(|(_, dispatcher)| {
-            self.add_error(
-                &input.ident,
-                format_args!(
-                    "'#[ryft(bounds({dispatcher}(...)))]' requires selecting '{dispatcher}' in \
-                     '#[ryft(dispatch(...))]'",
-                ),
-            );
-        });
     }
 
     /// Extracts the [`OperationVariant`]s that are contained in the provided [`syn::DeriveInput`]. This function
@@ -391,13 +282,6 @@ impl OperationParser {
             ryft_crate: self.ryft_crate.clone(),
             operation_type,
             dispatchers: self.dispatchers.unwrap_or_default(),
-            bounds: OperationBounds {
-                interpretation: self.interpretation_value_bounds.clone().unwrap_or_default(),
-                partial_evaluation: self.partial_evaluation_value_bounds.clone().unwrap_or_default(),
-                batching: self.batching_value_bounds.clone().unwrap_or_default(),
-                differentiation: self.differentiation_value_bounds.clone().unwrap_or_default(),
-                transposition: self.transposition_value_bounds.clone().unwrap_or_default(),
-            },
             ident,
             generics,
             conversion_generics,
@@ -690,13 +574,6 @@ impl OperationEnum {
             >
         });
 
-        // Extra partial-evaluation-only bounds apply to both value spaces because recursive payload rules may use
-        // either the program constants or values flowing through the known-side context.
-        let constant_type: syn::Type = syn::parse_quote!(#partial_evaluation_value_type);
-        add_value_bounds(where_clause, &constant_type, &self.bounds.partial_evaluation);
-        let flow_type: syn::Type = syn::parse_quote!(<__Context as #ryft::Domain>::Value);
-        add_value_bounds(where_clause, &flow_type, &self.bounds.partial_evaluation);
-
         // Bare generic extension payloads residualize the complete enum operation instead of naming a payload rule.
         where_clause
             .predicates
@@ -765,13 +642,12 @@ impl OperationEnum {
     ///
     /// The generated dispatcher is generic over a `__ParentContext` parent context pinned to the enum's primary
     /// type, program constant type, and the enum itself as its operation family. Every variant forwards the active
-    /// `BatchingContext<__ParentContext>` and instruction-scoped `BatchingDriver` to its payload's own rule:
-    /// ordinary rules execute their lifted work
-    /// through `context.parent()`, while rules keyed on the active frame (e.g., named-axis collectives) inspect its
-    /// axis metadata directly. Each payload carries its batching obligation as a per-variant
-    /// `BatchableOperation<__ParentContext>` predicate that transports the rule's own capability requirements to
-    /// the use site, together with the author-supplied leaf capability bounds (`#[ryft(bounds(batching(...)))]`) and
-    /// the parent `Zero` leaf that backs accumulator seeding. Nested programs batch structurally through
+    /// `BatchingContext<__ParentContext>` and instruction-scoped `BatchingDriver` to its payload's own rule. Ordinary
+    /// rules execute their lifted work through `context.parent()`, while rules keyed on the active frame (e.g.,
+    /// named-axis collectives) inspect its axis metadata directly. Each payload carries its batching obligation as a
+    /// per-variant `BatchableOperation<__ParentContext>` predicate that transports the rule's own capability
+    /// requirements to the use site, together with the parent `Zero` leaf that backs accumulator seeding. Nested
+    /// programs batch structurally through
     /// `Program::batched`, requested by higher-order rules through their active driver, whose implementation
     /// establishes the finite program-level bounds at its construction site.
     fn generate_batchable_operation(&self) -> TokenStream {
@@ -801,24 +677,8 @@ impl OperationEnum {
             predicate
         }));
 
-        // Recursive higher-order rules compute over the flowing parent value, so they need the author-declared
-        // batching value capabilities on that value plus the parent context's `Zero` leaf for accumulator seeding.
-        // The declared bounds are written against the enum's value parameter, but the dispatcher flows the parent
-        // context's value, so substitute that value into their associated-type constraints (e.g.,
-        // `Select<Condition = V>` becomes `Select<Condition = <__ParentContext as Domain>::Value>`).
-        let batching_value_substitutions = [(program_constant_type.clone(), parent_value_type.clone())];
-        let mut batching_value_substituter = TypeIdentSubstituter { substitutions: &batching_value_substitutions };
-        let batching_value_bounds = self
-            .bounds
-            .batching
-            .iter()
-            .map(|bound| {
-                let mut bound = bound.clone();
-                batching_value_substituter.visit_type_param_bound_mut(&mut bound);
-                bound
-            })
-            .collect::<Vec<_>>();
-        add_value_bounds(batching_where_clause, &parent_value_type, batching_value_bounds.as_slice());
+        // Recursive higher-order rules seed accumulators through the parent context's `Zero` capability. All other
+        // value requirements are transported by the per-payload batching predicates above.
         batching_where_clause
             .predicates
             .push(syn::parse_quote!(__ParentContext: #ryft::Zero<#parent_value_type>));
@@ -917,10 +777,6 @@ impl OperationEnum {
                 syn::parse_quote!(#operation_type: #ryft::DifferentiableOperation<__DifferentiationContext>);
             predicate
         }));
-        // Differentiation-only bounds describe capabilities of constants captured by the differentiated program.
-        // They therefore apply to the enum's program constant type rather than to the context's flowing value type.
-        let program_constant_type: syn::Type = syn::parse_quote!(#program_constant_type);
-        add_value_bounds(where_clause, &program_constant_type, &self.bounds.differentiation);
         // Higher-order payload rules (condition/while/scan) forward-differentiate and linearize their nested
         // programs through the call-scoped `DifferentiationDriver`, whose implementations carry the direct
         // `Program::jvp`/`Program::linearize` bounds at their construction sites, so the dispatcher itself only
@@ -1009,10 +865,6 @@ impl OperationEnum {
                 &transposed_value_type,
             ));
         }
-        // Extra transposition-only bounds requested via `#[ryft(bounds(transposition(...)))]`. These serve the same
-        // role as bounds declared on the enum's own value parameter (which the generated implementations inherit)
-        // without forcing the enum's stored constant type to carry transposition-only capabilities.
-        add_value_bounds(where_clause, &transposed_value_type, &self.bounds.transposition);
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
@@ -1139,8 +991,8 @@ impl OperationEnum {
     }
     /// Builds the generics for the generated [`InterpretableOperation`] dispatcher: the enum generics with
     /// program-shaped value substitutions applied, one generated `__Context` parameter, the context's [`Domain`]
-    /// equalities, the constant-lifting `Constant` context bound, the author-declared
-    /// `#[ryft(bounds(interpretation(...)))]` value bounds, and one `InterpretableOperation` predicate per payload.
+    /// equalities, the constant-lifting `Constant` context bound, and one `InterpretableOperation` predicate per
+    /// payload.
     fn interpretation_generics(&self) -> syn::Generics {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
@@ -1173,14 +1025,6 @@ impl OperationEnum {
                     #ryft::payloads::Captured,
                 >
             });
-        }
-        if !self.bounds.interpretation.is_empty() {
-            add_interpretation_value_bounds(
-                where_clause,
-                ryft,
-                &interpretation_value_type,
-                &self.bounds.interpretation,
-            );
         }
         where_clause.predicates.extend(self.variants.iter().map(|variant| {
             let operation_type = &variant.program_payload_type;
@@ -1399,46 +1243,6 @@ fn generic_parameter_bounds_as_predicates(
     predicates
 }
 
-/// Parses the parenthesized `Bound1 + Bound2 + ...` list of a `#[ryft(bounds(kind(...)))]` attribute, reporting an
-/// error for empty lists and for unexpected trailing tokens.
-fn parse_bounds(meta: &syn::meta::ParseNestedMeta, kind: &str) -> syn::Result<Vec<syn::TypeParamBound>> {
-    let content;
-    syn::parenthesized!(content in meta.input);
-    let bounds =
-        syn::punctuated::Punctuated::<syn::TypeParamBound, syn::Token![+]>::parse_separated_nonempty(&content)?;
-    if !content.is_empty() {
-        return Err(content.error(format!("unexpected tokens after {kind} bounds")));
-    }
-    Ok(bounds.into_iter().collect())
-}
-
-/// Adds the caller-provided `#[ryft(bounds(...))]` value bounds to the provided where clause as one predicate on
-/// `value_type`, doing nothing when no bounds were declared.
-fn add_value_bounds(where_clause: &mut syn::WhereClause, value_type: &syn::Type, value_bounds: &[syn::TypeParamBound]) {
-    if value_bounds.is_empty() {
-        return;
-    }
-    where_clause.predicates.push(syn::parse_quote! {
-        #value_type:
-            #(#value_bounds)+*
-    });
-}
-
-/// Adds the caller-provided `#[ryft(bounds(interpretation(...)))]` value bounds to the provided where clause,
-/// together with the standard companion requirement `__Context: Zero<V>` that recursive higher-order
-/// payload interpretation rules need whenever interpretation bounds are declared.
-fn add_interpretation_value_bounds(
-    where_clause: &mut syn::WhereClause,
-    ryft: &syn::Path,
-    interpretation_value_type: &syn::Type,
-    interpretation_value_bounds: &[syn::TypeParamBound],
-) {
-    add_value_bounds(where_clause, interpretation_value_type, interpretation_value_bounds);
-    where_clause.predicates.push(syn::parse_quote! {
-        __Context: #ryft::Zero<#interpretation_value_type>
-    });
-}
-
 /// [`VisitMut`] visitor that replaces bare type identifier mentions with concrete replacement types: a
 /// single-segment argument-free path is replaced wholesale, while a multi-segment path whose first segment matches a
 /// substituted identifier has that first segment replaced by the replacement path (preserving the remaining
@@ -1603,12 +1407,7 @@ mod tests {
     fn test_operation_parser_extract_attributes() {
         let generator = extract_attributes(quote! {
             #[ryft(crate = "wrapped::ryft")]
-            #[ryft(bounds(batching(BooleanLike)))]
             #[ryft(dispatch(batching, differentiation, transposition))]
-            #[ryft(bounds(interpretation(BooleanLike + Slice)))]
-            #[ryft(bounds(partial_evaluation(PartialEq)))]
-            #[ryft(bounds(differentiation(BooleanLike)))]
-            #[ryft(bounds(transposition(Clone)))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
@@ -1620,15 +1419,8 @@ mod tests {
         assert!(dispatchers.batching);
         assert!(dispatchers.differentiation);
         assert!(dispatchers.transposition);
-        assert_eq!(generator.interpretation_value_bounds.unwrap().len(), 2);
-        assert_eq!(generator.partial_evaluation_value_bounds.unwrap().len(), 1);
-        assert_eq!(generator.batching_value_bounds.unwrap().len(), 1);
-        assert_eq!(generator.differentiation_value_bounds.unwrap().len(), 1);
-        assert_eq!(generator.transposition_value_bounds.unwrap().len(), 1);
 
         let generator = extract_attributes(quote! {
-            #[ryft(bounds(interpretation(BooleanLike)))]
-            #[ryft(bounds(partial_evaluation(PartialEq)))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
@@ -1638,8 +1430,6 @@ mod tests {
         assert!(!dispatchers.batching);
         assert!(!dispatchers.differentiation);
         assert!(!dispatchers.transposition);
-        assert_eq!(generator.interpretation_value_bounds.unwrap().len(), 1);
-        assert_eq!(generator.partial_evaluation_value_bounds.unwrap().len(), 1);
     }
 
     #[test]
@@ -1664,52 +1454,15 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_parser_applies_differentiation_bounds() {
-        let mut input: syn::DeriveInput = syn::parse2(quote! {
-            #[ryft(dispatch(differentiation))]
-            #[ryft(bounds(differentiation(SpecialDifferentiableValue)))]
-            enum Operation<V: Value<Type = DataType>> {
-                Zero(ZeroOperation<DataType>),
-            }
-        })
-        .expect("failed to parse derive input");
-        replace_self_type(&mut input);
-
-        let mut parser = OperationParser::new();
-        parser.extract_attributes(&input);
-        let operation_enum = parser.normalize_input(&input).expect("failed to normalize operation enum");
-        let generated = operation_enum.generate_differentiable_operation().to_string();
-
-        assert!(generated.contains("V : SpecialDifferentiableValue"));
-    }
-
-    #[test]
     fn test_operation_parser_rejects_invalid_attributes() {
         let cases = [
             (quote!(#[ryft(crate = "ryft", unknown = "value")]), "invalid '#[ryft(...)]' attribute: 'unknown'"),
             (quote!(#[ryft(dispatch())]), "must select at least one dispatcher"),
-            (quote!(#[ryft(bounds(interpretation()))]), "unexpected end of input"),
             (quote!(#[ryft(dispatch(lowering))]), "invalid '#[ryft(dispatch(...))]' dispatcher: 'lowering'"),
             (quote!(#[ryft(dispatch(batching, batching))]), "duplicate ryft dispatcher 'batching'"),
             (
                 quote!(#[ryft(dispatch(batching))] #[ryft(dispatch(transposition))]),
                 "duplicate ryft attribute 'dispatch(...)'",
-            ),
-            (
-                quote!(#[ryft(bounds(interpretation(BooleanLike)))] #[ryft(bounds(interpretation(Slice)))]),
-                "duplicate ryft attribute 'bounds(interpretation(...))'",
-            ),
-            (
-                quote!(#[ryft(bounds(batching(BooleanLike)))]),
-                "'#[ryft(bounds(batching(...)))]' requires selecting 'batching'",
-            ),
-            (
-                quote!(#[ryft(bounds(differentiation(BooleanLike)))]),
-                "'#[ryft(bounds(differentiation(...)))]' requires selecting 'differentiation'",
-            ),
-            (
-                quote!(#[ryft(bounds(transposition(BooleanLike)))]),
-                "'#[ryft(bounds(transposition(...)))]' requires selecting 'transposition'",
             ),
         ];
         for (attributes, expected_error) in cases {

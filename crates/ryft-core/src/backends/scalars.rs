@@ -59,7 +59,6 @@ use crate::types::DataType;
 /// recursively parameterized by this enum itself.
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(differentiation, transposition))]
-#[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),

@@ -681,10 +681,10 @@ where
 /// # Deriving Partially Evaluatable Operation Enums
 ///
 /// The `#[derive(Operation)]` macro generates a [`PartiallyEvaluatableOperation`] implementation for operation enums
-/// that forwards every variant to its payload's own rule, and extra value capabilities that recursive payload rules
-/// require can be supplied with `#[ryft(bounds(partial_evaluation(Bound1 + Bound2 + ...)))]`. Refer to the
-/// documentation of [`Operation`] for information on how to use that macro and on the shape of the generated code.
-/// Partial evaluation is always generated and does not require a `dispatch(...)` selection.
+/// that forwards every variant to its payload's own rule. The generated per-payload trait predicates transport each
+/// rule's value and context requirements to the enum's use site. Refer to the documentation of [`Operation`] for
+/// information on how to use that macro and on the shape of the generated code. Partial evaluation is always generated
+/// and does not require a `dispatch(...)` selection.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses

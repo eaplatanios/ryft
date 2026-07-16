@@ -723,8 +723,6 @@ where
 ///     to the use site. Nested programs batch structurally through [`Program::batched`], requested by higher-order
 ///     rules through their active [`BatchingDriver`], whose concrete implementation establishes the finite
 ///     program-level bounds at its construction site.
-///
-/// `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's value type.
 pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
     /// `context` borrows the durable [`BatchingContext`] for the transform level being applied. `driver` exposes the
