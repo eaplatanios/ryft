@@ -15,7 +15,8 @@ use ryft_macros::Parameter;
 
 use crate::batching::{BatchableOperation, BatchingContext};
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
@@ -172,6 +173,7 @@ where
 
 impl<C: CapturingContext> CapturingContext for DifferentiationContext<C>
 where
+    C::Type: DifferentiableType,
     C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>

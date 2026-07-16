@@ -2,7 +2,8 @@ use thiserror::Error;
 
 use crate::batching::{BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
@@ -130,6 +131,7 @@ where
 
 impl<C: NamedAxes> NamedAxes for DifferentiationContext<C>
 where
+    C::Type: DifferentiableType,
     C::Operation: DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>

@@ -30,8 +30,8 @@ use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::logical::{And, Not, Or, Xor};
 use crate::operations::manipulation::{
-    Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
-    ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
+    Concatenate, ConvertElementType, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad,
+    Reshape, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::operations::math::{Abs, Add, Atan2, Cos, Div, Exp, Log, Mul, Neg, Sin, Sqrt, Sub};
 use crate::operations::tag::Tag;
@@ -469,6 +469,17 @@ impl Neg for TestArray {
     }
 }
 
+impl ConvertElementType for TestArray {
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() == DataType::Token || data_type == DataType::Token {
+            return Err(
+                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
+            );
+        }
+        Ok(Self { r#type: self.r#type.clone().with_data_type(data_type), values: self.values.clone() })
+    }
+}
+
 impl Sin for TestArray {
     fn sin(&self) -> Result<Self, ProgramError> {
         Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sin).collect() })
@@ -635,10 +646,15 @@ impl Reshape for TestArray {
     }
 }
 
-// `TestArray` is a concrete single-device value, so resharding and sharding hints are no-ops on the payload (a
-// sharding only describes distribution metadata). The trait defaults already return the value unchanged, which is
-// the correct semantics here.
-impl crate::operations::sharding::Reshard for TestArray {}
+// `TestArray` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
+// requested distribution metadata so interpreted programs preserve their declared boundaries exactly.
+impl crate::operations::sharding::Reshard for TestArray {
+    fn reshard(&self, sharding: &crate::Sharding) -> Self {
+        let mut output = self.clone();
+        output.r#type.sharding = Some(sharding.clone());
+        output
+    }
+}
 
 impl crate::operations::sharding::ConstrainSharding for TestArray {}
 
@@ -4089,19 +4105,8 @@ mod array_linearization_tests {
         )
     }
 
-    /// Binds the same `condition(predicate, x*2+1, sin(x))` through the forward-mode dual context, the `jvp` twin of
-    /// [`condition_function`].
-    fn condition_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
-        let condition = crate::operations::control_flow::ConditionOperation::new();
-        inputs[0].context().bind(
-            ArrayOperation::Condition(condition),
-            vec![affine_branch(), sine_branch()],
-            &[inputs[0].clone(), inputs[1].clone()],
-        )
-    }
-
-    /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)`,
-    /// interpreted directly, reproduces both the primal and the tangent outputs of [`ForwardModeDifferentiate::jvp`].
+    /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)` computes
+    /// the analytic primal and tangent outputs.
     ///
     /// The condition's predicate is a scalar-boolean operand whose tangent input is dead (Boolean predicates have
     /// no tangent space), so the partial-evaluation split prunes it and the reassembling
@@ -4114,13 +4119,29 @@ mod array_linearization_tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let predicate_value = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![predicate as u8 as f64]);
         let predicate_tangent = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let (reference_primals, reference_tangents) = domain
+        let error = domain
             .jvp(
-                condition_jvp_function,
+                |inputs: Vec<ArrayJvpTracer>| {
+                    let condition = crate::operations::control_flow::ConditionOperation::new();
+                    inputs[0].context().bind(
+                        ArrayOperation::Condition(condition),
+                        vec![affine_branch(), sine_branch()],
+                        &[inputs[0].clone(), inputs[1].clone()],
+                    )
+                },
                 vec![predicate_value.clone(), TestArray::scalar(x)],
                 vec![predicate_tangent.clone(), TestArray::scalar(dx)],
             )
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(
+            error,
+            crate::differentiation::DifferentiationError::Program(ProgramError::MalformedProgram(
+                "JVP input 0 has live tangent type bool[] but primal type bool[] has no tangent space".to_string(),
+            )),
+        );
+
+        let reference_primals = vec![TestArray::scalar(if predicate { 2.0 * x + 1.0 } else { x.sin() })];
+        let reference_tangents = vec![TestArray::scalar(if predicate { 2.0 * dx } else { x.cos() * dx })];
 
         let (_, primal_program) = NestedTracingContext::trace(
             domain.clone(),
