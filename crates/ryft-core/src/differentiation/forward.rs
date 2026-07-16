@@ -7,7 +7,6 @@ use ryft_macros::Parameter;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -15,9 +14,16 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
     PartialValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::{Atom, FlatProgram, MaybeZero, Program, ProgramError, Value};
+use crate::programs::ProgramError;
+use crate::programs::atoms::{Atom, MaybeZero};
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{
+    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+};
+use crate::programs::types::Typed;
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::Typed;
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
 /// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
@@ -92,7 +98,7 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
 /// This is the domain-free, interpretation-free core shared by every linearization entry point. It carries only the
 /// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
 /// callers that interpret [`primal`](Self::primal) under a value semantics of their choice.
-pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
+pub struct Linearization<V: Value, O: Operation<V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
     /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
     /// form the residual environment consumed by the tangent sub-program.
@@ -107,7 +113,7 @@ pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
     residual_count: usize,
 }
 
-impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
+impl<V: Value, O: Operation<V::Type>> Linearization<V, O> {
     /// Creates a new [`Linearization`] from its parts, validating the boundary contract documented on [`Linearization`]
     /// where `primal` produces its primal outputs followed by its trailing `residual_count` residuals, and `tangent`
     /// consumes one tangent input per primal input followed by those same residuals and produces one tangent output per
@@ -219,7 +225,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: Clone + TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
@@ -272,11 +278,8 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     marker: PhantomData<fn() -> Input>,
 }
 
-impl<
-    C: Context<Operation: Clone>,
-    Input: Parameterized<C::Value>,
-    Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
-> Pushforward<C, Input, Output>
+impl<C: Context, Input: Parameterized<C::Value>, Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>>
+    Pushforward<C, Input, Output>
 {
     /// Creates a new [`Pushforward`] closing `program` over the linearization-point `residuals`, validating the
     /// contract documented on [`Pushforward`] where `program` consumes the flat tangents followed by `residuals`
@@ -345,6 +348,126 @@ impl<
     }
 }
 
+/// Provides call-scoped access to the regions attached to the instruction being differentiated. Transform dispatch
+/// constructs a driver for one operation application and passes it directly to that operation's
+/// [`jvp`](DifferentiableOperation::jvp) rule. [`RegionDriver`] provides structural region access, while this trait adds
+/// differentiation-specific recursion. Region-free applications receive a driver with no regions.
+///
+/// Structural transform requests accept borrowed [`RegionRef`]s directly, allowing the same request to serve both a
+/// region selected from this driver and the entry region of a program rebuilt by an operation rule. Implementations
+/// must recursively dispatch each nested instruction with the driver for that nested application.
+pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operation> {
+    /// Builds the fused forward-mode program of `region`. The returned program maps
+    /// `[primals..., tangents...]` to `[primal outputs..., tangent outputs...]`.
+    fn jvp_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, DifferentiationError>;
+
+    /// Linearizes `region` into its primal and tangent program halves, re-entering the active differentiation
+    /// machinery.
+    fn linearize_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError>;
+
+    /// Applies `operation`'s forward-mode rule over the provided owned region programs (in region order),
+    /// re-entering the active differentiation machinery. Rules that rewrite a region-carrying operation and
+    /// differentiate the rewritten form recursively — for example the batched-predicate `while` rule, which rebuilds
+    /// a masked condition and body — request that recursion here so they carry no operation-family semantic bounds
+    /// of their own.
+    fn jvp_operation(
+        &self,
+        operation: &C::Operation,
+        programs: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
+}
+
+impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {
+    fn jvp_program(
+        &self,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, DifferentiationError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot differentiate a program".to_string()).into())
+    }
+
+    fn linearize_program(
+        &self,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot linearize a program".to_string()).into())
+    }
+
+    fn jvp_operation(
+        &self,
+        _operation: &C::Operation,
+        _programs: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot differentiate an operation".to_string()).into())
+    }
+}
+
+/// [`DifferentiationDriver`] scoped to one [`Operation`] application. It borrows the application's complete region
+/// driver, which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees
+/// without materializing a combined region collection. Recursive requests are answered through [`Program::jvp`] and
+/// [`Program::linearize`].
+struct RecursiveDifferentiationDriver<'r, D> {
+    /// Application-scoped region driver, in operation-defined order.
+    driver: &'r D,
+}
+
+impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+    for RecursiveDifferentiationDriver<'_, D>
+{
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.driver.regions()
+    }
+}
+
+impl<C, D> DifferentiationDriver<C> for RecursiveDifferentiationDriver<'_, D>
+where
+    C: Context,
+    D: RegionDriver<C::Constant, C::Operation>,
+    C::Operation: DifferentiableOperation<C>
+        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+        + From<ZeroOperation<C::Type>>,
+{
+    fn jvp_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, DifferentiationError> {
+        region.jvp()
+    }
+
+    fn linearize_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+    ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
+        region.linearize()
+    }
+
+    fn jvp_operation(
+        &self,
+        operation: &C::Operation,
+        programs: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let driver = RecursiveDifferentiationDriver { driver: &programs };
+        operation.jvp(context, &driver, inputs)
+    }
+}
+
 /// Represents [`Operation`]s that support forward-mode differentiation (i.e., computing Jacobian-Vector Products).
 /// Reading an operation as a function `y = f(x₁, …, xₙ)` from its operands to its outputs, the [`jvp`](Self::jvp)
 /// function propagates [`DifferentiationDual`]s through it. Each input dual `(xᵢ, ẋᵢ)` pairs an operand with its
@@ -358,37 +481,29 @@ impl<
 ///
 /// ## Deriving Differentiable Operation Enums
 ///
-/// Ryft also provides a `#[derive(DifferentiableOperation)]` procedural macro for operation enums whose variants own
-/// forward-mode (JVP) rules through this trait. The derivation enables forward-mode differentiation only. Enums that
-/// also need reverse-mode differentiation additionally derive [`TransposableOperation`](crate::TransposableOperation),
-/// whose transposition dispatchers reverse mode is built on. It follows the same enum-shape inference rules as
-/// `#[derive(Operation)]` and generates:
+/// `#[derive(Operation)]` generates a [`DifferentiableOperation`] dispatcher when the enum specifies
+/// `#[ryft(dispatch(differentiation))]`. This selection enables forward-mode differentiation only. Enums that also
+/// need reverse-mode differentiation independently select `transposition`, whose dispatcher reverse mode is built
+/// on. It follows the operation derivation's enum-shape inference rules and generates:
 ///
-///   - An `impl DifferentiableOperation<C> for Enum` that is generic over a [`StagingContext`](crate::StagingContext)
-///     `C` pinned to the enum's primary type, program constant type, and the enum itself as its operation family. Every
-///     variant forwards [`jvp`](Self::jvp) to its payload's own rule, and so payloads without a forward-mode form must
-///     still implement the trait with a rule that returns an
-///     [`UnsupportedOperation`](ProgramError::UnsupportedOperation).
+///   - An `impl DifferentiableOperation<C> for Enum` that is generic over a [`StagingContext`] `C` pinned to the enum's
+///     primary type, program constant type, and the enum itself as its operation family. Every variant forwards
+///     [`jvp`](Self::jvp) to its payload's own rule, and so payloads without a forward-mode form must still implement
+///     the trait with a rule that returns an [`UnsupportedOperation`](ProgramError::UnsupportedOperation).
 ///   - A `where` clause following the same shape as the generated interpretation and partial-evaluation
-///     implementations: a per-variant `Payload: DifferentiableOperation<C>` predicate for every *non-recursive* payload
-///     which transports each rule's own capability requirements (e.g., `C::Value: Sin` for the sine rule) to the use
-///     site, so that the enum does not spell them, plus a `Self: From<Payload>` conversion for every concrete payload
-///     (the rules stage ordinary primal-enum operations for both the primal and the tangent side) and the `Self:
-///     From<ZeroOperation<T>> + DifferentiableProgramOperation<C::Constant, Self> +
-///     LinearizableProgramOperation<C::Constant, Self>` fixed-point witnesses that higher-order payload rules like
-///     those for `condition`, `while`, and `scan` use to forward-differentiate and linearize their nested programs.
-///     Rules that additionally need `Self: MaybeZeroOperation<T>` get it through that trait's blanket implementation
-///     over the borrowed `TryFrom` conversion that `#[derive(Operation)]` generates.
-///     *Recursive* payloads (i.e., those mentioning `Self`) are skipped (such a predicate would re-enter the enum's
-///     own obligation and overflow the trait solver) and their rules are discharged as definition-time body obligations
-///     against the witnesses instead.
-///   - The [`DifferentiableProgramOperation`] and [`LinearizableProgramOperation`] witnesses themselves, whose fixed
-///     bodies call [`Program::jvp`] and [`Program::linearize`] and whose `where` clauses spell only the leaf value
-///     capabilities those bodies need on the program constant type, supplied with
-///     `#[ryft(bounds(differentiation(Bound1 + Bound2 + ...)))]`.
+///     implementations: a per-variant `Payload: DifferentiableOperation<C>` predicate for every payload which
+///     transports each rule's own capability requirements (e.g., `C::Value: Sin` for the sine rule) to the use site,
+///     so that the enum does not spell them, plus a `Self: From<Payload>` conversion for every concrete payload (the
+///     rules stage ordinary primal-enum operations for both the primal and the tangent side) and the direct
+///     `Self: From<ZeroOperation<T>>` bound that the nested-region differentiation drivers require. Higher-order
+///     payload rules request nested forward-mode and linearization work through their instruction-scoped
+///     [`DifferentiationDriver`], whose concrete implementation establishes the finite program-level bounds at its
+///     construction site. Rules that additionally need `Self: MaybeZeroOperation<T>` get it through that trait's
+///     blanket implementation over the borrowed `TryFrom` conversion that `#[derive(Operation)]` generates.
 ///
-/// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
-pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Type> {
+/// `#[ryft(bounds(differentiation(Bound1 + Bound2 + ...)))]` adds extra leaf capabilities to the parent context's
+/// value type.
+pub trait DifferentiableOperation<C: Context>: Operation<C::Type> {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector
     /// must be aligned with this operation's outputs, each element pairing a primal output value with its tangent, both
@@ -397,75 +512,15 @@ pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Ty
     /// # Parameters
     ///
     ///   - `context`: [`Context`] through which the rule binds the primal and tangent [`Operation`]s it synthesizes.
+    ///   - `driver`: [`DifferentiationDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to
+    ///     attached [`Region`](crate::Region)s.
     ///   - `inputs`: Input [`DifferentiationDual`]s aligned with this operation's inputs/operands.
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
+        driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
-}
-
-/// Represents closed [`Operation`] families whose captured [`Program`]s can be built into *fused* jvp programs on
-/// behalf of an enclosing forward-mode rule. Higher-order forward-mode rules, such as the control-flow rules, must
-/// forward-differentiate captured branch or body programs whose operation family is the same closed enum currently
-/// being proven [`DifferentiableOperation`]. Writing that need directly as a recursive [`DifferentiableOperation`]
-/// bound at every recursive payload boundary makes Rust's trait solver re-enter the same enum and overflow.
-/// [`DifferentiableProgramOperation`] names that recursive fixed point once. The value type `V` and operation
-/// family `O` stay fixed across the recursion, and a closed operation enum implements this trait directly, calling
-/// [`Program::jvp`] in the body while spelling only the *leaf* closure of capabilities that body needs in the
-/// implementation's `where` clause, rather than the recursive `Self: DifferentiableOperation<…>` bound itself. That
-/// recursive obligation is then discharged once, as a definition-time body check, which is what lets a higher-order
-/// rule require `Self: DifferentiableProgramOperation<V, Self>` without sending the trait solver into an unbounded
-/// recursion. Higher-order payloads depend on this semantic witness instead of reproducing the full forward-mode
-/// obligation.
-///
-/// [`LinearizableProgramOperation`] is the sibling witness for the *split* linearization form. The two are separated so
-/// a rule requires only the shape it actually stages: the fused forward-mode `scan`, `condition`, etc. rules need only
-/// this trait, while the bounded `while` rule (which must stack per-iteration residuals) needs the split one.
-///
-/// This trait is intentionally about complete operation families rather than individual primitive payloads,
-/// and is implemented explicitly per operation enum rather than through a blanket implementation as a blanket
-/// `impl DifferentiableProgramOperation for O where O: DifferentiableOperation` implementation would reintroduce
-/// exactly the kind of recursion that this trait exists to break.
-pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>>:
-    Operation<V::Type> + Sized
-{
-    /// Builds the *fused* JVP [`Program`] of `program`. Interpreting the provided program as a function `x ↦ y = f(x)`
-    /// over its flattened inputs and outputs, the returned program computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`
-    /// over the flat boundary `[x₁, …, xₙ, ẋ₁, …, ẋₙ] ↦ [y₁, …, yₘ, ẏ₁, …, ẏₘ]`, without splitting it into primal and
-    /// tangent halves. Refer to [`Program::jvp`] for more information. This is what the fused higher-order JVP rules
-    /// (e.g., `scan`, `condition`, etc.) stage as their nested JVP bodies. Keeping these bodies fused lets pure forward
-    /// mode stage no residual stacks and pay the cost of only a single pass. Split linearization is separately exposed
-    /// by [`LinearizableProgramOperation`].
-    fn jvp_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
-}
-
-/// Represents closed [`Operation`] families whose captured [`Program`]s can be _linearized_ on behalf of an enclosing
-/// rule. This is the split-form sibling of [`DifferentiableProgramOperation`]: where that witness builds a fused JVP
-/// program `(x, ẋ) ↦ (y, ẏ)`, this one directly builds a [`Linearization`] holding the primal (i.e., known) sub-program
-/// `x ↦ (y, r)`, where the residuals `r` are the intermediate values the derivative is evaluated at, and the tangent
-/// (i.e., unknown) sub-program `(ẋ, r) ↦ ẏ = (∂f/∂x)(x) · ẋ`, which is linear in `ẋ`. Refer to [`Program::linearize`]
-/// for more information.
-///
-/// It breaks the same recursive fixed point the same way as [`DifferentiableProgramOperation`]. A closed operation
-/// enum implements it directly, calling [`Program::linearize`] in the body while spelling only the *leaf* closure of
-/// capabilities that body needs, so that a higher-order rule can require `Self: LinearizableProgramOperation<V, Self>`
-/// without the trait solver re-entering the enum's own [`DifferentiableOperation`] obligation. For example, the bounded
-/// `while` rule uses it because a loop must stack per-iteration residuals for its tangent map to replay. The fused
-/// forward-mode rules that keep their bodies un-split depend on [`DifferentiableProgramOperation`] instead.
-///
-/// Like [`DifferentiableProgramOperation`], it is implemented explicitly per operation enum rather than through a
-/// blanket implementation, which would reintroduce the recursion it exists to break.
-pub trait LinearizableProgramOperation<V: Value, O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>>:
-    Clone + Operation<V::Type> + Sized
-{
-    /// Linearizes `program` into the primal sub-program `x ↦ (y, r)` and the linear tangent sub-program `(ẋ, r) ↦ ẏ`.
-    /// Refer to [`Program::linearize`] for more information.
-    fn linearize_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Linearization<V, Self>, DifferentiationError>;
 }
 
 /// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
@@ -627,7 +682,14 @@ impl<C: Context> Domain for DifferentiationContext<C> {
     type Operation = C::Operation;
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> Context for DifferentiationContext<C> {
+impl<C: Context> Context for DifferentiationContext<C>
+where
+    C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<C>
+        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+        + From<ZeroOperation<C::Type>>,
+{
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         // Constants are independent of every differentiation input and so their tangents are structural zeros.
@@ -635,24 +697,13 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 
-    fn bind<O: Into<C::Operation>>(
+    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: O,
-        regions: &[FlatProgram<Self>],
-        callees: &[Rc<FlatProgram<Self>>],
+        driver: D,
         inputs: &[DifferentiationTracer<C>],
     ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
         let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard until `DifferentiationContext` binds regions (phases 2-6);
-        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
 
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
@@ -665,12 +716,15 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
         let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
             let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.parent
-                .bind(operation, &[], &[], &primal_inputs)?
+                .bind(operation, driver, &primal_inputs)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect()
         } else {
-            operation.jvp(&self.parent, input_duals.as_slice())?
+            // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
+            // it into temporary storage.
+            let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
+            operation.jvp(&self.parent, &differentiation_driver, input_duals.as_slice())?
         };
 
         // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
@@ -686,39 +740,15 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
     }
 }
 
-impl<
-    V: Value,
-    O: Clone + Operation<V::Type> + DifferentiableOperation<TracingContext<V, O>> + From<ZeroOperation<V::Type>>,
-> Program<V, O, Vec<V>, Vec<V>>
+impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O>
+where
+    O: PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
+        + From<ZeroOperation<V::Type>>,
 {
-    /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
-    /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
-    /// computes `f` together with its _pushforward_ (i.e., the forward-mode Jacobian-vector product): given an input
-    /// tangent (i.e., perturbation direction) `ẋ`, the pushforward produces the output tangent `ẏ = (∂f/∂x)(x) · ẋ`,
-    /// the directional derivative of `f` at `x` along `ẋ`. As a single map, the returned program computes
-    /// `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`. In terms of the program boundaries, if the input program has inputs
-    /// `[x_1, …, x_n]` and outputs `[y_1, …, y_m]` (so that `y = f(x)`), the returned program has:
-    ///
-    ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]`m which correspond to the `n` primal inputs followed by one fresh tangent
-    ///     input `ẋ_i` per primal input `x_i`, of the same type, and
-    ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]`, which correspond to the `m` primal outputs `y_j = f_j(x)` followed by
-    ///     the `m` tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
-    ///
-    /// The program is *not* split into separate primal and tangent sub-programs unlike [`Self::linearize`], which
-    /// directly composes differentiation with partial evaluation. This un-split form remains exposed for fused
-    /// higher-order JVP rules and direct forward-mode interpretation.
-    ///
-    /// Each primal instruction is replayed once through its [`DifferentiableOperation`] rule, which returns the dual
-    /// (i.e., primal result plus tangent) for the instruction's outputs. Both are staged into the shared builder as
-    /// ordinary primal operations, and so the result contains no symbolic captures.
-    ///
-    /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
-    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits the all-zero case (an
-    /// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
-    /// operation directly and pairing each primal output with a typed structural zero tangent, so that zero-ness
-    /// propagates transitively without staging or scanning [`Instruction`](crate::Instruction)s. Structural zero
-    /// tangents are materialized as typed [`ZeroOperation`] instructions only at the output boundary, preserving the
-    /// `(primal_outputs ++ tangent_outputs)` program contract.
+    /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`](crate::Region).
+    /// Refer to the documentation of [`Program::jvp`] for more information.
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
 
@@ -761,6 +791,7 @@ impl<
 
             // Replay each primal instruction in JVP form, staging both the primal result and the tangent operations
             // into the shared builder.
+            let region_mappings = RegionReplayMappings::new();
             for instruction in self.instructions() {
                 let input_duals = instruction
                     .inputs()
@@ -785,15 +816,17 @@ impl<
                 // primal outputs are staged directly and each output tangent is a typed structural zero. Zero-input
                 // operations are excluded so their dedicated rules keep handling primal synthesis and tangent typing.
                 let all_input_tangents_are_zero = input_duals.iter().all(|dual| dual.tangent().is_zero());
+                let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
                 let output_duals = if !input_duals.is_empty() && all_input_tangents_are_zero {
                     let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
                     context
-                        .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
+                        .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
                         .into_iter()
                         .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
                         .collect()
                 } else {
-                    instruction.operation().jvp(&context, input_duals.as_slice())?
+                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
+                    instruction.operation().jvp(&context, &differentiation_driver, input_duals.as_slice())?
                 };
 
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
@@ -852,38 +885,10 @@ impl<
             .build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
             .map_err(DifferentiationError::from)
     }
-}
 
-impl<
-    V: Value,
-    O: Clone
-        + Operation<V::Type>
-        + PartiallyEvaluatableOperation<TracingContext<V, O>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + From<ZeroOperation<V::Type>>,
-> Program<V, O, Vec<V>, Vec<V>>
-{
-    /// Linearizes this [`Program`] directly by replaying it once through a [`DifferentiationContext`] over a
-    /// [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. This context composition
-    /// handles each source instruction once while simultaneously separating its two halves: primal-only work stages
-    /// into the primal trace, and tangent-dependent work stages into the residual tangent program. An instruction
-    /// normally dispatches its forward-mode rule once; the established nonempty all-structural-zero fast path instead
-    /// binds only its primal operation and propagates typed structural zeros.
-    ///
-    /// The resulting [`Linearization`] has the canonical boundary `x -> (y, r)` and `(dx, r) -> dy`. Every source input
-    /// is seeded eagerly as one known primal tracer and one leading unknown tangent input. When tangent work first
-    /// consumes a known primal value, partial evaluation materializes that value as a residual and its shared
-    /// materialization slot deduplicates later uses; literal constants instead remain inline tangent-program constants.
-    /// Residual feeder tracers are appended to the primal outputs in exactly the tangent program's trailing input
-    /// order. Structural-zero tangent outputs are materialized only at the public tangent output boundary, preserving
-    /// one tangent output per primal output without introducing zero work inside the walk. A tangent that folds to a
-    /// known value is rejected: a well-formed linear tangent map must represent an input-independent zero as
-    /// [`MaybeZero::Zero`], while accepting an arbitrary known value would silently mask a nonlinear rule.
-    ///
-    /// Effect placement is inherited from [`PartialEvaluationContext`]. All-known effects stage once into the primal
-    /// program, while tangent-dependent effects residualize once into the tangent program. Higher-order operations own
-    /// their nested splitting through their existing differentiation and partial-evaluation rules. This function does
-    /// not inspect or special-case their payloads. The final pair is validated only by [`Linearization::new`].
+    /// Linearizes this borrowed [`Region`](crate::Region) by replaying it once through a [`DifferentiationContext`]
+    /// over a [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. Refer to the
+    /// documentation of [`Program::linearize`] for more information.
     pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
 
@@ -917,10 +922,14 @@ impl<
 
         // Replay the source program once. Constants lift as known values with structural-zero tangents. Instruction
         // binds dispatch through differentiation-over-partial-evaluation, including its all-structural-zero fast path.
+        let region_mappings = RegionReplayMappings::new();
         let output_duals = self.interpret_with(
             input_duals,
             |_, constant| differentiation_context.lift(constant.clone()),
-            |instruction, inputs| differentiation_context.bind(instruction.operation().clone(), &[], &[], inputs),
+            |instruction, inputs| {
+                let regions = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
+                differentiation_context.bind(instruction.operation().clone(), regions, inputs)
+            },
         )?;
 
         // Split the direct output duals. Primal halves must be known tracers in the primal builder. Structural-zero
@@ -928,7 +937,7 @@ impl<
         // value tangent that folded to known is malformed: rules must preserve input-independent zeros structurally,
         // and accepting any other known value would turn the tangent program into an affine map.
         let staged_zero = |r#type: V::Type| {
-            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), &[])?;
+            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok::<_, ProgramError>(outputs.remove(0))
         };
@@ -1048,6 +1057,73 @@ impl<
     }
 }
 
+impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>>
+where
+    O: PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
+        + From<ZeroOperation<V::Type>>,
+{
+    /// Builds the *fused* Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
+    /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
+    /// computes `f` together with its _pushforward_ (i.e., the forward-mode Jacobian-vector product): given an input
+    /// tangent (i.e., perturbation direction) `ẋ`, the pushforward produces the output tangent `ẏ = (∂f/∂x)(x) · ẋ`,
+    /// the directional derivative of `f` at `x` along `ẋ`. As a single map, the returned program computes
+    /// `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`. In terms of the program boundaries, if the input program has inputs
+    /// `[x_1, …, x_n]` and outputs `[y_1, …, y_m]` (so that `y = f(x)`), the returned program has:
+    ///
+    ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]`m which correspond to the `n` primal inputs followed by one fresh tangent
+    ///     input `ẋ_i` per primal input `x_i`, of the same type, and
+    ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]`, which correspond to the `m` primal outputs `y_j = f_j(x)` followed by
+    ///     the `m` tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+    ///
+    /// The program is *not* split into separate primal and tangent sub-programs unlike [`Self::linearize`], which
+    /// directly composes differentiation with partial evaluation. This un-split form remains exposed for fused
+    /// higher-order JVP rules and direct forward-mode interpretation.
+    ///
+    /// Each primal instruction is replayed once through its [`DifferentiableOperation`] rule, which returns the dual
+    /// (i.e., primal result plus tangent) for the instruction's outputs. Both are staged into the shared builder as
+    /// ordinary primal operations, and so the result contains no symbolic captures.
+    ///
+    /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
+    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits the all-zero case (an
+    /// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
+    /// operation directly and pairing each primal output with a typed structural zero tangent, so that zero-ness
+    /// propagates transitively without staging or scanning [`Instruction`](crate::Instruction)s. Structural zero
+    /// tangents are materialized as typed [`ZeroOperation`] instructions only at the output boundary, preserving the
+    /// `(primal_outputs ++ tangent_outputs)` program contract.
+    #[inline]
+    pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        self.entry_region_ref().jvp()
+    }
+
+    /// Linearizes this [`Program`] directly by replaying it once through a [`DifferentiationContext`] over a
+    /// [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. This context composition
+    /// handles each source instruction once while simultaneously separating its two halves: primal-only work stages
+    /// into the primal trace, and tangent-dependent work stages into the residual tangent program. An instruction
+    /// normally dispatches its forward-mode rule once; the established nonempty all-structural-zero fast path instead
+    /// binds only its primal operation and propagates typed structural zeros.
+    ///
+    /// The resulting [`Linearization`] has the canonical boundary `x -> (y, r)` and `(dx, r) -> dy`. Every source input
+    /// is seeded eagerly as one known primal tracer and one leading unknown tangent input. When tangent work first
+    /// consumes a known primal value, partial evaluation materializes that value as a residual and its shared
+    /// materialization slot deduplicates later uses; literal constants instead remain inline tangent-program constants.
+    /// Residual feeder tracers are appended to the primal outputs in exactly the tangent program's trailing input
+    /// order. Structural-zero tangent outputs are materialized only at the public tangent output boundary, preserving
+    /// one tangent output per primal output without introducing zero work inside the walk. A tangent that folds to a
+    /// known value is rejected: a well-formed linear tangent map must represent an input-independent zero as
+    /// [`MaybeZero::Zero`], while accepting an arbitrary known value would silently mask a nonlinear rule.
+    ///
+    /// Effect placement is inherited from [`PartialEvaluationContext`]. All-known effects stage once into the primal
+    /// program, while tangent-dependent effects residualize once into the tangent program. Higher-order operations own
+    /// their nested splitting through their existing differentiation and partial-evaluation rules. This function does
+    /// not inspect or special-case their payloads. The final pair is validated only by [`Linearization::new`].
+    #[inline]
+    pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
+        self.entry_region_ref().linearize()
+    }
+}
+
 /// Extension trait carrying the value-level *forward-mode* differentiation transforms on every [`Context`], mirroring
 /// how [`Batch`](crate::Batch) carries batching. [`ReverseModeDifferentiate`](crate::ReverseModeDifferentiate) is its
 /// sibling that builds reverse mode on top of it (i.e., `vjp = linearize + transpose`).
@@ -1086,7 +1162,7 @@ pub trait ForwardModeDifferentiate: Context {
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
         Self: Zero<Self::Value>,
-        Self::Operation: Clone + DifferentiableOperation<Self>,
+        Self::Operation: DifferentiableOperation<Self>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1145,7 +1221,9 @@ pub trait ForwardModeDifferentiate: Context {
         primals: Input,
     ) -> Result<(Output::To<Self::Value>, Pushforward<Self, Input, Output::To<Self::Value>>), DifferentiationError>
     where
-        Self::Operation: PartiallyEvaluatableOperation<Self> + From<ZeroOperation<Self::Type>>,
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
+            + From<ZeroOperation<Self::Type>>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1184,7 +1262,7 @@ pub trait ForwardModeDifferentiate: Context {
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
         let staged_zero = |r#type: Self::Type| {
-            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), &[])?;
+            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok::<_, ProgramError>(outputs.remove(0))
         };
@@ -1288,7 +1366,7 @@ impl<C: Context> ForwardModeDifferentiate for C {}
 /// [`ForwardModeDifferentiate::jvp`] is the explicit-context method form behind this function.
 #[inline]
 pub fn jvp<
-    V: Value<ExecutionDomain: Context<Operation: Clone + DifferentiableOperation<V::ExecutionDomain>> + Zero<V>>,
+    V: Value<ExecutionDomain: Context<Operation: DifferentiableOperation<V::ExecutionDomain>> + Zero<V>>,
     F: FnOnce(Input::To<DifferentiationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<
             V,
@@ -1337,11 +1415,12 @@ pub fn jvp<
 pub fn linearize<
     V: Value<
         ExecutionDomain: Context<
-            Operation: Clone
-                           + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+            Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                            + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                           + From<ZeroOperation<V::Type>>,
-        >,
+                           + PartiallyEvaluatableOperation<
+                TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+            > + From<ZeroOperation<V::Type>>,
+        > + Zero<V>,
     >,
     F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
@@ -1365,11 +1444,11 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::operations::BooleanLike;
-    use crate::operations::Operation;
     use crate::operations::differentiation::StopGradientOperation;
     use crate::operations::math::{MulOperation, Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
-    use crate::programs::ProgramBuilder;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::tracing::Trace;
     use crate::types::DataType;
 
@@ -1382,7 +1461,7 @@ mod tests {
         // its tangent.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1411,8 +1490,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::F64(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![input, constant]).unwrap()[0];
-        let severed = builder.add_instruction(StopGradientOperation, vec![scaled]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
+        let severed = builder.add_instruction(StopGradientOperation, Vec::new(), vec![scaled]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
@@ -1443,7 +1522,7 @@ mod tests {
         // whose trailing output is the `cos(x)` residual, and the linear tangent sub-program `(ẋ, r) ↦ r · ẋ`.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1493,7 +1572,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::F64(2.0));
-        let scaled = builder.add_instruction(MulOperation, vec![input, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![input, constant]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();

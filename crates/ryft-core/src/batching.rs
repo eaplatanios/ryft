@@ -713,7 +713,8 @@ where
 /// # Deriving Batchable Operation Enums
 ///
 /// `#[derive(Operation)]` generates a [`BatchableOperation`] dispatcher when the enum specifies
-/// `#[ryft(dispatch(batching))]`. It follows the operation derive's enum-shape and type-inference rules and generates:
+/// `#[ryft(dispatch(batching))]`. It follows the operation derivation's enum-shape and type-inference rules
+/// and generates:
 ///
 ///   - A dispatcher at `BatchableOperation<C>`, generic over the parent [`Context`] `C`, that forwards the active
 ///     [`BatchingContext`] to every variant's own rule. One dispatcher covers eager and staging parents alike, because
