@@ -167,7 +167,7 @@ impl Shape {
     /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any of its dimensions is
     /// dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+    pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         if self.dimensions.contains(&Size::Static(0)) {
             return Ok(Some(0));
         }
@@ -582,7 +582,7 @@ impl ArrayType {
     /// Returns the number of elements in arrays of this [`ArrayType`] or `Ok(None)` if any dimension in [`Self::shape`]
     /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+    pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         self.shape.element_count()
     }
 
@@ -811,7 +811,6 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::Error;
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
@@ -919,9 +918,7 @@ mod tests {
         assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(None));
         assert_eq!(
             Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
-            Err(Error::from(TypeError {
-                message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
-            })),
+            Err(TypeError { message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX) }),
         );
     }
 
