@@ -391,7 +391,9 @@ where
 /// are stacked via [`stack_expansion_items`]. This is the shared fallback for batched operands that cannot ride
 /// along structurally — batch-varying dynamic-slice start indices and batch-varying pad padding values — and it stages
 /// `O(axis_size)` operations because everything goes through the value capability traits (which also makes it work
-/// identically in eager and tracing contexts, since capabilities stage on tracers).
+/// identically in eager and tracing contexts, since capabilities stage on tracers). For an empty batch, it infers the
+/// per-item output type and synthesizes the correctly typed empty packed result without interpreting a nonexistent
+/// item.
 pub(crate) fn batch_by_item_expansion<C, O>(
     context: &BatchingContext<C>,
     operation_name: &'static str,
@@ -400,12 +402,20 @@ pub(crate) fn batch_by_item_expansion<C, O>(
     axis_size: usize,
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     O: InterpretableOperation<C>,
 {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    }
+    if axis_size == 0 {
+        let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Result<Vec<_>, BatchingError>>()?;
+        let mut output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = output_types.remove(0).with_inserted_dimension(0, Size::Static(0))?;
+        let output = context.parent().zero(&output_type)?;
+        return Ok(vec![ArrayBatch::new(output_type, output, Some(0))?]);
     }
     let aligned = inputs.iter().map(|input| input.move_axis(0)).collect::<Result<Vec<_>, _>>()?;
     let stacked = stack_expansion_items(operation_name, axis_size, |item| {
@@ -501,7 +511,7 @@ where
 /// because it only goes through the value capability traits.
 impl<C> BatchableOperation<C> for DynamicSliceOperation
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
@@ -562,7 +572,7 @@ where
 /// only goes through the value capability traits.
 impl<C> BatchableOperation<C> for DynamicUpdateSliceOperation
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
@@ -612,7 +622,7 @@ mod tests {
     use crate::differentiation::LinearizationTracer;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::DataType;
 
     use crate::tracing::Trace;
@@ -676,9 +686,9 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[2]);
-        assert_eq!(block.input_shape(), &[4]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     }
 
@@ -728,9 +738,9 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[2]);
-        assert_eq!(block.input_shape(), &[4]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     }
 

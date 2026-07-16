@@ -10,7 +10,7 @@ use crate::operations::constants::{
 };
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use crate::operations::debugging::PrintOperation;
-use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
     BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
@@ -52,6 +52,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Constant(ConstantOperation<V>),
     Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
+    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),

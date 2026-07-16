@@ -174,7 +174,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -209,13 +209,14 @@ mod tests {
                 (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0])),
             )
             .unwrap();
-        let (x_block, y_block) = jacobian.rows().partials();
-        assert_eq!(x_block.output_shape(), &[3]);
-        assert_eq!(x_block.input_shape(), &[2]);
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [x_block, y_block] = blocks.as_slice() else { unreachable!() };
+        assert_eq!(x_block.output_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(x_block.input_type().static_shape().unwrap().as_slice(), &[2]);
         // d(output)/d(x): output rows 0 and 1 are x0 and x1; row 2 (from y) is unaffected by x.
         assert_eq!(x_block.value().values(), &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(y_block.output_shape(), &[3]);
-        assert_eq!(y_block.input_shape(), &[1]);
+        assert_eq!(y_block.output_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(y_block.input_type().static_shape().unwrap().as_slice(), &[1]);
         // d(output)/d(y): only output row 2 (from y0) depends on y.
         assert_eq!(y_block.value().values(), &[0.0, 0.0, 1.0]);
     }

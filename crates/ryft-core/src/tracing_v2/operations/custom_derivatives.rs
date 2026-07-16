@@ -1380,7 +1380,6 @@ mod tests {
         // `diag(3 * cos(x))`.
         let vector = test_type(&[2]);
         let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
@@ -1388,7 +1387,7 @@ mod tests {
             TestArray::new(vector, vec![0.5, 1.0]),
         )
         .unwrap();
-        let (_, _, block) = jacobian.iter_blocks().next().unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
         assert_abs_diff_eq!(block.value().values()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);

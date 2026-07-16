@@ -8,6 +8,7 @@ use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, 
 use crate::contexts::Context;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::constants::Zero;
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, Reshape, Slice, Transpose, UpdateSlice,
 };
@@ -54,7 +55,7 @@ where
 /// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
 impl<C> BatchableOperation<C> for GatherOperation
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     GatherOperation: InterpretableOperation<C>,
 {
@@ -77,11 +78,13 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::manipulation::{Gather, GatherDimensionNumbers, GatherOperation};
+    use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -129,9 +132,9 @@ mod tests {
                 TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
             )
             .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[2, 2]);
-        assert_eq!(block.input_shape(), &[3, 2]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2, 2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3, 2]);
         assert_eq!(
             block.value().values(),
             &[
@@ -141,5 +144,31 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
             ],
         );
+    }
+
+    #[test]
+    fn test_gather_batching_expands_an_empty_batch() {
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)]));
+        let operand = ArrayBatch::new(operand_type.clone(), TestArray::new(operand_type, Vec::new()), Some(0)).unwrap();
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(0), Size::Static(1), Size::Static(1)]));
+        let indices = ArrayBatch::new(indices_type.clone(), TestArray::new(indices_type, Vec::new()), Some(0)).unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
+
+        let outputs = operation
+            .batch(
+                &crate::BatchingContext::new(EagerContext::<TestArray>::new(), 0, None),
+                &crate::EmptyRegionDriver,
+                &[operand, indices],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            *outputs[0].value().r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(1)])),
+        );
+        assert!(outputs[0].value().values.is_empty());
     }
 }

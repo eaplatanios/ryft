@@ -226,17 +226,13 @@ fn reduce_sharding(
 /// `i + 1` when `i >= batch_axis`. The output batch axis is `batch_axis` minus the number of
 /// reduced axes that lie strictly below it (because those axes get dropped in the output).
 ///
-/// Reducing the batch axis itself is rejected because the user's reduce describes per-item
-/// semantics; collapsing the batch axis would change the meaning of `batch`. Callers should
-/// surface this as a [`BatchingError::UnsupportedOperation`](
-/// crate::batching::BatchingError::UnsupportedOperation).
-pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> Option<(Vec<usize>, usize)> {
+/// The axes are expressed in the per-item coordinate system and therefore cannot name the inserted
+/// batch dimension. In particular, a user axis equal to `batch_axis` shifts past the physical batch
+/// dimension rather than reducing it.
+pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize) {
     let mut lifted = Vec::with_capacity(axes.len());
     let mut axes_below_batch = 0usize;
     for axis in axes {
-        if *axis == batch_axis {
-            return None;
-        }
         if *axis < batch_axis {
             lifted.push(*axis);
             axes_below_batch += 1;
@@ -245,7 +241,7 @@ pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> Option<(Vec<usize>
         }
     }
     let output_batch_axis = batch_axis - axes_below_batch;
-    Some((lifted, output_batch_axis))
+    (lifted, output_batch_axis)
 }
 
 /// Primitive representing one N-dimensional axis-collapsing reduction.
@@ -623,15 +619,7 @@ where
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
-        let Some((lifted_axes, output_axis)) = lift_reduce_axes(self.axes.as_slice(), batch_axis) else {
-            return Err(crate::batching::BatchingError::UnsupportedOperation {
-                message: format!(
-                    "{} cannot reduce along the mapped batch axis {batch_axis}; use an explicit \
-                    reduction inside the function instead of batch-collapsing the batch item",
-                    self.name(),
-                ),
-            });
-        };
+        let (lifted_axes, output_axis) = lift_reduce_axes(self.axes.as_slice(), batch_axis);
         // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
         // dot batch rule.
         let lifted_output_sharding = match &self.output_sharding {
@@ -731,7 +719,7 @@ pub fn reduce_evaluate<T: Clone>(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
@@ -946,11 +934,11 @@ mod tests {
         // Per-item reduce over axes [0, 2] of a rank-3 input. Batching at axis 1 inserts a new
         // dimension at position 1, so per-item axis 0 stays at 0, per-item axis 2 shifts to 3.
         // Output batch axis is at position 1 - 1 = 0 (one reduced axis was below the batch axis).
-        assert_eq!(lift_reduce_axes(&[0, 2], 1), Some((vec![0, 3], 0)));
+        assert_eq!(lift_reduce_axes(&[0, 2], 1), (vec![0, 3], 0));
         // Reducing only above the batch axis leaves the batch axis position unchanged.
-        assert_eq!(lift_reduce_axes(&[2], 0), Some((vec![3], 0)));
-        // Reducing the batch axis itself is rejected.
-        assert_eq!(lift_reduce_axes(&[0, 1], 1), None);
+        assert_eq!(lift_reduce_axes(&[2], 0), (vec![3], 0));
+        // A per-item axis at the physical batch position shifts past the inserted batch dimension.
+        assert_eq!(lift_reduce_axes(&[0, 1], 1), (vec![0, 2], 0));
     }
 
     #[test]
@@ -1008,24 +996,23 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_operation_rejects_reducing_the_batch_axis() {
+    fn test_reduce_operation_batches_a_per_item_axis_at_the_physical_batch_position() {
         let input = {
             let value = TestArray::matrix(3, 2, vec![1.0; 6]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        // Per-item axis 0 collides with the mapped batch axis once lifted.
-        let error = ReduceOperation::new(vec![0], ReductionKind::Sum)
+        let outputs = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(
                 &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            BatchingError::UnsupportedOperation { message } if message.contains("reduce along the mapped batch axis"),
-        ));
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].r#type().shape(), &Shape::new(vec![Size::Static(3)]));
+        assert_eq!(outputs[0].value().values(), &[2.0, 2.0, 2.0]);
     }
 
     #[test]

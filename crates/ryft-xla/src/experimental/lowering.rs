@@ -9,6 +9,7 @@ use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation,
     ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
@@ -672,6 +673,20 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for IotaOpera
     }
 }
 
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CoordinateBasisOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 0, ProgramError);
+        lower_coordinate_basis_to_mlir(self, output_types, &mut lowerer.block, lowerer.context, lowerer.location)
+    }
+}
+
 impl<V: MlirLowerableValue + BooleanLike, Payload: Clone> LowerableXlaOperation<V> for ConstantOperation<V, Payload> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -932,6 +947,16 @@ where
                 mode,
                 lowerer,
             ),
+            Self::CoordinateBasis(operation) => {
+                <CoordinateBasisOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    regions,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             Self::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -1554,6 +1579,16 @@ where
                 mode,
                 lowerer,
             ),
+            ArrayOperation::CoordinateBasis(operation) => {
+                <CoordinateBasisOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    regions,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -4793,6 +4828,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.iota should return one result").as_ref()])
         }
+        XlaOperation::CoordinateBasis(operation) => {
+            check_count!("input", input_values, 0, ProgramError);
+            lower_coordinate_basis_to_mlir(
+                operation,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )
+        }
         XlaOperation::Reshape(_) => {
             check_count!("output", output_types, 1, ProgramError);
             let output_type = &output_types[0];
@@ -5087,6 +5132,131 @@ impl ToMlir for ComparisonDirection {
     }
 }
 
+/// Lowers a packed [`CoordinateBasisOperation`] directly into the current StableHLO block.
+fn lower_coordinate_basis_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
+    operation: &CoordinateBasisOperation<ArrayType>,
+    output_types: &[ArrayType],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    check_count!("output", output_types, 1, ProgramError);
+    let output_type = &output_types[0];
+    let leaf_dimensions = operation
+        .leaf_type()
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension_size| match dimension_size {
+            Size::Static(dimension_size) => Ok(*dimension_size),
+            Size::Dynamic(_) => Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "coordinate basis requires a fully static leaf type but got {}",
+                    operation.leaf_type(),
+                ),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // A zero-sized leaf contributes no local coordinates. Lowering its fragment directly as a typed empty zero avoids
+    // constructing irrelevant row-major index arithmetic and, in particular, makes stride computation independent of
+    // where the zero-sized dimension occurs.
+    if leaf_dimensions.contains(&0) {
+        return lower_constant_output(output_types, 0, block, context, location);
+    }
+
+    let index_type = output_type.clone().with_data_type(DataType::U64);
+    let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
+    let basis_index = block.append_operation(stable_hlo::iota(index_tensor_type, 0, location)?)?;
+    let basis_index = basis_index.result(0).expect("stablehlo.iota should return one result").as_ref();
+
+    // Compute each leaf element's row-major flat coordinate in the physical `[basis] ++ leaf_shape` tensor. Keeping
+    // all index arithmetic in u64 preserves exact coordinates throughout the generated graph.
+    let mut flat_coordinate = None;
+    let mut stride = 1u64;
+    for (leaf_axis, dimension_size) in leaf_dimensions.iter().copied().enumerate().rev() {
+        let coordinate = block.append_operation(stable_hlo::iota(index_tensor_type, leaf_axis + 1, location)?)?;
+        let coordinate = coordinate.result(0).expect("stablehlo.iota should return one result").as_ref();
+        let coordinate = if stride == 1 {
+            coordinate
+        } else {
+            let stride_value =
+                lower_u64_constant_splat(stride, &index_type, index_tensor_type, block, context, location)?;
+            let product = block.append_operation(stable_hlo::multiply(coordinate, stride_value, location)?)?;
+            product.result(0).expect("stablehlo.multiply should return one result").as_ref()
+        };
+        flat_coordinate = Some(match flat_coordinate {
+            Some(accumulated) => {
+                let sum = block.append_operation(stable_hlo::add(accumulated, coordinate, location)?)?;
+                sum.result(0).expect("stablehlo.add should return one result").as_ref()
+            }
+            None => coordinate,
+        });
+        stride = stride
+            .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
+                message: format!("leaf dimension {dimension_size} does not fit in u64"),
+            })?)
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("coordinate count overflows u64 for leaf type {}", operation.leaf_type()),
+            })?;
+    }
+    let mut flat_coordinate = match flat_coordinate {
+        Some(flat_coordinate) => flat_coordinate,
+        None => lower_u64_constant_splat(0, &index_type, index_tensor_type, block, context, location)?,
+    };
+    if operation.coordinate_offset() != 0 {
+        let offset = u64::try_from(operation.coordinate_offset()).map_err(|_| ProgramError::InvalidArgument {
+            message: format!("coordinate offset {} does not fit in u64", operation.coordinate_offset()),
+        })?;
+        let offset = lower_u64_constant_splat(offset, &index_type, index_tensor_type, block, context, location)?;
+        let sum = block.append_operation(stable_hlo::add(flat_coordinate, offset, location)?)?;
+        flat_coordinate = sum.result(0).expect("stablehlo.add should return one result").as_ref();
+    }
+
+    let selected = block.append_operation(stable_hlo::compare(
+        basis_index,
+        flat_coordinate,
+        stable_hlo::ComparisonDirection::Equal,
+        stable_hlo::ComparisonType::Unsigned,
+        location,
+    )?)?;
+    let selected = selected.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let one = lower_constant_output(output_types, 1, block, context, location)?[0];
+    let zero = lower_constant_output(output_types, 0, block, context, location)?[0];
+    let result = block.append_operation(stable_hlo::select(selected, one, zero, location)?)?;
+    Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
+}
+
+/// Lowers an exact `u64` value as a splatted constant of `output_type`.
+fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
+    value: u64,
+    output_type: &ArrayType,
+    output_tensor_type: TensorTypeRef<'c, 't>,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
+    let attribute = context
+        .dense_u64_elements_attribute(scalar_tensor_type, &[value])
+        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::U64 })?;
+    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
+    let constant = constant.result(0).expect("stablehlo.constant should return one result").as_ref();
+    if output_type.shape().dimensions().is_empty() {
+        return Ok(constant);
+    }
+    let broadcast = block.append_operation(stable_hlo::broadcast(constant, output_tensor_type, &[], location)?)?;
+    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
+}
+
 /// Lowers an [`ArrayOperation::Compare`]-style dispatch to
 /// `stablehlo.compare`. The resulting value has the broadcasted shape of the inputs and Boolean
 /// element type. The comparison semantic is routed based on the LHS value's element type
@@ -5221,12 +5391,9 @@ fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
-    let attribute = context
-        .dense_u64_elements_attribute(scalar_tensor_type, &[value])
-        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::U64 })?;
-    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
-    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+    let output_type = ArrayType::scalar(DataType::U64);
+    let output_tensor_type = lower_tensor_type(&output_type, context, location)?;
+    lower_u64_constant_splat(value, &output_type, output_tensor_type, block, context, location)
 }
 
 /// Lowers one [`AxisIndexOperation`] inside a `sdy.manual_computation` region to the executing device's coordinate
@@ -6001,6 +6168,23 @@ mod tests {
         std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
+    /// Builds a nullary callee that materializes one scalar leaf's fragment of a packed coordinate basis.
+    fn xla_coordinate_basis_callee(coordinate_offset: usize) -> std::rc::Rc<FlatXlaProgram> {
+        let mut builder = XlaProgramBuilder::new();
+        let output = builder
+            .add_instruction(
+                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(
+                    ArrayType::scalar(DataType::F32),
+                    coordinate_offset,
+                    2,
+                )),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        std::rc::Rc::new(builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap())
+    }
+
     /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
     fn add_xla_jit_call(
         builder: &mut XlaProgramBuilder,
@@ -6097,6 +6281,30 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_jit_call_dedup_distinguishes_coordinate_basis_attributes() {
+        let first_callee = xla_coordinate_basis_callee(0);
+        let second_callee = xla_coordinate_basis_callee(1);
+        assert!(jit_call_program_key(&first_callee) != jit_call_program_key(&second_callee));
+
+        let mut builder = XlaProgramBuilder::new();
+        let first = add_xla_jit_call(&mut builder, &first_callee, Vec::new());
+        let second = add_xla_jit_call(&mut builder, &second_callee, Vec::new());
+        let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let input_types = Vec::<ArrayType>::new();
+        let output_types = vec![test_vector_type(2)];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        // Each semantic basis operation occurs only once, so both callees inline rather than incorrectly sharing a
+        // private function under a cache key that omits the coordinate offset.
+        assert!(!module.contains("func.func private"), "{module}");
+        assert!(!module.contains("call @jit_call"), "{module}");
     }
 
     #[test]
@@ -6442,6 +6650,55 @@ mod tests {
                 }
             "#}
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_coordinate_basis() {
+        let mut builder = XlaProgramBuilder::new();
+        let output = builder
+            .add_instruction(
+                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(test_matrix_type(2, 3), 1, 8)),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(stablehlo.matches("stablehlo.iota").count(), 3);
+        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 1);
+        assert_eq!(stablehlo.matches("stablehlo.add").count(), 2);
+        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 1);
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 1);
+        assert!(stablehlo.contains("tensor<8x2x3xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_zero_sized_coordinate_basis() {
+        let leaf_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(0), Size::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let output = builder
+            .add_instruction(
+                XlaOperation::CoordinateBasis(CoordinateBasisOperation::new(leaf_type, 0, 0)),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(stablehlo.matches("stablehlo.iota").count(), 0);
+        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 0);
+        assert_eq!(stablehlo.matches("stablehlo.add").count(), 0);
+        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 0);
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 0);
+        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 1);
+        assert!(stablehlo.contains("tensor<0x2x0x3xf32>"), "{stablehlo}");
     }
 
     #[test]

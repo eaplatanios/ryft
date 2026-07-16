@@ -231,15 +231,13 @@ mod tests {
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::control_flow::SelectCondition;
-    use ryft_core::operations::differentiation::StopGradient;
+    use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{Concatenate, Pad, Reshape, Slice, Transpose, UpdateSlice};
     use ryft_core::operations::math::{Cos, Sin};
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use ryft_core::tracing_v2::{
-        CoordinateBasis, DifferentiableDomainExtension, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev,
-    };
+    use ryft_core::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -750,9 +748,9 @@ mod tests {
         let domain = x.execution_domain();
         let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
 
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[3]);
-        assert_eq!(block.input_shape(), &[3]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
         assert!(block.value().client().is_some(), "the derivative block must remain attached to its device client");
         assert_eq!(block.value().shape(), StaticShape::new(vec![3, 3]));
         assert_eq!(read_f64_coordinates(block.value()).as_slice(), &[2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 6.0]);
@@ -776,7 +774,11 @@ mod tests {
             let array = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
             assert_eq!(read_f64_coordinates(&array), vec![1.0, 2.0, 3.0]);
 
-            let basis = array.execution_domain().coordinate_basis(array.r#type().as_ref(), 0, 3).unwrap();
+            let basis = array
+                .execution_domain()
+                .bind(CoordinateBasisOperation::new(array.r#type().into_owned(), 0, 3), Vec::new(), &[])
+                .unwrap()
+                .remove(0);
             assert_eq!(basis.data_type(), data_type);
             assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
             assert_eq!(read_f64_coordinates(&basis), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
@@ -787,7 +789,11 @@ mod tests {
         let complex_values = [num_complex::Complex::new(2.0f32, 1.0), num_complex::Complex::new(-1.0, 3.0)];
         let complex =
             Array::from_host_buffer(&client, complex_type, mesh.clone(), values_to_bytes(&complex_values)).unwrap();
-        let basis = complex.execution_domain().coordinate_basis(complex.r#type().as_ref(), 0, 2).unwrap();
+        let basis = complex
+            .execution_domain()
+            .bind(CoordinateBasisOperation::new(complex.r#type().into_owned(), 0, 2), Vec::new(), &[])
+            .unwrap()
+            .remove(0);
         assert_eq!(
             read_c64s(&basis),
             vec![
@@ -813,10 +819,31 @@ mod tests {
         let domain = x.execution_domain();
         let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
 
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[3]);
-        assert_eq!(block.input_shape(), &[3]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(read_f64_coordinates(block.value()).as_slice(), &[2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 6.0]);
+    }
+
+    #[test]
+    fn test_eager_holomorphic_dense_differentiation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+        let value = num_complex::Complex::new(1.0f32, 2.0);
+        let input = c64_scalar(&client, &mesh, value);
+        let context = input.execution_domain();
+
+        let forward = context.jacfwd_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
+        let reverse = context.jacrev_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
+        let hessian = context.hessian_holomorphic(|input| Mul::mul(&input, &input), input).unwrap();
+
+        assert_c64_close(read_c64s(forward.iter_blocks().next().unwrap().value())[0], 2.0 * value);
+        assert_c64_close(read_c64s(reverse.iter_blocks().next().unwrap().value())[0], 2.0 * value);
+        assert_c64_close(
+            read_c64s(hessian.iter_blocks().next().unwrap().value())[0],
+            num_complex::Complex::new(2.0, 0.0),
+        );
     }
 
     /// Dense forward-mode Jacobian over a *sharded* primal: `jacfwd` of `f(x) = x * x` at `x = [1, 2, 3, 4]`
@@ -835,9 +862,9 @@ mod tests {
         let domain = x.execution_domain();
         let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
 
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[4]);
-        assert_eq!(block.input_shape(), &[4]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(
             read_f64_coordinates(block.value()).as_slice(),
             &[2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
@@ -856,12 +883,11 @@ mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
-        let domain = x.execution_domain();
-        let jacobian = jacrev(&domain, |x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = jacrev(|x| Mul::mul(&x, &x), x).unwrap();
 
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[4]);
-        assert_eq!(block.input_shape(), &[4]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(
             read_f64_coordinates(block.value()).as_slice(),
             &[2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
@@ -876,12 +902,11 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let domain = x.execution_domain();
-        let jacobian = jacrev(&domain, |x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = jacrev(|x| Mul::mul(&x, &x), x).unwrap();
 
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[3]);
-        assert_eq!(block.input_shape(), &[3]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(read_f64_coordinates(block.value()).as_slice(), &[2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 6.0]);
     }
 
@@ -899,15 +924,16 @@ mod tests {
             .hessian(
                 |x| {
                     let squared = Mul::mul(&x, &x).unwrap();
-                    squared.reduce(&[0], ReductionKind::Sum)
+                    Ok(squared.reduce(&[0], ReductionKind::Sum))
                 },
                 x,
             )
             .unwrap();
 
-        let block = hessian.rows().partials();
-        assert_eq!(block.output_shape(), &[3]);
-        assert_eq!(block.input_shape(), &[3]);
+        let block = hessian.iter_blocks().next().unwrap();
+        assert!(block.output_type().static_shape().unwrap().as_slice().is_empty());
+        assert_eq!(block.first_input_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(block.second_input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(read_f64_coordinates(block.value()).as_slice(), &[2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
     }
 

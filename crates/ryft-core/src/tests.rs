@@ -42,8 +42,8 @@ use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
+use crate::tracing_v2::ArrayOperation;
 use crate::tracing_v2::operations::TransferToMemory;
-use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
@@ -386,29 +386,6 @@ impl ZeroLike for TestArray {
 impl OneLike for TestArray {
     fn one_like(&self) -> Self {
         Self { r#type: self.r#type.clone(), values: vec![1.0; self.values.len()] }
-    }
-}
-
-impl<O: crate::programs::operations::Operation<ArrayType>> CoordinateBasis<TestArray> for EagerContext<TestArray, O> {
-    fn coordinate_basis(
-        &self,
-        leaf_type: &ArrayType,
-        coordinate_offset: usize,
-        basis_size: usize,
-    ) -> Result<TestArray, ProgramError> {
-        let leaf_count = TestArray::materialized_element_count(leaf_type)?;
-        let value_count = basis_size.checked_mul(leaf_count).ok_or_else(|| ProgramError::InvalidArgument {
-            message: format!("coordinate basis size overflows usize for leaf type {leaf_type}"),
-        })?;
-        let mut values = vec![0.0; value_count];
-        for basis_index in 0..basis_size {
-            if let Some(leaf_index) = basis_index.checked_sub(coordinate_offset)
-                && leaf_index < leaf_count
-            {
-                values[basis_index * leaf_count + leaf_index] = 1.0;
-            }
-        }
-        Ok(TestArray { r#type: leaf_type.with_inserted_dimension(0, Size::Static(basis_size))?, values })
     }
 }
 

@@ -11,7 +11,7 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::programs::types::{TypeError, Typed};
-use crate::types::{ArrayType, Shape, Size};
+use crate::types::{ArrayType, Size};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
@@ -125,9 +125,7 @@ pub fn lift_broadcast(
     axis_size: usize,
 ) -> Result<(Vec<usize>, ArrayType, usize), TypeError> {
     let target_batch_axis = input_batch_axis;
-    let mut lifted_target_dimensions: Vec<Size> = output_type.shape().dimensions().to_vec();
-    lifted_target_dimensions.insert(target_batch_axis, Size::Static(axis_size));
-    let lifted_target = ArrayType::new(output_type.data_type(), Shape::new(lifted_target_dimensions));
+    let lifted_target = output_type.with_inserted_dimension(target_batch_axis, Size::Static(axis_size))?;
 
     let mut lifted_dimensions = Vec::with_capacity(output_axes.len() + 1);
     for &output_axis in output_axes.iter() {
@@ -184,11 +182,12 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::Program;
     use crate::programs::types::Typed;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing::TracingContext;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
-    use crate::types::DataType;
+    use crate::types::{DataType, Memory, Shape};
 
     use super::*;
 
@@ -222,6 +221,21 @@ mod tests {
         let builder =
             Rc::try_unwrap(builder).expect("transpose builder should not have outstanding terms").into_inner();
         builder.build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder).unwrap()
+    }
+
+    #[test]
+    fn test_lift_broadcast_preserves_memory_and_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+
+        let (output_axes, lifted, batch_axis) = lift_broadcast(&[0], &output_type, 0, 2).unwrap();
+
+        assert_eq!(output_axes, vec![0, 1]);
+        assert_eq!(lifted, output_type.with_inserted_dimension(0, Size::Static(2)).unwrap());
+        assert_eq!(batch_axis, 0);
     }
 
     #[test]

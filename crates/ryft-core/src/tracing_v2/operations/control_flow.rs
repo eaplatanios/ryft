@@ -9,7 +9,7 @@ use crate::operations::BooleanLike;
 use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{
-    ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation, WhileTypeSemantics,
+    ConditionOperation, ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation, WhileTypeSemantics,
 };
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
@@ -803,44 +803,41 @@ where
     }
 }
 
-/// Batches a condition whose predicate is *batch-varying* by interpreting both branches over the operand inputs via
-/// `interpret_program` and merging their outputs per batch item via
-/// [`Select`](crate::operations::control_flow::Select). Each output's batch axis is joined across the branches
-/// (erroring when the branches disagree on a mapped position and defaulting to the predicate's axis when both branch
-/// outputs are replicated). The predicate must carry a mapped batch axis; the replicated case is the caller's
-/// structural staging path.
-pub(crate) fn batch_condition_with_interpreter<V, F>(
-    predicate_batch: &ArrayBatch<V>,
-    operand_inputs: &[ArrayBatch<V>],
+/// Batches a condition whose predicate is *batch-varying* by replaying both attached regions over the operand inputs
+/// through `batch_branch` and merging their outputs per batch item via
+/// [`Select`](crate::operations::control_flow::Select). The ordinary [`SelectOperation`] batching rule aligns every
+/// branch output with the predicate's mapped axis, broadcasts replicated branch outputs across the batch, and expands
+/// the per-item scalar predicate across non-scalar branch output shapes. The predicate must carry a mapped batch axis;
+/// the replicated case is the caller's structural staging path.
+pub(crate) fn batch_condition_with_interpreter<C, F>(
+    context: &BatchingContext<C>,
+    predicate_batch: &ArrayBatch<C::Value>,
+    operand_inputs: &[ArrayBatch<C::Value>],
     mut batch_branch: F,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    V: Value<Type = ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
-    F: FnMut(usize, Vec<ArrayBatch<V>>) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast
+        + Transpose
+        + SelectCondition<Condition = C::Value>
+        + crate::operations::control_flow::Select<Condition = C::Value>,
+    C::Operation: From<BroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
+    F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {
-    let predicate_axis = predicate_batch.batch_axis_position().unwrap();
     let true_outputs = batch_branch(0, operand_inputs.to_vec())?;
     let false_outputs = batch_branch(1, operand_inputs.to_vec())?;
     check_count!("output", true_outputs, false_outputs.len(), ProgramError);
     true_outputs
         .into_iter()
         .zip(false_outputs)
-        .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, BatchingError> {
-            let output_axis = match (true_output.batch_axis_position(), false_output.batch_axis_position()) {
-                (Some(left), Some(right)) if left != right => {
-                    return Err(BatchingError::MisalignedBatchAxes {
-                        message: format!(
-                            "condition branches produced batch-varying outputs at mismatched axes \
-                            ({left} vs {right})",
-                        ),
-                    });
-                }
-                (Some(axis), _) | (_, Some(axis)) => axis,
-                (None, None) => predicate_axis,
-            };
-            let selected = V::select(predicate_batch.value(), true_output.value(), false_output.value())?;
-            let output_type = selected.r#type().into_owned();
-            ArrayBatch::new(output_type, selected, BatchAxis::from_position(output_axis))
+        .map(|(true_output, false_output)| -> Result<ArrayBatch<C::Value>, BatchingError> {
+            let mut selected = SelectOperation.batch(
+                context,
+                &crate::EmptyRegionDriver,
+                &[predicate_batch.clone(), true_output, false_output],
+            )?;
+            check_count!("output", selected, 1, ProgramError);
+            Ok(selected.remove(0))
         })
         .collect()
 }
@@ -858,14 +855,19 @@ where
 ///     unbatched predicate passed through as its scalar Boolean operand. A staging parent therefore keeps one
 ///     `condition` operation whose branches run whole batches per batch item, while an eager parent concretizes the
 ///     predicate and interprets the chosen batched branch.
-///   - **Batch-varying predicate.** Both branches are interpreted over the operand inputs and merged per batch item
-///     via [`Select`]: every per-item primitive re-enters this operation
+///   - **Batch-varying predicate.** Both pure branches are interpreted over the operand inputs and merged per batch
+///     item via [`Select`]: every per-item primitive re-enters this operation
 ///     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
-///     and staging parents alike.
+///     and staging parents alike. Effectful branches are rejected because evaluating both branches would perform
+///     effects that the per-item selection cannot mask.
 impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: BooleanLike + Select<Condition = <C as Domain>::Value>,
+    <C as Domain>::Value: BooleanLike
+        + Broadcast
+        + Transpose
+        + SelectCondition<Condition = <C as Domain>::Value>
+        + Select<Condition = <C as Domain>::Value>,
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
@@ -884,11 +886,23 @@ where
             });
         };
         if !predicate_batch.batch_axis().is_replicated() {
+            let true_region = driver.region(0)?;
+            let false_region = driver.region(1)?;
+            if !true_region.effects().is_pure() || !false_region.effects().is_pure() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "cannot batch a condition with a batch-varying predicate and effectful branches because \
+                              observable effects cannot be selected per batch item"
+                        .to_string(),
+                });
+            }
             // Batch-varying predicate: batch both branches item-agnostically through the region access and merge
             // their outputs per batch item via `Select`.
-            return batch_condition_with_interpreter(predicate_batch, operand_inputs, |index, region_inputs| {
-                driver.batch_region(context, index, region_inputs)
-            });
+            return batch_condition_with_interpreter(
+                context,
+                predicate_batch,
+                operand_inputs,
+                |index, region_inputs| driver.batch_region(context, index, region_inputs),
+            );
         }
 
         // Replicated (abstract) predicate: batch both branches at the operand batch axes with natural output axes to

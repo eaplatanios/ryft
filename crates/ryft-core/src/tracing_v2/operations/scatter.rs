@@ -178,7 +178,7 @@ where
 /// the scatter applies once, unbatched.
 impl<C> BatchableOperation<C> for ScatterOperation
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     ScatterOperation: InterpretableOperation<C>,
 {
@@ -205,7 +205,7 @@ mod tests {
     use crate::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -261,9 +261,9 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[4]);
-        assert_eq!(block.input_shape(), &[4]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(
             block.value().values(),
             &[

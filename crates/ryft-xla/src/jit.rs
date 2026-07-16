@@ -885,10 +885,12 @@ where
 #[cfg(test)]
 mod tests {
     use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::math::{Cos, Sin};
+    use ryft_core::operations::math::{Cos, Mul, Sin};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use ryft_core::tracing_v2::{
+        DenseDifferentiate, ForwardModeDifferentiate, Hessian, Jacobian, ReverseModeDifferentiate,
+    };
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -972,6 +974,113 @@ mod tests {
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
+    }
+
+    #[test]
+    fn test_dense_differentiation_compiles_as_part_of_the_enclosing_program() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        let forward: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> =
+            compile(
+                |input| {
+                    input
+                        .context()
+                        .clone()
+                        .jacfwd(|value| Mul::mul(&value, &value), input)
+                        .expect("forward Jacobian should stage")
+                },
+                input_type.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+        let reverse: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> =
+            compile(
+                |input| {
+                    input
+                        .context()
+                        .clone()
+                        .jacrev(|value| Mul::mul(&value, &value), input)
+                        .expect("reverse Jacobian should stage")
+                },
+                input_type.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+        let second: CompiledXlaFunction<'_, ArrayType, Hessian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+            |input| {
+                input
+                    .context()
+                    .clone()
+                    .hessian(|value| Mul::mul(&value, &value), input)
+                    .expect("Hessian should stage")
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(domain.cache_size(), 2);
+        let _: CompiledXlaFunction<'_, ArrayType, Jacobian<ArrayType, ArrayType, ArrayType, ArrayType>> = compile(
+            |input| {
+                input
+                    .context()
+                    .clone()
+                    .jacfwd(|value| Mul::mul(&value, &value), input)
+                    .expect("forward Jacobian should stage")
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(domain.cache_size(), 2, "an equivalent dense transform should reuse its enclosing compilation");
+
+        assert!(forward.source_program().program().regions().iter().any(|region| {
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::CoordinateBasis(_)))
+        }));
+        assert!(reverse.source_program().program().regions().iter().any(|region| {
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::CoordinateBasis(_)))
+        }));
+        assert!(second.source_program().program().regions().iter().any(|region| {
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::CoordinateBasis(_)))
+        }));
+
+        for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
+            let input = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[3.0]).as_slice(),
+            )
+            .unwrap();
+            let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+                domain.interpret(&compiled.executable_program(), input).unwrap();
+            assert_eq!(read_f32_array(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
+        }
+
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
+            domain.interpret(&second.executable_program(), input).unwrap();
+        assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
 
     #[test]

@@ -25,13 +25,10 @@ use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
 use ryft_core::operations::constants::{
     Constant, Fill, FillOperation, Iota, IotaOperation, ONE_OPERATION_NAME, One, OneOperation, ZERO_OPERATION_NAME,
     Zero, ZeroOperation,
 };
-use ryft_core::operations::control_flow::SelectOperation;
-use ryft_core::operations::math::{AddOperation, MulOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
 use ryft_core::programs::operations::Operation;
@@ -41,7 +38,6 @@ use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
 use ryft_core::tracing::DomainTracer;
-use ryft_core::tracing_v2::CoordinateBasis;
 use ryft_core::types::{
     ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout,
 };
@@ -112,7 +108,7 @@ pub enum XlaDomainError {
 ///   per-operation programs behind eager [`Context::bind`] dispatch),
 /// - an optional concrete [`DeviceMesh`] that eager binds prefer when deriving their execution mesh and that the
 ///   constant-materialization fast path requires,
-/// - default [`CompilationOptions`] that the compile path forwards to PJRT, and
+/// - an immutable, shared default [`CompilationOptions`] template that the compile path forwards to PJRT, and
 /// - an internal [`CompilationContext`] that memoizes compiled programs across calls, shared
 ///   across [`Clone`] of this domain via an [`Arc`].
 ///
@@ -132,8 +128,9 @@ pub struct XlaDomain<'c> {
     /// constant-materialization fast path requires.
     mesh: Option<DeviceMesh>,
 
-    /// Default compilation options forwarded to [`Client::compile`].
-    compilation_options: CompilationOptions,
+    /// Default compilation options forwarded to [`Client::compile`]. Shared because the template is immutable and
+    /// [`XlaDomain`] values are cloned into every transform tracer that executes through this domain.
+    compilation_options: Arc<CompilationOptions>,
 
     /// Process-local cache of compiled programs, shared across domain clones via [`Arc`].
     cache: Arc<CompilationContext<XlaDomain<'c>>>,
@@ -150,7 +147,7 @@ impl<'c> Clone for XlaDomain<'c> {
         Self {
             client: self.client,
             mesh: self.mesh.clone(),
-            compilation_options: self.compilation_options.clone(),
+            compilation_options: Arc::clone(&self.compilation_options),
             cache: Arc::clone(&self.cache),
             marker: PhantomData,
         }
@@ -158,6 +155,13 @@ impl<'c> Clone for XlaDomain<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Returns the shared default [`CompilationOptions`] template.
+    #[inline]
+    fn default_compilation_options() -> Arc<CompilationOptions> {
+        static DEFAULT: LazyLock<Arc<CompilationOptions>> = LazyLock::new(|| Arc::new(CompilationOptions::default()));
+        Arc::clone(&DEFAULT)
+    }
+
     /// Creates a new [`XlaDomain`] from a PJRT [`Client`] with default [`CompilationOptions`]
     /// and an empty compile cache.
     #[inline]
@@ -171,7 +175,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: Some(client),
             mesh: None,
-            compilation_options,
+            compilation_options: Arc::new(compilation_options),
             cache: Arc::new(CompilationContext::new()),
             marker: PhantomData,
         }
@@ -184,7 +188,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: Some(client),
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(CompilationContext::with_capacity(capacity)),
             marker: PhantomData,
         }
@@ -199,7 +203,7 @@ impl<'c> XlaDomain<'c> {
         Ok(Self {
             client: Some(client),
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(cache),
             marker: PhantomData,
         })
@@ -212,7 +216,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: Some(client),
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(CompilationContext::new().with_configured_disk_cache(disk_cache)),
             marker: PhantomData,
         }
@@ -228,7 +232,7 @@ impl<'c> XlaDomain<'c> {
         Ok(Self {
             client: Some(client),
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()?),
             marker: PhantomData,
         })
@@ -245,7 +249,7 @@ impl<'c> XlaDomain<'c> {
         static TOKEN: LazyLock<XlaDomain<'static>> = LazyLock::new(|| XlaDomain {
             client: None,
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: XlaDomain::default_compilation_options(),
             cache: Arc::new(CompilationContext::new()),
             marker: PhantomData,
         });
@@ -262,7 +266,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: Some(client),
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache,
             marker: PhantomData,
         }
@@ -279,7 +283,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: None,
             mesh: None,
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(CompilationContext::new()),
             marker: PhantomData,
         }
@@ -302,7 +306,7 @@ impl<'c> XlaDomain<'c> {
     /// Returns the base [`CompilationOptions`] template that the compile path forwards to PJRT.
     #[inline]
     pub fn compilation_options(&self) -> &CompilationOptions {
-        &self.compilation_options
+        self.compilation_options.as_ref()
     }
 
     /// Returns the number of compiled programs currently cached in the in-memory tier.
@@ -332,7 +336,7 @@ impl<'c> XlaDomain<'c> {
         Self {
             client: Some(client),
             mesh: Some(mesh),
-            compilation_options: CompilationOptions::default(),
+            compilation_options: Self::default_compilation_options(),
             cache: Arc::new(CompilationContext::new()),
             marker: PhantomData,
         }
@@ -436,130 +440,6 @@ impl<'c> Iota<Array<'c>> for XlaDomain<'c> {
         let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-/// Synthesizes one packed standard-basis leaf entirely through a single compiled XLA program. The program constructs
-/// the global row-major coordinate of every leaf element from integer iotas, compares it with the leading basis-row
-/// iota plus `coordinate_offset`, and selects a typed one or zero. XLA can fuse that graph into one device kernel;
-/// no one-hot buffers are built on the host and no derivative payload is copied back to the host.
-impl<'c> CoordinateBasis<Array<'c>> for XlaDomain<'c> {
-    fn coordinate_basis(
-        &self,
-        leaf_type: &ArrayType,
-        coordinate_offset: usize,
-        basis_size: usize,
-    ) -> Result<Array<'c>, ProgramError> {
-        let Some(client) = self.client else {
-            return Err(ProgramError::InvalidArgument {
-                message: "xla domain cannot synthesize a coordinate basis without a PJRT client".into(),
-            });
-        };
-        if leaf_type.data_type() == DataType::Token {
-            return Err(TypeError { message: "coordinate basis does not support token arrays".into() }.into());
-        }
-        let leaf_dimensions = leaf_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|size| match size {
-                ryft_core::types::Size::Static(size) => Ok(*size),
-                ryft_core::types::Size::Dynamic(_) => Err(TypeError {
-                    message: format!("coordinate basis requires a fully static leaf type but got {leaf_type}"),
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let basis_type = leaf_type.with_inserted_dimension(0, ryft_core::types::Size::Static(basis_size))?;
-        let index_type = basis_type.clone().with_data_type(DataType::U64);
-        let offset = u64::try_from(coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
-            message: format!("coordinate offset {coordinate_offset} does not fit in u64"),
-        })?;
-
-        let mut builder = XlaProgramBuilder::new();
-        let basis_index =
-            builder.add_instruction(IotaOperation::new(index_type.clone(), 0), Vec::new(), Vec::new())?[0];
-
-        // Compute each leaf element's row-major flat coordinate in the same physical `[basis] ++ leaf_shape` tensor.
-        // All arithmetic stays in u64 so large coordinate spaces retain exact indices.
-        let mut flat_coordinate = None;
-        let mut stride = 1u64;
-        for (leaf_axis, &dimension_size) in leaf_dimensions.iter().enumerate().rev() {
-            let coordinate = builder.add_instruction(
-                IotaOperation::new(index_type.clone(), leaf_axis + 1),
-                Vec::new(),
-                Vec::new(),
-            )?[0];
-            let coordinate = if stride == 1 {
-                coordinate
-            } else {
-                let stride_value = builder.add_instruction(
-                    FillOperation::new(index_type.clone(), Scalar::U64(stride)),
-                    Vec::new(),
-                    Vec::new(),
-                )?[0];
-                builder.add_instruction(MulOperation, Vec::new(), vec![coordinate, stride_value])?[0]
-            };
-            flat_coordinate = Some(match flat_coordinate {
-                Some(accumulated) => {
-                    builder.add_instruction(AddOperation, Vec::new(), vec![accumulated, coordinate])?[0]
-                }
-                None => coordinate,
-            });
-            let dimension_size = u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
-                message: format!("leaf dimension {dimension_size} does not fit in u64"),
-            })?;
-            stride = stride.checked_mul(dimension_size).ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("coordinate count overflows u64 for leaf type {leaf_type}"),
-            })?;
-        }
-        let mut flat_coordinate = match flat_coordinate {
-            Some(flat_coordinate) => flat_coordinate,
-            None => builder.add_instruction(
-                FillOperation::new(index_type.clone(), Scalar::U64(0)),
-                Vec::new(),
-                Vec::new(),
-            )?[0],
-        };
-        if offset != 0 {
-            let offset_value = builder.add_instruction(
-                FillOperation::new(index_type.clone(), Scalar::U64(offset)),
-                Vec::new(),
-                Vec::new(),
-            )?[0];
-            flat_coordinate =
-                builder.add_instruction(AddOperation, Vec::new(), vec![flat_coordinate, offset_value])?[0];
-        }
-
-        let selected = builder.add_instruction(
-            CompareOperation::new(ComparisonDirection::Equal),
-            Vec::new(),
-            vec![basis_index, flat_coordinate],
-        )?[0];
-        let one = builder.add_instruction(OneOperation::new(basis_type.clone()), Vec::new(), Vec::new())?[0];
-        let zero = builder.add_instruction(ZeroOperation::new(basis_type.clone()), Vec::new(), Vec::new())?[0];
-        let output = builder.add_instruction(SelectOperation, Vec::new(), vec![selected, one, zero])?[0];
-        let program: FlatXlaProgram = builder.build(vec![output], Vec::new(), vec![Placeholder])?;
-
-        // Execution has no runtime inputs. The complete lowered computation is the cache identity, so the output
-        // type and coordinate declaration are represented directly by its StableHLO instead of a separate source
-        // fingerprint.
-        let mesh = self.eager_mesh(client, &[], program.output_types().as_slice())?;
-        let options = XlaOptions::new(mesh);
-        let lowered = self
-            .lower_xla_program(&program, 0, &options)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let cache_key = self
-            .compilation_key(&lowered)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let compiled = self
-            .cache
-            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let mut outputs = self
-            .execute_xla_program(&compiled, Vec::new())
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0).with_compilation_cache(Arc::clone(&self.cache)))
     }
 }
 
@@ -2019,7 +1899,7 @@ impl<'c> XlaDomain<'c> {
         let result_shardings =
             output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
         let compilation_options = jit_compilation_options(
-            &self.compilation_options,
+            self.compilation_options.as_ref(),
             options.mesh.devices().len(),
             options.feedback_directed_profile.as_ref(),
         );
@@ -2929,9 +2809,12 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let cloned = domain.clone();
 
         assert_eq!(domain.mesh().unwrap(), &mesh);
         assert_eq!(domain.compilation_options(), &CompilationOptions::default());
+        assert!(Arc::ptr_eq(&domain.compilation_options, &cloned.compilation_options));
+        assert!(size_of::<XlaDomain<'_>>() < size_of::<CompilationOptions>());
     }
 
     #[test]

@@ -178,7 +178,7 @@ where
 /// batched pullbacks) total even though the padding-value tangent is represented as a per-item batch there.
 impl<C> BatchableOperation<C> for PadOperation
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
     PadOperation: InterpretableOperation<C>,
 {
@@ -219,7 +219,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::types::{DataType, Shape, Size};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -261,9 +262,9 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
             )
             .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[8]);
-        assert_eq!(block.input_shape(), &[3]);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[8]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
         assert_eq!(
             block.value().values(),
             &[
@@ -340,5 +341,30 @@ mod tests {
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_pad_batching_expands_an_empty_batch() {
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
+        let input = ArrayBatch::new(input_type.clone(), TestArray::new(input_type, Vec::new()), Some(0)).unwrap();
+        let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
+        let padding = ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, Vec::new()), Some(0)).unwrap();
+
+        let outputs = PadOperation::new(vec![1], vec![0], vec![0])
+            .unwrap()
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 0, None),
+                &crate::EmptyRegionDriver,
+                &[input, padding],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            *outputs[0].value().r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)])),
+        );
+        assert!(outputs[0].value().values.is_empty());
     }
 }

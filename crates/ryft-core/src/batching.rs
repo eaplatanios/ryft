@@ -971,7 +971,7 @@ impl<C> BatchingContext<C> {
     /// to its attached regions, and returns the region output batches. This is the batching counterpart of
     /// [`Program::interpret_in_context`].
     #[inline]
-    fn batch_region(
+    pub(crate) fn batch_region(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<ArrayBatch<C::Value>>,

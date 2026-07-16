@@ -21,7 +21,7 @@ use ryft_core::operations::constants::{
     ZeroOperation,
 };
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
-use ryft_core::operations::differentiation::StopGradientOperation;
+use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
@@ -78,6 +78,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Constant(ConstantOperation<V>),
     Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
+    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -163,6 +164,7 @@ where
             ArrayOperation::Constant(operation) => Self::Constant(operation),
             ArrayOperation::Fill(operation) => Self::Fill(operation),
             ArrayOperation::Iota(operation) => Self::Iota(operation),
+            ArrayOperation::CoordinateBasis(operation) => Self::CoordinateBasis(operation),
             ArrayOperation::Neg(operation) => Self::Neg(operation),
             ArrayOperation::Add(operation) => Self::Add(operation),
             ArrayOperation::Sub(operation) => Self::Sub(operation),

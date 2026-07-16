@@ -1,9 +1,12 @@
 use std::ops::Add;
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+    transpose_input_cotangent_type,
+};
 use crate::macros::check_count;
-use crate::operations::math::AddOperation;
+use crate::operations::math::{ADD_OPERATION_NAME, AddOperation};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Value};
@@ -15,17 +18,40 @@ use crate::programs::types::Typed;
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
     AddOperation: Operation<V::Type>,
+    V::Type: DifferentiableType,
 {
     #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
         _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![outputs[0].clone(), outputs[0].clone()])
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(inputs
+                .iter()
+                .enumerate()
+                .map(|(input_index, input)| {
+                    transpose_input_cotangent_type(ADD_OPERATION_NAME, input_index, input.r#type().as_ref(), None)
+                        .map(MaybeZero::Zero)
+                })
+                .collect::<Result<Vec<_>, _>>()?),
+            MaybeZero::Value(cotangent) => {
+                let actual_type = cotangent.r#type();
+                for (input_index, input) in inputs.iter().enumerate() {
+                    transpose_input_cotangent_type(
+                        ADD_OPERATION_NAME,
+                        input_index,
+                        input.r#type().as_ref(),
+                        Some(actual_type.as_ref()),
+                    )?;
+                }
+                Ok(vec![MaybeZero::Value(cotangent.clone()), MaybeZero::Value(cotangent.clone())])
+            }
+        }
     }
 }
 

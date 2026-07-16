@@ -3017,7 +3017,7 @@ mod tests {
 
     #[test]
     fn test_second_order_reverse_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::tracing_v2::DifferentiableDomainExtension;
+        use crate::tracing_v2::DenseDifferentiate;
 
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
@@ -3026,8 +3026,8 @@ mod tests {
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
         );
-        let hessian = domain.hessian(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
-        let (_, _, block) = hessian.iter_blocks().next().unwrap();
+        let hessian = domain.hessian(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let block = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(
             block.value().values()[0],
@@ -3085,12 +3085,11 @@ mod tests {
 
         // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`; `jacrev` exercises
         // the batched replay of the derived backward program.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
         );
-        let jacobian = jacrev(&domain, |x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
-        let (_, _, block) = jacobian.iter_blocks().next().unwrap();
+        let jacobian = jacrev(|x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
         assert_abs_diff_eq!(block.value().values()[0], 0.25f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);

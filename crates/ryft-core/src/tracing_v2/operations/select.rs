@@ -315,7 +315,7 @@ mod tests {
     use crate::operations::control_flow::Select;
     use crate::operations::math::Add;
     use crate::tests::TestArray;
-    use crate::tracing_v2::{ArrayOperation, DifferentiableDomainExtension, jacrev};
+    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, jacrev};
 
     use super::LinearSelectOperation;
 
@@ -341,21 +341,11 @@ mod tests {
         // Reverse mode through `f(x) = select(x > 0, 2x, 3x)` exercises the captured-condition select transpose:
         // the on_true cotangent is `select(condition, cotangent, 0)` and the on_false cotangent is
         // `select(condition, 0, cotangent)`.
-        let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| Ok(piecewise_select(x)),
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| Ok(piecewise_select(x)),
-            TestArray::scalar(-2.0),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 3.0, epsilon = 1e-9);
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -371,27 +361,22 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0))
             .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0))
             .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
     #[test]
     fn test_select_jacrev_over_vector_masks_per_element() {
         // Per-element masking over a vector input: the Jacobian of `select(x > 0, 2x, 3x)` is diagonal with entries
         // 2 where x > 0 and 3 elsewhere.
-        let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| Ok(piecewise_select(x)),
-            TestArray::vector(vec![1.0, -1.0]),
-        )
-        .unwrap();
-        let block = jacobian.rows().partials();
-        assert_eq!(block.output_shape(), &[2]);
-        assert_eq!(block.input_shape(), &[2]);
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::vector(vec![1.0, -1.0])).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
         assert_abs_diff_eq!(block.value().values()[0], 2.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);

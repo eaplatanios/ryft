@@ -19,22 +19,24 @@ pub(crate) fn scalar_scale_branch(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::DifferentiationError;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::compare::CompareOperation;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::ConditionOperation;
+    use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, MulOperation, Sin, SubOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::programs::types::Typed;
-    use crate::tracing_v2::{
-        DifferentiableDomainExtension, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev,
-    };
+    use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -194,12 +196,11 @@ mod tests {
             )
             .unwrap();
 
-        let (row_0, row_1) = jacobian.rows();
-        let (block_00, block_01) = row_0.partials();
-        let (block_10, block_11) = row_1.partials();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [block_00, block_01, block_10, block_11] = blocks.as_slice() else { unreachable!() };
 
-        assert_eq!(block_00.output_shape(), &[] as &[usize]);
-        assert_eq!(block_00.input_shape(), &[] as &[usize]);
+        assert_eq!(block_00.output_type().static_shape().unwrap().as_slice(), &[] as &[usize]);
+        assert_eq!(block_00.input_type().static_shape().unwrap().as_slice(), &[] as &[usize]);
 
         assert_abs_diff_eq!(block_00.value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block_01.value().values()[0], 2.0, epsilon = 1e-9);
@@ -210,20 +211,74 @@ mod tests {
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
         let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
         .unwrap();
 
-        let (row_0, row_1) = jacobian.rows();
-        let (block_00, block_01) = row_0.partials();
-        let (block_10, block_11) = row_1.partials();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [block_00, block_01, block_10, block_11] = blocks.as_slice() else { unreachable!() };
 
         assert_abs_diff_eq!(block_00.value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block_01.value().values()[0], 2.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block_10.value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block_11.value().values()[0], 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_jacrev_rejects_transpose_contributions_with_promoted_types() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let f32 = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let f64 = TestArray::new(ArrayType::scalar(DataType::F64), vec![3.0]);
+
+        assert_eq!(
+            context.jacrev(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap_err(),
+            DifferentiationError::InvalidCotangentType {
+                operation: "add",
+                input_index: 0,
+                expected: "f32[]".to_string(),
+                actual: "f64[]".to_string(),
+            },
+        );
+        assert_eq!(
+            context.jacrev(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap_err(),
+            DifferentiationError::InvalidCotangentType {
+                operation: "sub",
+                input_index: 0,
+                expected: "f32[]".to_string(),
+                actual: "f64[]".to_string(),
+            },
+        );
+        assert_eq!(
+            context.jacrev(|(left, right)| Ok(left * right), (f32, f64)).unwrap_err(),
+            DifferentiationError::InvalidCotangentType {
+                operation: "mul",
+                input_index: 1,
+                expected: "f32[]".to_string(),
+                actual: "f64[]".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_batching_composes_around_dense_jacobian() {
+        let jacobian = crate::batching::batch(
+            |input| {
+                input
+                    .context()
+                    .clone()
+                    .jacfwd(|value| Ok(value.clone() * value), input)
+                    .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))
+            },
+            TestArray::vector(vec![1.0, 2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().values(), &[2.0, 4.0, 6.0]);
     }
 
     #[test]
@@ -233,19 +288,25 @@ mod tests {
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         let forward = context.jacfwd(|x| Ok(x.clone() + x), input.clone()).unwrap();
-        let forward_block = forward.rows().partials();
-        assert_eq!(forward_block.output_shape(), &[0]);
-        assert_eq!(forward_block.input_shape(), &[0]);
+        let forward_block = forward.iter_blocks().next().unwrap();
+        assert_eq!(forward_block.output_type().static_shape().unwrap().as_slice(), &[0]);
+        assert_eq!(forward_block.input_type().static_shape().unwrap().as_slice(), &[0]);
         let block_type = r#type.with_inserted_dimension(0, Size::Static(0)).unwrap();
         assert_eq!(forward_block.value().r#type().as_ref(), &block_type);
         assert!(forward_block.value().values().is_empty());
 
-        let reverse = jacrev(&context, |x| Ok(x.clone() + x), input).unwrap();
-        let reverse_block = reverse.rows().partials();
-        assert_eq!(reverse_block.output_shape(), &[0]);
-        assert_eq!(reverse_block.input_shape(), &[0]);
+        let reverse = jacrev(|x| Ok(x.clone() + x), input).unwrap();
+        let reverse_block = reverse.iter_blocks().next().unwrap();
+        assert_eq!(reverse_block.output_type().static_shape().unwrap().as_slice(), &[0]);
+        assert_eq!(reverse_block.input_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(reverse_block.value().r#type(), forward_block.value().r#type());
         assert!(reverse_block.value().values().is_empty());
+
+        let input = TestArray::new(r#type, Vec::new());
+        let hessian = context.hessian(|x| Ok(x.clone() * x), input).unwrap();
+        let hessian_block = hessian.iter_blocks().next().unwrap();
+        assert_eq!(hessian_block.value().r#type().static_shape().unwrap().as_slice(), &[0, 0, 0]);
+        assert!(hessian_block.value().values().is_empty());
     }
 
     #[test]
@@ -259,9 +320,7 @@ mod tests {
 
         let triples = jacobian
             .iter_blocks()
-            .map(|(output_path, input_path, block)| {
-                (output_path.to_string(), input_path.to_string(), block.value().values()[0])
-            })
+            .map(|block| (block.output_path().to_string(), block.input_path().to_string(), block.value().values()[0]))
             .collect::<Vec<_>>();
 
         assert_eq!(triples.len(), 4);
@@ -282,17 +341,254 @@ mod tests {
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
         let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .hessian(|(x, y)| x.clone() * y + x.sin().unwrap(), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
+            .hessian(|(x, y)| Ok(x.clone() * y + x.sin()?), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
 
-        let (row_0, row_1) = hessian.rows();
-        let (block_00, block_01) = row_0.partials();
-        let (block_10, block_11) = row_1.partials();
+        let blocks = hessian.iter_blocks().collect::<Vec<_>>();
+        let [block_00, block_01, block_10, block_11] = blocks.as_slice() else { unreachable!() };
 
         assert_abs_diff_eq!(block_00.value().values()[0], -2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(block_01.value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block_10.value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block_11.value().values()[0], 0.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_hessian_materializes_all_structured_output_blocks() {
+        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .hessian(|x| Ok((x.clone() * x.clone(), x.clone() * x.clone() * x)), TestArray::scalar(2.0))
+            .unwrap();
+
+        let blocks = hessian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].output_path().to_string(), "$.0");
+        assert_eq!(blocks[0].first_input_path().to_string(), "$");
+        assert_eq!(blocks[0].second_input_path().to_string(), "$");
+        assert_abs_diff_eq!(blocks[0].value().values()[0], 2.0, epsilon = 1e-9);
+        assert_eq!(blocks[1].output_path().to_string(), "$.1");
+        assert_abs_diff_eq!(blocks[1].value().values()[0], 12.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_hessian_materializes_structured_mixed_rank_cartesian_product() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let hessian = context
+            .hessian(
+                |(vector, scalar)| Ok((vector.clone() * vector, scalar.clone() * scalar)),
+                (TestArray::vector(vec![1.0, 2.0]), TestArray::scalar(3.0)),
+            )
+            .unwrap();
+        let blocks = hessian.iter_blocks().collect::<Vec<_>>();
+
+        assert_eq!(blocks.len(), 8);
+        assert_eq!(blocks[0].output_path().to_string(), "$.0");
+        assert_eq!(blocks[0].first_input_path().to_string(), "$.0");
+        assert_eq!(blocks[0].second_input_path().to_string(), "$.0");
+        assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2, 2, 2]);
+        assert_eq!(blocks[0].value().values(), &[2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
+        assert_eq!(blocks[1].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
+        assert_eq!(blocks[1].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[2].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
+        assert_eq!(blocks[2].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[3].value().r#type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(blocks[3].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[4].output_path().to_string(), "$.1");
+        assert_eq!(blocks[4].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
+        assert_eq!(blocks[4].value().values(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[5].value().r#type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(blocks[5].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[6].value().r#type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(blocks[6].value().values(), &[0.0, 0.0]);
+        assert_eq!(blocks[7].first_input_path().to_string(), "$.1");
+        assert_eq!(blocks[7].second_input_path().to_string(), "$.1");
+        assert!(blocks[7].value().r#type().static_shape().unwrap().as_slice().is_empty());
+        assert_eq!(blocks[7].value().values(), &[2.0]);
+    }
+
+    #[test]
+    fn test_dense_differentiation_can_differentiate_hessian_values() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let derivative = context
+            .jacfwd(
+                |input| {
+                    let nested_context = input.context().clone();
+                    let hessian = nested_context
+                        .hessian(|value| Ok(value.clone() * value.clone() * value), input)
+                        .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))?;
+                    Ok(hessian.into_values().remove(0))
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
+
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().values()[0], 6.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_reverse_mode_composes_around_forward_jacobian() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let derivative = context
+            .jacrev(
+                |input| {
+                    let nested_context = input.context().clone();
+                    let jacobian = nested_context
+                        .jacfwd(|value| Ok(value.clone() * value), input)
+                        .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))?;
+                    Ok(jacobian.into_values().remove(0))
+                },
+                TestArray::scalar(3.0),
+            )
+            .unwrap();
+
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_dense_differentiation_with_aux_preserves_auxiliary_values() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+
+        let forward_evaluations = Cell::new(0);
+        let (forward, forward_auxiliary) = context
+            .jacfwd_with_aux(
+                |x| {
+                    forward_evaluations.set(forward_evaluations.get() + 1);
+                    Ok((x.clone() * x.clone(), x))
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
+        assert_eq!(forward_evaluations.get(), 1);
+        assert_abs_diff_eq!(forward.iter_blocks().next().unwrap().value().values()[0], 4.0, epsilon = 1e-9);
+        assert_eq!(forward_auxiliary.values(), &[2.0]);
+
+        let reverse_evaluations = Cell::new(0);
+        let (reverse, reverse_auxiliary) = context
+            .jacrev_with_aux(
+                |x| {
+                    reverse_evaluations.set(reverse_evaluations.get() + 1);
+                    Ok((x.clone() * x.clone(), x))
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
+        assert_eq!(reverse_evaluations.get(), 1);
+        assert_abs_diff_eq!(reverse.iter_blocks().next().unwrap().value().values()[0], 4.0, epsilon = 1e-9);
+        assert_eq!(reverse_auxiliary.values(), &[2.0]);
+
+        let hessian_evaluations = Cell::new(0);
+        let (hessian, hessian_auxiliary) = context
+            .hessian_with_aux(
+                |x| {
+                    hessian_evaluations.set(hessian_evaluations.get() + 1);
+                    Ok((x.clone() * x.clone(), x))
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
+        assert_eq!(hessian_evaluations.get(), 1);
+        assert_abs_diff_eq!(hessian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_eq!(hessian_auxiliary.values(), &[2.0]);
+    }
+
+    #[test]
+    fn test_dense_differentiation_validates_element_and_coordinate_types() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+
+        assert_eq!(
+            crate::tracing_v2::jacfwd(|inputs| Ok(inputs), Vec::<TestArray>::new()).unwrap_err(),
+            DifferentiationError::EmptyInput,
+        );
+
+        let integer = TestArray::new(ArrayType::scalar(DataType::I32), vec![2.0]);
+        assert_eq!(
+            context.jacfwd(|x| Ok(x), integer).unwrap_err(),
+            DifferentiationError::NonDifferentiableDenseLeaf {
+                transform: "jacfwd",
+                role: "input",
+                path: "$".to_string(),
+                r#type: "i32[]".to_string(),
+            },
+        );
+
+        let complex = TestArray::new(ArrayType::scalar(DataType::C64), vec![2.0]);
+        assert_eq!(
+            context.jacfwd(|x| Ok(x), complex.clone()).unwrap_err(),
+            DifferentiationError::ComplexDenseLeaf {
+                transform: "jacfwd",
+                holomorphic_transform: "jacfwd_holomorphic",
+                role: "input",
+                path: "$".to_string(),
+                r#type: "c64[]".to_string(),
+            },
+        );
+        let holomorphic = context.jacfwd_holomorphic(|x| Ok(x), complex).unwrap();
+        assert_eq!(holomorphic.iter_blocks().next().unwrap().value().values(), &[1.0]);
+
+        assert_eq!(
+            context.jacrev_holomorphic(|x| Ok(x), TestArray::scalar(2.0)).unwrap_err(),
+            DifferentiationError::NonComplexDenseLeaf {
+                transform: "jacrev_holomorphic",
+                role: "input",
+                path: "$".to_string(),
+                r#type: "f64[]".to_string(),
+            },
+        );
+
+        let complex_output_error = context
+            .jacrev(
+                |input| Ok(input.context().lift(TestArray::new(ArrayType::scalar(DataType::C64), vec![1.0]))?),
+                TestArray::scalar(2.0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            complex_output_error,
+            DifferentiationError::ComplexDenseLeaf {
+                transform: "jacrev",
+                holomorphic_transform: "jacrev_holomorphic",
+                role: "output",
+                path: "$".to_string(),
+                r#type: "c64[]".to_string(),
+            },
+        );
+
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic = TestArray::new(dynamic_type, vec![1.0]);
+        assert_eq!(
+            context.jacfwd(|x| Ok(x), dynamic).unwrap_err(),
+            DifferentiationError::NonFiniteDenseLeaf {
+                transform: "jacfwd",
+                role: "input",
+                path: "$".to_string(),
+                r#type: "f64[*]".to_string(),
+            },
+        );
+
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        assert_eq!(
+            context
+                .jacfwd(
+                    |input| Ok(input.context().lift(TestArray::new(dynamic_type.clone(), vec![1.0]))?),
+                    TestArray::scalar(1.0),
+                )
+                .unwrap_err(),
+            DifferentiationError::NonFiniteDenseLeaf {
+                transform: "jacfwd",
+                role: "output",
+                path: "$".to_string(),
+                r#type: "f64[*]".to_string(),
+            },
+        );
+
+        let dynamic = TestArray::new(dynamic_type, vec![1.0]);
+        assert_eq!(
+            context.jacrev(|input| Ok(input.context().lift(TestArray::scalar(1.0))?), dynamic).unwrap_err(),
+            DifferentiationError::NonFiniteDenseLeaf {
+                transform: "jacrev",
+                role: "input",
+                path: "$".to_string(),
+                r#type: "f64[*]".to_string(),
+            },
+        );
     }
 
     #[test]
@@ -307,9 +603,7 @@ mod tests {
 
         let triples = jacobian
             .iter_blocks()
-            .map(|(output_path, input_path, block)| {
-                (output_path.to_string(), input_path.to_string(), block.value().values()[0])
-            })
+            .map(|block| (block.output_path().to_string(), block.input_path().to_string(), block.value().values()[0]))
             .collect::<Vec<_>>();
 
         // 3 outputs * 2 inputs = 6 blocks
@@ -334,6 +628,51 @@ mod tests {
             ArrayType::scalar(DataType::Boolean),
             vec![if value { 1.0 } else { 0.0 }],
         ))
+    }
+
+    /// Builds a single-input program that scales a vector input by `factor`.
+    fn vector_scale_branch(
+        size: usize,
+        factor: f64,
+    ) -> crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)])));
+        let factor = builder.add_constant(TestArray::scalar(factor));
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a vector-input program that returns a replicated constant vector.
+    fn constant_vector_branch(
+        values: Vec<f64>,
+    ) -> crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())])));
+        let output = builder.add_constant(TestArray::vector(values));
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Batches a vector-valued condition whose true and false branches scale their input by two and three.
+    fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<TestArray> {
+        let physical_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size), Size::Static(item_size)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
+        let predicate = TestArray::new(predicate_type.clone(), predicate_values);
+        let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
+        let operand = TestArray::new(physical_type.clone(), input_values);
+        let operand = ArrayBatch::new(physical_type, operand, Some(0)).unwrap();
+        let context =
+            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+        let mut outputs = context
+            .bind(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![vector_scale_branch(item_size, 2.0), vector_scale_branch(item_size, 3.0)],
+                &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        outputs.remove(0).into_batch()
     }
 
     #[test]
@@ -459,14 +798,13 @@ mod tests {
         // replicated pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
         // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
             (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
         )
         .unwrap();
 
-        let row = jacobian.rows();
-        let (block_x, block_y) = row.partials();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [block_x, block_y] = blocks.as_slice() else { unreachable!() };
         assert_eq!(block_x.value().values(), &[7.0, 11.0, 13.0]);
         assert_eq!(block_y.value().values(), &[2.0, 3.0, 5.0]);
     }
@@ -485,8 +823,8 @@ mod tests {
             )
             .unwrap();
 
-        let row = jacobian.rows();
-        let (block_x, block_y) = row.partials();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [block_x, block_y] = blocks.as_slice() else { unreachable!() };
         assert_eq!(block_x.value().values(), &[7.0, 11.0, 13.0]);
         assert_eq!(block_y.value().values(), &[2.0, 3.0, 5.0]);
     }
@@ -523,6 +861,81 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].batch().value().values, vec![2.0, 6.0, 6.0, 12.0]);
+    }
+
+    #[test]
+    fn test_batching_batch_varying_condition_selects_non_scalar_outputs_along_the_batch_axis() {
+        // The batch size differs from the per-item vector length. The Boolean `[2]` predicate must become `[2, 1]`
+        // before selecting between the `[2, 3]` branch values.
+        let output = batch_vector_condition(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().values(), &[2.0, 4.0, 6.0, 12.0, 15.0, 18.0]);
+
+        // Equal batch and item sizes previously made trailing-axis broadcasting type-check while selecting columns
+        // instead of rows. Pin the row-wise result explicitly.
+        let output = batch_vector_condition(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().values(), &[2.0, 4.0, 9.0, 12.0]);
+    }
+
+    #[test]
+    fn test_batching_batch_varying_condition_aligns_replicated_and_mapped_branch_outputs() {
+        let batch_size = 2;
+        let item_size = 3;
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate = TestArray::new(predicate_type.clone(), vec![1.0, 0.0]);
+        let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
+        let operand = TestArray::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
+        let context =
+            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+
+        let outputs = context
+            .bind(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![constant_vector_branch(vec![10.0, 20.0, 30.0]), vector_scale_branch(item_size, 3.0)],
+                &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].batch().value().values(), &[10.0, 20.0, 30.0, 12.0, 15.0, 18.0]);
+    }
+
+    #[test]
+    fn test_batching_batch_varying_condition_rejects_effectful_branches_before_replay() {
+        let mut effectful_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
+        let output =
+            effectful_builder.add_instruction(PrintOperation::new("branch"), Vec::new(), vec![input]).unwrap()[0];
+        let effectful_branch = effectful_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let batch_size = 2;
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate = TestArray::new(predicate_type.clone(), vec![1.0, 0.0]);
+        let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
+        let operand = TestArray::vector(vec![1.0, 2.0]);
+        let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
+        let context =
+            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+
+        let error = context
+            .bind(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![effectful_branch, scalar_scale_branch(3.0)],
+                &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::UnsupportedOperation { message })
+                if message == "cannot batch a condition with a batch-varying predicate and effectful branches because \
+                               observable effects cannot be selected per batch item",
+        ));
     }
 
     #[test]
@@ -672,14 +1085,8 @@ mod tests {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
         // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
         // that the constant-op rule composes cleanly with reverse-mode autodiff.
-        let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| Ok(x.clone() + x.zero_like()),
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
-        let row = jacobian.rows();
-        let block = row.partials();
+        let jacobian = jacrev(|x| Ok(x.clone() + x.zero_like()), TestArray::scalar(2.0)).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 0) / dx = 1 at the scalar point.
         assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
     }
@@ -691,8 +1098,7 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0))
             .unwrap();
-        let row = jacobian.rows();
-        let block = row.partials();
+        let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 1) / dx = 1.
         assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
     }
@@ -717,22 +1123,52 @@ mod tests {
         outputs.remove(0)
     }
 
+    /// Applies a condition whose predicate is computed from `x`, so differentiation and packed replay must retain
+    /// and execute both attached branch regions instead of folding the condition from a captured predicate.
+    fn stage_runtime_predicate_condition<V>(x: V) -> Result<V, crate::ProgramError>
+    where
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain:
+            crate::contexts::Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
+    {
+        let context = x.dispatch_domain();
+        let zero = context.lift(TestArray::scalar(0.0))?;
+        let mut predicates = context.bind(
+            ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
+            Vec::new(),
+            &[x.clone(), zero],
+        )?;
+        let predicate = predicates.remove(0);
+        let mut outputs = context.bind(
+            ArrayOperation::Condition(ConditionOperation::new()),
+            vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+            &[predicate, x],
+        )?;
+        Ok(outputs.remove(0))
+    }
+
     #[test]
     fn test_condition_composes_with_jacrev_and_jacfwd() {
         // The constant `true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
         // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
-        let jacobian = jacrev(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| Ok(stage_constant_predicate_condition(x)),
-            TestArray::scalar(4.0),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
+        let jacobian = jacrev(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
             .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_dense_jacobians_replay_runtime_condition_regions() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        for (input, expected) in [(4.0, 2.0), (-4.0, 3.0)] {
+            let forward = context.jacfwd(stage_runtime_predicate_condition, TestArray::scalar(input)).unwrap();
+            let reverse = context.jacrev(stage_runtime_predicate_condition, TestArray::scalar(input)).unwrap();
+            assert_abs_diff_eq!(forward.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
+            assert_abs_diff_eq!(reverse.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
+        }
     }
 
     /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests,
@@ -813,7 +1249,27 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
-        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 8.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 8.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_jacrev_through_bounded_while_batches_basis_cotangents() {
+        let (while_operation, while_regions) = doubling_while_operation();
+        let while_operation = while_operation.with_iteration_bound(5).unwrap();
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jacrev(
+                move |x| {
+                    let mut outputs = x.context().bind(
+                        ArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[x.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 8.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -1028,6 +1484,47 @@ mod tests {
         let cotangents = pullback.interpret(pullback_inputs(TestArray::scalar(2.0))).unwrap();
         assert_eq!(cotangents[0].values, vec![48.0]);
         assert_eq!(cotangents[1].values, vec![24.0, 16.0, 12.0]);
+    }
+
+    #[test]
+    fn test_dense_jacobians_replay_scan_regions() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
+        let (scan, body) = product_scan_operation(false);
+        let forward = context
+            .jacfwd(
+                move |(initial, values)| {
+                    let mut outputs = initial.context().bind(
+                        ArrayOperation::Scan(scan),
+                        vec![body.clone()],
+                        &[initial.clone(), values],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                primals.clone(),
+            )
+            .unwrap();
+        let (scan, body) = product_scan_operation(false);
+        let reverse = context
+            .jacrev(
+                move |(initial, values)| {
+                    let mut outputs = initial.context().bind(
+                        ArrayOperation::Scan(scan),
+                        vec![body.clone()],
+                        &[initial.clone(), values],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                primals,
+            )
+            .unwrap();
+
+        for jacobian in [forward, reverse] {
+            let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].value().values(), &[24.0]);
+            assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+        }
     }
 
     #[test]

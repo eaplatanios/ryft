@@ -26,8 +26,10 @@ pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
 pub use linear::{
-    CoordinateBasis, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
-    Jacobian, jacrev,
+    DenseDifferentiableType, DenseDifferentiate, Hessian, HessianBlock, Jacobian, JacobianBlock, hessian,
+    hessian_holomorphic, hessian_holomorphic_with_aux, hessian_with_aux, jacfwd, jacfwd_holomorphic,
+    jacfwd_holomorphic_with_aux, jacfwd_with_aux, jacrev, jacrev_holomorphic, jacrev_holomorphic_with_aux,
+    jacrev_with_aux,
 };
 pub use operations::collective::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
