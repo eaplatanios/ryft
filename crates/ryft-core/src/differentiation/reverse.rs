@@ -2,20 +2,26 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use crate::DifferentiationContext;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, ForwardModeDifferentiate, LinearizationTracer,
 };
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::Operation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::ProgramError;
+use crate::programs::atoms::{Atom, AtomId, MaybeZero};
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::Operation;
+use crate::programs::programs::Program;
+use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
+use crate::programs::types::{Type, Typed};
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{Type, Typed};
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
 /// packaged as a reusable callable. This is the reverse-mode dual of [`Pushforward`](crate::Pushforward), whose
@@ -58,11 +64,8 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     marker: PhantomData<fn() -> Output>,
 }
 
-impl<
-    C: Context<Operation: Clone>,
-    Input: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
-    Output: Parameterized<C::Value>,
-> Pullback<C, Input, Output>
+impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>, Output: Parameterized<C::Value>>
+    Pullback<C, Input, Output>
 {
     /// Creates a new [`Pullback`] closing `program` over the linearization-point `residuals`, validating the contract
     /// documented on [`Pullback`] where `program` consumes the flat output cotangents followed by `residuals` and
@@ -130,6 +133,71 @@ impl<
     }
 }
 
+/// [`RegionDriver`] that provides call-scoped access to the [`Region`](crate::Region)s attached to the
+/// [`Instruction`](crate::Instruction) being transposed and to nested transposition work over those regions.
+/// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
+/// structural region access, while this trait adds transposition-specific recursion.
+pub trait TranspositionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> {
+    /// Transposes `region` according to the input linearity mask, re-entering the active transposition machinery,
+    /// and returns the transposed standalone [`Program`].
+    fn transpose_program(
+        &self,
+        region: RegionRef<'_, V, O>,
+        input_linearity: &[bool],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>;
+}
+
+impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {
+    #[inline]
+    fn transpose_program(
+        &self,
+        _region: RegionRef<'_, V, O>,
+        _input_linearity: &[bool],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot transpose a program".to_string()).into())
+    }
+}
+
+/// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
+/// [`Region`](crate::Region)s attached to that instruction.
+struct RecursiveTranspositionDriver<'r, V: Value, O> {
+    /// Borrowed attached [`Region`](crate::Region)s, in region order.
+    regions: Vec<RegionRef<'r, V, O>>,
+}
+
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O> {
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.regions.iter().copied()
+    }
+}
+
+impl<
+    V: Value<Type: DifferentiableType>,
+    O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+> TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
+{
+    #[inline]
+    fn transpose_program(
+        &self,
+        region: RegionRef<'_, V, O>,
+        input_linearity: &[bool],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        region.transpose_with_respect_to(
+            input_linearity
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &linear)| linear.then_some(index))
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    }
+}
+
 /// Represents [`Operation`]s that provide a transposition rule for linear [`Program`]s. Reading a linear
 /// [`Instruction`](crate::Instruction) as a linear map `y = L(x)` (in differentiation, `L` is a piece of the tangent
 /// map `(∂f/∂x)(x)` produced by linearization), the [`transpose`](Self::transpose) function computes the action of
@@ -148,72 +216,52 @@ impl<
 ///
 /// # Deriving Transposable Operation Enums
 ///
-/// Ryft provides a `#[derive(TransposableOperation)]` procedural macro via the `ryft-macros` crate for
-/// [`TransposableOperation`] sum types whose variants already own their transpose rules. Deriving it is what enables
-/// *reverse-mode* differentiation for programs staged in the operation family. `#[derive(DifferentiableOperation)]`
-/// adds forward-mode (JVP) support only, and the transposition dispatchers generated here are what
-/// [`Program::transpose`] and the reverse-mode entry points build on, so enums that support both modes derive
-/// both. The derivation is intentionally only a dispatcher: it matches on the enum variant and forwards
-/// [`transpose`](Self::transpose) to the wrapped payload. Operation-specific transpose semantics still live on the
-/// concrete payload types. The derived implementation follows the same enum-shape rules as `#[derive(Operation)]`:
+/// `#[derive(Operation)]` generates a [`TransposableOperation`] dispatcher when the enum specifies
+/// `#[ryft(dispatch(transposition))]`. Selecting it enables *reverse-mode* differentiation for programs staged in the
+/// operation family. The independent `differentiation` selection adds forward-mode (JVP) support, and the transposition
+/// dispatcher is what [`Program::transpose`] and the reverse-mode entry points build on. The generated implementation
+/// is intentionally only a dispatcher: it matches on the enum variant and forwards [`transpose`](Self::transpose) to
+/// the wrapped payload. Operation-specific transpose semantics still live on the concrete payload types. The derived
+/// implementation follows the same enum-shape rules as `#[derive(Operation)]`:
 ///
 ///   - The derivation macro input must be an enum.
 ///   - Every variant must be a tuple variant with exactly one payload field.
 ///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`.
-///   - The enum must implement [`Operation`]. In practice, transposable operation enums usually derive both
-///     [`Operation`] and [`TransposableOperation`].
+///   - The enum derives [`Operation`] and selects `transposition`.
 ///
 /// The generated implementation is:
 ///
 ///   - `impl TransposableOperation<V, Enum> for Enum`, where the transposition value type `V` carries the primary
 ///     type `T` selected using the same rules that are used for inferring `T` in the `#[derive(Operation)]` macro.
-///   - For enums with one `Value<Type = T>` parameter and no recursive payloads (i.e., payloads that mention `Self`),
-///     that parameter is treated as the operation family's stored constant type and the generated implementation is
-///     generic over a separate transposition value type `V`. For enums with two or more `Value<Type = T>` parameters,
-///     the first value parameter is treated as the tangent/cotangent value type and later value parameters are
-///     constants or captured factors. Enums with recursive payloads likewise pin the transposition value to the
-///     program constant type (i.e., no separate `V` is introduced). Recursive higher-order payload rules name the
-///     operation-family fixed point through [`TransposableProgramOperation`] and pin their transposition value to the
-///     program constant type, so the generated witness's [`Program::transpose_with_respect_to`] call is only provable
-///     at that instantiation.
+///   - For enums with one `Value<Type = T>` parameter, that parameter is treated as the operation family's stored
+///     constant type and the generated implementation is generic over a separate transposition value type `V`. For
+///     enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as the
+///     tangent/cotangent value type and later value parameters are constants or captured factors.
 ///   - Concrete payload variants forward directly to their payload implementations and receive a generated
 ///     `Payload: TransposableOperation<V, Enum>` `where` predicate. Payload-specific capability requirements should
 ///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
 ///     this generated payload bound.
-///   - `impl TransposableProgramOperation<V> for Enum`, using the same value-type inference and all non-recursive
-///     payload transposition bounds as the dispatcher implementation. The generated implementation is the standard
-///     operation-family witness for nested linear programs: it calls [`Program::transpose_with_respect_to`] on the
-///     provided program for [`transpose_program`](TransposableProgramOperation::transpose_program) (fully linear
-///     callers pass an all-`true` linearity mask). If a higher-order payload contains the enum type being derived
-///     (e.g., a branch or loop body whose operation family is `Self`), the macro does not restate that payload's direct
-///     transposition bound on this witness. That recursive payload should instead depend on
-///     [`TransposableProgramOperation`], which names the fixed point and keeps the trait solver finite.
-///     The implementation is additionally constrained by the [`Zero`](crate::Zero)/[`Add`](std::ops::Add) capabilities
-///     that [`Program::transpose`] requires.
 ///   - Bare generic payload variants such as `Extension(Extension)` receive the same generated
 ///     `Extension: TransposableOperation<V, Enum>` bound, because the macro cannot know which concrete extension
 ///     type will be substituted by the caller.
 ///
-/// Recursive higher-order payloads that need to transpose captured linear programs should depend on
-/// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<V, Enum>` bound.
-/// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
-/// parameters or on the payload implementations themselves, so the generated dispatcher and program-transposition
-/// witness inherit them through normal Rust bounds, or supply them with `#[ryft(bounds(transposition(Bound + ...)))]`,
-/// which adds them to the generated dispatcher's and witness's transposition value type without forcing the enum's
-/// stored constant type to carry transposition-only capabilities.
-///
-/// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
-/// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
-/// attribute.
+/// Higher-order payloads that need to transpose nested linear programs request that work through their
+/// [`TranspositionDriver`] (whose implementation calls [`Program::transpose_with_respect_to`] directly) instead of
+/// carrying a direct `Enum: TransposableOperation<V, Enum>` bound, which keeps the enum's bound graph finite. When
+/// payload rules need value capabilities, express those requirements on the enum's generic parameters or on the payload
+/// implementations themselves, so the generated dispatcher inherits them through normal Rust bounds, or supply them
+/// with `#[ryft(bounds(transposition(Bound1 + Bound2 + ...)))]`, which adds them to the generated dispatcher's
+/// transposition value type without forcing the enum's stored constant type to carry transposition-only capabilities.
 ///
 /// ## Example
 ///
 /// ```rust
 /// # use ryft_core as ryft;
 /// # use ryft_core::{ArrayType, ConstantOperation, Value, ZeroOperation};
-/// # use ryft_macros::{Operation, TransposableOperation};
+/// # use ryft_macros::Operation;
 ///
-/// #[derive(Clone, Debug, Operation, TransposableOperation)]
+/// #[derive(Clone, Debug, Operation)]
+/// #[ryft(dispatch(transposition))]
 /// enum LinearOperation<V: Value<Type = ArrayType>> {
 ///     Zero(ZeroOperation<ArrayType>),
 ///     Constant(ConstantOperation<V>),
@@ -229,6 +277,7 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
     /// # Parameters
     ///
     ///   - `context`: Active [`TracingContext`] in which rules may stage additional linear operations.
+    ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction.
     ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation-input order. A [`PartialValue::Unknown`]
     ///     entry marks an input that is linear in the transposed program and therefore receives a cotangent
     ///     contribution of that type. The type also recovers cotangent shapes that are not derivable from the operation
@@ -239,146 +288,23 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
     ///     [`Typed`] trait. Rules that transpose fully linear operations need only read the types, since every input
     ///     is then [`PartialValue::Unknown`].
     ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation-output order.
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TracingContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
 }
 
-/// Represents closed [`Operation`] families whose linear [`Program`]s can be transposed as nested programs.
-/// Higher-order transpose rules, such as the rules for linear condition branches and linear scan bodies, need
-/// to transpose captured programs whose operation family is the same closed enum that is currently being proven
-/// transposable. Writing that need directly as `O: TransposableOperation<V, O>` at every recursive payload boundary
-/// can send Rust's trait solver through the enum's higher-order variants indefinitely. [`TransposableProgramOperation`]
-/// names the recursive fixed point once. The closed operation enum implements this trait by calling
-/// [`Program::transpose_with_respect_to`], while higher-order payloads depend on this semantic witness instead
-/// of reproducing all variant-level transposition bounds.
-///
-/// The trait is intentionally about complete operation families, not individual primitive payloads. Implementations
-/// that delegate to [`Program::transpose_with_respect_to`] add that function's [`Zero`](crate::Zero), etc. bounds
-/// locally because those are requirements of the standard implementation strategy, not of this semantic witness itself.
-pub trait TransposableProgramOperation<V: Value<Type: DifferentiableType>>: Operation<V::Type> + Sized {
-    /// Transposes the provided [`Program`] in this operation family with respect to the inputs flagged in
-    /// `input_linearity`. Refer to the documentation of [`Program::transpose_with_respect_to`] for the pullback's
-    /// input and output layout. The operand-form higher-order transpose rules (e.g., for condition branches and scan
-    /// bodies whose known residual factors ride as ordinary operands) pass their genuine linearity masks, while the
-    /// fully linear captured-program rules pass an all-`true` mask. The flat-transposition case is exactly the partial
-    /// one with every input linear, so this single function serves both.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: [`Program`] whose inputs and outputs are flattened vectors of values.
-    ///   - `input_linearity`: Per-input linearity flags, in program-input order.
-    fn transpose_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-        input_linearity: &[bool],
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
-}
-
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: Clone + TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Program<V, O, Input, Output>
+    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+> RegionRef<'_, V, O>
 {
-    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_. This is the main entrypoint
-    /// for transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map
-    /// on _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
-    /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
-    /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
-    /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
-    /// instructions in reverse order, and applies each primitive operation's [`TransposableOperation::transpose`] rule
-    /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
-    /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
-    ///
-    /// Over complex types, transposition is defined with respect to the **bilinear** (i.e., conjugation-free) pairing
-    /// `⟨a, b⟩ = Real(a · b)`: the transpose of multiplying by a known complex factor multiplies by that same factor
-    /// (never its conjugate), which keeps transposition an involution and keeps every bilinear transpose rule identical
-    /// across real and complex types. Conjugation enters only through the transpose rules of the
-    /// ℝ-linear-but-not-ℂ-linear primitives (i.e., `conjugate`, `real`, `imaginary`, and `complex`), whose adjoints
-    /// under this pairing carry the conjugations and negations explicitly. The user-facing consequence is documented on
-    /// the gradient entry points: the holomorphic ones return the complex derivative `∂f/∂z`, and the plain ones return
-    /// `2 · ∂f/∂z̄` for ℂ → ℝ functions.
-    ///
-    /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`](crate::Zero)
-    /// implementation evaluates at interpretation time. This applies uniformly to linear programs whose values are
-    /// [`Tracer`]s from an outer trace. Interpreting such a pullback [`ZeroOperation`] over outer-trace [`Tracer`]s
-    /// stages a typed zero into the surrounding tracing context, so that backends whose traced constants are abstract
-    /// metadata do not need to materialize a runtime value just to transpose an enclosing traced program.
-    ///
-    /// This is the fully linear case of [`transpose_with_respect_to`](Self::transpose_with_respect_to). The program
-    /// is transposed with respect to every input, so every reachable [`Atom`] is linear, each operation's transpose
-    /// rule receives an all-`true` operand-linearity slice, and the pullback's inputs and outputs preserve this
-    /// program's output and input structures respectively.
-    #[inline]
-    pub fn transpose(&self) -> Result<Program<V, O, Output, Input>, DifferentiationError> {
-        // Every input is linear, so the pullback has one cotangent input per primal output and one cotangent output
-        // per primal input. Recover the structured form by reattaching this program's output and input structures to
-        // the flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
-        let flat = self.transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
-        let Program { regions, entry, .. } = flat;
-        Ok(Program {
-            input_structure: self.output_structure().clone(),
-            output_structure: self.input_structure().clone(),
-            regions,
-            entry,
-            marker: PhantomData,
-        })
-    }
-
-    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ **with respect to** the inputs
-    /// selected by `input_indices`, holding the remaining inputs as constant parameters of the linear map. The program
-    /// must be linear in the selected inputs, but it can depend arbitrarily on the known ones. This is the partial
-    /// entry point behind the fully linear [`transpose`](Self::transpose).
-    ///
-    /// Linearity is propagated forward from the program inputs: a program-input [`Atom`] is linear exactly when its
-    /// index appears in `input_indices`, constant atoms are always known, and an operation result is linear when any
-    /// of its operands is linear. Each operation's [`transpose`](TransposableOperation::transpose) rule receives the
-    /// per-operand linearity knowledge derived from this propagation.
-    ///
-    /// The pullback's inputs are the cotangents of this program's outputs followed by the runtime values of the known
-    /// inputs (in program-input order), and the pullback's outputs are the accumulated cotangents of the selected
-    /// inputs, **in `input_indices` order**. Known inputs receive no cotangent output. Because this layout depends on
-    /// `input_indices`, the pullback's inputs and outputs are returned as flat [`Vec`]s rather than reusing this
-    /// program's structured input and output types. The fully linear [`transpose`](Self::transpose) recovers the
-    /// structured form. Disconnected selected inputs are emitted as [`ZeroOperation`]s, exactly as in
-    /// [`transpose`](Self::transpose).
-    ///
-    /// # Known Intermediates and Rematerialization
-    ///
-    /// The normal differentiation path linearizes and partially evaluates before transposition. Values computed only
-    /// from primals then cross the linear boundary as residual inputs, and so transposing such a normalized pushforward
-    /// does **not** rebuild their producer instructions in the pullback. This method nevertheless accepts a hand-built
-    /// or otherwise unnormalized linear program whose live transpose rules read internal known values. For such a
-    /// value, transposition lazily copies the demanded, pure known-producer ancestor subgraph into the generated
-    /// pullback. This is _rematerialization_: the copied instructions execute every time the pullback is interpreted,
-    /// trading saved residuals for recomputation. Only ancestors of a known value actually demanded by a live transpose
-    /// rule are copied; dead known instructions and dead constants remain absent. Each source producer is copied at
-    /// most once, all of its output atoms are memoized together, and every later consumer reuses those mapped outputs.
-    /// The producer walk is iterative, so its call-stack usage does not grow with producer-chain depth. This behavior
-    /// is a correctness fallback, and not an implicit recommendation to rematerialize hot or expensive primal work.
-    /// Callers that want predictable pullback cost should partially evaluate and carry such values as residual inputs.
-    /// Effectful known producers are never copied. Replaying one in the pullback could duplicate, omit, or reorder an
-    /// effect that belongs on the primal side, so this method returns [`ProgramError::UnsupportedOperation`] and asks
-    /// the caller to partial-evaluate that value into a residual input. Known program inputs are always exposed as
-    /// pullback inputs, while literal constants are copied lazily under the same demand-driven policy.
-    ///
-    /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
-    /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
-    /// [`transpose`](TransposableOperation::transpose) rule, and accumulates the per-input cotangent contributions
-    /// (summing repeated contributions with staged adds). A transpose rule that needs to transpose a nested subprogram
-    /// (e.g., a captured control-flow branch) calls [`transpose`](Self::transpose) on it, which transposes it in its
-    /// own fresh context.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_indices`: Indices of the program inputs the program is transposed with respect to. Each index must
-    ///     be in range and appear at most once, otherwise this returns [`ProgramError::InvalidArgument`]. The order of
-    ///     the indices defines the order of the pullback's cotangent outputs.
+    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
+    /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
     pub fn transpose_with_respect_to(
         &self,
         input_indices: &[usize],
@@ -435,7 +361,8 @@ impl<
             *adjoint = Some(match *adjoint {
                 Some(existing) => {
                     let mut builder_borrow = builder.borrow_mut();
-                    let outputs = builder_borrow.add_instruction(AddOperation, vec![existing, contribution])?;
+                    let outputs =
+                        builder_borrow.add_instruction(AddOperation, Vec::new(), vec![existing, contribution])?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs[0]
                 }
@@ -476,13 +403,8 @@ impl<
         ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
         ///      and cycle detection.
         ///   - `atom`: ID of the known source atom to materialize in the pullback builder.
-        fn materialize_known<
-            V: Value,
-            O: Clone + Operation<V::Type>,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        >(
-            program: &Program<V, O, Input, Output>,
+        fn materialize_known<V: Value, O: Operation<V::Type>>(
+            program: RegionRef<'_, V, O>,
             instruction_by_output: &[Option<usize>],
             linear: &[bool],
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -560,8 +482,10 @@ impl<
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        let outputs =
-                            builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+                        let outputs = builder
+                            .borrow_mut()
+                            .add_instruction(instruction.operation().clone(), Vec::new(), inputs)?
+                            .to_vec();
                         check_count!("output", outputs, instruction.outputs().len(), ProgramError);
                         for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
                             known_map[source.index()] = Some(mapped);
@@ -653,7 +577,7 @@ impl<
 
         // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
         // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
-        let instruction_by_output = self.instruction_by_output();
+        let instruction_by_output = self.region().instruction_by_output();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
         // Walk the primal program backward, applying each operation's transpose rule only when at least one of its
@@ -722,7 +646,7 @@ impl<
                         Ok(PartialValue::Unknown(r#type))
                     } else {
                         let atom = materialize_known(
-                            self,
+                            *self,
                             instruction_by_output.as_slice(),
                             linear.as_slice(),
                             &builder,
@@ -734,8 +658,16 @@ impl<
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
+            let transposition_driver = RecursiveTranspositionDriver {
+                regions: instruction
+                    .regions()
+                    .iter()
+                    .map(|id| RegionRef::new(self.regions(), *id))
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
             let input_cotangents = instruction.operation().transpose(
                 &mut context,
+                &transposition_driver,
                 inputs.as_slice(),
                 instruction_output_cotangents.as_slice(),
             )?;
@@ -771,7 +703,11 @@ impl<
                         let input_type = input_atom.r#type();
                         let cotangent_type = input_type.cotangent().unwrap_or_else(|| input_type.into_owned());
                         let mut builder_borrow = builder.borrow_mut();
-                        let outputs = builder_borrow.add_instruction(ZeroOperation::new(cotangent_type), Vec::new())?;
+                        let outputs = builder_borrow.add_instruction(
+                            ZeroOperation::new(cotangent_type),
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs[0])
                     }
@@ -799,6 +735,111 @@ impl<
     }
 }
 
+impl<T, V, O, Input, Output> Program<V, O, Input, Output>
+where
+    T: DifferentiableType,
+    V: Value<Type = T>,
+    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+{
+    /// Transposes this linear [`Program`] with respect to every input while preserving its structured boundary.
+    /// Refer to [`Program::transpose_with_respect_to`] for more information.
+    pub fn transpose(&self) -> Result<Program<V, O, Output, Input>, DifferentiationError> {
+        let flat = self
+            .entry_region_ref()
+            .transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
+        let Program { regions, entry, .. } = flat;
+        Ok(Program {
+            input_structure: self.output_structure().clone(),
+            output_structure: self.input_structure().clone(),
+            regions,
+            entry,
+            marker: PhantomData,
+        })
+    }
+
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_. This is the main entrypoint
+    /// for transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map
+    /// on _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
+    /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
+    /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
+    /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
+    /// instructions in reverse order, and applies each primitive operation's [`TransposableOperation::transpose`] rule
+    /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
+    /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
+    ///
+    /// Over complex types, transposition is defined with respect to the **bilinear** (i.e., conjugation-free) pairing
+    /// `⟨a, b⟩ = Real(a · b)`: the transpose of multiplying by a known complex factor multiplies by that same factor
+    /// (never its conjugate), which keeps transposition an involution and keeps every bilinear transpose rule identical
+    /// across real and complex types. Conjugation enters only through the transpose rules of the
+    /// ℝ-linear-but-not-ℂ-linear primitives (i.e., `conjugate`, `real`, `imaginary`, and `complex`), whose adjoints
+    /// under this pairing carry the conjugations and negations explicitly. The user-facing consequence is documented on
+    /// the gradient entry points: the holomorphic ones return the complex derivative `∂f/∂z`, and the plain ones return
+    /// `2 · ∂f/∂z̄` for ℂ → ℝ functions.
+    ///
+    /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`] implementation
+    /// evaluates at interpretation time. This applies uniformly to linear programs whose values are [`Tracer`]s from
+    /// an outer trace. Interpreting such a pullback [`ZeroOperation`] over outer-trace [`Tracer`]s stages a typed zero
+    /// into the surrounding tracing context, so that backends whose traced constants are abstract metadata do not need
+    /// to materialize a runtime value just to transpose an enclosing traced program.
+    ///
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ **with respect to** the inputs
+    /// selected by `input_indices`, holding the remaining inputs as constant parameters of the linear map. The program
+    /// must be linear in the selected inputs, but it can depend arbitrarily on the known ones. This is the partial
+    /// entry point behind the fully linear [`Program::transpose`].
+    ///
+    /// Linearity is propagated forward from the program inputs: a program-input [`Atom`] is linear exactly when its
+    /// index appears in `input_indices`, constant atoms are always known, and an operation result is linear when any
+    /// of its operands is linear. Each operation's [`transpose`](TransposableOperation::transpose) rule receives the
+    /// per-operand linearity knowledge derived from this propagation.
+    ///
+    /// The pullback's inputs are the cotangents of this program's outputs followed by the runtime values of the known
+    /// inputs (in program-input order), and the pullback's outputs are the accumulated cotangents of the selected
+    /// inputs, **in `input_indices` order**. Known inputs receive no cotangent output. Because this layout depends on
+    /// `input_indices`, the pullback's inputs and outputs are returned as flat [`Vec`]s rather than reusing this
+    /// program's structured input and output types. The fully linear [`Program::transpose`] recovers the structured
+    /// form. Disconnected selected inputs are emitted as [`ZeroOperation`]s in the same way.
+    ///
+    /// # Known Intermediates and Rematerialization
+    ///
+    /// The normal differentiation path linearizes and partially evaluates before transposition. Values computed only
+    /// from primals then cross the linear boundary as residual inputs, and so transposing such a normalized pushforward
+    /// does **not** rebuild their producer instructions in the pullback. This method nevertheless accepts a hand-built
+    /// or otherwise unnormalized linear program whose live transpose rules read internal known values. For such a
+    /// value, transposition lazily copies the demanded, pure known-producer ancestor subgraph into the generated
+    /// pullback. This is _rematerialization_: the copied instructions execute every time the pullback is interpreted,
+    /// trading saved residuals for recomputation. Only ancestors of a known value actually demanded by a live transpose
+    /// rule are copied; dead known instructions and dead constants remain absent. Each source producer is copied at
+    /// most once, all of its output atoms are memoized together, and every later consumer reuses those mapped outputs.
+    /// The producer walk is iterative, so its call-stack usage does not grow with producer-chain depth. This behavior
+    /// is a correctness fallback, and not an implicit recommendation to rematerialize hot or expensive primal work.
+    /// Callers that want predictable pullback cost should partially evaluate and carry such values as residual inputs.
+    /// Effectful known producers are never copied. Replaying one in the pullback could duplicate, omit, or reorder an
+    /// effect that belongs on the primal side, so this method returns [`ProgramError::UnsupportedOperation`] and asks
+    /// the caller to partial-evaluate that value into a residual input. Known program inputs are always exposed as
+    /// pullback inputs, while literal constants are copied lazily under the same demand-driven policy.
+    ///
+    /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
+    /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
+    /// [`transpose`](TransposableOperation::transpose) rule, and accumulates the per-input cotangent contributions
+    /// (summing repeated contributions with staged adds). Nested subprograms are transposed directly through their
+    /// borrowed [`RegionRef`]s in their own fresh contexts.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_indices`: Indices of the program inputs the program is transposed with respect to. Each index must
+    ///     be in range and appear at most once, otherwise this returns [`ProgramError::InvalidArgument`]. The order of
+    ///     the indices defines the order of the pullback's cotangent outputs.
+    #[inline]
+    pub fn transpose_with_respect_to(
+        &self,
+        input_indices: &[usize],
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        self.entry_region_ref().transpose_with_respect_to(input_indices)
+    }
+}
+
 /// Extension trait carrying the value-level *reverse-mode* differentiation transforms on every [`Context`]. Reverse
 /// mode differentiation is implemented as forward mode plus transposition. Like [`ForwardModeDifferentiate`], this
 /// trait is blanket-implemented for all [`Context`]s and has no items of its own to implement: every entry point is a
@@ -822,9 +863,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError>
     where
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<AddOperation>,
@@ -855,9 +896,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     ) -> Result<(Self::Value, Input::To<Self::Value>), DifferentiationError>
     where
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -888,9 +929,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     ) -> Result<Input::To<Self::Value>, DifferentiationError>
     where
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -914,9 +955,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     ) -> Result<(Self::Value, Input::To<Self::Value>), DifferentiationError>
     where
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -949,9 +990,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     ) -> Result<Input::To<Self::Value>, DifferentiationError>
     where
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -981,9 +1022,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     where
         Self: Zero<Self::Value>,
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -1037,9 +1078,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     where
         Self: Zero<Self::Value>,
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -1074,9 +1115,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     where
         Self: Zero<Self::Value>,
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -1128,9 +1169,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     where
         Self: Zero<Self::Value>,
         Self::Type: DifferentiableType,
-        Self::Operation: Clone
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
             + TransposableOperation<Self::Constant, Self::Operation>
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
@@ -1176,7 +1217,7 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         let output_cotangent_type = output_type.cotangent().ok_or_else(|| {
             DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() }
         })?;
-        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), &[], &[], &[])?;
+        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
         check_count!("output", seeds, 1, ProgramError);
         Ok(seeds.pop().unwrap())
     }
@@ -1198,10 +1239,11 @@ pub fn vjp<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1231,10 +1273,11 @@ pub fn value_and_gradient<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1266,10 +1309,11 @@ pub fn gradient<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1298,10 +1342,11 @@ pub fn value_and_gradient_holomorphic<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1332,10 +1377,11 @@ pub fn gradient_holomorphic<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1364,10 +1410,11 @@ pub fn value_and_gradient_with_aux<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1413,10 +1460,11 @@ pub fn gradient_with_aux<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1460,10 +1508,11 @@ pub fn value_and_gradient_holomorphic_with_aux<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1510,10 +1559,11 @@ pub fn gradient_holomorphic_with_aux<
     V: Value<
             Type: DifferentiableType,
             ExecutionDomain: Context<
-                Operation: Clone
-                               + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
                                + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + TransposableOperation<
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + TransposableOperation<
                     <V::ExecutionDomain as Domain>::Constant,
                     <V::ExecutionDomain as Domain>::Operation,
                 > + From<ZeroOperation<V::Type>>
@@ -1548,6 +1598,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::programs::regions::RegionInterface;
     use std::cell::Cell;
     use std::marker::PhantomData;
 
@@ -1557,22 +1608,26 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jvp;
-    use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::BooleanLike;
-    use crate::operations::Operation;
     use crate::operations::constants::ZeroOperation;
     use crate::operations::math::{AddOperation, MulOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{
-        Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, Value,
-    };
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::{Atom, AtomId, MaybeZero};
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::{Effect, Effects};
+    use crate::programs::instructions::Instruction;
+    use crate::programs::operations::Operation;
+    use crate::programs::programs::Program;
+    use crate::programs::regions::{Region, RegionId};
+    use crate::programs::types::{TypeError, Typed};
+    use crate::programs::values::Value;
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
-    use crate::types::{DataType, TypeError, Typed};
+    use crate::types::DataType;
 
     use super::*;
 
@@ -1633,7 +1688,11 @@ mod tests {
             }
         }
 
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        fn infer_output_types(
+            &self,
+            input_types: &[DataType],
+            region_interfaces: &[RegionInterface<DataType>],
+        ) -> Result<Vec<DataType>, TypeError> {
             match self {
                 Self::Identity
                 | Self::EffectfulIdentity
@@ -1651,7 +1710,7 @@ mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone(), input_types[0].clone()])
                 }
-                Self::Zero(zero) => zero.infer_output_types(input_types),
+                Self::Zero(zero) => zero.infer_output_types(input_types, region_interfaces),
             }
         }
 
@@ -1697,9 +1756,10 @@ mod tests {
     }
 
     impl<V: Value<Type = DataType>> TransposableOperation<V, TestLinearOperation> for TestLinearOperation {
-        fn transpose(
+        fn transpose<D: TranspositionDriver<V, TestLinearOperation>>(
             &self,
             context: &mut TracingContext<V, TestLinearOperation>,
+            _driver: &D,
             _inputs: &[PartialValue<Tracer<TracingContext<V, TestLinearOperation>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>],
         ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>>, DifferentiationError> {
@@ -1721,8 +1781,11 @@ mod tests {
                     check_count!("output", outputs, 1, ProgramError);
                     let zero = {
                         let mut builder = context.builder().borrow_mut();
-                        let outputs =
-                            builder.add_instruction(Self::Zero(ZeroOperation::new(DataType::F64)), Vec::new())?;
+                        let outputs = builder.add_instruction(
+                            Self::Zero(ZeroOperation::new(DataType::F64)),
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
                         check_count!("output", outputs, 1, ProgramError);
                         outputs[0]
                     };
@@ -1750,7 +1813,7 @@ mod tests {
         // Test that transposing an identity instruction forwards the output cotangent straight to the input.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Identity, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
@@ -1768,7 +1831,7 @@ mod tests {
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
@@ -1791,7 +1854,8 @@ mod tests {
         // `TwoOutputs` rule asserts that its second output cotangent is a structural zero).
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let outputs = builder.add_instruction(TestLinearOperation::TwoOutputs, vec![input]).unwrap().to_vec();
+        let outputs =
+            builder.add_instruction(TestLinearOperation::TwoOutputs, Vec::new(), vec![input]).unwrap().to_vec();
         let program = builder.build::<Scalar, Scalar>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(outputs, &[AtomId::new(1), AtomId::new(2)]);
@@ -1837,8 +1901,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let dead_input = builder.add_input(DataType::F64);
         let live_input = builder.add_input(DataType::F64);
-        let dead_output = builder.add_instruction(TestLinearOperation::BadArity, vec![dead_input]).unwrap()[0];
-        let output = builder.add_instruction(TestLinearOperation::Identity, vec![live_input]).unwrap()[0];
+        let dead_output =
+            builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![dead_input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![live_input]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -1907,7 +1972,9 @@ mod tests {
         let outer_builder = tracing_context.builder().clone();
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(TestLinearOperation::StagedZeroContribution, Vec::new(), vec![input])
+            .unwrap()[0];
         let program =
             builder.build::<TestTracingValue, TestTracingValue>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose().unwrap();
@@ -1936,7 +2003,7 @@ mod tests {
         // of silently dropping cotangents.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
@@ -1947,7 +2014,8 @@ mod tests {
         // unrelated atom in the destination pullback.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::ForeignContribution, vec![input]).unwrap()[0];
+        let output =
+            builder.add_instruction(TestLinearOperation::ForeignContribution, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
@@ -2004,7 +2072,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2040,8 +2108,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let known = builder.add_input(DataType::F64);
         let linear = builder.add_input(DataType::F64);
-        let known_square = builder.add_instruction(MulOperation, vec![known, known]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![known_square, linear]).unwrap()[0];
+        let known_square = builder.add_instruction(MulOperation, Vec::new(), vec![known, known]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![known_square, linear]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
                 vec![known_square, product],
@@ -2060,11 +2128,14 @@ mod tests {
         let known = builder.add_input(DataType::F64);
         let first_linear = builder.add_input(DataType::F64);
         let second_linear = builder.add_input(DataType::F64);
-        let known_intermediate = builder.add_instruction(TestLinearOperation::Identity, vec![known]).unwrap()[0];
-        let first_output =
-            builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, first_linear]).unwrap()[0];
-        let second_output =
-            builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, second_linear]).unwrap()[0];
+        let known_intermediate =
+            builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known]).unwrap()[0];
+        let first_output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, first_linear])
+            .unwrap()[0];
+        let second_output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, second_linear])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
                 vec![first_output, second_output],
@@ -2094,8 +2165,10 @@ mod tests {
         let known = builder.add_input(DataType::F64);
         let linear = builder.add_input(DataType::F64);
         let known_intermediate =
-            builder.add_instruction(TestLinearOperation::EffectfulIdentity, vec![known]).unwrap()[0];
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, linear]).unwrap()[0];
+            builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![known]).unwrap()[0];
+        let output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -2119,10 +2192,13 @@ mod tests {
         let linear = builder.add_input(DataType::F64);
         let mut known_intermediate = known;
         for _ in 0..CHAIN_LENGTH {
-            known_intermediate =
-                builder.add_instruction(TestLinearOperation::Identity, vec![known_intermediate]).unwrap()[0];
+            known_intermediate = builder
+                .add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known_intermediate])
+                .unwrap()[0];
         }
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, linear]).unwrap()[0];
+        let output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
