@@ -1,7 +1,8 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+use crate::differentiation::{DifferentiableType, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
@@ -1143,9 +1144,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
                 let outputs = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -1182,11 +1183,16 @@ where
         }
         check_count!("output", outputs, 1, ProgramError);
         // One structural zero per operand: a contribution for the linear operand and zeros for the known indices.
-        let mut contributions =
-            inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect::<Vec<_>>();
+        let mut contributions = inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent().unwrap_or_else(|| input_type.into_owned()))
+            })
+            .collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
-            let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+            let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
             let mut operands = Vec::with_capacity(2 + start_indices.len());
             operands.push(zeros);
             operands.push(cotangent.clone());
@@ -1311,12 +1317,12 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
-                let zeros = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -1380,12 +1386,17 @@ where
         check_count!("output", outputs, 1, ProgramError);
         // One structural zero per operand: contributions for the linear input and update, and zeros for the known
         // start indices.
-        let mut contributions =
-            inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect::<Vec<_>>();
+        let mut contributions = inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent().unwrap_or_else(|| input_type.into_owned()))
+            })
+            .collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
             let start_indices = read_known_start_indices(&inputs[2..]);
-            let zeros = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
+            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()).materialize(context)?;
             // Input cotangent: the output cotangent with the update window overwritten by zeros.
             let mut input_operands = Vec::with_capacity(2 + start_indices.len());
             input_operands.push(cotangent.clone());
@@ -2195,20 +2206,6 @@ mod tests {
         assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
     }
 
-    /// Minimal operation enum hosting the primal [`DynamicSliceOperation`] and [`DynamicUpdateSliceOperation`] (each is
-    /// both a forward operation and the other's staged adjoint) plus the structural `zero` and `add` operations the
-    /// transpose pass needs. The `Constant` variant carries the value parameter `V` so the [`Operation`] derive can
-    /// infer the primary type.
-    #[derive(Clone, Debug, ryft_macros::Operation)]
-    #[ryft(dispatch(transposition))]
-    enum TestSlicingOperation<V: Value<Type = ArrayType>> {
-        Zero(ZeroOperation<ArrayType>),
-        Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(crate::operations::math::AddOperation),
-        DynamicSlice(DynamicSliceOperation),
-        DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    }
-
     #[test]
     fn test_dynamic_slice_partitioned_transpose_computes_update_slice_adjoint() {
         // Slice a [1, 2] block at start (1, 1) of a [2, 3] operand: the operand is linear and the scalar start indices
@@ -2219,7 +2216,7 @@ mod tests {
 
         // Build `dynamic_slice(operand, start_row, start_col)` over the test enum, treat only the operand as linear,
         // and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<TestArray, TestSlicingOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
         let operand_input = builder.add_input(operand_type.clone());
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
@@ -2256,7 +2253,7 @@ mod tests {
 
         // Build `dynamic_update_slice(input, update, start_row, start_col)` over the test enum, treat the input and
         // update as linear, and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<TestArray, TestSlicingOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
         let input_input = builder.add_input(input_type.clone());
         let update_input = builder.add_input(update_type.clone());
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));

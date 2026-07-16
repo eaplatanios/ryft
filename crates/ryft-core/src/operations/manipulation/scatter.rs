@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -844,8 +844,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_cotangents = context.stage_operation(

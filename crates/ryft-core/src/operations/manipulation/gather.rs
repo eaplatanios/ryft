@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
@@ -900,9 +900,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
                 let dimensions = self.operation().dimensions();
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     dimensions.offset_dimensions().to_vec(),
@@ -952,7 +952,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
                 MaybeZero::Zero(inputs[1].r#type().into_owned()),
             ]),
             MaybeZero::Value(cotangent) => {
@@ -962,7 +962,7 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),

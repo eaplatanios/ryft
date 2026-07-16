@@ -1,5 +1,6 @@
 pub mod broadcasting;
 pub mod concatenation;
+pub mod conversion;
 pub mod gather;
 pub mod padding;
 pub mod reshape;
@@ -9,6 +10,7 @@ pub mod transpose;
 
 pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
+pub use conversion::{CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation};
 pub use gather::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
 };
