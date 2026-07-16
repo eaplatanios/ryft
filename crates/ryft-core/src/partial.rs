@@ -68,17 +68,12 @@
 //! while mixed or unknown work is residualized. Probe-based rewrites of higher-order programs must not speculatively
 //! execute effectful bodies, and residual projections keep explicitly requested effectful atoms alive.
 //!
-//! [`PartiallyEvaluatableProgramOperation`] is the recursive fixed point for operation families containing nested
-//! flat programs. Higher-order operations may split their bodies more precisely than the default, but their replay
-//! and residualization logic stays with the operation that owns those programs.
-//!
 //! # Extending Partial Evaluation
 //!
 //! Implement [`PartiallyEvaluatableOperation`] for primitive operation payloads. The usual rule is to fold when every
 //! input is known and to residualize otherwise, but control flow, loops, scans, and other higher-order operations can
 //! preserve more known work with a dedicated rule. Use the supplied context's materialization and residualization APIs
-//! rather than constructing duplicate boundary atoms manually. Implement [`PartiallyEvaluatableProgramOperation`] on an
-//! operation family that recursively evaluates nested programs. Rules inspecting known payloads must first establish a
+//! rather than constructing duplicate boundary atoms manually. Rules inspecting known payloads must first establish a
 //! concrete [`ValueResolution`] and fall back conservatively otherwise.
 
 use std::borrow::Cow;
@@ -90,23 +85,30 @@ use std::rc::Rc;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilder;
+use crate::programs::operations::Operation;
+use crate::programs::programs::{FlatProgram, Program};
+use crate::programs::regions::{
+    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+};
+use crate::programs::types::Typed;
+use crate::programs::values::Value;
 use crate::tracing::TracingContext;
-use crate::types::Typed;
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
-/// interprets a [`Program`] over. Every [`Atom`] and every intermediate result is either [`Known`](Self::Known)
-/// (i.e., a concrete value available now) or [`Unknown`](Self::Unknown) (i.e., only its [`Type`] is available until
-/// the residual program runs). For more information on partial evaluation, refer to the documentation of
-/// [`Program::partially_evaluate`].
+/// interprets a [`Program`] over. Every [`Atom`](crate::Atom) and every intermediate result is either
+/// [`Known`](Self::Known) (i.e., a concrete value available now) or [`Unknown`](Self::Unknown) (i.e., only its
+/// [`Type`](crate::Type) is available until the residual program runs). For more information on partial evaluation,
+/// refer to the documentation of [`Program::partially_evaluate`].
 #[derive(Clone, Debug)]
 pub enum PartialValue<V: Value> {
     /// [`Value`] that is fully known at partial-evaluation time and can be folded forward.
     Known(V),
 
-    /// [`Value`] that is not known until the residual program runs and only its [`Type`] is known.
+    /// [`Value`] that is not known until the residual program runs and only its [`Type`](crate::Type) is known.
     Unknown(V::Type),
 }
 
@@ -404,7 +406,7 @@ impl<C: Context<Operation: Debug>> Debug for PartialEvaluation<C> {
     }
 }
 
-impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
+impl<C: Context> PartialEvaluation<C> {
     /// Interprets the residual [`Program`] that this [`PartialEvaluation`] represents in the provided `context` and
     /// at the provided unknown input values, and reassembles the original program's outputs, in original output order.
     /// This is the single replay path for both known-side flavors: residual program constants are lifted through
@@ -540,6 +542,128 @@ impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
     }
 }
 
+/// [`RegionDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to [`Region`](crate::Region)s
+/// attached to a partially evaluated [`Operation`] application. A [`PartialEvaluationDriver`] borrows the current
+/// instruction's regions and supports recursive partial evaluation. Operation rules receive it separately from their
+/// durable [`PartialEvaluationContext`], so the borrowed region access cannot escape through a [`PartialTracer`].
+/// [`RegionDriver`] provides structural region access, while this trait adds partial-evaluation-specific recursion.
+pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Operation> {
+    /// Partially evaluates the [`Region`](crate::Region) at `index` over the provided partial-evaluation values
+    /// by re-entering the active partial-evaluation transform.
+    fn partially_evaluate_region(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        index: usize,
+        inputs: Vec<PartialEvaluationValue<C::Value>>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>;
+
+    /// Partially evaluates `region` against the provided input knowledge through the active known-side context and
+    /// returns the region's residual split.
+    fn partially_evaluate_program(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        knowledge: &[PartialValue<C::Value>],
+    ) -> Result<PartialEvaluation<C>, ProgramError>;
+
+    /// Partitions `region` into known and residual programs through a fresh staging context whose inputs encode the
+    /// provided known-ness mask.
+    fn partition_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_known: &[bool],
+    ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError>;
+}
+
+impl<C: Context> PartialEvaluationDriver<C> for EmptyRegionDriver {
+    #[inline]
+    fn partially_evaluate_region(
+        &self,
+        _context: &PartialEvaluationContext<C>,
+        _index: usize,
+        _inputs: Vec<PartialEvaluationValue<C::Value>>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot partially evaluate a region".to_string()))
+    }
+
+    #[inline]
+    fn partially_evaluate_program(
+        &self,
+        _context: &PartialEvaluationContext<C>,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+        _knowledge: &[PartialValue<C::Value>],
+    ) -> Result<PartialEvaluation<C>, ProgramError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot partially evaluate a program".to_string()))
+    }
+
+    #[inline]
+    fn partition_program(
+        &self,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
+        _input_known: &[bool],
+    ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot partition a program".to_string()))
+    }
+}
+
+/// [`PartialEvaluationDriver`] scoped to one [`Operation`] application. It borrows the application's complete
+/// [`RegionDriver`], preserving the operation-defined ordering of owned [`Region`](crate::Region)s, borrowed regions,
+/// and shared callees without collecting [`Program`]s or region views. Recursive requests re-enter partial evaluation
+/// for a selected region or partition it into known and residual programs.
+struct RecursivePartialEvaluationDriver<'r, D> {
+    /// Application-scoped [`RegionDriver`], in [`Operation`]-defined order.
+    driver: &'r D,
+}
+
+impl<V: Value, O: Operation<V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+    for RecursivePartialEvaluationDriver<'_, D>
+{
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.driver.regions()
+    }
+}
+
+impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> PartialEvaluationDriver<C>
+    for RecursivePartialEvaluationDriver<'_, D>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+{
+    #[inline]
+    fn partially_evaluate_region(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        index: usize,
+        inputs: Vec<PartialEvaluationValue<C::Value>>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        context.inline_region(self.region(index)?, inputs)
+    }
+
+    #[inline]
+    fn partially_evaluate_program(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        knowledge: &[PartialValue<C::Value>],
+    ) -> Result<PartialEvaluation<C>, ProgramError> {
+        region.partially_evaluate_in_context(context.parent(), knowledge)
+    }
+
+    #[inline]
+    fn partition_program(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_known: &[bool],
+    ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError> {
+        region.partition(input_known)
+    }
+}
+
 /// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
 /// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
 /// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
@@ -548,11 +672,11 @@ impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
 /// # Type Parameters
 ///
 ///   - `C`: Known-side [`Context`] that partial evaluation folds known work through. Its
-///     [`Operation`](crate::DispatchDomain::Operation) is the operation family of the residual [`Program`] and of any
-///     inlined nested programs (e.g., the enum this operation may belong to). Its
-///     [`Constant`](crate::DispatchDomain::Constant) is the staged constant space those programs store. Finally, its
-///     [`Value`](crate::DispatchDomain::Value) is the space known values flow in (i.e., concrete values under eager
-///     contexts and [`Tracer`](crate::Tracer)s into the outer program under [`StagingContext`]s).
+///     [`Operation`](Domain::Operation) is the operation family of the residual [`Program`] and of any inlined nested
+///     programs (e.g., the enum this operation may belong to). Its [`Constant`](Domain::Constant) is the staged
+///     constant space those programs store. Finally, its [`Value`](Domain::Value) is the space known values flow in
+///     (i.e., concrete values under eager contexts and [`Tracer`](crate::Tracer)s into the outer program under
+///     [`StagingContext`]s).
 ///
 /// # Deriving Partially Evaluatable Operation Enums
 ///
@@ -560,6 +684,7 @@ impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
 /// that forwards every variant to its payload's own rule, and extra value capabilities that recursive payload rules
 /// require can be supplied with `#[ryft(bounds(partial_evaluation(Bound1 + Bound2 + ...)))]`. Refer to the
 /// documentation of [`Operation`] for information on how to use that macro and on the shape of the generated code.
+/// Partial evaluation is always generated and does not require a `dispatch(...)` selection.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
@@ -570,9 +695,9 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///     and staging it into the outer program under a [`StagingContext`], so that the operation's outputs become
     ///     known values and the operation contributes nothing to the residual [`Program`].
     ///   - Otherwise, it **residualizes** the operation unchanged, meaning that it emits the operation into the
-    ///     residual program over its inputs' residual program [`Atom`]s, materializing each known input as a residual
-    ///     input for a known variable or as an inlined residual program constant for a literal, so that the operation
-    ///     runs at residual program execution time.
+    ///     residual program over its inputs' residual program [`Atom`](crate::Atom)s, materializing each known input as
+    ///     a residual input for a known variable or as an inlined residual program constant for a literal, so that the
+    ///     operation runs at residual program execution time.
     ///
     /// There are situations where overriding this function can result in improved performance and better partitioning
     /// of a computation into known and unknown parts. For example, a `condition` instruction whose predicate is
@@ -585,53 +710,18 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`PartialEvaluationContext`] that owns residual emission, inlining, and materialization.
-    ///   - `inputs`: [`PartialEvaluationValue`] for each of this operation's inputs, in input order.
+    ///   - `context`: Durable [`PartialEvaluationContext`] that owns residual emission, inlining, and materialization.
+    ///   - `driver`: [`PartialEvaluationDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to the
+    ///     application [`Region`](crate::Region)s.
+    ///   - `inputs`: [`PartialEvaluationValue`] for each of this [`Operation`]'s inputs, in input order.
     #[inline]
-    fn partially_evaluate(
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
         context: &PartialEvaluationContext<C>,
+        driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        context.fold_or_residualize(self.clone(), inputs)
-    }
-}
-
-/// Represents closed [`Operation`] families whose nested flat [`Program`]s can be partially evaluated. This is the
-/// partial evaluation analogue of [`InterpretableProgramOperation`](crate::InterpretableProgramOperation). It names the
-/// recursive fixed point needed by higher-order partial evaluation helpers without requiring the full operation enum's
-/// [`PartiallyEvaluatableOperation`] implementation while proving that implementation. Operation families implement it
-/// by replaying nested flat [`Program`]s through their operation-owned partial evaluation rules.
-///
-/// Unlike the linearization and transposition witnesses, whose context and operation type parameters grow with each
-/// recursion level and must therefore name a fixed point to stop the trait solver from diverging, this witness's
-/// known-side context parameter `C` is fixed across recursion. The blanket implementation grounds it in
-/// [`PartiallyEvaluatableOperation`], which a recursive operation enum's own generated implementation supplies, and so
-/// proving it for a self-containing operation enum (i.e., one whose higher-order variants hold `Program`s of itself)
-/// introduces no new recursive obligation.
-pub trait PartiallyEvaluatableProgramOperation<C: Context<Operation = Self>>: Operation<C::Type> + Sized {
-    /// Partially evaluates a nested flat [`Program`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Known-side context used to fold known subcomputations.
-    ///   - `program`: Nested [`Program`] to partially evaluate.
-    ///   - `inputs`: Input [`PartialValue`]s to use for partially evaluating the provided [`Program`].
-    fn partially_evaluate_program(
-        context: &C,
-        program: &Program<C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: &[PartialValue<C::Value>],
-    ) -> Result<PartialEvaluation<C>, ProgramError>;
-}
-
-impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> PartiallyEvaluatableProgramOperation<C> for C::Operation {
-    #[inline]
-    fn partially_evaluate_program(
-        context: &C,
-        program: &Program<C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: &[PartialValue<C::Value>],
-    ) -> Result<PartialEvaluation<C>, ProgramError> {
-        program.partially_evaluate_in_context(context, inputs)
+        context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
 
@@ -738,14 +828,25 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Some higher-order rules *analyze* a nested program by speculatively folding it (sometimes repeatedly, iterating
     /// to a fixed point) before deciding how to rewrite it (e.g., the `scan` and `while` loop-invariance fixed points).
     /// When such a rule folds through the **live** known-side context (rather than a throwaway context it builds and
-    /// then discards) each speculative fold has a real consequence: it executes the effect when in an eager context or
+    /// then discards), each speculative fold has a real consequence: it executes the effect when in an eager context or
     /// stages it into the outer program when in a [`StagingContext`]. A rule that iterates would then fire or stage the
     /// effect once per round instead of exactly once, and so it must skip effectful programs and residualize them
     /// unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: [`Operation`] to fold into the known-side context when all inputs are known, or to emit into
+    ///     the residual [`Program`] otherwise.
+    ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in
+    ///     the order defined by [`Operation::region_names`]. Folding binds these regions with the operation, while
+    ///     residualization imports them into the residual [`Program`].
+    ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order.
+    ///     Their known-ness determines whether the operation is folded or residualized.
     #[inline]
     pub fn fold_or_residualize<P: Into<C::Operation>>(
         &self,
         operation: P,
+        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let operation = operation.into();
@@ -753,12 +854,12 @@ impl<C: Context> PartialEvaluationContext<C> {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
             Ok(self
                 .parent
-                .bind(operation, &[], &[], &known)?
+                .bind(operation, regions, &known)?
                 .into_iter()
                 .map(PartialEvaluationValue::known)
                 .collect())
         } else {
-            self.residualize(operation, inputs)
+            self.residualize(operation, regions, inputs)
         }
     }
 
@@ -776,9 +877,20 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// [`Context::resolve`] is expected to succeed. This is what keeps the residual program in the staged-constant
     /// space, since under a staging known-side context a known value is a [`Tracer`](crate::Tracer) that can never
     /// itself be a residual-program constant.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: [`Operation`] to emit into the residual [`Program`].
+    ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in the
+    ///     order defined by [`Operation::region_names`]. These programs are imported into the residual [`Program`]
+    ///     before the operation is emitted.
+    ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order. Known
+    ///     inputs are materialized as residual inputs or constants, while unknown inputs reuse their existing residual
+    ///     atoms.
     pub fn residualize<P: Into<C::Operation>>(
         &self,
         operation: P,
+        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
@@ -852,7 +964,13 @@ impl<C: Context> PartialEvaluationContext<C> {
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
 
-        let output_atoms = self.builder.borrow_mut().add_instruction(operation, input_atoms)?.to_vec();
+        // Residualized regions splice into the residual builder's arena directly (i.e., owned move), in region order.
+        let region_ids = {
+            let mut builder = self.builder.borrow_mut();
+            regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
+        };
+        let output_atoms = self.builder.borrow_mut().add_instruction(operation, region_ids, input_atoms)?.to_vec();
+
         let builder = self.builder.borrow();
         Ok(output_atoms
             .into_iter()
@@ -874,18 +992,51 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// [`Operation`]-specific rules can call this function to recursively replay nested programs over selected inputs,
     /// so that an operation can rewrite itself into transformed work. For example, a known-predicate `condition` can
     /// inline its selected branch.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: [`Program`] whose entry [`Region`](crate::Region) is replayed through this
+    ///     [`PartialEvaluationContext`].
+    ///   - `inputs`: Partially evaluated values bound to `program`'s input [`Atom`](crate::Atom)s in input order.
+    #[inline]
     pub fn inline_program(
         &self,
         program: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         inputs: Vec<PartialEvaluationValue<C::Value>>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
     where
-        C::Operation: PartiallyEvaluatableOperation<C>,
+        C::Operation:
+            PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
-        program.interpret_with(
+        self.inline_region(program.entry_region_ref(), inputs)
+    }
+
+    /// Replays a borrowed [`Region`](crate::Region) through this context without materializing it as a standalone
+    /// source [`Program`]. This is the borrowed-region counterpart of [`inline_program`](Self::inline_program) and
+    /// otherwise uses the same partial-evaluation replay, input binding, and output ordering described there.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Borrowed [`Region`](crate::Region) to replay through this [`PartialEvaluationContext`].
+    ///   - `inputs`: Partially evaluated values bound to `region`'s input [`Atom`](crate::Atom)s in input order.
+    pub(crate) fn inline_region(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<PartialEvaluationValue<C::Value>>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        C::Operation:
+            PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
             inputs,
             |_, constant| Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant.clone())?)),
-            |instruction, inputs| instruction.operation().partially_evaluate(self, inputs),
+            |instruction, inputs| {
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let driver = RecursivePartialEvaluationDriver { driver: &regions };
+                instruction.operation().partially_evaluate(self, &driver, inputs)
+            },
         )
     }
 
@@ -898,20 +1049,23 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// [residualized](Self::residualize) over the surviving unknown boundary inputs plus the known-side operation's
     /// residual outputs. Each original output is picked from the known-side or residual-side operation's outputs per
     /// the partitioned program's [`outputs`](PartitionedProgram::outputs). Consuming the partitioned program in a
-    /// single step keeps it whole until it is gone, so no partially-moved partition state can ever be observed.
+    /// single step keeps it whole until it is gone, so no partially moved partition state can ever be observed.
     ///
     /// # Parameters
     ///
     ///   - `partition`: [`PartitionedProgram`] to inline, produced by [`Program::partition`].
     ///   - `inputs`: Input [`PartialEvaluationValue`]s in the order of the original program's input, pre-partitioning.
-    ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary operation.
-    ///   - `build_residual_operation`: Wraps the provided residual [`Program`] in the residual boundary operation.
+    ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary [`Operation`]
+    ///     together with the owned [`Region`](crate::Region) programs (in region order) that the emitted instruction
+    ///     attaches. Operations that carry the program in their payload return no regions.
+    ///   - `build_residual_operation`: Wraps the provided residual [`Program`] in the residual boundary [`Operation`],
+    ///     with the same [`Region`](crate::Region) contract as `build_known_operation`.
     pub fn inline_partitioned_program<
         V: Value<Type = C::Type>,
         O: Operation<C::Type>,
         P: Into<C::Operation>,
-        BuildKnownProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> P,
-        BuildResidualProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> P,
+        BuildKnownProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> (P, Vec<FlatProgram<C>>),
+        BuildResidualProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> (P, Vec<FlatProgram<C>>),
     >(
         &self,
         program: PartitionedProgram<V, O>,
@@ -930,8 +1084,9 @@ impl<C: Context> PartialEvaluationContext<C> {
                     .ok_or(ProgramError::InvalidInputCount { expected: index + 1, actual: inputs.len() })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let known_program_operation = build_known_operation(program.known_program);
-        let known_outputs = self.fold_or_residualize(known_program_operation, known_inputs.as_slice())?;
+        let (known_program_operation, known_regions) = build_known_operation(program.known_program);
+        let known_outputs =
+            self.fold_or_residualize(known_program_operation, known_regions, known_inputs.as_slice())?;
 
         // Emit the residual operation over the surviving unknown boundary inputs plus the residual edges, which trail
         // the fully known outputs among the known-side operation's outputs. The emission is unconditional: a residual
@@ -956,8 +1111,9 @@ impl<C: Context> PartialEvaluationContext<C> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let residual_program_operation = build_residual_operation(program.residual_program);
-        let residual_outputs = self.residualize(residual_program_operation, residual_inputs.as_slice())?;
+        let (residual_program_operation, residual_regions) = build_residual_operation(program.residual_program);
+        let residual_outputs =
+            self.residualize(residual_program_operation, residual_regions, residual_inputs.as_slice())?;
 
         // Reassemble the original outputs from the two operations' outputs.
         program
@@ -1095,7 +1251,11 @@ impl<C: Context> Domain for PartialEvaluationContext<C> {
     type Operation = C::Operation;
 }
 
-impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> Context for PartialEvaluationContext<C> {
+impl<C: Context> Context for PartialEvaluationContext<C>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+{
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
         // Lifting a staged constant produces a known value carrying an inline-constant materialization, so that
@@ -1103,33 +1263,23 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> Context for Partia
         Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known_constant(self.parent.lift(constant)?)))
     }
 
-    fn bind<O: Into<C::Operation>>(
+    fn bind<O: Into<C::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: O,
-        regions: &[FlatProgram<Self>],
-        callees: &[Rc<FlatProgram<Self>>],
+        driver: D,
         inputs: &[PartialTracer<C>],
     ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
         // Unwrap the input tracers into context-free partial-evaluation values, dispatch the operation's partial
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         let operation = operation.into();
-        // TODO(eaplatanios): [regions] Transitional guard until `PartialEvaluationContext` binds regions (phases 2-6);
-        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
-        if !regions.is_empty() || !callees.is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` carries nested regions which this context cannot bind yet",
-                    operation.name(),
-                ),
-            });
-        }
-
         let input_values = inputs.iter().map(|input| input.value()).collect::<Result<Vec<_>, _>>();
         let error = match input_values {
             Ok(input_values) => {
                 let input_values = input_values.into_iter().cloned().collect::<Vec<_>>();
-                match operation.partially_evaluate(self, input_values.as_slice()) {
+                let partial_evaluation_driver = RecursivePartialEvaluationDriver { driver: &driver };
+                let outputs = operation.partially_evaluate(self, &partial_evaluation_driver, input_values.as_slice());
+                match outputs {
                     Ok(outputs) => {
                         return Ok(outputs.into_iter().map(|value| PartialTracer::new(self.clone(), value)).collect());
                     }
@@ -1145,7 +1295,9 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> Context for Partia
         // never panics. The poisoned outputs are typed by output type inference. When even that fails, the output arity
         // is unknowable and the error surfaces immediately instead.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let Ok(output_types) = operation.infer_output_types(input_types.as_slice()) else {
+        let region_interfaces = driver.regions().map(RegionRef::interface).collect::<Vec<_>>();
+        let Ok(output_types) = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())
+        else {
             return Err(error);
         };
 
@@ -1337,6 +1489,123 @@ impl<C: Context> Value for PartialTracer<C> {
     }
 }
 
+impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
+    /// Partially evaluates this borrowed [`Region`](crate::Region) through the provided known-side context without
+    /// materializing it. Refer to the documentation of [`Program::partially_evaluate_in_context`] for more information.
+    pub fn partially_evaluate_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
+        self,
+        context: &C,
+        inputs: &[PartialValue<C::Value>],
+    ) -> Result<PartialEvaluation<C>, ProgramError>
+    where
+        O: PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<V, O>>,
+    {
+        if inputs.len() != self.input_ids().len() {
+            return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
+        }
+
+        let context = PartialEvaluationContext::new(context.clone());
+        let mut seed = Vec::with_capacity(inputs.len());
+        for (index, knowledge) in inputs.iter().enumerate() {
+            match knowledge {
+                PartialValue::Known(value) => seed.push(PartialEvaluationValue::known_input(value.clone())),
+                PartialValue::Unknown(r#type) => seed.push(context.unknown_input(r#type.clone(), index)),
+            }
+        }
+
+        let outputs = context.inline_region(self, seed)?;
+        context.into_evaluation(outputs)
+    }
+
+    /// Partitions this borrowed [`Region`](crate::Region) based on per-input known-ness without first detaching its
+    /// source computation. Refer to the documentation of [`Program::partition`] for more information.
+    pub fn partition(self, input_known: &[bool]) -> Result<PartitionedProgram<V, O>, ProgramError>
+    where
+        O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
+    {
+        let input_types = self.input_types();
+        check_count!("input", input_known, input_types.len(), ProgramError);
+
+        let context = TracingContext::<V, O>::new();
+        let inputs = input_types
+            .iter()
+            .zip(input_known.iter())
+            .map(|(input_type, &known)| match known {
+                true => PartialValue::Known(context.input(input_type.clone())),
+                false => PartialValue::Unknown(input_type.clone()),
+            })
+            .collect::<Vec<_>>();
+        let evaluation = self.partially_evaluate_in_context(&context, inputs.as_slice())?;
+
+        let known_input_indices = input_known
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &known)| known.then_some(index))
+            .collect::<Vec<_>>();
+        let known_output_atoms = evaluation
+            .outputs
+            .iter()
+            .filter_map(|output| match output {
+                PartialEvaluationOutput::Known(value) => Some(value.atom_id()),
+                PartialEvaluationOutput::Unknown(_) => None,
+            })
+            .chain(evaluation.inputs.iter().filter_map(|input| match input {
+                PartialEvaluationInput::Known(value) => Some(value.atom_id()),
+                PartialEvaluationInput::Unknown(_) => None,
+            }))
+            .collect::<Result<Vec<_>, _>>()?;
+        let residual_inputs = evaluation
+            .inputs
+            .iter()
+            .scan(0, |known_count, input| {
+                Some(match input {
+                    PartialEvaluationInput::Unknown(index) => PartialEvaluationInput::Unknown(*index),
+                    PartialEvaluationInput::Known(_) => {
+                        let index = *known_count;
+                        *known_count += 1;
+                        PartialEvaluationInput::Known(index)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let outputs = evaluation
+            .outputs
+            .iter()
+            .scan(0, |known_count, output| {
+                Some(match output {
+                    PartialEvaluationOutput::Known(_) => {
+                        let index = *known_count;
+                        *known_count += 1;
+                        PartialEvaluationOutput::Known(index)
+                    }
+                    PartialEvaluationOutput::Unknown(ordinal) => PartialEvaluationOutput::Unknown(*ordinal),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let known_input_count = known_input_indices.len();
+        let known_output_count = known_output_atoms.len();
+        let known_program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<V>, Vec<V>>(
+                known_output_atoms,
+                vec![Placeholder; known_input_count],
+                vec![Placeholder; known_output_count],
+            )?
+            .into_simplified()?;
+
+        Ok(PartitionedProgram {
+            known_program,
+            residual_program: evaluation.program,
+            known_input_indices,
+            residual_inputs,
+            outputs,
+        })
+    }
+}
+
 impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work eagerly.
     /// This is the main partial evaluation entry point, instantiated at this program's own [`EagerContext`] so that
@@ -1381,7 +1650,9 @@ impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         inputs: &[PartialValue<V>],
     ) -> Result<PartialEvaluation<EagerContext<V, O>>, ProgramError>
     where
-        O: InterpretableOperation<V, EagerContext<V, O>> + PartiallyEvaluatableOperation<EagerContext<V, O>>,
+        O: InterpretableOperation<EagerContext<V, O>>
+            + PartiallyEvaluatableOperation<EagerContext<V, O>>
+            + PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
         self.partially_evaluate_in_context(&EagerContext::new(), inputs)
     }
@@ -1395,25 +1666,9 @@ impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         inputs: &[PartialValue<C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
-        O: PartiallyEvaluatableOperation<C>,
+        O: PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
-        if inputs.len() != self.input_ids().len() {
-            return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
-        }
-
-        // Seed top-level inputs. Known inputs hold their value and unknown inputs lead the residual program's inputs.
-        let context = PartialEvaluationContext::new(context.clone());
-        let mut seed = Vec::with_capacity(inputs.len());
-        for (index, knowledge) in inputs.iter().enumerate() {
-            match knowledge {
-                PartialValue::Known(value) => seed.push(PartialEvaluationValue::known_input(value.clone())),
-                PartialValue::Unknown(r#type) => seed.push(context.unknown_input(r#type.clone(), index)),
-            }
-        }
-
-        // Replay this program through the context and finalize the accumulated residual state.
-        let outputs = context.inline_program(self, seed)?;
-        context.into_evaluation(outputs)
+        self.entry_region_ref().partially_evaluate_in_context(context, inputs)
     }
 
     /// Partitions this [`Program`] based on the provided per-input known-ness into a known-side program and a
@@ -1431,84 +1686,7 @@ impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
-        let input_types = self.input_types();
-        check_count!("input", input_known, input_types.len(), ProgramError);
-
-        let context = TracingContext::<V, O>::new();
-        let inputs = input_types
-            .iter()
-            .zip(input_known.iter())
-            .map(|(input_type, &known)| match known {
-                true => PartialValue::Known(context.input(input_type.clone())),
-                false => PartialValue::Unknown(input_type.clone()),
-            })
-            .collect::<Vec<_>>();
-        let evaluation = self.partially_evaluate_in_context(&context, inputs.as_slice())?;
-
-        let known_input_indices = input_known
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &known)| known.then_some(index))
-            .collect::<Vec<_>>();
-
-        let known_output_atoms = evaluation
-            .outputs
-            .iter()
-            .filter_map(|output| match output {
-                PartialEvaluationOutput::Known(value) => Some(value.atom_id()),
-                PartialEvaluationOutput::Unknown(_) => None,
-            })
-            .chain(evaluation.inputs.iter().filter_map(|input| match input {
-                PartialEvaluationInput::Known(value) => Some(value.atom_id()),
-                PartialEvaluationInput::Unknown(_) => None,
-            }))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let residual_inputs = evaluation
-            .inputs
-            .iter()
-            .scan(0, |known_count, input| {
-                Some(match input {
-                    PartialEvaluationInput::Unknown(index) => PartialEvaluationInput::Unknown(*index),
-                    PartialEvaluationInput::Known(_) => {
-                        let index = *known_count;
-                        *known_count += 1;
-                        PartialEvaluationInput::Known(index)
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let outputs = evaluation
-            .outputs
-            .iter()
-            .scan(0, |known_count, output| {
-                Some(match output {
-                    PartialEvaluationOutput::Known(_) => {
-                        let index = *known_count;
-                        *known_count += 1;
-                        PartialEvaluationOutput::Known(index)
-                    }
-                    PartialEvaluationOutput::Unknown(ordinal) => PartialEvaluationOutput::Unknown(*ordinal),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let known_input_count = known_input_indices.len();
-        let known_output_count = known_output_atoms.len();
-        let known_program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<V>, Vec<V>>(
-                known_output_atoms,
-                vec![Placeholder; known_input_count],
-                vec![Placeholder; known_output_count],
-            )?
-            .into_simplified()?;
-        let residual_program = evaluation.program;
-
-        Ok(PartitionedProgram { known_program, residual_program, known_input_indices, residual_inputs, outputs })
+        self.entry_region_ref().partition(input_known)
     }
 }
 
@@ -1524,7 +1702,9 @@ mod tests {
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, MulOperation, NegOperation, SinOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::AtomId;
+    use crate::programs::builders::ProgramBuilder;
     use crate::types::DataType;
 
     use super::*;
@@ -1538,8 +1718,8 @@ mod tests {
         let x = builder.add_input(DataType::F64);
         let r = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(3.0));
-        let product = builder.add_instruction(MulOperation, vec![x, r]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![x, r]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, Vec::new(), vec![product, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1549,8 +1729,8 @@ mod tests {
             outputs: vec![PartialEvaluationOutput::Known(Scalar::from(5.0)), PartialEvaluationOutput::Unknown(0)],
         };
 
-        // Interpretation takes exactly one value per `Unknown` feeder, feeds `Known` feeders from their carried values,
-        // returns folded outputs directly, and reads the rest from the replayed residual program:
+        // Interpretation takes exactly one value per `Unknown` feeder, feeds `Known` feeders from their carried
+        // values, returns folded outputs directly, and reads the rest from the replayed residual program:
         // `(5, 4 * 2 + 3) = (5, 11)`.
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
@@ -1621,15 +1801,15 @@ mod tests {
     fn test_partial_evaluation_context() {
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         assert_eq!(
-            context.parent().bind(AddOperation, &[], &[], &[Scalar::from(1.0), Scalar::from(2.0)]),
+            context.parent().bind(AddOperation, Vec::new(), &[Scalar::from(1.0), Scalar::from(2.0)]),
             Ok(vec![Scalar::from(3.0)]),
         );
 
-        // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs are
-        // known values with no residual materialization decision yet.
+        // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
+        // are known values with no residual materialization decision yet.
         let inputs =
             [PartialEvaluationValue::known(Scalar::from(2.0)), PartialEvaluationValue::known(Scalar::from(3.0))];
-        let folded = context.fold_or_residualize(MulOperation, &inputs).unwrap();
+        let folded = context.fold_or_residualize(MulOperation, Vec::new(), &inputs).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(folded[0].is_known());
         assert!(!folded[0].is_unknown());
@@ -1641,7 +1821,7 @@ mod tests {
         // `residualize` emits the operation into the residual program, materializing each known input as a fresh
         // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
         // (i.e., atom 2).
-        let residual = context.residualize(AddOperation, &inputs).unwrap();
+        let residual = context.residualize(AddOperation, Vec::new(), &inputs).unwrap();
         assert_eq!(residual.len(), 1);
         assert!(residual[0].is_unknown());
         assert_eq!(residual[0].as_known(), None);
@@ -1653,15 +1833,15 @@ mod tests {
 
         // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
         // over the residual variable, producing the next residual atom.
-        let mixed = context.fold_or_residualize(NegOperation, &[residual[0].clone()]).unwrap();
+        let mixed = context.fold_or_residualize(NegOperation, Vec::new(), &[residual[0].clone()]).unwrap();
         assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
 
         // Materializing the same known value twice reuses the residual atom assigned on first materialization through
         // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
         // single residual input.
         let shared = PartialEvaluationValue::known_input(Scalar::from(4.0));
-        let first = context.residualize(NegOperation, &[shared.clone()]).unwrap();
-        let second = context.residualize(SinOperation, &[shared.clone()]).unwrap();
+        let first = context.residualize(NegOperation, Vec::new(), &[shared.clone()]).unwrap();
+        let second = context.residualize(SinOperation, Vec::new(), &[shared.clone()]).unwrap();
         assert_eq!(
             shared.materialization(),
             PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) }
@@ -1675,8 +1855,8 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![a, x]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, Vec::new(), vec![product, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1708,8 +1888,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![sine, x]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![sine, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1718,8 +1898,8 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[PartialEvaluationValue::known(Scalar::from(2.0)), residual[0].clone()],
-                |_known_program| ScalarOperation::Sin(SinOperation),
-                |_residual_program| ScalarOperation::Mul(MulOperation),
+                |_| (ScalarOperation::Sin(SinOperation), Vec::new()),
+                |_| (ScalarOperation::Mul(MulOperation), Vec::new()),
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1730,7 +1910,7 @@ mod tests {
         // reassembled outputs are known values even though the (empty) residual operation is still emitted.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
-        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
         let program =
             builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
         let partition = program.partition(&[true]).unwrap();
@@ -1738,8 +1918,8 @@ mod tests {
             .inline_partitioned_program(
                 partition,
                 &[PartialEvaluationValue::known(Scalar::from(2.0))],
-                |_known_program| ScalarOperation::Sin(SinOperation),
-                |_residual_program| ScalarOperation::Constant(ConstantOperation::new(Scalar::from(0.0))),
+                |_| (ScalarOperation::Sin(SinOperation), Vec::new()),
+                |_| (ScalarOperation::Constant(ConstantOperation::new(Scalar::from(0.0))), Vec::new()),
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -1804,7 +1984,7 @@ mod tests {
             PartialValueMaterialization::Constant { residual_atom: None },
         ));
         assert!(matches!(context.resolve(&lifted), ValueResolution::Concrete(value) if value == Scalar::from(2.0)));
-        let folded = context.bind(AddOperation, &[], &[], &[lifted.clone(), lifted.clone()]).unwrap();
+        let folded = context.bind(AddOperation, Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Scalar::from(4.0)));
         assert_eq!(folded[0].boolean(), Ok(true));
@@ -1823,7 +2003,7 @@ mod tests {
         context.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(0));
         let unknown =
             PartialTracer::new(context.clone(), PartialEvaluationValue::variable(DataType::F64, unknown_atom));
-        let mixed = context.bind(MulOperation, &[], &[], &[folded[0].clone(), unknown.clone()]).unwrap();
+        let mixed = context.bind(MulOperation, Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
         assert!(matches!(context.resolve(&mixed[0]), ValueResolution::Opaque));
         assert!(matches!(mixed[0].boolean(), Err(ProgramError::Concretization { .. })));
@@ -1855,14 +2035,12 @@ mod tests {
         // not return an error; it poisons its outputs so the infallible operator sugar driving closures never panics.
         // The poison propagates through later binds, resolves `Opaque`, rejects concretizing extractions with the
         // deferred error, and surfaces that original error at the value boundary.
-        use crate::operations::BooleanLike;
-
         let outer_a = ScalarTracingContext::new();
         let outer_b = ScalarTracingContext::new();
         let context = PartialEvaluationContext::new(outer_a.clone());
         let known_a = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_a.input(DataType::F64)));
         let known_b = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_b.input(DataType::F64)));
-        let poisoned = context.bind(AddOperation, &[], &[], &[known_a.clone(), known_b]).unwrap();
+        let poisoned = context.bind(AddOperation, Vec::new(), &[known_a.clone(), known_b]).unwrap();
         assert_eq!(poisoned.len(), 1);
         assert_eq!(format!("{}", poisoned[0]), "<poison:f64>");
         assert_eq!(poisoned[0].r#type().into_owned(), DataType::F64);
@@ -1871,7 +2049,7 @@ mod tests {
 
         // Poison propagates from inputs to outputs of later binds, and unwrapping at a boundary reports the original
         // deferred error rather than a generic poison error.
-        let propagated = context.bind(MulOperation, &[], &[], &[known_a, poisoned[0].clone()]).unwrap();
+        let propagated = context.bind(MulOperation, Vec::new(), &[known_a, poisoned[0].clone()]).unwrap();
         assert!(matches!(propagated[0].value(), Err(ProgramError::MismatchedProgramBuilders)));
         assert!(matches!(propagated[0].clone().into_value(), Err(ProgramError::MismatchedProgramBuilders)));
     }
@@ -1885,10 +2063,10 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let squared = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation, vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation, vec![scaled, c]).unwrap()[0];
-        let offset = builder.add_instruction(AddOperation, vec![squared, x]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, c]).unwrap()[0];
+        let offset = builder.add_instruction(AddOperation, Vec::new(), vec![squared, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
                 vec![squared, shifted, offset],
@@ -1983,9 +2161,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let printed = builder.add_instruction(PrintOperation::new("known"), vec![a]).unwrap()[0];
-        builder.add_instruction(PrintOperation::new("dead"), vec![x]).unwrap();
-        let product = builder.add_instruction(MulOperation, vec![printed, x]).unwrap()[0];
+        let printed = builder.add_instruction(PrintOperation::new("known"), Vec::new(), vec![a]).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("dead"), Vec::new(), vec![x]).unwrap();
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![printed, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2023,9 +2201,9 @@ mod tests {
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
-        let squared = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation, vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation, vec![scaled, c]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation, Vec::new(), vec![scaled, c]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2086,9 +2264,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, vec![a, a]).unwrap()[0];
-        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![sine, x]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![a, a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation, Vec::new(), vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![sine, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled, product], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
