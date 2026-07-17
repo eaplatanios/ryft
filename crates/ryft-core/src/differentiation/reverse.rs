@@ -15,9 +15,12 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
+use crate::programs::effects::Effects;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
+use crate::programs::regions::{
+    BindingRegionDriver, EmptyRegionDriver, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
@@ -132,7 +135,7 @@ impl<C: Context, Input: Parameterized<C::Value, Family: ParameterizedFamily<C::V
     }
 }
 
-/// [`RegionDriver`] that provides call-scoped access to the [`Region`](crate::Region)s attached to the
+/// [`RegionDriver`] that provides call-scoped access to the [`Region`]s attached to the
 /// [`Instruction`](crate::Instruction) being transposed and to nested transposition work over those regions.
 /// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
 /// structural region access, while this trait adds transposition-specific recursion.
@@ -158,7 +161,7 @@ impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionD
 }
 
 /// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
-/// [`Region`](crate::Region)s attached to that instruction.
+/// [`Region`]s attached to that instruction.
 struct RecursiveTranspositionDriver<'r, V: Value, O> {
     /// Borrowed attached [`Region`](crate::Region)s, in region order.
     regions: Vec<RegionRef<'r, V, O>>,
@@ -300,7 +303,7 @@ impl<
     O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
 > RegionRef<'_, V, O>
 {
-    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
+    /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_.
     /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
     pub fn transpose_with_respect_to(
         &self,
@@ -395,6 +398,9 @@ impl<
         ///   - `instruction_by_output`: Source-instruction index for each produced atom, or `None` for atoms
         ///     without an instruction producer.
         ///   - `linear`: Per-source-atom mask indicating whether the atom depends on a selected linear input.
+        ///   - `region_effects`: Recursively derived effects of the source arena.
+        ///   - `region_mappings`: Replay-scoped region remapping shared by every known producer
+        ///     materialized from the source arena.
         ///   - `builder`: Destination pullback builder into which demanded pure producers are replayed.
         ///   - `known_map`: Per-source-atom mapping to an already materialized pullback atom.
         ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
@@ -404,6 +410,8 @@ impl<
             program: RegionRef<'_, V, O>,
             instruction_by_output: &[Option<usize>],
             linear: &[bool],
+            region_effects: &[Effects],
+            region_mappings: &RegionReplayMappings<V, O>,
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             known_map: &mut [Option<AtomId>],
             materialization_state: &mut [MaterializationState],
@@ -436,7 +444,19 @@ impl<
                             .instructions()
                             .get(instruction_index)
                             .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
-                        if !instruction.operation().effects().is_pure() {
+                        let effects = instruction.regions().iter().try_fold(
+                            instruction.operation().effects(),
+                            |effects, region| {
+                                region_effects
+                                    .get(region.index())
+                                    .copied()
+                                    .map(|region_effects| effects.union(region_effects))
+                                    .ok_or_else(|| {
+                                        ProgramError::MalformedProgram(format!("region {region} is out of range"))
+                                    })
+                            },
+                        )?;
+                        if !effects.is_pure() {
                             return Err(ProgramError::UnsupportedOperation {
                                 message: format!(
                                     "partition-aware transpose cannot replay effectful known intermediate producer \
@@ -479,9 +499,11 @@ impl<
                                 })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
+                        let driver = ReplayRegionDriver::new(program, instruction.regions(), region_mappings)?;
+                        let regions = driver.import_into(builder)?;
                         let outputs = builder
                             .borrow_mut()
-                            .add_instruction(instruction.operation().clone(), Vec::new(), inputs)?
+                            .add_instruction(instruction.operation().clone(), regions, inputs)?
                             .to_vec();
                         check_count!("output", outputs, instruction.outputs().len(), ProgramError);
                         for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
@@ -543,18 +565,18 @@ impl<
         }
 
         // Seed the reverse pass with one cotangent input for each primal output, typed with that output's cotangent
-        // slot type. A differentiable output's slot carries its cotangent dual (e.g., swapping unreduced and reduced
-        // sharding axes for arrays). A non-differentiable output (i.e., the analogue to JAX's `float0`, such as a
-        // Boolean or integer) has no cotangent space, so its slot carries only structural zeros typed by the output's
-        // own primal type. The adjoint table is indexed by atoms from the original program, and each slot stores the
-        // staged pullback atom that currently represents the accumulated cotangent for that primal atom.
+        // descriptor. A differentiable output carries its cotangent dual (e.g., swapping unreduced and reduced sharding
+        // axes for arrays). A non-differentiable output, such as a Boolean, integer, or token, uses the first-class
+        // zero-space descriptor. The adjoint table is indexed by atoms from the original program, and each slot stores
+        // the staged pullback atom that currently represents the accumulated cotangent for that primal atom.
         let mut adjoints = vec![None; self.atoms().len()];
         for output in self.output_ids().iter().copied() {
             let output_atom = self.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
             let output_type = output_atom.r#type();
-            let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.into_owned());
+            let cotangent_type = output_type.cotangent();
+            let has_cotangent = !cotangent_type.is_zero_space();
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
-            if *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
+            if has_cotangent && *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
                 accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
             }
         }
@@ -575,6 +597,8 @@ impl<
         // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
         // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
         let instruction_by_output = self.region().instruction_by_output();
+        let region_effects = Region::effects(self.regions());
+        let region_mappings = RegionReplayMappings::new();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
         // Walk the primal program backward, applying each operation's transpose rule only when at least one of its
@@ -601,11 +625,11 @@ impl<
 
             // Materialize the instruction's output cotangents in operation-result order. Missing adjoint slots become
             // structural zeros so transpose rules can distinguish unused outputs without staging zero operations.
-            // Structural zeros carry the output's cotangent slot type: a differentiable output's cotangent dual or,
-            // for a non-differentiable output (i.e., the analogue to JAX's `float0`), the output's own primal type.
-            // Accumulated adjoints are always live: rules communicate zero-ness symbolically through `MaybeZero`
-            // (opaque program splices such as the custom-VJP backward replay recover it at their own boundary),
-            // and so no staged canonical zero ever needs to be recognized here.
+            // Structural zeros carry the output's cotangent descriptor: a differentiable output's cotangent dual or
+            // the first-class zero-space descriptor for a non-differentiable output. Accumulated adjoints are always
+            // live: rules communicate zero-ness symbolically through `MaybeZero` (opaque program splices such as the
+            // custom-VJP backward replay recover it at their own boundary), and so no staged canonical zero ever needs
+            // to be recognized here.
             instruction_output_cotangents.clear();
             for output in instruction.outputs().iter().copied() {
                 let cotangent = adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
@@ -617,7 +641,7 @@ impl<
                             .get(output.index())
                             .ok_or(ProgramError::UnboundAtomId { id: output })?
                             .r#type();
-                        MaybeZero::Zero(output_type.cotangent().unwrap_or_else(|| output_type.into_owned()))
+                        MaybeZero::Zero(output_type.cotangent())
                     }
                 });
             }
@@ -646,6 +670,8 @@ impl<
                             *self,
                             instruction_by_output.as_slice(),
                             linear.as_slice(),
+                            region_effects.as_slice(),
+                            &region_mappings,
                             &builder,
                             known_map.as_mut_slice(),
                             materialization_state.as_mut_slice(),
@@ -685,9 +711,8 @@ impl<
         // The pullback outputs are the accumulated cotangents of the selected inputs, emitted directly in
         // `input_indices` order. Known inputs receive no cotangent output. Disconnected selected inputs are emitted
         // as input-free `ZeroOperation` instructions, which the value type's `Zero` implementation evaluates at
-        // interpretation time, typed with the input's cotangent slot type: a differentiable input's cotangent dual,
-        // or, for a non-differentiable selected input (i.e., the analogue to JAX's `float0`), the input's own primal
-        // type, whose cotangent slot carries only structural zeros.
+        // interpretation time, typed with the input's cotangent descriptor: a differentiable input's cotangent dual,
+        // or the first-class zero-space descriptor for a non-differentiable selected input.
         let outputs = input_indices
             .iter()
             .map(|&index| {
@@ -698,7 +723,7 @@ impl<
                         let input_atom =
                             self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let input_type = input_atom.r#type();
-                        let cotangent_type = input_type.cotangent().unwrap_or_else(|| input_type.into_owned());
+                        let cotangent_type = input_type.cotangent();
                         let mut builder_borrow = builder.borrow_mut();
                         let outputs = builder_borrow.add_instruction(
                             ZeroOperation::new(cotangent_type),
@@ -756,15 +781,15 @@ where
         })
     }
 
-    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_. This is the main entrypoint
-    /// for transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map
-    /// on _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
-    /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
-    /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
-    /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
-    /// instructions in reverse order, and applies each primitive operation's [`TransposableOperation::transpose`] rule
-    /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
-    /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ with respect to selected
+    /// inputs. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on _dual_ spaces
+    /// `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix transpose. Here the
+    /// linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents to output tangents,
+    /// and transposition builds the dual program that maps output cotangents back to input cotangents. Operationally,
+    /// transposition creates cotangent inputs for this program's outputs, walks the instructions in reverse order,
+    /// and applies each primitive operation's [`TransposableOperation::transpose`] rule to accumulate cotangent
+    /// contributions for the original inputs. This is the same decomposition of reverse-mode automatic differentiation
+    /// as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
     /// Over complex types, transposition is defined with respect to the **bilinear** (i.e., conjugation-free) pairing
     /// `⟨a, b⟩ = Real(a · b)`: the transpose of multiplying by a known complex factor multiplies by that same factor
@@ -781,10 +806,9 @@ where
     /// into the surrounding tracing context, so that backends whose traced constants are abstract metadata do not need
     /// to materialize a runtime value just to transpose an enclosing traced program.
     ///
-    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ **with respect to** the inputs
-    /// selected by `input_indices`, holding the remaining inputs as constant parameters of the linear map. The program
-    /// must be linear in the selected inputs, but it can depend arbitrarily on the known ones. This is the partial
-    /// entry point behind the fully linear [`Program::transpose`].
+    /// `input_indices` selects the inputs to transpose with respect to, while the remaining inputs are held as constant
+    /// parameters of the linear map. The program must be linear in the selected inputs, but it can depend arbitrarily
+    /// on the known ones. This is the partial entry point behind the fully linear [`Program::transpose`].
     ///
     /// Linearity is propagated forward from the program inputs: a program-input [`Atom`] is linear exactly when its
     /// index appears in `input_indices`, constant atoms are always known, and an operation result is linear when any
@@ -870,11 +894,20 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         let input_structure = primals.parameter_structure();
         let (output, pushforward) = self.linearize(function, primals)?;
         let (program, residuals) = pushforward.into_parts();
+
         // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
         // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as a
         // pullback input rather than folding it into a captured factor, so the pullback maps
         // `(output_cotangents ++ residuals)` to the input cotangents.
-        let with_respect_to = (0..program.input_ids().len() - residuals.len()).collect::<Vec<_>>();
+        let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "pushforward program consumes {} inputs which is fewer than its {} residuals",
+                program.input_ids().len(),
+                residuals.len(),
+            ))
+        })?;
+
+        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
         let program = program.transpose_with_respect_to(with_respect_to.as_slice())?;
         Ok((output, Pullback::new(self.clone(), program, residuals, input_structure)?))
     }
@@ -1043,7 +1076,7 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         // staging context stages into its enclosing trace.
         let mut pullback_inputs = vec![self.gradient_seed(&output, false)?];
         for value in Parameterized::<Self::Value>::parameters(&aux) {
-            pullback_inputs.push(self.zero(value.r#type().as_ref())?);
+            pullback_inputs.push(self.zero(&value.r#type().cotangent())?);
         }
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret_in_context(self, pullback_inputs)?;
@@ -1134,7 +1167,7 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         let (pullback, residuals) = pullback.into_parts();
         let mut pullback_inputs = vec![self.gradient_seed(&output, true)?];
         for value in Parameterized::<Self::Value>::parameters(&aux) {
-            pullback_inputs.push(self.zero(value.r#type().as_ref())?);
+            pullback_inputs.push(self.zero(&value.r#type().cotangent())?);
         }
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret_in_context(self, pullback_inputs)?;
@@ -1211,9 +1244,10 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         }
         // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
         // is degenerate and is rejected up front.
-        let output_cotangent_type = output_type.cotangent().ok_or_else(|| {
-            DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() }
-        })?;
+        let output_cotangent_type = output_type.cotangent();
+        if output_cotangent_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
+        }
         let mut seeds = self.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
         check_count!("output", seeds, 1, ProgramError);
         Ok(seeds.pop().unwrap())
@@ -1595,7 +1629,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::programs::regions::RegionInterface;
     use std::cell::Cell;
     use std::marker::PhantomData;
 
@@ -1607,9 +1640,9 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jvp;
-    use crate::macros::check_count;
+    use crate::macros::{check_count, check_types};
     use crate::operations::BooleanLike;
-    use crate::operations::constants::ZeroOperation;
+    use crate::operations::constants::{Constant, ZeroOperation};
     use crate::operations::math::{AddOperation, MulOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1620,7 +1653,7 @@ mod tests {
     use crate::programs::instructions::Instruction;
     use crate::programs::operations::Operation;
     use crate::programs::programs::Program;
-    use crate::programs::regions::{Region, RegionId};
+    use crate::programs::regions::{Region, RegionId, RegionInterface};
     use crate::programs::types::{TypeError, Typed};
     use crate::programs::values::Value;
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
@@ -1641,6 +1674,10 @@ mod tests {
 
         /// Effectful passthrough used to verify that known-side producer replay never duplicates observable effects.
         EffectfulIdentity,
+
+        /// Passthrough with one attached region used to verify that known-side producer replay preserves nested region
+        /// closures and observes their recursively derived effects.
+        RegionIdentity,
 
         /// Two-input addition used to verify cotangent accumulation through repeated primal inputs.
         Add,
@@ -1676,6 +1713,7 @@ mod tests {
             match self {
                 Self::Identity => "identity",
                 Self::EffectfulIdentity => "effectful_identity",
+                Self::RegionIdentity => "region_identity",
                 Self::Add => "add",
                 Self::TwoOutputs => "two_outputs",
                 Self::StagedZeroContribution => "staged_zero_contribution",
@@ -1696,14 +1734,24 @@ mod tests {
                 | Self::StagedZeroContribution
                 | Self::BadArity
                 | Self::ForeignContribution => {
+                    check_count!("region", region_interfaces, 0, TypeError);
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
+                Self::RegionIdentity => {
+                    check_count!("region", region_interfaces, 1, TypeError);
+                    check_count!("input", input_types, 1, TypeError);
+                    check_types!("region identity input", input_types, region_interfaces[0].input_types());
+                    check_types!("region identity output", input_types, region_interfaces[0].output_types());
+                    Ok(vec![input_types[0].clone()])
+                }
                 Self::Add => {
+                    check_count!("region", region_interfaces, 0, TypeError);
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::TwoOutputs => {
+                    check_count!("region", region_interfaces, 0, TypeError);
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone(), input_types[0].clone()])
                 }
@@ -1711,10 +1759,10 @@ mod tests {
             }
         }
 
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        fn region_names(&self) -> &'static [&'static str] {
             match self {
-                Self::Zero(zero) => zero.render(formatter, indentation),
-                _ => formatter.write_str(self.name()),
+                Self::RegionIdentity => &["body"],
+                _ => &[],
             }
         }
 
@@ -1722,6 +1770,13 @@ mod tests {
             match self {
                 Self::EffectfulIdentity => Effects::single(Effect::OrderedIo),
                 _ => Effects::PURE,
+            }
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Zero(zero) => zero.render(formatter, indentation),
+                _ => formatter.write_str(self.name()),
             }
         }
     }
@@ -1761,7 +1816,7 @@ mod tests {
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>],
         ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>>, DifferentiationError> {
             match self {
-                Self::Identity | Self::EffectfulIdentity => {
+                Self::Identity | Self::EffectfulIdentity | Self::RegionIdentity => {
                     check_count!("output", outputs, 1, ProgramError);
                     Ok(vec![outputs[0].clone()])
                 }
@@ -1824,6 +1879,29 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // A primal representation may use a different cotangent representation. E8M0 cannot represent zero or
+        // negative values, so both pullback boundaries use F32 while the source program remains E8M0-typed.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F8E8M0FNU);
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let transposed = program.transpose().unwrap();
+        assert_eq!(transposed.input_types(), vec![DataType::F32]);
+        assert_eq!(transposed.output_types(), vec![DataType::F32]);
+        assert!(transposed.instructions().is_empty());
+
+        // Zero-space cotangent boundary leaves preserve the primal leaf structure, but can never carry live adjoints.
+        // Transposing identity programs over non-differentiable types therefore returns the zero-space value.
+        for data_type in [DataType::Token, DataType::Boolean, DataType::I32] {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let input = builder.add_input(data_type);
+            let program = builder.build::<Scalar, Scalar>(vec![input], Placeholder, Placeholder).unwrap();
+            let transposed = program.transpose().unwrap();
+            assert_eq!(transposed.input_types(), vec![DataType::Zero]);
+            assert_eq!(transposed.output_types(), vec![DataType::Zero]);
+            assert_eq!(transposed.interpret(Scalar::Zero), Ok(Scalar::Zero));
+        }
 
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
@@ -2156,6 +2234,47 @@ mod tests {
             "each linear input must receive its corresponding output cotangent",
         );
 
+        // Region-bearing known producers retain their attached closure when replayed, and two producers that attach
+        // the same source region reuse one imported destination region rather than cloning equivalent closures.
+        let mut region_builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region = region_builder.build::<Scalar, Scalar>(vec![region_input], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let shared_region = builder.import_region(region.entry_region_ref());
+        let known = builder.add_input(DataType::F64);
+        let first_linear = builder.add_input(DataType::F64);
+        let second_linear = builder.add_input(DataType::F64);
+        let first_known = builder
+            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known])
+            .unwrap()[0];
+        let second_known = builder
+            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known])
+            .unwrap()[0];
+        let first_output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![first_known, first_linear])
+            .unwrap()[0];
+        let second_output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![second_known, second_linear])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![first_output, second_output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
+        let replayed_region_ids = pullback
+            .instructions()
+            .iter()
+            .filter_map(|instruction| {
+                matches!(instruction.operation(), TestLinearOperation::RegionIdentity).then(|| instruction.regions()[0])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replayed_region_ids.len(), 2);
+        assert_eq!(replayed_region_ids[0], replayed_region_ids[1]);
+        assert_eq!(pullback.regions().len(), 2, "the shared nested region must be imported only once");
+
         // Replaying a known producer with observable effects in the pullback could duplicate or reorder that effect,
         // so the partition-aware transpose must require partial evaluation to residualize the value instead.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
@@ -2173,6 +2292,32 @@ mod tests {
             program.transpose_with_respect_to(&[1]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message.contains("cannot replay effectful known intermediate producer `effectful_identity`"),
+        ));
+
+        // Effects nested inside a known producer's attached region are equally observable. The outer operation is
+        // intrinsically pure, so this specifically verifies recursive effect accounting through the region closure.
+        let mut region_builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_output = region_builder
+            .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![region_input])
+            .unwrap()[0];
+        let region = region_builder.build::<Scalar, Scalar>(vec![region_output], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let region = builder.import_region(region.entry_region_ref());
+        let known = builder.add_input(DataType::F64);
+        let linear = builder.add_input(DataType::F64);
+        let known_intermediate =
+            builder.add_instruction(TestLinearOperation::RegionIdentity, vec![region], vec![known]).unwrap()[0];
+        let output = builder
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message.contains("cannot replay effectful known intermediate producer `region_identity`"),
         ));
     }
 
@@ -2227,6 +2372,12 @@ mod tests {
         assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(pullback.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
 
+        let (value, pullback) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .vjp(|token| Ok(token), Scalar::Token)
+            .unwrap();
+        assert_eq!(value, Scalar::Token);
+        assert_eq!(pullback.apply(Scalar::Zero), Ok(Scalar::Zero));
+
         // Under an active trace, the free `vjp` recovers the staging context from its tracer input instead, so the
         // primal work and the pullback replay both stage into the enclosing trace.
         let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
@@ -2242,6 +2393,19 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+
+        // Replaying a pullback inside an enclosing trace likewise carries absent token cotangents through zero-space
+        // leaves and never constructs a token-valued zero operation.
+        let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+            |inputs: Vec<_>| {
+                let (value, pullback) = vjp(|token| Ok(token), inputs[0].clone())?;
+                let cotangent = pullback.apply(inputs[1].clone())?;
+                Ok(vec![value, cotangent])
+            },
+            vec![DataType::Token, DataType::Zero],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![Scalar::Token, Scalar::Zero]), Ok(vec![Scalar::Token, Scalar::Zero]),);
 
         // With no leaf value to recover a context from, the free `vjp` reports an invalid input count.
         let error = vjp(
@@ -2447,6 +2611,22 @@ mod tests {
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
         assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
+
+        // Auxiliary cotangent seeds use each auxiliary leaf's cotangent descriptor. This matters both for
+        // non-differentiable leaves, whose descriptor is the first-class zero space, and for differentiable storage
+        // representations such as E8M0, whose cotangent descriptor is widened to F32 and can represent zero.
+        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), Scalar) = value_and_gradient_with_aux(
+            |x| {
+                let integer = x.context().constant(Scalar::from(7i32))?;
+                let e8m0 = x.context().constant(Scalar::F8E8M0FNU(0x7f))?;
+                Ok::<_, ProgramError>((x.clone() * x, (integer, e8m0)))
+            },
+            Scalar::from(2.0),
+        )
+        .unwrap();
+        assert_eq!(value, Scalar::from(4.0));
+        assert_eq!(aux, (Scalar::from(7i32), Scalar::F8E8M0FNU(0x7f)));
+        assert_eq!(gradient, Scalar::from(4.0));
     }
 
     #[test]
@@ -2485,6 +2665,19 @@ mod tests {
             value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z)).unwrap();
         assert_eq!(value, Scalar::from(z * z));
         assert_eq!(aux, Scalar::from(z));
+        assert_eq!(gradient, Scalar::from(z + z));
+
+        // The holomorphic entry point uses the same zero-space cotangent rule for non-differentiable auxiliary leaves.
+        let ((value, aux), gradient): ((Scalar, Scalar), Scalar) = value_and_gradient_holomorphic_with_aux(
+            |x| {
+                let aux = x.context().constant(Scalar::from(7i32))?;
+                Ok::<_, ProgramError>((x.clone() * x, aux))
+            },
+            Scalar::from(z),
+        )
+        .unwrap();
+        assert_eq!(value, Scalar::from(z * z));
+        assert_eq!(aux, Scalar::from(7i32));
         assert_eq!(gradient, Scalar::from(z + z));
 
         // The holomorphy gate also runs at the type level under an active trace. A complex output with
