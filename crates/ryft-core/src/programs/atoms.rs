@@ -88,13 +88,13 @@ impl<V: Typed> From<V> for MaybeZero<V> {
     }
 }
 
-/// Unique identifier for an [`Atom`] within one [`Region`] of a [`Program`]. [`AtomId`]s are stable indexes into the
-/// containing [`Region`]'s atom table (every region owns its own table, so an [`AtomId`] is meaningful only together
-/// with its region). [`Instruction`]s refer to their inputs and outputs by these IDs, which keeps the intermediate
-/// representation compact and easy to clone.
+/// Unique identifier for an [`Atom`] within one [`Region`](crate::Region) of a [`Program`](crate::Program). [`AtomId`]s
+/// are stable indexes into the containing [`Region`](crate::Region)'s atom table (every region owns its own table, so
+/// an [`AtomId`] is meaningful only together with its region). [`Instruction`](crate::Instruction)s refer to their
+/// inputs and outputs by these IDs, which keeps the intermediate representation compact and easy to clone.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
 pub struct AtomId {
-    /// Zero-based index of the corresponding [`Atom`] inside the containing [`Region`]'s atom table.
+    /// Zero-based index of the corresponding [`Atom`] inside the containing [`Region`](crate::Region)'s atom table.
     index: usize,
 }
 
@@ -105,7 +105,8 @@ impl AtomId {
         Self { index }
     }
 
-    /// Returns the zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
+    /// Returns the zero-based index of the corresponding [`Atom`] inside the owning [`Program`](crate::Program)'s
+    /// atom table.
     #[inline]
     pub fn index(self) -> usize {
         self.index
@@ -119,14 +120,14 @@ impl Display for AtomId {
     }
 }
 
-/// [`Atom`]s represent nodes in the [`Region`]s of [`Program`]s that represent either concrete values or variables
-/// of specific [`Type`](crate::Type)s.
+/// [`Atom`]s represent nodes in the [`Region`](crate::Region)s of [`Program`](crate::Program)s that represent either
+/// concrete values or variables of specific [`Type`](crate::Type)s.
 #[derive(Clone, Debug, Parameter)]
 pub enum Atom<V: Typed> {
-    /// Literal constant value that appears in a [`Program`].
+    /// Literal constant value that appears in a [`Program`](crate::Program).
     Constant(V),
 
-    /// Non-constant variable of a specific [`Type`](crate::Type) that appears in a [`Program`].
+    /// Non-constant variable of a specific [`Type`](crate::Type) that appears in a [`Program`](crate::Program).
     Variable(V::Type),
 }
 

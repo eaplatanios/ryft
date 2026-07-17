@@ -1,17 +1,19 @@
 use std::fmt::Display;
-use std::ops::Mul;
+use std::ops::{Div, Mul};
 
 use crate::Compare;
 use crate::backends::scalars::Scalar;
 use crate::batching::{BatchAxis, InterpretableBatchableOperation};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::compare::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::FillOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation};
-use crate::operations::math::MulOperation;
+use crate::operations::math::{DivOperation, MulOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -24,6 +26,8 @@ use crate::differentiation::{DifferentiationDriver, DifferentiationDual, Transpo
 use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::types::{ArrayType, DataType, Shape, StaticShape};
+
+use super::broadcasting::ElementwiseDifferentiableValue;
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -479,16 +483,16 @@ where
         let input_type = inputs[0].r#type();
         let input_shape = input_type.shape();
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.clone().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent())]),
             MaybeZero::Value(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    let output_type = ArrayType::new(cotangent.r#type().data_type(), input_shape.clone());
+                    let output_type = input_type.cotangent();
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
-                            let element_count: usize = self
+                            let reduced_extents = self
                                 .axes
                                 .iter()
                                 .map(|axis| {
@@ -499,7 +503,19 @@ where
                                         ),
                                     })
                                 })
-                                .product::<Result<usize, _>>()?;
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let element_count = if reduced_extents.contains(&0) {
+                                0
+                            } else {
+                                reduced_extents.iter().try_fold(1usize, |count, extent| {
+                                    count.checked_mul(*extent).ok_or_else(|| TypeError {
+                                        message: format!(
+                                            "mean transpose reduced element count overflows usize for input shape \
+                                             {input_shape}",
+                                        ),
+                                    })
+                                })?
+                            };
                             let inverse_count = 1.0 / element_count as f64;
                             // Stage a nullary rank-0 fill holding `1 / N` and rely on implicit rank-0 broadcasting in
                             // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
@@ -543,8 +559,17 @@ where
 /// zero operand tangent before this rule is consulted, so the operand tangent reaching every supported case is live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperation
 where
-    C::Operation: From<ReduceOperation> + From<BroadcastOperation> + From<CompareOperation> + From<MulOperation>,
-    C::Value: Reduce + Broadcast + Compare<Output = C::Value> + Mul<Output = C::Value>,
+    C::Operation: From<ReduceOperation>
+        + From<BroadcastOperation>
+        + From<CompareOperation>
+        + From<DivOperation>
+        + From<MulOperation>,
+    C::Value: Reduce
+        + Broadcast
+        + Compare<Output = C::Value>
+        + Div<Output = C::Value>
+        + ElementwiseDifferentiableValue<ArrayType>
+        + Mul<Output = C::Value>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -555,17 +580,23 @@ where
         check_count!("input", inputs, 1, ProgramError);
         match self.kind() {
             ReductionKind::Sum | ReductionKind::Mean => {
-                let primal = inputs[0].primal().reduce(self.axes(), self.kind());
+                let reduce = |value: &C::Value| match self.output_sharding() {
+                    Some(output_sharding) => {
+                        value.reduce_with_output_sharding(self.axes(), self.kind(), output_sharding)
+                    }
+                    None => value.reduce(self.axes(), self.kind()),
+                };
+                let primal = reduce(inputs[0].primal());
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
-                    MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reduce(self.axes(), self.kind())),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)])
             }
             kind @ (ReductionKind::Max | ReductionKind::Min) => {
                 // Stage the argmax mask from the operand primal capture-free: `compare` the operand primal against the
-                // broadcast-back reduced value (an ordinary `compare`/`broadcast`), then `mul` the boolean mask against
-                // the operand tangent (an ordinary `mul`), and sum-reduce the masked tangent.
+                // broadcast-back reduced value (an ordinary `compare`/`broadcast`), convert it to the tangent type,
+                // normalize it by the number of ties, and route the operand tangent through that normalized mask.
                 let primal_input = inputs[0].primal();
                 let primal = primal_input.reduce(self.axes(), kind);
                 let input_type = primal_input.r#type().into_owned();
@@ -573,10 +604,12 @@ where
                 let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(input_tangent) => {
-                        let masked_tangent = mask * input_tangent.clone();
-                        MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum))
+                        let numeric_mask = mask.normalize_elementwise_tangent(input_tangent.r#type().as_ref())?;
+                        let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
+                        let masked_tangent = numeric_mask * input_tangent.clone();
+                        MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)
                     }
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -717,9 +750,12 @@ pub fn reduce_evaluate<T: Clone>(
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::programs::types::Typed;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
@@ -858,7 +894,7 @@ mod tests {
 
         // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
         // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.
-        let context = TracingContext::<ArrayType, ArrayOperation<ArrayType>>::new();
+        let context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
         let builder = context.builder().clone();
         let input_atom = builder.borrow_mut().add_input(input_type);
         let output = context.tracer(input_atom, None).reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced);
@@ -869,9 +905,19 @@ mod tests {
         let program = Rc::try_unwrap(builder)
             .expect("staging should not retain the builder")
             .into_inner()
-            .build::<ArrayType, ArrayType>(vec![output_atom], Placeholder, Placeholder)
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output_atom], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(program.to_string().contains(&format!("output_sharding={unreduced}")));
+
+        // Linearization must preserve the requested sharding on both applications of the linear reduction: the
+        // primal reduction and the same reduction applied to the tangent. Otherwise differentiation silently turns
+        // a requested per-shard partial sum into the default reduced result.
+        let linearization = program.linearize().unwrap();
+        let expected_output_type = array_type(&[3], DataType::F64).with_sharding(unreduced.clone()).unwrap();
+        assert_eq!(linearization.primal().output_types()[0], expected_output_type);
+        assert_eq!(linearization.tangent().output_types()[0], expected_output_type);
+        assert!(linearization.primal().to_string().contains(&format!("output_sharding={unreduced}")));
+        assert!(linearization.tangent().to_string().contains(&format!("output_sharding={unreduced}")));
     }
 
     #[test]
@@ -954,6 +1000,25 @@ mod tests {
         let output = outputs.into_iter().next().unwrap();
         assert_eq!(output.r#type().shape(), &Shape::new(vec![Size::Static(2)]));
         assert_eq!(output.values(), &[6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_reduce_extrema_derivatives_split_ties_evenly() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        for kind in [ReductionKind::Max, ReductionKind::Min] {
+            let input = TestArray::vector(vec![1.0, 1.0]);
+            let (primal, tangent) = context
+                .jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), TestArray::vector(vec![1.0, 3.0]))
+                .unwrap();
+            assert_eq!(primal.values(), &[1.0]);
+            assert_eq!(tangent.values(), &[2.0]);
+
+            let (primal, gradient) =
+                context.value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)), input).unwrap();
+            assert_eq!(primal.values(), &[1.0]);
+            assert_abs_diff_eq!(gradient.values()[0], 0.5, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.values()[1], 0.5, epsilon = 1e-9);
+        }
     }
 
     #[test]
@@ -1099,6 +1164,63 @@ mod tests {
             let delta = (*value - 0.25).abs();
             assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");
         }
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_checks_reduced_element_count() {
+        use crate::differentiation::DifferentiationError;
+        use crate::partial::PartialValue;
+        use crate::programs::ProgramError;
+        use crate::programs::atoms::MaybeZero;
+        use crate::programs::types::TypeError;
+        use crate::tracing::TracingContext;
+
+        let input_shape = Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]);
+        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
+        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let output_cotangent = {
+            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+            context.tracer(atom, None)
+        };
+
+        assert!(matches!(
+            ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
+                &mut context,
+                &crate::programs::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type)],
+                &[MaybeZero::Value(output_cotangent)],
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+                if message == format!(
+                    "mean transpose reduced element count overflows usize for input shape {input_shape}",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_accepts_zero_reduced_element_count_without_overflow() {
+        use crate::partial::PartialValue;
+        use crate::programs::atoms::MaybeZero;
+        use crate::tracing::TracingContext;
+
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]));
+        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let output_cotangent = {
+            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+            context.tracer(atom, None)
+        };
+
+        let contributions = ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
+            .transpose(
+                &mut context,
+                &crate::programs::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type.clone())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type);
     }
 
     #[test]

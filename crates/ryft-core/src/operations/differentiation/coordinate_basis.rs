@@ -100,22 +100,20 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        match self.leaf_type.data_type().cotangent() {
-            None => {
-                return Err(TypeError {
-                    message: format!("coordinate basis requires a differentiable leaf type but got {}", self.leaf_type,),
-                });
-            }
-            Some(cotangent_data_type) if cotangent_data_type != self.leaf_type.data_type() => {
-                return Err(TypeError {
-                    message: format!(
-                        "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
-                        self.leaf_type,
-                        self.leaf_type.clone().with_data_type(cotangent_data_type),
-                    ),
-                });
-            }
-            Some(_) => {}
+        let cotangent_data_type = self.leaf_type.data_type().cotangent();
+        if cotangent_data_type.is_zero_space() {
+            return Err(TypeError {
+                message: format!("coordinate basis requires a differentiable leaf type but got {}", self.leaf_type,),
+            });
+        }
+        if cotangent_data_type != self.leaf_type.data_type() {
+            return Err(TypeError {
+                message: format!(
+                    "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
+                    self.leaf_type,
+                    self.leaf_type.clone().with_data_type(cotangent_data_type),
+                ),
+            });
         }
         let dimensions = self.leaf_type.shape().dimensions();
         if dimensions.iter().any(|size| matches!(size, Size::Dynamic(_))) {

@@ -2,8 +2,8 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::math::{Atan2, Atan2Operation};
@@ -13,6 +13,8 @@ use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
+use super::broadcasting::ElementwiseDifferentiableValue;
+
 impl<C: Context> DifferentiableOperation<C> for Atan2Operation
 where
     C::Value: Atan2
@@ -20,7 +22,9 @@ where
         + Sub<Output = C::Value>
         + Mul<Output = C::Value>
         + Div<Output = C::Value>
-        + Neg<Output = C::Value>,
+        + Neg<Output = C::Value>
+        + ElementwiseDifferentiableValue<C::Type>,
+    C::Type: DifferentiableType,
     Atan2Operation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -33,10 +37,35 @@ where
         let y = &inputs[0];
         let x = &inputs[1];
         let primal = y.primal().atan2(x.primal())?;
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'atan2' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
         // d(atan2(y, x)) = (x · dy - y · dx) / (x² + y²). Zero terms are dropped so the staged numerator stays as
         // small as its live tangents, and the tangent stays a symbolic zero when both input tangents are zeros.
-        let y_term = y.tangent().as_value().map(|tangent| x.primal().clone() * tangent.clone());
-        let x_term = x.tangent().as_value().map(|tangent| y.primal().clone() * tangent.clone());
+        let y_term = y
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    x.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
+        let x_term = x
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    y.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
         let numerator = match (y_term, x_term) {
             (None, None) => None,
             (Some(y_term), None) => Some(y_term),
@@ -44,9 +73,11 @@ where
             (Some(y_term), Some(x_term)) => Some(y_term - x_term),
         };
         let tangent = match numerator {
-            None => MaybeZero::Zero(primal.r#type().into_owned()),
+            None => MaybeZero::Zero(target),
             Some(numerator) => {
-                let denominator = x.primal().clone() * x.primal().clone() + y.primal().clone() * y.primal().clone();
+                let x_primal = x.primal().normalize_elementwise_tangent(&target)?;
+                let y_primal = y.primal().normalize_elementwise_tangent(&target)?;
+                let denominator = x_primal.clone() * x_primal + y_primal.clone() * y_primal;
                 MaybeZero::Value(numerator / denominator)
             }
         };
@@ -83,8 +114,9 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::operations::complex::{Imaginary, Real};
+    use crate::operations::manipulation::ConvertElementType;
     use crate::operations::math::Atan2;
-    use crate::tracing_v2::{gradient, value_and_gradient};
+    use crate::tracing_v2::{gradient, jvp, value_and_gradient};
 
     #[test]
     fn test_atan2_gradient_matches_the_analytic_derivatives() {
@@ -96,6 +128,18 @@ mod tests {
         let (y_gradient, x_gradient) = gradient_value;
         assert_abs_diff_eq!(y_gradient, x / (x * x + y * y), epsilon = 1e-9);
         assert_abs_diff_eq!(x_gradient, -y / (x * x + y * y), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_atan2_jvp_computes_widened_denominator_in_tangent_type() {
+        let y = Scalar::from(2.0f32).convert_element_type(crate::types::DataType::F8E8M0FNU).unwrap();
+        let x = Scalar::from(4.0f32).convert_element_type(crate::types::DataType::F8E8M0FNU).unwrap();
+        let (primal, tangent): (Scalar, Scalar) =
+            jvp(|(y, x)| y.atan2(&x), (y, x), (Scalar::from(1.0f32), Scalar::from(1.0f32))).unwrap();
+
+        assert!(matches!(primal, Scalar::F8E8M0FNU(_)));
+        let Scalar::F32(tangent) = tangent else { panic!("expected an f32 tangent") };
+        assert_abs_diff_eq!(tangent, 0.1f32, epsilon = 1e-6);
     }
 
     #[test]

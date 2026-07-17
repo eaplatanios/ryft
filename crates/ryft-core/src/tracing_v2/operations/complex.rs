@@ -1,7 +1,7 @@
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::complex::{
@@ -17,6 +17,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 impl<C: Context> DifferentiableOperation<C> for ComplexOperation
 where
+    C::Type: DifferentiableType,
     C: Zero<C::Value>,
     C::Value: Complex,
     ComplexOperation: Operation<C::Type>,
@@ -36,7 +37,7 @@ where
         // when only one is, the missing part is materialized as a real zero through the context so the staged
         // `complex` keeps its two-part arity.
         let tangent = match (real.tangent(), imaginary.tangent()) {
-            (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().into_owned()),
+            (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()),
             (real_tangent, imaginary_tangent) => MaybeZero::Value(
                 real_tangent
                     .clone()
@@ -55,6 +56,7 @@ where
 /// ignored — a known part contributes an additive constant whose adjoint is dropped at the pullback output boundary.
 impl<V: Value, O> TransposableOperation<V, O> for ComplexOperation
 where
+    V::Type: DifferentiableType,
     O: Operation<V::Type> + From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
     ComplexOperation: Operation<V::Type>,
 {
@@ -68,7 +70,7 @@ where
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect(),
+            MaybeZero::Zero(_) => inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect(),
             MaybeZero::Value(output_cotangent) => vec![
                 MaybeZero::Value(output_cotangent.unary(RealOperation)),
                 MaybeZero::Value(output_cotangent.unary(NegOperation).unary(ImaginaryOperation)),
@@ -105,6 +107,7 @@ where
 /// that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
 impl<V: Value, O: Operation<V::Type> + From<ConjugateOperation>> TransposableOperation<V, O> for ConjugateOperation
 where
+    V::Type: DifferentiableType,
     ConjugateOperation: Operation<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -117,7 +120,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().into_owned())],
+            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
             MaybeZero::Value(output_cotangent) => vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation))],
         })
     }
@@ -125,6 +128,7 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for RealOperation
 where
+    C::Type: DifferentiableType,
     C::Value: Real,
     RealOperation: Operation<C::Type>,
 {
@@ -140,7 +144,7 @@ where
         // Real-part extraction is ℝ-linear: `d(Re(z)) = Re(dz)`. A structural zero tangent stays symbolic, retyped
         // to the real output type.
         let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -152,6 +156,7 @@ where
 /// `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
 impl<V: Value, O> TransposableOperation<V, O> for RealOperation
 where
+    V::Type: DifferentiableType,
     O: Operation<V::Type> + From<ComplexOperation> + From<ZeroLikeOperation>,
     RealOperation: Operation<V::Type>,
 {
@@ -165,7 +170,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().into_owned())],
+            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
             MaybeZero::Value(output_cotangent) => {
                 let zero = output_cotangent.unary(ZeroLikeOperation);
                 vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation))]
@@ -176,6 +181,7 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for ImaginaryOperation
 where
+    C::Type: DifferentiableType,
     C::Value: Imaginary,
     ImaginaryOperation: Operation<C::Type>,
 {
@@ -191,7 +197,7 @@ where
         // Imaginary-part extraction is ℝ-linear: `d(Im(z)) = Im(dz)`. A structural zero tangent stays symbolic,
         // retyped to the real output type.
         let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -203,6 +209,7 @@ where
 /// `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary part.
 impl<V: Value, O> TransposableOperation<V, O> for ImaginaryOperation
 where
+    V::Type: DifferentiableType,
     O: Operation<V::Type> + From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
     ImaginaryOperation: Operation<V::Type>,
 {
@@ -216,7 +223,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().into_owned())],
+            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
             MaybeZero::Value(output_cotangent) => {
                 let zero = output_cotangent.unary(ZeroLikeOperation);
                 let negated = output_cotangent.unary(NegOperation);

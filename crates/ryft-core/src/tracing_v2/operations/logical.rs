@@ -50,6 +50,7 @@ logical_unsupported_transpose!(XorOperation);
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for NotOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<NotOperation>,
     NotOperation: Operation<C::Type>,
 {
@@ -74,6 +75,7 @@ where
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for AndOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<AndOperation>,
     AndOperation: Operation<C::Type>,
 {
@@ -98,6 +100,7 @@ where
 /// the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for OrOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<OrOperation>,
     OrOperation: Operation<C::Type>,
 {
@@ -122,6 +125,7 @@ where
 /// on the input primals and paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for XorOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<XorOperation>,
     XorOperation: Operation<C::Type>,
 {

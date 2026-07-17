@@ -20,16 +20,17 @@ use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::payloads::{Captured, Input};
 use crate::programs::operations::Operation;
+use crate::programs::regions::RegionRef;
 use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
+use crate::differentiation::forward::validate_tangent;
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{TypeError, Typed};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
-use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::types::{ArrayType, DataType};
 
 impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
@@ -98,7 +99,13 @@ where
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+        return Ok(inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
+            })
+            .collect());
     }
 
     // The rule operates on the attached branch regions through its driver (region 0 is the `true` branch and region 1
@@ -159,11 +166,14 @@ where
     let cotangents = operand_linear
         .iter()
         .zip(inputs)
-        .map(
-            |(&linear, input)| {
-                if linear { branch_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().into_owned()) }
-            },
-        )
+        .map(|(&linear, input)| {
+            if linear {
+                branch_cotangents.next().unwrap()
+            } else {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
+            }
+        })
         .collect();
     Ok(cotangents)
 }
@@ -356,7 +366,7 @@ where
             .iter()
             .cloned()
             .zip(tangent_outputs.iter().cloned())
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
             .collect())
     }
 }
@@ -366,7 +376,7 @@ where
 /// `while` module) so that the [`ArrayType`] and [`DataType`] rules stay coherent without the operation struct
 /// naming its type family as a parameter, and so that each family implementation carries exactly the capability
 /// bounds its rule needs.
-pub(crate) trait WhileJvp<C>: WhileTypeSemantics
+pub(crate) trait WhileJvp<C>: DifferentiableType + WhileTypeSemantics
 where
     C: Context<Type = Self>,
 {
@@ -397,9 +407,8 @@ where
 /// [`jvp_while_eagerly`], with no bound needed), and without a semantic
 /// [`iteration_bound`](crate::operations::control_flow::WhileOperation::with_iteration_bound) there is no statically
 /// shaped residual stack and no transposable form, so the rule reports
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) and the non-transposable unbounded-while boundary is
-/// preserved (the capture-based rule's unbounded regime stages a non-transposable doubled-state loop, which has
-/// no capture-free counterpart here).
+/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation), preserving the non-transposable staged
+/// unbounded-while boundary.
 ///
 /// For a bound `B`, the rule linearizes the body capture-free through its instruction-scoped driver,
 /// giving a primal body `[state] -> [next_state, residuals...]` and a tangent body
@@ -425,7 +434,7 @@ where
 /// scan re-key path into a captured-stack linear scan whose body re-keys the per-iteration `select` over its mask-item
 /// capture, and the single outer transpose flips the scan direction and transposes the body — the masked pushforward
 /// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
-/// cotangents pass through inactive batch items unchanged exactly like the capture-based rule.
+/// cotangents pass through inactive batch items unchanged.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Value: BooleanLike,
@@ -467,7 +476,8 @@ where
             let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
             check_count!("output", initial_mask, 1, ProgramError);
             let mut extended_inputs = inputs.to_vec();
-            extended_inputs.push(DifferentiationDual::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type)));
+            extended_inputs
+                .push(DifferentiationDual::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type.tangent())));
             // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
             // requested through the instruction-scoped driver over them.
             let mut outputs = driver.jvp_operation(
@@ -530,22 +540,22 @@ where
         while_outputs.truncate(state_count);
         let primal_outputs = while_outputs;
 
-        // Only *differentiable* state elements receive a masked per-iteration update. A non-differentiable state
-        // element (the `float0` analogue, such as batching's Boolean active-mask carry) has a structural-zero tangent,
+        // Only state elements with a tangent space receive a masked per-iteration update. A state element without one
+        // (such as batching's Boolean active-mask carry) has a structural-zero tangent,
         // so masking it with `select(mask_item, pushforward, carried)` would be an all-known select that contributes
         // no linear computation. Following JAX's structure, such an element instead passes its pushforward tangent
         // through directly, so the tangent body stays genuinely linear (no all-known select) and reverse mode does no
-        // dead work. Mask stacks and mask items are therefore produced only for differentiable elements, keeping the
+        // dead work. Mask stacks and mask items are therefore produced only for tangent-carrying elements, keeping the
         // scanned mask operands and the body's appended mask-item inputs aligned.
-        let element_is_differentiable =
-            state_types.iter().map(|state_type| state_type.cotangent().is_some()).collect::<Vec<_>>();
+        let element_has_tangent =
+            state_types.iter().map(|state_type| !state_type.tangent().is_zero_space()).collect::<Vec<_>>();
 
-        // Broadcast the Boolean `[B]` mask stack to a shape-congruent `[B, ...state_shape]` stack per differentiable
+        // Broadcast the Boolean `[B]` mask stack to a shape-congruent `[B, ...state_shape]` stack per tangent-carrying
         // state element, so each per-iteration select reads a mask slice that matches that element's shape (select
         // requires a shape-congruent condition). Scalar state elements reuse the `[B]` mask stack directly.
         let mut mask_stacks = Vec::new();
-        for (state_type, &is_differentiable) in state_types.iter().zip(element_is_differentiable.iter()) {
-            if !is_differentiable {
+        for (state_type, &has_tangent) in state_types.iter().zip(element_has_tangent.iter()) {
+            if !has_tangent {
                 continue;
             }
             if state_type.rank() == 0 {
@@ -563,7 +573,7 @@ where
             mask_stacks.push(broadcasted.remove(0));
         }
 
-        // Build the masked tangent scan body: the tangent body extended so each *differentiable* per-iteration output
+        // Build the masked tangent scan body: the tangent body extended so each tangent-carrying per-iteration output
         // is selected against that state element's mask item, with the mask items appended as extra scanned inputs
         // after the residual slices. A non-differentiable state element's output is its pushforward tangent unchanged.
         // The body input order `[state_tangent..., residual_slice..., mask_slice...]` keeps the leading `state_count`
@@ -572,9 +582,9 @@ where
         check_count!("output", tangent_program.output_ids(), state_count, ProgramError);
         let mask_item_types = state_types
             .iter()
-            .zip(element_is_differentiable.iter())
-            .filter_map(|(state_type, &is_differentiable)| {
-                is_differentiable.then(|| ArrayType::new(DataType::Boolean, state_type.shape().clone()))
+            .zip(element_has_tangent.iter())
+            .filter_map(|(state_type, &has_tangent)| {
+                has_tangent.then(|| ArrayType::new(DataType::Boolean, state_type.shape().clone()))
             })
             .collect::<Vec<_>>();
         let scan_body_input_types =
@@ -592,10 +602,10 @@ where
                         tangent_program.interpret_in_context(&context, inputs[..tangent_input_count].to_vec())?;
                     check_count!("output", pushforward_outputs, state_count, ProgramError);
                     let mut masked_outputs = Vec::with_capacity(state_count);
-                    for ((pushforward_output, carried_input), &is_differentiable) in
-                        pushforward_outputs.into_iter().zip(carried_inputs).zip(element_is_differentiable.iter())
+                    for ((pushforward_output, carried_input), &has_tangent) in
+                        pushforward_outputs.into_iter().zip(carried_inputs).zip(element_has_tangent.iter())
                     {
-                        if !is_differentiable {
+                        if !has_tangent {
                             masked_outputs.push(pushforward_output);
                             continue;
                         }
@@ -614,7 +624,7 @@ where
         };
 
         // Stage the length-`bound` tangent scan over the carry tangents followed by the stacked residuals and then the
-        // per-differentiable-state-element mask stacks. Iteration `item` reads residual slice `item` and mask slice
+        // per-tangent-carrying-state-element mask stacks. Iteration `item` reads residual slice `item` and mask slice
         // `item`.
         let tangent_scan = ScanOperation::<C::Constant>::new(state_count, bound);
         // The tangent scan takes every carry tangent as a real program input, so materialize structural zeros.
@@ -630,7 +640,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
             .collect())
     }
 }
@@ -663,16 +673,13 @@ impl<C: Context<Type = DataType>> WhileJvp<C> for DataType {
 /// not concretize to one scalar Boolean (e.g., a batched per-item predicate) and the caller must therefore fall back
 /// to the type family's staged strategy.
 ///
-/// Each iteration evaluates the condition on the concrete primal carries, unrolls any nested data-dependent `while`
-/// in the body at those carries (through the same value-level rewrite the reverse-mode pre-pass uses), fuses the
-/// unrolled body into its JVP program through the differentiation driver's program-taking request, and replays that
-/// fused program once over `[primal_carries ++ tangent_carries]` to advance both halves. Data-dependent trip counts
-/// therefore need no iteration bound — this is the analogue of
+/// Each iteration evaluates the condition on the concrete primal carries and interprets the body once over the
+/// current dual carries. Body instructions re-enter their JVP rules through the differentiation driver, so nested
+/// data-dependent `while` operations recurse through this same eager path without a program-level unroll pre-pass.
+/// Data-dependent trip counts therefore need no iteration bound — this is the analogue of
 /// [JAX's `jvp` through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) — while a
 /// semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching
-/// the bounded-`while` truncation semantics. Body effects fire while the loop runs (the correct all-known placement),
-/// once during the nested-`while` unroll interpretation and once during the fused replay, exactly as they did on the
-/// reverse-mode pre-pass path.
+/// the bounded-`while` truncation semantics. Each body effect executes exactly once per logical iteration.
 fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
     operation: &WhileOperation,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -683,6 +690,7 @@ fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
 ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, ProgramError>
 where
     C: Context + Zero<C::Value>,
+    C::Type: DifferentiableType,
     C::Value: BooleanLike,
     C::Operation: From<ZeroOperation<C::Type>>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
@@ -692,7 +700,7 @@ where
     let mut tangent_carries = Vec::with_capacity(state_count);
     for input in inputs {
         primal_carries.push(input.primal().clone());
-        tangent_carries.push(input.tangent().clone().materialize(context)?);
+        tangent_carries.push(input.tangent().clone());
     }
 
     let mut completed_iterations = 0;
@@ -718,16 +726,52 @@ where
             break;
         }
 
-        // Advance one iteration: unroll nested data-dependent loops at the current concrete carries, fuse the
-        // straight-line body into its JVP program, and replay it over both carry halves.
-        let body = unroll_concretizable_whiles(context, body.clone(), primal_carries.clone())?;
-        let fused_body = driver.jvp_program(body.entry_region_ref())?;
-        let mut combined_carries = primal_carries;
-        combined_carries.extend(tangent_carries);
-        let mut outputs = fused_body.interpret_in_context(context, combined_carries)?;
-        check_count!("output", outputs, 2 * state_count, ProgramError);
-        tangent_carries = outputs.split_off(state_count);
-        primal_carries = outputs;
+        // Advance one iteration by replaying the body directly over dual values. This is deliberately not routed
+        // through `unroll_concretizable_whiles`: that rewrite interprets the body to discover concrete nested-loop
+        // trip counts, after which replaying its fused JVP would execute primal effects a second time. Direct dual
+        // interpretation lets a nested while recurse through this eager rule and executes every primal operation once.
+        let input_duals = primal_carries
+            .drain(..)
+            .zip(tangent_carries.drain(..))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Vec<_>>();
+        let body_region = body.entry_region_ref();
+        let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
+            input_duals,
+            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.lift(constant.clone())?)),
+            |instruction, input_duals| {
+                for (index, dual) in input_duals.iter().enumerate() {
+                    validate_tangent(dual, "eager while body input", index)?;
+                }
+                let programs = instruction
+                    .regions()
+                    .iter()
+                    .map(|region| RegionRef::new(body_region.regions(), *region).map(RegionRef::to_program))
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero())
+                {
+                    let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+                    context
+                        .bind(instruction.operation().clone(), programs, primal_inputs.as_slice())?
+                        .into_iter()
+                        .map(DifferentiationDual::new_with_zero_tangent)
+                        .collect::<Vec<_>>()
+                } else {
+                    driver.jvp_operation(instruction.operation(), programs, context, input_duals)?
+                };
+                check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
+                for (index, dual) in output_duals.iter().enumerate() {
+                    validate_tangent(dual, "eager while body output", index)?;
+                }
+                Ok(output_duals)
+            },
+        )?;
+        check_count!("output", output_duals, state_count, ProgramError);
+        for dual in output_duals {
+            let (primal, tangent) = dual.into_parts();
+            primal_carries.push(primal);
+            tangent_carries.push(tangent);
+        }
         completed_iterations += 1;
     }
 
@@ -781,11 +825,10 @@ where
     /// Rejects transposition. This rule is only reachable for *unbounded* staged while loops — the doubled-state
     /// linear loop staged by the [`WhileOperation`] JVP rule, which recomputes primal state *forward* through
     /// the iterations, so transposing it would have to run that recomputation backwards, which a while loop cannot
-    /// express. Two paths avoid it entirely: concretizing domains unroll the loop into a straight-line pushforward
-    /// that transposes (so eager reverse-mode differentiation through unbounded while loops works), and bounded
-    /// loops ([`WhileOperation::with_iteration_bound`]) never stage a linear `while` — their tangent side is a
-    /// masked linear scan whose transpose is total, so reverse mode through staged bounded loops flows through the
-    /// scan transpose without reaching this rule.
+    /// express. Two paths avoid it entirely: eager domains execute the loop directly over concrete duals and record a
+    /// straight-line pushforward during linearization, and bounded loops ([`WhileOperation::with_iteration_bound`])
+    /// never stage a linear `while` — their tangent side is a masked linear scan whose transpose is total, so reverse
+    /// mode through staged bounded loops flows through the scan transpose without reaching this rule.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -795,7 +838,7 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
-                      while loops is not supported; eager differentiation unrolls the loop instead, and loops built \
+                      while loops is not supported; eager differentiation executes concrete duals, and loops built \
                       with `with_iteration_bound` stage a transposable masked scan)"
                 .to_string(),
         }
@@ -1092,7 +1135,7 @@ where
         // staged broadcast); the batched body's outputs are already aligned to the state axes by the fixed point.
         for (element, state_axis) in state.iter_mut().zip(state_axes.iter()) {
             if !state_axis.is_replicated() && element.batch_axis().is_replicated() {
-                *element = element.broadcast(0, axis_size)?;
+                *element = element.broadcast_with_dimension(0, axis_size, context.batch_dimension().clone())?;
             }
         }
         let state_values = state.iter().map(|element| element.value().clone()).collect::<Vec<_>>();
@@ -1246,7 +1289,7 @@ where
             return Ok(true_branch
                 .input_types()
                 .into_iter()
-                .map(|input_type| MaybeZero::Zero(input_type.clone()))
+                .map(|input_type| MaybeZero::Zero(input_type.cotangent()))
                 .collect());
         }
         let transposed_condition = ConditionOperation::new_captured(self.predicate().clone());
@@ -1286,11 +1329,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::programs::regions::RegionInterface;
     use std::borrow::Cow;
-
-    use crate::macros::check_types;
+    use std::cell::Cell;
     use std::fmt::Display;
+    use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1299,10 +1341,13 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_types;
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{One, OneLike, OneLikeOperation, Zero, ZeroLike, ZeroLikeOperation};
+    use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{ADD_OPERATION_NAME, AddOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing::DomainTracingContext;
@@ -1783,6 +1828,90 @@ mod tests {
         }
     }
 
+    /// Eager test context that counts each interpreted [`PrintOperation`]. Clones share the counter so nested
+    /// transformation contexts and region replay contribute to one observation.
+    #[derive(Clone, Debug)]
+    struct CountingPrintContext {
+        /// Number of print operations bound through this context.
+        print_count: Rc<Cell<usize>>,
+    }
+
+    impl CountingPrintContext {
+        /// Creates a context whose print count starts at zero.
+        fn new() -> Self {
+            Self { print_count: Rc::new(Cell::new(0)) }
+        }
+
+        /// Returns the number of print operations bound so far.
+        fn print_count(&self) -> usize {
+            self.print_count.get()
+        }
+    }
+
+    impl Domain for CountingPrintContext {
+        type Type = ArrayType;
+        type Value = TestArray;
+        type Constant = TestArray;
+        type Operation = TestArrayOperation;
+    }
+
+    impl Context for CountingPrintContext {
+        fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
+            Ok(constant)
+        }
+
+        fn bind<P: Into<Self::Operation>, D: crate::BindingRegionDriver<Self::Constant, Self::Operation>>(
+            &self,
+            operation: P,
+            driver: D,
+            inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            let operation = operation.into();
+            if matches!(operation, ArrayOperation::Print(_)) {
+                self.print_count.set(self.print_count.get() + 1);
+            }
+            EagerContext::<TestArray, Self::Operation>::new().bind(operation, driver, inputs)
+        }
+
+        fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {
+            crate::ValueResolution::Concrete(value.clone())
+        }
+
+        fn is_eager(&self) -> bool {
+            true
+        }
+    }
+
+    impl crate::operations::constants::Zero<TestArray> for CountingPrintContext {
+        fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+            crate::operations::constants::Zero::zero(&EagerContext::<TestArray>::new(), r#type)
+        }
+    }
+
+    impl crate::operations::constants::One<TestArray> for CountingPrintContext {
+        fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+            crate::operations::constants::One::one(&EagerContext::<TestArray>::new(), r#type)
+        }
+    }
+
+    impl crate::operations::constants::Fill<Scalar, TestArray> for CountingPrintContext {
+        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
+            crate::operations::constants::Fill::fill(&EagerContext::<TestArray>::new(), r#type, value)
+        }
+    }
+
+    impl crate::operations::constants::Iota<TestArray> for CountingPrintContext {
+        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
+            crate::operations::constants::Iota::iota(&EagerContext::<TestArray>::new(), r#type, dimension)
+        }
+    }
+
+    impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for CountingPrintContext {
+        fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
+            Ok(value)
+        }
+    }
+
     /// Builds the `state < threshold` while condition program over one scalar state element.
     fn scalar_threshold_condition(
         threshold: f64,
@@ -1811,6 +1940,19 @@ mod tests {
             .unwrap();
         let operation = WhileOperation::new().with_iteration_bound(bound).unwrap();
         (operation, vec![scalar_threshold_condition(threshold), body])
+    }
+
+    /// Builds `while (x < 8) { print(x); x = 2 * x }`, whose input `1` executes exactly three body iterations.
+    fn effectful_doubling_while_operation()
+    -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+        let condition = scalar_threshold_condition(8.0);
+        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let input = body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let printed = body_builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![input]).unwrap()[0];
+        let two = body_builder.add_constant(TestArray::scalar(2.0));
+        let output = body_builder.add_instruction(MulOperation, Vec::new(), vec![printed, two]).unwrap()[0];
+        let body = body_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        (WhileOperation::new(), vec![condition, body])
     }
 
     /// Builds the `while (x < threshold) { x = x * x }` loop with the provided semantic iteration bound. Squaring
@@ -2019,6 +2161,31 @@ mod tests {
             .unwrap();
         assert_eq!(value.values, vec![8.0]);
         assert_eq!(gradient.values, vec![8.0]);
+    }
+
+    #[test]
+    fn test_unbounded_while_eager_jvp_executes_body_effects_once_per_iteration() {
+        let context = CountingPrintContext::new();
+        let observed_context = context.clone();
+        let (while_operation, while_regions) = effectful_doubling_while_operation();
+        let (primal, tangent) = context
+            .jvp(
+                move |x| {
+                    let mut outputs = x.context().bind(
+                        TestArrayOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[x.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(1.0),
+                TestArray::scalar(1.0),
+            )
+            .unwrap();
+
+        assert_eq!(primal.values, vec![8.0]);
+        assert_eq!(tangent.values, vec![8.0]);
+        assert_eq!(observed_context.print_count(), 3);
     }
 
     #[test]
@@ -2322,7 +2489,7 @@ mod tests {
     #[test]
     fn test_unbounded_while_staged_jvp_reports_unsupported_operation() {
         // Phase 0 boundary pin for the first-class-program-regions plan: an unbounded while loop has no staged
-        // forward-mode rule (the eager path unrolls instead), so no while-produced residual can ever reach a staged
+        // forward-mode rule (the eager path executes concrete duals instead), so no while-produced residual can reach a staged
         // linearization boundary through this path. The lazy residual-origin design relies on this rejection.
         fn unbounded_while<V>(x: V) -> Result<V, ProgramError>
         where

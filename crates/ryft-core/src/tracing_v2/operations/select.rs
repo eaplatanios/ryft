@@ -2,7 +2,9 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -17,6 +19,8 @@ use crate::differentiation::{DifferentiationDriver, DifferentiationDual, Transpo
 use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{TypeError, Typed};
 use crate::types::{ArrayType, DataType};
+
+use super::broadcasting::ElementwiseDifferentiableValue;
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
 ///
@@ -168,8 +172,10 @@ where
 /// wherever `LinearSelectOperation<F>` implements [`Operation`] for it (i.e., [`DataType`] and [`ArrayType`]).
 impl<V: Value, O: Operation<V::Type>, F: Clone> TransposableOperation<V, O> for LinearSelectOperation<F>
 where
+    V::Type: DifferentiableType,
     Self: Operation<V::Type>,
     O: From<ZeroOperation<V::Type>> + From<LinearSelectOperation<F>>,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -182,19 +188,25 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
-                let zero = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+                let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
                 let operation = || O::from(LinearSelectOperation::new(self.condition().clone()));
                 let on_true = context.stage_operation(operation(), Vec::new(), &[cotangent.clone(), zero.clone()])?;
                 check_count!("output", on_true, 1, ProgramError);
                 let on_false = context.stage_operation(operation(), Vec::new(), &[zero, cotangent.clone()])?;
                 check_count!("output", on_false, 1, ProgramError);
+                let on_true_type = inputs[0].r#type().cotangent();
+                let on_false_type = inputs[1].r#type().cotangent();
                 Ok(vec![
-                    MaybeZero::Value(on_true.into_iter().next().unwrap()),
-                    MaybeZero::Value(on_false.into_iter().next().unwrap()),
+                    MaybeZero::Value(
+                        on_true.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_true_type)?,
+                    ),
+                    MaybeZero::Value(
+                        on_false.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_false_type)?,
+                    ),
                 ])
             }
         }
@@ -216,8 +228,10 @@ where
 /// [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
 impl<V: Value, O> TransposableOperation<V, O> for SelectOperation
 where
+    V::Type: DifferentiableType,
     SelectOperation: Operation<V::Type>,
     O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -229,7 +243,13 @@ where
         check_count!("input", inputs, 3, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
+            MaybeZero::Zero(_) => Ok(inputs
+                .iter()
+                .map(|input| {
+                    let input_type = input.r#type();
+                    MaybeZero::Zero(input_type.cotangent())
+                })
+                .collect()),
             MaybeZero::Value(cotangent) => {
                 // The condition is the known operand; the dispatch guarantees a `Known` operand carries its pullback
                 // value, so read the tracer directly.
@@ -237,7 +257,7 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zero = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
+                let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
                 let on_true = context.stage_operation(
                     SelectOperation,
                     Vec::new(),
@@ -247,10 +267,16 @@ where
                 let on_false =
                     context.stage_operation(SelectOperation, Vec::new(), &[condition, zero, cotangent.clone()])?;
                 check_count!("output", on_false, 1, ProgramError);
+                let on_true_type = inputs[1].r#type().cotangent();
+                let on_false_type = inputs[2].r#type().cotangent();
                 Ok(vec![
-                    MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                    MaybeZero::Value(on_true.into_iter().next().unwrap()),
-                    MaybeZero::Value(on_false.into_iter().next().unwrap()),
+                    MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                    MaybeZero::Value(
+                        on_true.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_true_type)?,
+                    ),
+                    MaybeZero::Value(
+                        on_false.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_false_type)?,
+                    ),
                 ])
             }
         }
@@ -263,7 +289,9 @@ where
 /// tangents are canonical staged zeros, the output tangent is a canonical staged zero of the output type.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for SelectOperation
 where
+    C::Type: DifferentiableType,
     C::Operation: From<SelectOperation>,
+    C::Value: ElementwiseDifferentiableValue<C::Type>,
     SelectOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -287,7 +315,7 @@ where
         check_count!("output", primal, 1, ProgramError);
         let primal = primal.remove(0);
         let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().into_owned())
+            MaybeZero::Zero(primal.r#type().tangent())
         } else {
             // A select needs both branch tangents as real values, so materialize the structurally zero side.
             let on_true_tangent = on_true.tangent().clone().materialize(context)?;
@@ -298,7 +326,8 @@ where
                 &[condition.primal().clone(), on_true_tangent, on_false_tangent],
             )?;
             check_count!("output", tangents, 1, ProgramError);
-            MaybeZero::Value(tangents.remove(0))
+            let output_tangent_type = primal.r#type().tangent();
+            MaybeZero::Value(tangents.remove(0).normalize_elementwise_tangent(&output_tangent_type)?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
@@ -316,6 +345,7 @@ mod tests {
     use crate::operations::math::Add;
     use crate::tests::TestArray;
     use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, jacrev};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::LinearSelectOperation;
 
@@ -381,6 +411,49 @@ mod tests {
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[3], 3.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_select_jacrev_unbroadcasts_mixed_precision_scalar_branches() {
+        let scalar = TestArray::new(ArrayType::scalar(DataType::F32), vec![5.0]);
+        let f32_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let vector = TestArray::new(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
+
+        let jacobian = jacrev(
+            |(scalar, vector)| {
+                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                Select::select(&condition, &scalar, &vector)
+            },
+            (scalar.clone(), vector.clone()),
+        )
+        .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().r#type, f32_vector_type);
+        assert_eq!(blocks[0].value().values, vec![1.0, 0.0]);
+        assert_eq!(
+            blocks[1].value().r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(blocks[1].value().values, vec![0.0, 0.0, 0.0, 1.0]);
+
+        let jacobian = jacrev(
+            |(scalar, vector)| {
+                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                Select::select(&condition, &vector, &scalar)
+            },
+            (scalar, vector),
+        )
+        .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().r#type, f32_vector_type);
+        assert_eq!(blocks[0].value().values, vec![0.0, 1.0]);
+        assert_eq!(
+            blocks[1].value().r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(blocks[1].value().values, vec![1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -453,18 +526,6 @@ mod tests {
         assert_abs_diff_eq!(gradient.1, 3.0, epsilon = 1e-9);
     }
 
-    /// Minimal operation enum hosting the primal [`SelectOperation`] (used for both the forward select and its staged
-    /// adjoint selects) plus the structural `zero` and `add` operations the transpose pass needs. The `Constant`
-    /// variant carries the value parameter `V` so the [`Operation`] derive can infer the primary type.
-    #[derive(Clone, Debug, ryft_macros::Operation)]
-    #[ryft(dispatch(transposition))]
-    enum TestSelectOperation<V: crate::programs::Value<Type = crate::types::ArrayType>> {
-        Zero(crate::operations::constants::ZeroOperation<crate::types::ArrayType>),
-        Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(crate::operations::math::AddOperation),
-        Select(crate::operations::control_flow::SelectOperation),
-    }
-
     #[test]
     fn test_select_partitioned_transpose_matches_captured_condition_select_adjoint() {
         use crate::operations::BooleanLike;
@@ -482,7 +543,7 @@ mod tests {
 
         // Build `select(condition, on_true, on_false)` over the test enum, treat only the branches as linear, and
         // interpret the pullback on `[cotangent, condition]`.
-        let mut builder = ProgramBuilder::<TestArray, TestSelectOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
         let condition_input = builder.add_input(condition_type.clone());
         let on_true_input = builder.add_input(branch_type.clone());
         let on_false_input = builder.add_input(branch_type.clone());

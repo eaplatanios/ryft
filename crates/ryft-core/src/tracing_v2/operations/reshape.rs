@@ -1,8 +1,8 @@
 use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, InterpretableBatchableOperation};
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -113,7 +113,7 @@ where
             MaybeZero::Value(cotangent) => {
                 Ok(vec![MaybeZero::Value(cotangent.reshape(inputs[0].r#type().shape().clone())?)])
             }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
     }
 }
@@ -135,7 +135,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reshape(self.output_shape().clone())?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(self.output_shape().clone())?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])

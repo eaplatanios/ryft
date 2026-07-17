@@ -2,19 +2,23 @@ use std::ops::{Add, Div, Mul};
 
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::math::{Exp, ExpOperation, Log, LogOperation, Sqrt, SqrtOperation};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
+use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
+use super::broadcasting::ElementwiseDifferentiableValue;
+
 impl<C: Context> DifferentiableOperation<C> for ExpOperation
 where
-    C::Value: Exp + Mul<Output = C::Value>,
+    C::Type: DifferentiableType,
+    C::Value: Exp + Mul<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
     ExpOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -26,11 +30,22 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().exp()?;
-        // d(eˣ) = eˣ · dx, reusing the primal result as the coefficient (this also holds for the complex analytic
-        // continuation). A structural zero tangent stays symbolic.
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'exp' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
+        // d(eˣ) = eˣ · dx (this also holds for the complex analytic continuation). A structural zero tangent
+        // stays symbolic. Compute the coefficient from the input normalized to the output tangent descriptor before
+        // multiplying so a wider differential representation does not inherit primal rounding or range limitations.
         let tangent = match input.tangent() {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(primal.clone() * tangent.clone()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(target),
+            MaybeZero::Value(tangent) => {
+                let coefficient = input.primal().normalize_elementwise_tangent(&target)?.exp()?;
+                MaybeZero::Value(coefficient * tangent.normalize_elementwise_tangent(&target)?)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
@@ -59,7 +74,8 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for LogOperation
 where
-    C::Value: Log + Div<Output = C::Value>,
+    C::Type: DifferentiableType,
+    C::Value: Log + Div<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
     LogOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -71,11 +87,22 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().log()?;
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'log' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
         // d(ln x) = dx / x (this also holds for the principal branch of the complex logarithm away from its cut). A
-        // structural zero tangent stays symbolic.
+        // structural zero tangent stays symbolic. Normalize the tangent and primal denominator before dividing because
+        // the output tangent descriptor may be wider than the primal representation.
         let tangent = match input.tangent() {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.clone() / input.primal().clone()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(target),
+            MaybeZero::Value(tangent) => MaybeZero::Value(
+                tangent.normalize_elementwise_tangent(&target)?
+                    / input.primal().normalize_elementwise_tangent(&target)?,
+            ),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
@@ -104,7 +131,8 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for SqrtOperation
 where
-    C::Value: Sqrt + Add<Output = C::Value> + Div<Output = C::Value>,
+    C::Type: DifferentiableType,
+    C::Value: Sqrt + Add<Output = C::Value> + Div<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
     SqrtOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -116,11 +144,22 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().sqrt()?;
-        // d(√x) = dx / (2 · √x), reusing the primal result in the denominator (this also holds for the principal
-        // branch of the complex square root away from its cut). A structural zero tangent stays symbolic.
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'sqrt' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
+        // d(√x) = dx / (2 · √x) (this also holds for the principal branch of the complex square root away from
+        // its cut). A structural zero tangent stays symbolic. Compute the denominator from the input normalized to the
+        // output tangent descriptor so a wider differential representation does not inherit primal rounding.
         let tangent = match input.tangent() {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.clone() / (primal.clone() + primal.clone())),
+            MaybeZero::Zero(_) => MaybeZero::Zero(target),
+            MaybeZero::Value(tangent) => {
+                let denominator = input.primal().normalize_elementwise_tangent(&target)?.sqrt()?;
+                MaybeZero::Value(tangent.normalize_elementwise_tangent(&target)? / (denominator.clone() + denominator))
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
@@ -154,8 +193,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::contexts::EagerContext;
     use crate::operations::math::{Exp, Log, Sqrt};
-    use crate::tracing_v2::{ReverseModeDifferentiate, gradient, value_and_gradient_holomorphic};
+    use crate::programs::types::Typed;
+    use crate::tests::TestArray;
+    use crate::tracing_v2::{
+        ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate, gradient, value_and_gradient_holomorphic,
+    };
+    use crate::types::{ArrayType, DataType};
 
     #[test]
     fn test_exponential_family_gradients() {
@@ -185,5 +230,24 @@ mod tests {
         let gradient_value = domain.gradient_holomorphic(|x| x.exp().unwrap().log().unwrap(), Scalar::from(z)).unwrap();
         let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
         assert!((actual - ComplexNumber::new(1.0, 0.0)).norm() < 1e-12, "expected a unit derivative but got {actual}",);
+    }
+
+    #[test]
+    fn test_exponential_family_jvps_compute_in_widened_tangent_type() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+
+        let (_, exponential_tangent) = context.jvp(|input| input.exp(), primal.clone(), input_tangent.clone()).unwrap();
+        assert_eq!(exponential_tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(exponential_tangent.values()[0], 3.0 * 2.0f64.exp(), epsilon = 1e-9);
+
+        let (_, logarithm_tangent) = context.jvp(|input| input.log(), primal.clone(), input_tangent.clone()).unwrap();
+        assert_eq!(logarithm_tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(logarithm_tangent.values()[0], 1.5, epsilon = 1e-9);
+
+        let (_, square_root_tangent) = context.jvp(|input| input.sqrt(), primal, input_tangent).unwrap();
+        assert_eq!(square_root_tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(square_root_tangent.values()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-9);
     }
 }

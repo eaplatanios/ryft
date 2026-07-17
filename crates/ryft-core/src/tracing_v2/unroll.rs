@@ -1,14 +1,9 @@
-//! Eager unroll-then-fuse pre-pass.
+//! Test support for the eager unroll-then-fuse program pipeline.
 //!
-//! Eager differentiation domains (whose
-//! [`is_eager`](Context::is_eager) returns `true`) can
-//! differentiate unbounded, data-dependent `while` loops by unrolling them at the concrete primal
-//! state. Reverse mode needs that unrolling at the *program* level: transposition consumes a primal [`Program`], so
-//! given a traced primal [`Program`] and the concrete input values at which it is being differentiated,
-//! [`unroll_concretizable_whiles`] rewrites it into an equivalent straight-line [`Program`] with every concretizable
-//! `while` unrolled, which the capture-free path then consumes unchanged: an unrolled straight-line primal program
-//! produces a control-flow-free tangent program that the existing partitioned transposition handles. (Forward mode
-//! needs no pre-pass: the `while` forward-mode rule runs data-dependent loops directly at the concrete duals.)
+//! The production eager `while` JVP rule interprets each loop body directly over dual values. Tests use
+//! [`unroll_concretizable_whiles`] as an independent program-level oracle: given a traced primal [`Program`] and the
+//! concrete inputs at which it is being differentiated, the helper rewrites every concretizable `while` into an
+//! equivalent straight-line program that can pass through the ordinary capture-free differentiation pipeline.
 //!
 //! The rewrite is a dual-table pass over the source program's atoms. Each source atom is threaded with both (a) its
 //! concrete value, used to evaluate `while` conditions and drive trip counts, and (b) the [`AtomId`] of the
@@ -43,10 +38,9 @@ use crate::programs::regions::RegionRef;
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.
 ///
-/// This is the eager unroll-then-fuse pre-pass. It is value-level (`Program -> Program` over the domain's operation and
-/// value types) and carries no recursive trait obligation, so it composes with the front ends without growing the
-/// trait-solver obligation graph. The returned program has the same input and output parameter structures as `program`,
-/// so it slots in transparently before the JVP / linearization build.
+/// This test-only oracle is value-level (`Program -> Program` over the domain's operation and value types) and carries
+/// no recursive trait obligation. The returned program has the same input and output parameter structures as
+/// `program`, so tests can feed it directly to the JVP or linearization pipeline.
 ///
 /// The rewrite runs only when the context
 /// [is eager](Context::is_eager): only eager domains,

@@ -16,9 +16,12 @@
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
@@ -33,10 +36,11 @@ use crate::types::ArrayType;
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
 /// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input
-/// cotangent is distributed like the input. An input that carries no sharding receives its cotangent unconstrained.
+/// cotangent is distributed like the input. An input that carries no sharding receives an exactly unsharded
+/// cotangent through an identity-axis broadcast.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshardOperation
 where
-    O: Operation<ArrayType> + From<ReshardOperation>,
+    O: Operation<ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -47,15 +51,19 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        let input_cotangent_type = inputs[0].r#type().cotangent();
         match &outputs[0] {
             MaybeZero::Value(cotangent) => {
-                let contribution = match inputs[0].r#type().sharding() {
-                    Some(input_sharding) => cotangent.reshard(&input_sharding.cotangent()),
-                    None => cotangent.clone(),
+                let contribution = match input_cotangent_type.sharding() {
+                    Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding),
+                    None => cotangent.broadcast(
+                        input_cotangent_type.clone(),
+                        &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
+                    )?,
                 };
                 Ok(vec![MaybeZero::Value(contribution)])
             }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_cotangent_type)]),
         }
     }
 }
@@ -77,7 +85,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reshard(self.sharding());
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(self.sharding())),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -133,7 +141,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.constrain_sharding(self.sharding()))]),
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
     }
 }
@@ -155,7 +163,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().constrain_sharding(self.sharding());
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(self.sharding())),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -204,6 +212,7 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::linear::DenseDifferentiate;
     use crate::types::{DataType, Shape, Size};
 
     use crate::tracing::Trace;
@@ -262,12 +271,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reshard_transposition_passes_through_an_unsharded_input() {
+    fn test_reshard_transposition_restores_an_unsharded_input_cotangent() {
         let mesh = mesh();
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        // The input carries no sharding, so the reshard's cotangent flows back unconstrained — the pullback stages no
-        // reshard transposition at all.
-        let (_output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(8)]));
+        let input = TestArray::new(input_type.clone(), vec![1.0; 8]);
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 {
                     let target = target.clone();
@@ -275,16 +284,32 @@ mod tests {
                         Ok(x.reshard(&target))
                     }
                 },
-                TestArray::vector(vec![1.0; 8]),
+                input.clone(),
             )
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
-        assert!(
-            !pullback
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayOperation::Reshard(_))),
-            "an unsharded input should not stage a reshard transposition",
+        let cotangent = pullback.apply(TestArray::new(output.r#type().cotangent(), vec![1.0; 8])).unwrap();
+        assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent());
+        assert_eq!(cotangent.values(), &[1.0; 8]);
+
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jacrev(
+                {
+                    let target = target.clone();
+                    move |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                        Ok(x.reshard(&target))
+                    }
+                },
+                input,
+            )
+            .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.input_type(), &input_type);
+        assert_eq!(block.value().r#type().data_type(), DataType::F32);
+        assert_eq!(block.value().r#type().static_shape().unwrap().as_slice(), &[8, 8]);
+        assert_eq!(block.value().r#type().sharding(), None);
+        assert_eq!(
+            block.value().values(),
+            &(0..64).map(|index| if index / 8 == index % 8 { 1.0 } else { 0.0 }).collect::<Vec<_>>(),
         );
     }
 

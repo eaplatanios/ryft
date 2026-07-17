@@ -1,7 +1,9 @@
 use std::ops::{Add, Mul};
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::math::MulOperation;
 use crate::partial::PartialValue;
@@ -11,11 +13,13 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::programs::types::Typed;
+use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 impl<C: Context> DifferentiableOperation<C> for MulOperation
 where
-    C::Value: Mul<Output = C::Value> + Add<Output = C::Value>,
     MulOperation: Operation<C::Type>,
+    C::Type: DifferentiableType,
+    C::Value: Mul<Output = C::Value> + Add<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -30,14 +34,39 @@ where
         // Product rule: each surviving term is a primal-operand-times-tangent product, shape-congruent with the primal
         // output so the staged `Mul` needs no broadcasting. Zero terms are dropped so the program stays as small
         // as the capture-based pushforward.
-        let left_term = left.tangent().as_value().map(|tangent| right.primal().clone() * tangent.clone());
-        let right_term = right.tangent().as_value().map(|tangent| left.primal().clone() * tangent.clone());
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'mul' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
+        let left_term = left
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    right.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
+        let right_term = right
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    left.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
         // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
         let tangent = left_term
             .into_iter()
             .chain(right_term)
             .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
+            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
@@ -56,6 +85,8 @@ where
 impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation<V, O> for MulOperation
 where
     MulOperation: Operation<V::Type>,
+    V::Type: DifferentiableType,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -78,18 +109,34 @@ where
             // and the known operand contributes a structural zero. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {
                 let (linear_index, known_index) = if left_is_linear { (0, 1) } else { (1, 0) };
+                let target = inputs[linear_index].r#type().cotangent();
+                if target.is_zero_space() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "'mul' linear input has no cotangent space".to_string(),
+                    }
+                    .into());
+                }
                 let contribution = match &outputs[0] {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(target),
                     MaybeZero::Value(output_cotangent) => {
                         // The dispatch guarantees a `Known` operand carries its pullback value, so read it directly.
                         let known_value = inputs[known_index]
                             .as_known()
                             .expect("dispatch guarantees a known operand carries its pullback value");
-                        MaybeZero::Value(known_value.binary(output_cotangent, MulOperation))
+                        let output_type = output_cotangent.r#type();
+                        let contribution = known_value
+                            .normalize_elementwise_tangent(output_type.as_ref())?
+                            .binary(output_cotangent, MulOperation);
+                        MaybeZero::Value(contribution.unbroadcast_elementwise_cotangent(&target)?)
                     }
                 };
-                let mut contributions =
-                    inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect::<Vec<_>>();
+                let mut contributions = inputs
+                    .iter()
+                    .map(|input| {
+                        let input_type = input.r#type();
+                        MaybeZero::Zero(input_type.cotangent())
+                    })
+                    .collect::<Vec<_>>();
                 contributions[linear_index] = contribution;
                 Ok(contributions)
             }

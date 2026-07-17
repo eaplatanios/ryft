@@ -1,6 +1,8 @@
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -8,6 +10,7 @@ use crate::operations::manipulation::{
     Broadcast, Pad, PadOperation, Reshape, Slice, SliceOperation, Transpose, UpdateSlice,
 };
 use crate::operations::math::SubOperation;
+use crate::operations::sharding::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, Value};
@@ -59,8 +62,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let input_type = inputs[0].r#type();
@@ -107,7 +110,7 @@ where
                 let sliced_sum = if input_is_empty {
                     // The strided slice covered no positions, so its sum is a scalar zero of the padding value's
                     // type.
-                    MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?
                 } else {
                     let sliced_sums = context.stage_operation(
                         ReduceOperation::new(all_axes, ReductionKind::Sum),
@@ -179,7 +182,7 @@ where
 impl<C> BatchableOperation<C> for PadOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     PadOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -217,6 +220,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
@@ -344,27 +348,112 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_batching_expands_an_empty_batch() {
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
-        let input = ArrayBatch::new(input_type.clone(), TestArray::new(input_type, Vec::new()), Some(0)).unwrap();
-        let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
-        let padding = ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, Vec::new()), Some(0)).unwrap();
-
-        let outputs = PadOperation::new(vec![1], vec![0], vec![0])
-            .unwrap()
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 0, None),
-                &crate::EmptyRegionDriver,
-                &[input, padding],
+    fn test_pad_batching_expansion_preserves_batch_placement() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
             )
             .unwrap();
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]))
+                .with_sharding(physical_sharding)
+                .unwrap();
+            let input = ArrayBatch::new(
+                input_type.clone(),
+                TestArray::new(input_type, vec![1.0, 2.0, 3.0, 4.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh,
+                        vec![ShardingDimension::sharded(["x"])],
+                        Vec::<String>::new(),
+                        Vec::<String>::new(),
+                        (axis_type == MeshAxisType::Manual).then_some("x"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let padding =
+                ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, vec![8.0, 9.0]), BatchAxis::new(0))
+                    .unwrap();
+            let context = BatchingContext::with_batch_dimension(
+                EagerContext::<TestArray>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
 
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            *outputs[0].value().r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)])),
-        );
-        assert!(outputs[0].value().values.is_empty());
+            let outputs = PadOperation::new(vec![1], vec![0], vec![0])
+                .unwrap()
+                .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(
+                outputs[0].r#type().sharding().unwrap().dimensions(),
+                &[ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+            );
+            assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
+        }
+    }
+
+    #[test]
+    fn test_pad_batching_expands_an_empty_batch() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]))
+                .with_sharding(physical_sharding.clone())
+                .unwrap();
+            let input =
+                ArrayBatch::new(input_type.clone(), TestArray::new(input_type, Vec::new()), BatchAxis::new(0)).unwrap();
+            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]))
+                .with_sharding(
+                    Sharding::with_manual_axes(
+                        mesh,
+                        vec![ShardingDimension::sharded(["x"])],
+                        Vec::<String>::new(),
+                        Vec::<String>::new(),
+                        (axis_type == MeshAxisType::Manual).then_some("x"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let padding =
+                ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, Vec::new()), BatchAxis::new(0))
+                    .unwrap();
+            let context = BatchingContext::with_batch_dimension(
+                EagerContext::<TestArray>::new(),
+                0,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+
+            let outputs = PadOperation::new(vec![1], vec![0], vec![0])
+                .unwrap()
+                .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
+            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(3)]);
+            assert!(outputs[0].value().values.is_empty());
+        }
     }
 }

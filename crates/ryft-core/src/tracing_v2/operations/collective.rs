@@ -5,7 +5,9 @@ use crate::axes::{AxisError, NamedAxes};
 use crate::backends::scalars::Scalar;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{FillOperation, IotaOperation};
@@ -290,14 +292,14 @@ where
         }
         // A known (non-linear) operand contributes no cotangent.
         if inputs[0].is_known() {
-            return Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]);
+            return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]);
         }
         match &outputs[0] {
             MaybeZero::Value(cotangent) => {
                 let contribution = stage_collective(context, &self.axis_name, self.kind, cotangent)?;
                 Ok(vec![MaybeZero::Value(contribution)])
             }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
     }
 }
@@ -520,6 +522,7 @@ where
 /// is replayed and paired with a typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for AxisIndexOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<AxisIndexOperation>,
     AxisIndexOperation: Operation<C::Type>,
 {

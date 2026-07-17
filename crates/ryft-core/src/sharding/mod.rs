@@ -85,6 +85,17 @@ pub enum MeshAxisType {
     Manual,
 }
 
+impl Display for MeshAxisType {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(formatter, "auto"),
+            Self::Explicit => write!(formatter, "explicit"),
+            Self::Manual => write!(formatter, "manual"),
+        }
+    }
+}
+
 /// Named axis in a [`LogicalMesh`]. Each axis represents one dimension of the device grid with a human-readable name,
 /// a size (i.e., the number of devices along that dimension), and a [`MeshAxisType`] that controls sharding propagation
 /// behavior for that axis.
@@ -886,7 +897,7 @@ impl Display for Sharding {
             self.mesh
                 .axes
                 .iter()
-                .map(|axis| format!("'{}'={}", axis.name.replace('\'', "\\'"), axis.size))
+                .map(|axis| format!("'{}'={}:{}", axis.name.replace('\'', "\\'"), axis.size, axis.r#type))
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
@@ -1080,7 +1091,20 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 })
         );
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
-        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced={'manual'}}",);
+        assert_eq!(
+            sharding.to_string(),
+            "{mesh<['data'=4:explicit, 'manual'=2:manual]>, [{'data'}, {}], reduced={'manual'}}",
+        );
+
+        let auto = Sharding::replicated(
+            LogicalMesh::new(vec![MeshAxis::new("data", 4, MeshAxisType::Auto).unwrap()]).unwrap(),
+            1,
+        );
+        let explicit = Sharding::replicated(
+            LogicalMesh::new(vec![MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            1,
+        );
+        assert_ne!(auto.to_string(), explicit.to_string());
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -1100,7 +1124,7 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 3, rank: 3 })
         );
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
-        assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
+        assert_eq!(replicated.to_string(), "{mesh<['data'=4:explicit, 'manual'=2:manual]>, [{}, {}, {}]}");
 
         assert!(matches!(
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["z"])]),

@@ -2,8 +2,8 @@ use std::ops::{Add, Div, Mul, Neg};
 
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::macros::check_count;
 use crate::operations::constants::OneLike;
@@ -14,10 +14,17 @@ use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
+use super::broadcasting::ElementwiseDifferentiableValue;
+
 impl<C: Context> DifferentiableOperation<C> for DivOperation
 where
-    C::Value:
-        OneLike + Add<Output = C::Value> + Div<Output = C::Value> + Mul<Output = C::Value> + Neg<Output = C::Value>,
+    C::Value: OneLike
+        + Add<Output = C::Value>
+        + Div<Output = C::Value>
+        + Mul<Output = C::Value>
+        + Neg<Output = C::Value>
+        + ElementwiseDifferentiableValue<C::Type>,
+    C::Type: DifferentiableType,
     DivOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -30,25 +37,44 @@ where
         let left = &inputs[0];
         let right = &inputs[1];
         let primal = left.primal().clone() / right.primal().clone();
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'div' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
         // Quotient rule `d(a/b) = (1/b)*da - (a/b²)*db`, with each coefficient built as a fresh primal operation on the
         // primal tracers and then multiplied by the input tangent. Expressing each tangent term as a primal-coefficient
         // `Mul` (rather than a `Div` of the tangent) keeps the tangent map in the bilinear-`Mul` form that both the
         // scalar and array tangent transposers fold into closed constant factors. Zero terms are dropped so the
         // tangent stays minimal.
-        let left_term = left.tangent().as_value().map(|tangent| {
-            let reciprocal = right.primal().one_like() / right.primal().clone();
-            reciprocal * tangent.clone()
-        });
-        let right_term = right.tangent().as_value().map(|tangent| {
-            let denominator = right.primal().clone() * right.primal().clone();
-            -(left.primal().clone() / denominator) * tangent.clone()
-        });
+        let left_term = left
+            .tangent()
+            .as_value()
+            .map(|tangent| -> Result<_, DifferentiationError> {
+                let right_primal = right.primal().normalize_elementwise_tangent(&target)?;
+                let reciprocal = right_primal.one_like() / right_primal;
+                Ok(reciprocal * tangent.normalize_elementwise_tangent(&target)?)
+            })
+            .transpose()?;
+        let right_term = right
+            .tangent()
+            .as_value()
+            .map(|tangent| -> Result<_, DifferentiationError> {
+                let left_primal = left.primal().normalize_elementwise_tangent(&target)?;
+                let right_primal = right.primal().normalize_elementwise_tangent(&target)?;
+                let denominator = right_primal.clone() * right_primal;
+                let coefficient = -(left_primal / denominator);
+                Ok(coefficient * tangent.normalize_elementwise_tangent(&target)?)
+            })
+            .transpose()?;
         // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
         let tangent = left_term
             .into_iter()
             .chain(right_term)
             .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
+            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
@@ -63,6 +89,8 @@ where
 impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation<V, O> for DivOperation
 where
     DivOperation: Operation<V::Type>,
+    V::Type: DifferentiableType,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -79,16 +107,29 @@ where
             }
             .into());
         }
+        let numerator_type = inputs[0].r#type().cotangent();
+        if numerator_type.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "'div' numerator has no cotangent space".to_string(),
+            }
+            .into());
+        }
         let numerator_contribution = match &outputs[0] {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(numerator_type),
             MaybeZero::Value(output_cotangent) => {
                 // The dispatch guarantees a `Known` operand carries its pullback value, so read it directly.
                 let denominator =
                     inputs[1].as_known().expect("dispatch guarantees a known operand carries its pullback value");
-                MaybeZero::Value(output_cotangent.binary(denominator, DivOperation))
+                let denominator = denominator.normalize_elementwise_tangent(output_cotangent.r#type().as_ref())?;
+                MaybeZero::Value(
+                    output_cotangent
+                        .binary(&denominator, DivOperation)
+                        .unbroadcast_elementwise_cotangent(&numerator_type)?,
+                )
             }
         };
-        Ok(vec![numerator_contribution, MaybeZero::Zero(inputs[1].r#type().into_owned())])
+        let denominator_type = inputs[1].r#type();
+        Ok(vec![numerator_contribution, MaybeZero::Zero(denominator_type.cotangent())])
     }
 }
 
@@ -98,6 +139,7 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
+    use crate::operations::manipulation::ConvertElementType;
     use crate::tracing_v2::ForwardModeDifferentiate;
 
     #[test]
@@ -113,5 +155,17 @@ mod tests {
 
         assert_abs_diff_eq!(primal, 3.0, epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, -4.5, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_div_jvp_computes_widened_coefficients_in_tangent_type() {
+        let left = Scalar::from(4.0f32).convert_element_type(crate::types::DataType::F8E8M0FNU).unwrap();
+        let right = Scalar::from(2.0f32).convert_element_type(crate::types::DataType::F8E8M0FNU).unwrap();
+        let (primal, tangent): (Scalar, Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .jvp(|(left, right)| Ok(left / right), (left, right), (Scalar::from(1.0f32), Scalar::from(1.0f32)))
+            .unwrap();
+
+        assert_eq!(primal, Scalar::from(2.0f32).convert_element_type(crate::types::DataType::F8E8M0FNU).unwrap());
+        assert_eq!(tangent, Scalar::from(-0.5f32));
     }
 }

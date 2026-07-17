@@ -120,9 +120,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// operation payload and the enum should behave exactly like whichever payload it contains. The derived implementation
 /// generates:
 ///
-///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
-///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
-///     active variant payload.
+///   - An [`Operation<T>`](Operation) implementation whose semantic and rendering methods forward to the active
+///     variant payload.
 ///   - An [`InterpretableOperation<C>`](crate::InterpretableOperation) implementation that forwards
 ///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
 ///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
@@ -172,15 +171,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - For enums with one `Value<Type = T>` parameter, the payload parameter is treated as the nested program's
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
 ///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
-///     require that context to be a [`Constant`] provider that can lift captured constants from `C` into `V`.
+///     require that context to be a [`Constant`](crate::Constant) provider that can lift captured constants from `C`
+///     into `V`.
 ///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
 ///     runtime value type and the nested program constant type for direct program interpretation. Later value
 ///     parameters remain payload-specific metadata; when a dispatcher needs to instantiate a direct-linear operation
 ///     family, extra value parameters after the first two are substituted with the first value parameter.
 ///   - The generated dispatcher inherits value capabilities from the payload-owned
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementations. For example, a payload that extracts
-///     a predicate states its [`BooleanLike`] requirement on its own implementation, and the generated payload bound
-///     transports that requirement to the enum's use site.
+///     a predicate states its [`BooleanLike`](crate::BooleanLike) requirement on its own implementation, and the
+///     generated payload bound transports that requirement to the enum's use site.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
@@ -253,6 +253,17 @@ pub trait Operation<T: Type>: Clone {
         Vec::new()
     }
 
+    /// Returns `true` if the `output_index`-th output is structurally known to be zero independently
+    /// of this [`Operation`]'s inputs. The default implementation returns `false`. Operations such as
+    /// [`ZeroOperation`](crate::ZeroOperation) and [`ZeroLikeOperation`](crate::ZeroLikeOperation) override
+    /// it so that transforms can preserve symbolic zero-ness when replaying otherwise opaque [`Program`]s.
+    /// Implementations must return `false` for out-of-range indices.
+    #[inline]
+    fn is_zero(&self, output_index: usize) -> bool {
+        let _ = output_index;
+        false
+    }
+
     /// Returns the observable [`Effect`](crate::Effect) classes of this [`Operation`]. Refer to the documentation of
     /// [`Effects`] and [`Effect`](crate::Effect) for the semantics.
     #[inline]
@@ -307,6 +318,11 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.as_ref().output_region_provenance(output_index)
+    }
+
+    #[inline]
+    fn is_zero(&self, output_index: usize) -> bool {
+        self.as_ref().is_zero(output_index)
     }
 
     #[inline]

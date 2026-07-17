@@ -1,6 +1,8 @@
 use crate::batching::{BatchAxis, InterpretableBatchableOperation};
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::manipulation::{Transpose, TransposeOperation};
@@ -30,7 +32,7 @@ where
         let inverse = self.permutation().inverse();
         match &outputs[0] {
             MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.transpose(inverse)?)]),
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
     }
 }
@@ -52,7 +54,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().transpose(self.permutation())?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(self.permutation())?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])

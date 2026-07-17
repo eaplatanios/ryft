@@ -12,11 +12,12 @@ use crate::operations::constants::Zero;
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, Reshape, Slice, Transpose, UpdateSlice,
 };
+use crate::operations::sharding::Reshard;
 use crate::programs::MaybeZero;
 
 use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
 };
 use crate::programs::types::Typed;
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
@@ -40,7 +41,7 @@ where
         let indices = inputs[1].primal();
         let primal = inputs[0].primal().gather(indices, self)?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -56,7 +57,7 @@ where
 impl<C> BatchableOperation<C> for GatherOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     GatherOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(

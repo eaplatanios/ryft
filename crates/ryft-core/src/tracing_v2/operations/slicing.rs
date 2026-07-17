@@ -2,7 +2,9 @@ use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError, InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroLike, ZeroOperation};
@@ -10,9 +12,11 @@ use crate::operations::manipulation::{
     Broadcast, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, PadOperation,
     Reshape, Slice, SliceOperation, Transpose, UpdateSlice, UpdateSliceOperation,
 };
+use crate::operations::sharding::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::BatchingDriver;
@@ -50,9 +54,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
                 let outputs = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -90,7 +94,8 @@ where
                     edge_padding_high.push(high);
                     interior_padding.push(stride - 1);
                 }
-                let zero = MaybeZero::Zero(ArrayType::scalar(input_type.data_type())).materialize(context)?;
+                let zero =
+                    MaybeZero::Zero(ArrayType::scalar(input_type.data_type().cotangent())).materialize(context)?;
                 let outputs = context.stage_operation(
                     PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
                     Vec::new(),
@@ -125,13 +130,13 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().into_owned()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_type = inputs[1].r#type();
                 let update_sizes = static_update_sizes(UPDATE_SLICE_TRANSPOSE_CONTEXT, &update_type)?;
-                let zeros = MaybeZero::Zero(update_type.clone().into_owned()).materialize(context)?;
+                let zeros = MaybeZero::Zero(update_type.cotangent()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -198,7 +203,7 @@ where
         let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         let primal = operand.primal().dynamic_slice(&primal_starts, self.sizes())?;
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -228,7 +233,7 @@ where
         let primal_starts = inputs[2..].iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         let primal = operand.primal().dynamic_update_slice(update.primal(), &primal_starts)?;
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().into_owned())
+            MaybeZero::Zero(primal.r#type().tangent())
         } else {
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let update_tangent = update.tangent().clone().materialize(context)?;
@@ -255,7 +260,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().slice(self.start_indices(), self.limit_indices(), self.strides())?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => {
                 MaybeZero::Value(tangent.slice(self.start_indices(), self.limit_indices(), self.strides())?)
             }
@@ -283,7 +288,7 @@ where
         let update = &inputs[1];
         let primal = operand.primal().update_slice(update.primal(), self.start_indices())?;
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().into_owned())
+            MaybeZero::Zero(primal.r#type().tangent())
         } else {
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let update_tangent = update.tangent().clone().materialize(context)?;
@@ -338,17 +343,39 @@ where
     item_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
 }
 
+/// Returns a copy of `sharding` with the placement of array dimension `index` replaced by `dimension`, preserving the
+/// mesh, reduction state, and varying manual axes.
+fn replace_sharding_dimension(
+    sharding: &Sharding,
+    index: usize,
+    dimension: ShardingDimension,
+) -> Result<Sharding, BatchingError> {
+    let mut dimensions = sharding.dimensions().to_vec();
+    dimensions[index] = dimension;
+    Sharding::with_manual_axes(
+        sharding.mesh().clone(),
+        dimensions,
+        sharding.unreduced_axes().clone(),
+        sharding.reduced_axes().clone(),
+        sharding.varying_manual_axes().clone(),
+    )
+    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+}
+
 /// Stacks per-item expansion results along a fresh leading batch axis of size `axis_size`: item `0` seeds the stacked
-/// accumulator by broadcast replication and later items overwrite their slices via [`UpdateSlice`] at static item
-/// offsets. `interpret_item` produces the per-item result; an empty batch axis is rejected with a precise error
-/// naming `operation_name` because no batch item can seed the accumulator.
+/// accumulator with replicated placement and later items overwrite their slices via [`UpdateSlice`] at static item
+/// offsets. The completed accumulator is then resharded once to `batch_dimension`; keeping intermediate singleton
+/// updates replicated avoids assigning a nontrivial mapped-axis sharding to an extent-one update. `interpret_item`
+/// produces the per-item result; an empty batch axis is rejected with a precise error naming `operation_name` because
+/// no batch item can seed the accumulator.
 pub(crate) fn stack_expansion_items<V, InterpretItemFn>(
     operation_name: &'static str,
     axis_size: usize,
+    batch_dimension: ShardingDimension,
     mut interpret_item: InterpretItemFn,
 ) -> Result<ArrayBatch<V>, BatchingError>
 where
-    V: Value<Type = ArrayType> + Broadcast + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + Broadcast + UpdateSlice + Reshape + Reshard,
     InterpretItemFn: FnMut(usize) -> Result<V, ProgramError>,
 {
     let mut accumulator: Option<V> = None;
@@ -358,12 +385,9 @@ where
         accumulator = Some(match accumulator {
             None => {
                 // Item `0` seeds the stacked accumulator by replication; later items overwrite their slices.
-                let mut stacked_dimensions = Vec::with_capacity(output_item_type.rank() + 1);
-                stacked_dimensions.push(Size::Static(axis_size));
-                stacked_dimensions.extend(output_item_type.shape().dimensions().iter().cloned());
-                let stacked_type = ArrayType::new(output_item_type.data_type(), Shape::new(stacked_dimensions));
-                let output_axes: Vec<usize> = (1..=output_item_type.rank()).collect();
-                output_item.broadcast(stacked_type, output_axes.as_slice())?
+                ArrayBatch::replicated(output_item)
+                    .broadcast_with_dimension(0, axis_size, ShardingDimension::Replicated)?
+                    .into_value()
             }
             Some(accumulator) => {
                 let mut expanded_dimensions = Vec::with_capacity(output_item_type.rank() + 1);
@@ -381,6 +405,12 @@ where
             message: format!("'{operation_name}' does not support per-item expansion over an empty batch axis"),
         });
     };
+    let accumulator = match accumulator.r#type().sharding() {
+        Some(sharding) if sharding.dimensions().first() != Some(&batch_dimension) => {
+            accumulator.reshard(&replace_sharding_dimension(sharding, 0, batch_dimension)?)
+        }
+        _ => accumulator,
+    };
     let stacked_type = accumulator.r#type().into_owned();
     ArrayBatch::new(stacked_type, accumulator, Some(0))
 }
@@ -393,7 +423,9 @@ where
 /// `O(axis_size)` operations because everything goes through the value capability traits (which also makes it work
 /// identically in eager and tracing contexts, since capabilities stage on tracers). For an empty batch, it infers the
 /// per-item output type and synthesizes the correctly typed empty packed result without interpreting a nonexistent
-/// item.
+/// item. Nonempty explicitly sharded mapped inputs are resharded to replicated placement before item extraction, and
+/// the completed replicated accumulator is resharded once to the context's mapped placement. This avoids assigning a
+/// nontrivial sharding to the extent-one slices used internally by the expansion.
 pub(crate) fn batch_by_item_expansion<C, O>(
     context: &BatchingContext<C>,
     operation_name: &'static str,
@@ -403,7 +435,7 @@ pub(crate) fn batch_by_item_expansion<C, O>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     O: InterpretableOperation<C>,
 {
     if inputs.is_empty() {
@@ -413,12 +445,33 @@ where
         let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Result<Vec<_>, BatchingError>>()?;
         let mut output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        let output_type = output_types.remove(0).with_inserted_dimension(0, Size::Static(0))?;
-        let output = context.parent().zero(&output_type)?;
-        return Ok(vec![ArrayBatch::new(output_type, output, Some(0))?]);
+        let output = context.parent().zero(&output_types.remove(0))?;
+        return Ok(vec![ArrayBatch::replicated(output).broadcast_with_dimension(
+            0,
+            0,
+            context.batch_dimension().clone(),
+        )?]);
     }
-    let aligned = inputs.iter().map(|input| input.move_axis(0)).collect::<Result<Vec<_>, _>>()?;
-    let stacked = stack_expansion_items(operation_name, axis_size, |item| {
+    let aligned = inputs
+        .iter()
+        .map(|input| {
+            let aligned = input.move_axis(0)?;
+            let aligned_type = aligned.r#type();
+            let (Some(0), Some(sharding)) = (aligned.batch_axis_position(), aligned_type.sharding()) else {
+                return Ok(aligned);
+            };
+            if sharding.dimensions()[0] == ShardingDimension::Replicated {
+                return Ok(aligned);
+            }
+            // Slicing one global batch item cannot retain a nontrivial Explicit placement on its new extent-one
+            // dimension. Replicate the packed input once, run the expansion over replicated slices, and restore the
+            // mapped placement once on the completed output accumulator.
+            let replicated = replace_sharding_dimension(sharding, 0, ShardingDimension::Replicated)?;
+            let value = aligned.value().reshard(&replicated);
+            ArrayBatch::new(value.r#type().into_owned(), value, BatchAxis::new(0))
+        })
+        .collect::<Result<Vec<_>, BatchingError>>()?;
+    let stacked = stack_expansion_items(operation_name, axis_size, context.batch_dimension().clone(), |item| {
         let item_inputs = aligned
             .iter()
             .map(|input| expansion_item(operation_name, input, item))
@@ -482,8 +535,10 @@ where
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis as isize, axis_size)?;
-        let update = inputs[1].match_axis(batch_axis as isize, axis_size)?;
+        let input =
+            inputs[0].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
+        let update =
+            inputs[1].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
         UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
@@ -512,7 +567,7 @@ where
 impl<C> BatchableOperation<C> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -573,7 +628,7 @@ where
 impl<C> BatchableOperation<C> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -603,8 +658,10 @@ where
             return Ok(vec![inputs[1].clone()]);
         }
         let axis_size = axis_size.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis as isize, axis_size)?;
-        let update = inputs[1].match_axis(batch_axis as isize, axis_size)?;
+        let input =
+            inputs[0].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
+        let update =
+            inputs[1].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
         let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
@@ -620,6 +677,7 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::differentiation::LinearizationTracer;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
@@ -887,6 +945,59 @@ mod tests {
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
+    }
+
+    #[test]
+    fn test_update_slice_batching_preserves_materialized_batch_placement() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+                .with_sharding(physical_sharding.clone())
+                .unwrap();
+            let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+                .with_sharding(Sharding::replicated(mesh, 1))
+                .unwrap();
+            let context = BatchingContext::with_batch_dimension(
+                EagerContext::<TestArray>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+            let make_input = || {
+                ArrayBatch::new(
+                    input_type.clone(),
+                    TestArray::new(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+                    BatchAxis::new(0),
+                )
+                .unwrap()
+            };
+            let make_update = || ArrayBatch::replicated(TestArray::new(update_type.clone(), vec![9.0, 9.0]));
+
+            let static_outputs = UpdateSliceOperation::new(vec![1])
+                .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
+                .unwrap();
+            let dynamic_outputs = DynamicUpdateSliceOperation
+                .batch(
+                    &context,
+                    &crate::EmptyRegionDriver,
+                    &[make_input(), make_update(), ArrayBatch::replicated(index(1.0))],
+                )
+                .unwrap();
+
+            for output in [static_outputs[0].clone(), dynamic_outputs[0].clone()] {
+                assert_eq!(output.batch_axis(), BatchAxis::new(0));
+                assert_eq!(output.r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions());
+                assert_eq!(output.value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+            }
+        }
     }
 
     /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.

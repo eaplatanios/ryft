@@ -393,8 +393,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// input atom identifiers, output atom identifiers, and instruction sequence are preserved exactly. Only the
     /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
     /// output arities. This is the canonical shape for standalone nested computations supplied positionally through the
-    /// `regions` argument of [`Context::bind`], including both owned [`Region`]s and shared callees, without needing to
-    /// preserve the caller's original [`Parameterized`] type.
+    /// region driver passed to [`Context::bind`](crate::Context::bind), including both owned [`Region`]s and shared
+    /// callees, without needing to preserve the caller's original [`Parameterized`] type.
     pub fn to_flat_program(&self) -> Program<V, O, Vec<V>, Vec<V>>
     where
         O: Clone,
@@ -1079,8 +1079,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
 /// _Flat_ [`Program`] (i.e., with flat `Vec`-valued inputs and outputs) over a [`Domain`]'s constant and operation
 /// universe. This is the canonical shape for nested computations constructed standalone, including owned region
-/// attachments and shared callees composed into the `regions` argument of [`Context::bind`]. Borrowed replay exposes
-/// regions through [`BindingRegionDriver`](crate::BindingRegionDriver) without converting them into this owned shape.
+/// programs and shared callees composed into the region driver passed to [`Context::bind`](crate::Context::bind).
+/// Borrowed replay exposes regions through [`BindingRegionDriver`](crate::BindingRegionDriver) without converting
+/// them into this owned shape.
 pub type FlatProgram<D> = Program<
     <D as Domain>::Constant,
     <D as Domain>::Operation,

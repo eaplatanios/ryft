@@ -40,6 +40,11 @@ impl<T: Type> Operation<T> for ZeroLikeOperation {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
+
+    #[inline]
+    fn is_zero(&self, output_index: usize) -> bool {
+        output_index == 0
+    }
 }
 
 impl ElementwiseOperation for ZeroLikeOperation {
@@ -112,6 +117,8 @@ mod tests {
 
         let operation = ZeroLikeOperation;
         assert_eq!(Operation::<DataType>::name(&operation), ZERO_LIKE_OPERATION_NAME);
+        assert!(Operation::<DataType>::is_zero(&operation, 0));
+        assert!(!Operation::<DataType>::is_zero(&operation, 1));
         assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
         assert_eq!(

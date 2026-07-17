@@ -23,8 +23,8 @@ use crate::tracing::{DomainTracingContext, Tracer};
 
 use super::contexts::CompilationDomain;
 
-/// Flat source-program representation of a compiled call's callee, composed into the operation's region attachments
-/// and interned as a shared callee root region on the staged instruction.
+/// Flat source-program representation of a compiled call's callee, supplied through the operation's region driver and
+/// interned as a shared callee root region on the staged instruction.
 pub type FlatCompilationProgram<D> = Program<
     <D as Domain>::Constant,
     <D as Domain>::Operation,
@@ -391,13 +391,13 @@ impl Default for JitCacheCapacities {
 /// Operation-family capability for representing a call to a staged program.
 ///
 /// The call operation is metadata-only: the callee is a flat program (whose captures have been lifted into leading
-/// inputs) composed into the region attachments passed to [`Context::bind`], which interns it as a shared callee root
+/// inputs) composed into the region driver passed to [`Context::bind`], which interns it as a shared callee root
 /// region by [`Rc`] identity. The concrete operation family decides how that boundary lowers and how batching,
 /// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
 /// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
 pub trait CompiledCallOperation<Constant: Value>: Operation<Constant::Type> + Sized {
-    /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee as a shared region
-    /// attachment.
+    /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
+    /// region driver.
     fn compiled_call() -> Self;
 }
 

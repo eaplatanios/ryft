@@ -13,8 +13,9 @@ use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-    PadOperation, ReshapeOperation, ScatterOperation, SliceOperation, TransposeOperation, UpdateSliceOperation,
+    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicSliceOperation,
+    DynamicUpdateSliceOperation, GatherOperation, PadOperation, ReshapeOperation, ScatterOperation, SliceOperation,
+    TransposeOperation, UpdateSliceOperation,
 };
 use crate::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
@@ -50,6 +51,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
+    ConvertElementType(ConvertElementTypeOperation),
     Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     CoordinateBasis(CoordinateBasisOperation<ArrayType>),
@@ -101,6 +103,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Scan(ScanOperation<V>),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
-    CustomVjpTangent(CustomVjpTangentOperation),
+    CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
     Rematerialize(RematerializeOperation),
 }

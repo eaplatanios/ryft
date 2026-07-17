@@ -6,11 +6,11 @@ use crate::programs::atoms::AtomId;
 use crate::programs::regions::RegionId;
 use crate::programs::types::Typed;
 
-/// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`], identified by its containing
-/// [`Region`] and its region-local [`AtomId`].
+/// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`](crate::Program), identified by
+/// its containing [`Region`](crate::Region) and its region-local [`AtomId`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId {
-    /// [`Region`] containing the atom.
+    /// [`Region`](crate::Region) containing the atom.
     region: RegionId,
 
     /// Region-local [`AtomId`] of the value.
@@ -24,7 +24,7 @@ impl ValueId {
         Self { region, atom }
     }
 
-    /// Returns the [`RegionId`] of the [`Region`] containing the atom.
+    /// Returns the [`RegionId`] of the [`Region`](crate::Region) containing the atom.
     #[inline]
     pub fn region(self) -> RegionId {
         self.region
@@ -37,12 +37,12 @@ impl ValueId {
     }
 }
 
-/// Represents leaf values that can participate in traced [`Program`]s. [`Value`] is implemented by every type that
-/// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
-/// tracing wrappers such as [`Tracer`](crate::Tracer). It inherits its type descriptor from [`Typed`], so generic code
-/// recovers the descriptor as `V::Type` and pinning sites write `V: Value<Type = ArrayType>`. It additionally requires
-/// [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their carried
-/// values directly.
+/// Represents leaf values that can participate in traced [`Program`](crate::Program)s. [`Value`] is implemented by
+/// every type that can appear as a leaf in a staged [`Program`](crate::Program): both concrete data types such as
+/// `f32`, `f64`, and backend arrays, and tracing wrappers such as [`Tracer`](crate::Tracer). It inherits its type
+/// descriptor from [`Typed`], so generic code recovers the descriptor as `V::Type` and pinning sites write
+/// `V: Value<Type = ArrayType>`. It additionally requires [`Debug`] and [`Display`] so that diagnostics, constants,
+/// and [`Operation`](crate::Operation) metadata can render their carried values directly.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
     /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work

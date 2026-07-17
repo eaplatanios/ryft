@@ -9,7 +9,9 @@
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -17,6 +19,7 @@ use crate::operations::manipulation::{
     Broadcast, GatherDimensionNumbers, GatherOperation, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation,
     ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
+use crate::operations::sharding::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::{MaybeZero, ProgramError, Value};
@@ -51,7 +54,7 @@ where
         let updates = &inputs[2];
         let primal = operand.primal().scatter(indices, updates.primal(), self)?;
         let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().into_owned())
+            MaybeZero::Zero(primal.r#type().tangent())
         } else if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -106,7 +109,13 @@ where
             .into());
         }
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
+            MaybeZero::Zero(_) => Ok(inputs
+                .iter()
+                .map(|input| {
+                    let input_type = input.r#type();
+                    MaybeZero::Zero(input_type.cotangent())
+                })
+                .collect()),
             MaybeZero::Value(cotangent) => {
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
                 // value, so read the tracer directly.
@@ -162,7 +171,7 @@ where
                 check_count!("output", update_cotangents, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(cotangent.clone()),
-                    MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()),
                     MaybeZero::Value(update_cotangents.into_iter().next().unwrap()),
                 ])
             }
@@ -179,7 +188,7 @@ where
 impl<C> BatchableOperation<C> for ScatterOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     ScatterOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(

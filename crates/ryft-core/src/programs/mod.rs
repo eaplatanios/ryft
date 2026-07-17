@@ -54,17 +54,16 @@
 //! application, and carries the [`RegionId`]s of its attached nested regions, in the operation-defined order.
 //! Operations define their own type inference and effect classes and the program supplies graph structure and order.
 //!
-//! [`Program`] combines the region arena with typed, structured input and output boundaries on its entry region. The
-//! boundary types are [`Parameterized`] containers whose leaves correspond positionally to [`Program::input_ids`] and
-//! [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs while callers retain tuples,
-//! vectors, maps, or derived product types. [`InstructionId`] and [`ValueId`] locate instructions and values across
-//! [`Region`]s.
+//! [`Program`] combines the region arena with typed, structured input and output boundaries on its entry region.
+//! The boundary types are [`Parameterized`](crate::Parameterized) containers whose leaves correspond positionally to
+//! [`Program::input_ids`] and [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs
+//! while callers retain tuples, vectors, maps, or derived product types. [`InstructionId`] and [`ValueId`] locate
+//! instructions and values across [`Region`]s.
 //!
 //! # Regions, Sharing, and Sealing
 //!
-//! The canonical region graph and operation-application vocabulary lives in [`regions`](crate::programs::regions);
-//! this module owns the surrounding program arena and its construction, validation, transformation, and rendering
-//! machinery.
+//! The canonical region graph and operation-application vocabulary lives in the [`regions`] module. This module owns
+//! the surrounding program arena and its construction, validation, transformation, and rendering machinery.
 //!
 //! Every nested computation (e.g., a control-flow branch or body, a custom-derivative program, a rematerialization
 //! program, a JIT-ed callee, etc.) is a [`Region`] in the owning [`Program`]'s one canonical arena, referenced from its
@@ -76,9 +75,9 @@
 //!     preserving any sharing internal to the imported closure.
 //!   - [`ProgramBuilder::import_program`] splices an owned [`Program`]'s arena in directly without cloning, for owned
 //!     bodies whose builder would otherwise clone them away.
-//!   - [`ProgramBuilder::intern_callee`] interns a shared [`Rc`]-held [`Program`] by pointer identity (i.e., importing
-//!     the same `Rc` twice yields the same root [`RegionId`], which is how repeated JIT-compiled calls to one compiled
-//!     callee share one region and how lowering deduplication can count occurrences per root).
+//!   - [`ProgramBuilder::intern_callee`] interns a shared [`Rc`](std::rc::Rc)-held [`Program`] by pointer identity
+//!     (i.e., importing the same `Rc` twice yields the same root [`RegionId`], which is how repeated JIT-compiled calls
+//!     to one compiled callee share one region and how lowering deduplication can count occurrences per root).
 //!
 //! Only *sealed* regions are attachable. [`ProgramBuilder::add_instruction`] validates the attached region list
 //! against the operation's declared [`Operation::region_names`] slots, and every non-entry region enters the arena

@@ -447,6 +447,16 @@ impl OperationEnum {
                 },
             }
         });
+        let is_zero_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_type as #ryft::Operation<#primary_type>>::is_zero(#receiver, output_index)
+                },
+            }
+        });
         let effects_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -494,6 +504,10 @@ impl OperationEnum {
                     output_index: usize,
                 ) -> ::std::vec::Vec<#ryft::OutputRegionProvenance> {
                     match self { #(#provenance_arms)* }
+                }
+
+                fn is_zero(&self, output_index: usize) -> bool {
+                    match self { #(#is_zero_arms)* }
                 }
 
                 fn effects(&self) -> #ryft::Effects {

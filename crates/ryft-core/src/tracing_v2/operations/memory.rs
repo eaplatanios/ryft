@@ -4,7 +4,9 @@ use half::{bf16, f16};
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -185,7 +187,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().transfer_to_memory(self.destination());
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(self.destination())),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -209,7 +211,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             MaybeZero::Value(cotangent) => {
                 let outputs = context.stage_operation(
                     TransferToMemoryOperation::new(inputs[0].r#type().memory()),

@@ -1,6 +1,9 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
+};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -99,10 +102,13 @@ where
         let scanned_output_count = body_output_count - carry_count;
         let mut jvp_outputs = Vec::with_capacity(body_output_count);
         for index in 0..carry_count {
-            jvp_outputs.push(DifferentiationDual::new(outputs[index].clone(), outputs[carry_count + index].clone()));
+            jvp_outputs.push(DifferentiationDual::from_boundary_tangent(
+                outputs[index].clone(),
+                outputs[carry_count + index].clone(),
+            ));
         }
         for index in 0..scanned_output_count {
-            jvp_outputs.push(DifferentiationDual::new(
+            jvp_outputs.push(DifferentiationDual::from_boundary_tangent(
                 outputs[2 * carry_count + index].clone(),
                 outputs[2 * carry_count + scanned_output_count + index].clone(),
             ));
@@ -233,11 +239,10 @@ where
                 ))
             })?);
         } else {
-            // A differentiable carry's cotangent slot carries its cotangent dual; a non-differentiable carry (the
-            // `float0` analogue) has no cotangent space, so its slot carries only structural zeros typed by the
-            // carry's own primal type.
+            // A differentiable carry's cotangent boundary carries its cotangent dual; a non-differentiable carry uses
+            // the first-class zero-space descriptor returned by `cotangent`.
             let output_type = &body_output_types[carry_index];
-            let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.clone());
+            let cotangent_type = output_type.cotangent();
             let zero = builder.add_instruction(ZeroOperation::new(cotangent_type), Vec::new(), Vec::new())?;
             check_count!("output", zero, 1, ProgramError);
             restored_outputs.push(zero[0]);
@@ -246,6 +251,16 @@ where
     restored_outputs.extend(trailing_outputs);
     let output_count = restored_outputs.len();
     builder.build(restored_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
+}
+
+/// Maps a stacked scan input's physical batch axis to the corresponding per-iteration batch axis after removing the
+/// logical leading scan dimension.
+fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
+    match batch_axis.axis() {
+        Some(0) => BatchAxis::new(0),
+        Some(axis) => BatchAxis::new(axis - 1),
+        None => BatchAxis::replicated(),
+    }
 }
 
 /// Extracts slice `iteration` of a stacked batch along its *logical* leading axis and drops that axis.
@@ -293,8 +308,7 @@ where
         .collect::<Vec<_>>();
     let iteration_value = iteration_value.reshape(Shape::new(iteration_dimensions))?;
     let iteration_type = iteration_value.r#type().into_owned();
-    let batch_axis = stack.batch_axis_position().map(|axis| if axis > stack_axis { axis - 1 } else { axis });
-    ArrayBatch::new(iteration_type, iteration_value, BatchAxis::from_optional_position(batch_axis))
+    ArrayBatch::new(iteration_type, iteration_value, scan_iteration_batch_axis(stack.batch_axis()))
 }
 
 /// Per-output stacking state used by [`batch_scan_with_interpreter`]: the accumulator batch holding the iterations
@@ -362,7 +376,10 @@ where
                     accumulator
                 }
                 None => accumulator.insert(ScanOutputAccumulator {
-                    accumulator: allocate_zero(&stacked_scan_type(&iteration_type, length))?,
+                    // Unlike the scan operation's unbatched signature helper, this physical accumulator must retain
+                    // the iteration value's mapped-dimension placement. The newly inserted scan dimension itself is
+                    // replicated.
+                    accumulator: allocate_zero(&iteration_type.with_inserted_dimension(0, Size::Static(length))?)?,
                     batch_axis,
                 }),
             };
@@ -416,6 +433,52 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         let body = driver.region(0)?;
+        if self.length() == 0 {
+            check_count!("input", inputs, body.input_types().len(), ProgramError);
+
+            // No iteration executes, but batching the body structurally still determines which per-iteration outputs
+            // are mapped and where their physical batch dimensions live. Stacked inputs lose their logical leading
+            // scan dimension before entering the body, so their batch axes must be adjusted in the same way as an
+            // actual iteration slice.
+            let mut iteration_input_axes =
+                inputs[..self.carry_count()].iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+            iteration_input_axes
+                .extend(inputs[self.carry_count()..].iter().map(|input| scan_iteration_batch_axis(input.batch_axis())));
+            let (batched_body, output_axes) = driver.batch_program(
+                context,
+                body,
+                iteration_input_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
+            let output_types = batched_body.output_types();
+            check_count!("output", output_axes, output_types.len(), ProgramError);
+            if output_types.len() < self.carry_count() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "scan body has {} outputs but carry count is {}",
+                    output_types.len(),
+                    self.carry_count(),
+                ))
+                .into());
+            }
+
+            // A zero-length scan returns its initial carries unchanged. Its stacked outputs are empty arrays whose
+            // physical element types and batch axes come from the structurally batched body. Inserting the leading
+            // scan dimension shifts every mapped output axis right by one while preserving its placement metadata.
+            let mut outputs = inputs[..self.carry_count()].to_vec();
+            for (output_type, output_axis) in
+                output_types.into_iter().zip(output_axes.into_iter()).skip(self.carry_count())
+            {
+                let stacked_type = output_type.with_inserted_dimension(0, Size::Static(0))?;
+                let stacked_axis = match output_axis.axis() {
+                    Some(axis) => BatchAxis::new(axis + 1),
+                    None => BatchAxis::replicated(),
+                };
+                let stacked_value = context.parent().zero(&stacked_type)?;
+                outputs.push(ArrayBatch::new(stacked_type, stacked_value, stacked_axis)?);
+            }
+            return Ok(outputs);
+        }
+
         let y_slice_types = body.output_types().split_off(self.carry_count());
         batch_scan_with_interpreter(
             self.carry_count(),
@@ -483,7 +546,13 @@ where
         //
         // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
         if outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+            return Ok(inputs
+                .iter()
+                .map(|input| {
+                    let input_type = input.r#type();
+                    MaybeZero::Zero(input_type.cotangent())
+                })
+                .collect());
         }
         if operation.captures().is_empty() {
             return transpose_primal_scan(operation, context, driver, inputs, outputs)
@@ -571,7 +640,13 @@ where
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+        return Ok(inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
+            })
+            .collect());
     }
 
     // Operand layout is `[carries..., scanned_inputs...]`, mirroring the body's input order one-to-one, where each
@@ -681,7 +756,8 @@ where
             if index < carry_count || linear {
                 MaybeZero::Value(scan_cotangents.next().unwrap())
             } else {
-                MaybeZero::Zero(input.r#type().into_owned())
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
             }
         })
         .collect();
@@ -702,7 +778,13 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         if outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
+            return Ok(inputs
+                .iter()
+                .map(|input| {
+                    let input_type = input.r#type();
+                    MaybeZero::Zero(input_type.cotangent())
+                })
+                .collect());
         }
         if !operation.captures().is_empty() {
             return Err(ProgramError::UnsupportedOperation {
@@ -763,6 +845,7 @@ mod tests {
     use crate::operations::math::MulOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
@@ -777,12 +860,34 @@ mod tests {
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`.
     fn product_body() -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
+        product_body_with_type(ArrayType::scalar(DataType::F64))
+    }
+
+    /// Builds a cumulative-product body over `r#type` that maps `[carry, x]` to
+    /// `[carry * x, carry * x]`.
+    fn product_body_with_type(r#type: ArrayType) -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
-        let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let carry = builder.add_input(r#type.clone());
+        let x = builder.add_input(r#type);
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         builder
             .build(vec![product, product], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
+            .unwrap()
+    }
+
+    /// Builds a body for zero-length scan tests whose first stacked result follows the carry's mapped axis and whose
+    /// second stacked result is a replicated constant.
+    fn zero_length_body(r#type: ArrayType) -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+        let carry = builder.add_input(r#type.clone());
+        let _x = builder.add_input(r#type.clone());
+        let constant = builder.add_constant(TestArray::new(r#type, vec![7.0]));
+        builder
+            .build(
+                vec![carry, carry, constant],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder, Placeholder],
+            )
             .unwrap()
     }
 
@@ -1104,5 +1209,173 @@ mod tests {
         assert_eq!(outputs[0].value().values, vec![24.0, 24.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
         assert_eq!(outputs[1].value().values, vec![24.0, 24.0, 12.0, 12.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn test_scan_batching_preserves_stacked_output_batch_placement() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let logical_type =
+                ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+            let carry_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"])],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
+            let carries =
+                ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
+                    .unwrap();
+            let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+            let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, vec![2.0, 3.0, 4.0]));
+            let context = BatchingContext::with_batch_dimension(
+                TestEagerContext::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+
+            let outputs = batch_scan(
+                &context,
+                TestScanOperation::new(1, 3),
+                product_body_with_type(logical_type),
+                vec![carries, stacked_inputs],
+            );
+
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
+            assert_eq!(outputs[0].value().values, vec![24.0, 48.0]);
+            assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
+            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(2)]);
+            assert_eq!(
+                outputs[1].r#type().sharding().unwrap().dimensions(),
+                &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+            );
+            assert_eq!(outputs[1].value().values, vec![2.0, 4.0, 6.0, 12.0, 24.0, 48.0]);
+        }
+    }
+
+    #[test]
+    fn test_zero_length_scan_batching_infers_mapped_and_replicated_outputs_eagerly() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let logical_type =
+                ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+            let carry_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"])],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
+            let carries =
+                ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
+                    .unwrap();
+            let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+            let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, Vec::new()));
+            let context = BatchingContext::with_batch_dimension(
+                TestEagerContext::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+
+            let outputs = batch_scan(
+                &context,
+                TestScanOperation::new(1, 0),
+                zero_length_body(logical_type),
+                vec![carries, stacked_inputs],
+            );
+
+            assert_eq!(outputs.len(), 3);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2)]);
+            assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
+            assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
+            assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
+            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
+            assert_eq!(
+                outputs[1].r#type().sharding().unwrap().dimensions(),
+                &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+            );
+            assert!(outputs[1].value().values.is_empty());
+            assert_eq!(outputs[2].batch_axis(), BatchAxis::replicated());
+            assert_eq!(outputs[2].r#type().shape().dimensions(), &[Size::Static(0)]);
+            assert_eq!(outputs[2].r#type().sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
+            assert!(outputs[2].value().values.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_zero_length_scan_batching_infers_mapped_and_replicated_outputs_while_tracing() {
+        use std::rc::Rc;
+
+        use crate::tracing::TracingContext;
+
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let logical_type =
+                ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+            let carry_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"])],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
+            let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+            let parent = TracingContext::<TestArray, TestOperation>::new();
+            let builder = parent.builder().clone();
+            let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
+            let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
+            let context =
+                BatchingContext::with_batch_dimension(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
+            let carries = ArrayBatch::new(carry_type, parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
+            let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
+            let tracer_inputs =
+                [BatchingTracer::new(context.clone(), carries), BatchingTracer::new(context.clone(), stacked_inputs)];
+            let outputs = context
+                .bind(
+                    TestOperation::Scan(TestScanOperation::new(1, 0)),
+                    [zero_length_body(logical_type)],
+                    &tracer_inputs,
+                )
+                .unwrap();
+            let output_axes = outputs.iter().map(BatchingTracer::batch_axis).collect::<Vec<_>>();
+            let output_atoms =
+                outputs.iter().map(|output| output.batch().value().atom_id().unwrap()).collect::<Vec<_>>();
+            drop(outputs);
+            drop(tracer_inputs);
+            drop(context);
+            drop(parent);
+
+            let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
+            let program = builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(
+                    output_atoms,
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder, Placeholder],
+                )
+                .unwrap();
+            let output_types = program.output_types();
+
+            assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
+            assert_eq!(output_types[0].shape().dimensions(), &[Size::Static(2)]);
+            assert_eq!(output_types[0].sharding().unwrap().dimensions(), carry_sharding.dimensions());
+            assert_eq!(output_types[1].shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
+            assert_eq!(
+                output_types[1].sharding().unwrap().dimensions(),
+                &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+            );
+            assert_eq!(output_types[2].shape().dimensions(), &[Size::Static(0)]);
+            assert_eq!(output_types[2].sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
+        }
     }
 }

@@ -46,8 +46,6 @@ pub mod math;
 /// Shared marker types for operations with payload-dependent interpretation.
 pub mod payloads;
 
-/// Scalar operation types built from the core primitive operation traits.
-
 /// Sharding-related operations (e.g., resharding and propagation hints) and capability traits.
 pub mod sharding;
 
@@ -122,8 +120,9 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
     }
 }
 
-/// Represents [`Type`]s and [`Value`]s that have a Boolean counterpart and that may carry a scalar Rust Boolean.
-/// [`BooleanLike`] is the shared contract between predicate-producing and predicate-consuming operations:
+/// Represents [`Type`](crate::Type)s and [`Value`](crate::Value)s that have a Boolean counterpart and that may carry
+/// a scalar Rust Boolean. [`BooleanLike`] is the shared contract between predicate-producing and predicate-consuming
+/// operations:
 ///
 /// - **Predicate-Producing Operations (e.g., [`CompareOperation`]):** Call [`as_boolean`](Self::as_boolean)
 ///   on *type metadata* to infer their output types from their broadcasted input types. For type metadata (e.g.,

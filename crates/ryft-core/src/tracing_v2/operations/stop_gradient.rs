@@ -13,6 +13,7 @@ use crate::tracing::{Tracer, TracingContext};
 /// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for StopGradientOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<StopGradientOperation>,
     StopGradientOperation: Operation<C::Type>,
 {

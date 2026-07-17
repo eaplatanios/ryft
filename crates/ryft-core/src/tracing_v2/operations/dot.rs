@@ -3,10 +3,12 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::{BatchAxis, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::manipulation::Transpose;
+use crate::operations::manipulation::{ConvertElementType, Transpose};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -639,8 +641,14 @@ where
         let mixed_axis_size = || axis_size.expect("a mapped input pins the batch size");
         let aligned_inputs: Vec<crate::batching::ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
-            (Some(_), None) => vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size())?],
-            (None, Some(_)) => vec![inputs[0].broadcast(0, mixed_axis_size())?, inputs[1].clone()],
+            (Some(_), None) => vec![
+                inputs[0].clone(),
+                inputs[1].broadcast_with_dimension(0, mixed_axis_size(), context.batch_dimension().clone())?,
+            ],
+            (None, Some(_)) => vec![
+                inputs[0].broadcast_with_dimension(0, mixed_axis_size(), context.batch_dimension().clone())?,
+                inputs[1].clone(),
+            ],
         };
         let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])
@@ -664,7 +672,7 @@ where
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DotOperation
 where
     C::Operation: From<DotOperation>,
-    C::Value: Dot + std::ops::Add<Output = C::Value>,
+    C::Value: ConvertElementType + Dot + std::ops::Add<Output = C::Value>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -680,14 +688,34 @@ where
             None => left.dot(right, self.dimensions()),
         };
         let primal = stage_dot(left.primal(), right.primal());
-        let left_term = left.tangent().as_value().map(|tangent| stage_dot(tangent, right.primal()));
-        let right_term = right.tangent().as_value().map(|tangent| stage_dot(left.primal(), tangent));
+        let tangent_type = primal.r#type().tangent();
+        let convert_to_tangent_type = |value: &C::Value| {
+            if value.r#type().data_type() == tangent_type.data_type() {
+                Ok(value.clone())
+            } else {
+                value.convert_element_type(tangent_type.data_type()).map_err(DifferentiationError::from)
+            }
+        };
+        let left_term = left
+            .tangent()
+            .as_value()
+            .map(|tangent| -> Result<_, DifferentiationError> {
+                Ok(stage_dot(&convert_to_tangent_type(tangent)?, &convert_to_tangent_type(right.primal())?))
+            })
+            .transpose()?;
+        let right_term = right
+            .tangent()
+            .as_value()
+            .map(|tangent| -> Result<_, DifferentiationError> {
+                Ok(stage_dot(&convert_to_tangent_type(left.primal())?, &convert_to_tangent_type(tangent)?))
+            })
+            .transpose()?;
         // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
         let tangent = left_term
             .into_iter()
             .chain(right_term)
             .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
+            .map_or_else(|| MaybeZero::Zero(tangent_type), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
@@ -712,8 +740,10 @@ where
 /// captured-factor rules: the produced value *is* that operand's cotangent, so its sharding swaps the operand's
 /// unreduced and reduced axes instead of being re-derived. A zero output cotangent stays a structural zero, and two
 /// linear operands (a bilinear product that is not a linear map jointly) are rejected as unsupported.
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> TransposableOperation<V, O>
-    for DotOperation
+impl<
+    V: Value<Type = ArrayType>,
+    O: Operation<ArrayType> + From<crate::operations::manipulation::ConvertElementTypeOperation> + From<DotOperation>,
+> TransposableOperation<V, O> for DotOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -735,14 +765,19 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> T
             // structural zero for the known operand. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {
                 let (linear_index, known_index) = if left_is_linear { (0, 1) } else { (1, 0) };
+                let linear_cotangent_type = inputs[linear_index].r#type().cotangent();
                 let contribution = match &outputs[0] {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(linear_cotangent_type),
                     MaybeZero::Value(output_cotangent) => {
                         // The dispatch guarantees a `Known` operand carries its pullback value, so read it directly.
                         let known_value = inputs[known_index]
                             .as_known()
-                            .expect("dispatch guarantees a known operand carries its pullback value")
-                            .clone();
+                            .expect("dispatch guarantees a known operand carries its pullback value");
+                        let known_value = if known_value.r#type().data_type() == output_cotangent.r#type().data_type() {
+                            known_value.clone()
+                        } else {
+                            known_value.convert_element_type(output_cotangent.r#type().data_type())?
+                        };
                         let left_rank = inputs[0].r#type().rank();
                         let right_rank = inputs[1].r#type().rank();
                         let adjoint_output_sharding = inputs[linear_index].r#type().sharding().map(Sharding::cotangent);
@@ -765,8 +800,13 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> T
                         MaybeZero::Value(outputs.remove(0))
                     }
                 };
-                let mut contributions =
-                    inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect::<Vec<_>>();
+                let mut contributions = inputs
+                    .iter()
+                    .map(|input| {
+                        let input_type = input.r#type();
+                        MaybeZero::Zero(input_type.cotangent())
+                    })
+                    .collect::<Vec<_>>();
                 contributions[linear_index] = contribution;
                 Ok(contributions)
             }
@@ -1021,10 +1061,6 @@ fn for_each_multi_index(extents: &[usize], mut action: impl FnMut(&[usize])) {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_macros::Operation;
-
-    use crate::operations::constants::ZeroOperation;
-    use crate::operations::math::AddOperation;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -1512,6 +1548,70 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_batching_preserves_materialized_batch_placement() {
+        use std::rc::Rc;
+
+        use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+        use crate::parameters::Placeholder;
+        use crate::tests::TestArray;
+        use crate::tracing::TracingContext;
+        use crate::tracing_v2::ArrayOperation;
+
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let lhs_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                ],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let lhs_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]))
+                    .with_sharding(lhs_sharding)
+                    .unwrap();
+            let rhs_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]))
+                .with_sharding(Sharding::replicated(mesh, 2))
+                .unwrap();
+            let parent = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+            let builder = parent.builder().clone();
+            let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
+            let rhs_atom = builder.borrow_mut().add_input(rhs_type);
+            let lhs = ArrayBatch::new(lhs_type, parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
+            let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
+            let context =
+                BatchingContext::with_batch_dimension(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
+
+            let outputs = DotOperation::matmul().batch(&context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            let output_atom = outputs[0].value().atom_id().unwrap();
+            drop(outputs);
+            drop(context);
+            drop(parent);
+
+            let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
+            let program = builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(
+                    vec![output_atom],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                program.output_types()[0].sharding().unwrap().dimensions(),
+                &[ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated(),],
+            );
+        }
+    }
+
+    #[test]
     fn test_dot_operation_output_sharding_builder_and_render() {
         let mesh = test_mesh();
         let sharding =
@@ -1522,19 +1622,6 @@ mod tests {
         // The output sharding is rendered only when present.
         assert!(!DotOperation::matmul().to_string().contains("output_sharding="));
         assert!(operation.to_string().contains(&format!("output_sharding={sharding}")));
-    }
-
-    /// Minimal operation enum hosting the primal [`DotOperation`] (used for both the forward dot and its staged
-    /// adjoint dot) plus the structural `zero` and `add` operations the transpose pass needs. It lets the
-    /// partition-aware [`DotOperation`] transpose run on a program whose known operand is a program input. The
-    /// `Constant` variant carries the value parameter `V` so the [`Operation`] derive can infer the primary type.
-    #[derive(Clone, Debug, Operation)]
-    #[ryft(dispatch(transposition))]
-    enum TestDotOperation<V: Value<Type = ArrayType>> {
-        Zero(ZeroOperation<ArrayType>),
-        Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(AddOperation),
-        Dot(DotOperation),
     }
 
     #[test]
@@ -1553,7 +1640,7 @@ mod tests {
         // Known LEFT operand (linear RHS): the partition-aware transpose stages the adjoint of `t -> dot(left, t)`,
         // whose RHS cotangent is `dot(left^T, cotangent)`. Build `dot(left, right)` over the test enum, treat only the
         // RHS as linear, and interpret the pullback on `[cotangent, left]`.
-        let mut builder = ProgramBuilder::<TestArray, TestDotOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder
@@ -1572,7 +1659,7 @@ mod tests {
 
         // Known RIGHT operand (linear LHS): the partition-aware transpose stages the adjoint of `t -> dot(t, right)`,
         // whose LHS cotangent is `dot(cotangent, right^T)`.
-        let mut builder = ProgramBuilder::<TestArray, TestDotOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder

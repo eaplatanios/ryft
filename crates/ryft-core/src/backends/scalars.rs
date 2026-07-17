@@ -107,9 +107,10 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 /// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.
 ///
 /// Each variant carries the payload of the corresponding [`DataType`]. The [`Token`](Scalar::Token) variant is the
-/// payload-free effect-ordering token value of [`DataType::Token`]: it supports no arithmetic, comparisons, or
-/// Boolean conversion, and its `zero_like`/`one_like` are the identity. The `F4*` and `F8*` variants carry their
-/// exact encoded bits in a `u8`, preserving signed zeros and NaN payloads. Prefer
+/// payload-free effect-ordering token value of [`DataType::Token`]. [`Zero`](Scalar::Zero) is the unique value of
+/// [`DataType::Zero`], used for trivial differential spaces. Neither supports arithmetic, comparisons, or Boolean
+/// conversion, and their `zero_like`/`one_like` are the identity. The `F4*` and `F8*` variants carry their exact
+/// encoded bits in a `u8`, preserving signed zeros and NaN payloads. Prefer
 /// [`Scalar::from_low_precision_float_bits`] when constructing them dynamically because it validates the four-bit
 /// format, and use [`Scalar::low_precision_float_bits`] to recover the encoding.
 ///
@@ -127,6 +128,7 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 #[derive(Copy, Clone, Debug, Parameter)]
 pub enum Scalar {
     Token,
+    Zero,
     Bool(bool),
     I8(i8),
     I16(i16),
@@ -168,6 +170,7 @@ impl PartialEq for Scalar {
         }
         match (self, other) {
             (Scalar::Token, Scalar::Token) => true,
+            (Scalar::Zero, Scalar::Zero) => true,
             (Scalar::Bool(left), Scalar::Bool(right)) => left == right,
             (Scalar::I8(left), Scalar::I8(right)) => left == right,
             (Scalar::I16(left), Scalar::I16(right)) => left == right,
@@ -388,6 +391,7 @@ impl PartialOrd for Scalar {
                 .flatten();
         }
         match (self, other) {
+            (Scalar::Zero, Scalar::Zero) => Some(Ordering::Equal),
             (Scalar::Bool(left), Scalar::Bool(right)) => left.partial_cmp(right),
             (Scalar::I8(left), Scalar::I8(right)) => left.partial_cmp(right),
             (Scalar::I16(left), Scalar::I16(right)) => left.partial_cmp(right),
@@ -413,6 +417,7 @@ impl Display for Scalar {
         }
         match self {
             Scalar::Token => formatter.write_str("token"),
+            Scalar::Zero => formatter.write_str("zero"),
             Scalar::Bool(value) => Display::fmt(value, formatter),
             Scalar::I8(value) => Display::fmt(value, formatter),
             Scalar::I16(value) => Display::fmt(value, formatter),
@@ -453,6 +458,7 @@ impl Typed for Scalar {
     fn r#type(&self) -> Cow<'_, DataType> {
         Cow::Owned(match self {
             Scalar::Token => DataType::Token,
+            Scalar::Zero => DataType::Zero,
             Scalar::Bool(_) => DataType::Boolean,
             Scalar::I8(_) => DataType::I8,
             Scalar::I16(_) => DataType::I16,
@@ -621,6 +627,9 @@ impl BooleanLike for Scalar {
             Scalar::Token => {
                 return Err(TypeError { message: "cannot convert a token scalar to a Boolean".to_string() }.into());
             }
+            Scalar::Zero => {
+                return Err(TypeError { message: "cannot convert a zero-space scalar to a Boolean".to_string() }.into());
+            }
             Scalar::Bool(value) => *value,
             Scalar::I8(value) => *value != 0,
             Scalar::I16(value) => *value != 0,
@@ -659,6 +668,7 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
         Ok(match r#type {
+            DataType::Zero => Scalar::Zero,
             DataType::Boolean => Scalar::Bool(false),
             DataType::I8 => Scalar::I8(0),
             DataType::I16 => Scalar::I16(0),
@@ -694,6 +704,7 @@ impl ZeroLike for Scalar {
     fn zero_like(&self) -> Self {
         match self {
             Scalar::Token => Scalar::Token,
+            Scalar::Zero => Scalar::Zero,
             Scalar::Bool(_) => Scalar::Bool(false),
             Scalar::I8(_) => Scalar::I8(0),
             Scalar::I16(_) => Scalar::I16(0),
@@ -762,6 +773,7 @@ impl OneLike for Scalar {
     fn one_like(&self) -> Self {
         match self {
             Scalar::Token => Scalar::Token,
+            Scalar::Zero => Scalar::Zero,
             Scalar::Bool(_) => Scalar::Bool(true),
             Scalar::I8(_) => Scalar::I8(1),
             Scalar::I16(_) => Scalar::I16(1),
@@ -1401,6 +1413,9 @@ impl ConvertElementType for Scalar {
                 TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
             );
         }
+        if source == DataType::Zero || target == DataType::Zero {
+            return Err(TypeError { message: "cannot convert values to or from the zero data type".to_string() }.into());
+        }
         let converted = if let Some((data_type, bits)) = self.low_precision_float_parts() {
             convert_real!(Self::decode_low_precision_float(data_type, bits))
         } else {
@@ -1591,7 +1606,7 @@ mod tests {
         );
         assert_eq!(program.interpret(Scalar::from(1.0)), Ok(Scalar::from(8.0)));
 
-        // The eager while JVP rule unrolls the loop, so forward-mode duals flow through the doubling body.
+        // The eager while JVP rule executes the loop directly over duals, so tangents flow through the doubling body.
         let (primal, tangent): (Scalar, Scalar) = domain
             .jvp(
                 |carry| {
@@ -1638,6 +1653,38 @@ mod tests {
         assert!(context.zero(&DataType::Token).is_err());
         assert!(context.one(&DataType::Token).is_err());
         assert_eq!(token.convert_element_type(DataType::Token), Ok(token));
+    }
+
+    #[test]
+    fn test_scalar_zero() {
+        let zero = Scalar::Zero;
+
+        // The zero-space scalar is the unique value of its type. Its total equality and ordering operations therefore
+        // compare it equal only to itself, while semantic comparison, arithmetic, and predicate conversion remain
+        // unsupported.
+        assert_eq!(zero.r#type().into_owned(), DataType::Zero);
+        assert_eq!(zero.to_string(), "zero");
+        assert_eq!(zero, Scalar::Zero);
+        assert_ne!(zero, Scalar::from(false));
+        assert_eq!(zero.partial_cmp(&Scalar::Zero), Some(Ordering::Equal));
+        assert_eq!(zero.as_boolean(), zero);
+        assert!(zero.boolean().is_err());
+        assert!(zero.compare(&zero, ComparisonDirection::Equal).is_err());
+        assert!(Neg::neg(&zero).is_err());
+        assert!(Add::add(&zero, &zero).is_err());
+        assert_eq!(zero.zero_like(), zero);
+        assert_eq!(zero.one_like(), zero);
+
+        // Additive-zero construction and identity conversion produce the unique value. Multiplicative-one
+        // construction and conversions to or from ordinary element types are rejected.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(context.zero(&DataType::Zero), Ok(zero));
+        assert!(context.one(&DataType::Zero).is_err());
+        assert_eq!(zero.convert_element_type(DataType::Zero), Ok(zero));
+        assert!(zero.convert_element_type(DataType::Boolean).is_err());
+        assert!(Scalar::from(false).convert_element_type(DataType::Zero).is_err());
+        assert_eq!(zero.promote_element_type(DataType::Zero), Ok(zero));
+        assert!(zero.promote_element_type(DataType::Boolean).is_err());
     }
 
     #[test]

@@ -522,7 +522,7 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
+    use crate::operations::constants::{OneOperation, ZeroOperation};
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
@@ -621,7 +621,7 @@ mod tests {
             assert_eq!(builder.instructions().len(), 2);
             assert_eq!(builder.instructions()[0].inputs(), &[]);
             assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(0)]);
-            assert!(builder.instructions()[0].operation().is_zero_operation());
+            assert!(builder.instructions()[0].operation().is_zero(0));
             assert_eq!(builder.instructions()[1].inputs(), &[AtomId::new(1), AtomId::new(2)]);
             assert_eq!(builder.instructions()[1].outputs(), &[AtomId::new(3)]);
         }

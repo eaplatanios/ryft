@@ -91,7 +91,7 @@ pub struct RematerializeOperation {
 
 impl RematerializeOperation {
     /// Creates a rematerialization operation. The primal, forward, backward, and tangent [`Program`]s are supplied
-    /// separately as the operation's attached regions (via the `regions` argument of
+    /// separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]) in the region order `["primal", "forward", "backward", "tangent"]`;
     /// [`Operation::infer_output_types`] validates the forward, backward, and tangent interfaces against the
     /// primal interface.
@@ -231,7 +231,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation whe
 /// replayed recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation {
+impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOperation {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
@@ -274,7 +274,7 @@ impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for RematerializeOp
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
             .collect())
     }
 }

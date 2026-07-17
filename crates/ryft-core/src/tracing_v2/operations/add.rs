@@ -3,22 +3,23 @@ use std::ops::Add;
 use crate::contexts::Context;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
-    transpose_input_cotangent_type,
 };
 use crate::macros::check_count;
-use crate::operations::math::{ADD_OPERATION_NAME, AddOperation};
+use crate::operations::math::AddOperation;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
-use crate::programs::{MaybeZero, Value};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::programs::types::Typed;
+use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
     AddOperation: Operation<V::Type>,
     V::Type: DifferentiableType,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
 {
     #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -31,34 +32,41 @@ where
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs
+            MaybeZero::Zero(_) => inputs
                 .iter()
-                .enumerate()
-                .map(|(input_index, input)| {
-                    transpose_input_cotangent_type(ADD_OPERATION_NAME, input_index, input.r#type().as_ref(), None)
-                        .map(MaybeZero::Zero)
+                .map(|input| {
+                    let target = input.r#type().cotangent();
+                    if target.is_zero_space() {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "'add' input has no cotangent space".to_string(),
+                        });
+                    }
+                    Ok(MaybeZero::Zero(target))
                 })
-                .collect::<Result<Vec<_>, _>>()?),
-            MaybeZero::Value(cotangent) => {
-                let actual_type = cotangent.r#type();
-                for (input_index, input) in inputs.iter().enumerate() {
-                    transpose_input_cotangent_type(
-                        ADD_OPERATION_NAME,
-                        input_index,
-                        input.r#type().as_ref(),
-                        Some(actual_type.as_ref()),
-                    )?;
-                }
-                Ok(vec![MaybeZero::Value(cotangent.clone()), MaybeZero::Value(cotangent.clone())])
-            }
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into),
+            MaybeZero::Value(cotangent) => inputs
+                .iter()
+                .map(|input| {
+                    let target = input.r#type().cotangent();
+                    if target.is_zero_space() {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: "'add' input has no cotangent space".to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(MaybeZero::Value(cotangent.unbroadcast_elementwise_cotangent(&target)?))
+                })
+                .collect(),
         }
     }
 }
 
 impl<C: Context> DifferentiableOperation<C> for AddOperation
 where
-    C::Value: Add<Output = C::Value>,
     AddOperation: Operation<C::Type>,
+    C::Type: DifferentiableType,
+    C::Value: Add<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -73,11 +81,22 @@ where
         let left = inputs[0].tangent().as_value().cloned();
         let right = inputs[1].tangent().as_value().cloned();
         // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
-        let tangent = left
-            .into_iter()
-            .chain(right)
-            .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'add' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
+        let tangent = match (left, right) {
+            (Some(left), Some(right)) => MaybeZero::Value(
+                left.normalize_elementwise_tangent(&target)? + right.normalize_elementwise_tangent(&target)?,
+            ),
+            (Some(tangent), None) | (None, Some(tangent)) => {
+                MaybeZero::Value(tangent.normalize_elementwise_tangent(&target)?)
+            }
+            (None, None) => MaybeZero::Zero(target),
+        };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }

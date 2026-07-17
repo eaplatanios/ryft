@@ -1,6 +1,8 @@
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
@@ -43,7 +45,7 @@ where
         }
         let axis = self.axis();
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
+            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect()),
             MaybeZero::Value(cotangent) => {
                 let rank = inputs[0].r#type().rank();
                 let mut offset = 0usize;
@@ -152,7 +154,9 @@ where
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let materialized = inputs
             .iter()
-            .map(|input| input.match_axis(batch_axis as isize, axis_size))
+            .map(|input| {
+                input.match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         ConcatenateOperation::new(lifted_axis).interpret_with_batch_axes(
@@ -172,9 +176,11 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::manipulation::Concatenate;
     use crate::programs::types::Typed;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::types::{ArrayType, DataType, Shape};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -276,5 +282,48 @@ mod tests {
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_concatenate_batching_preserves_materialized_batch_placement() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]))
+                .with_sharding(physical_sharding.clone())
+                .unwrap();
+            let mapped = ArrayBatch::new(
+                physical_type.clone(),
+                TestArray::new(physical_type, vec![1.0, 2.0, 3.0, 4.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]))
+                .with_sharding(Sharding::replicated(mesh, 1))
+                .unwrap();
+            let replicated = ArrayBatch::replicated(TestArray::new(replicated_type, vec![5.0]));
+            let context = BatchingContext::with_batch_dimension(
+                EagerContext::<TestArray>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+
+            let outputs = ConcatenateOperation::new(0)
+                .batch(&context, &crate::EmptyRegionDriver, &[mapped, replicated])
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
+            assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 3.0, 4.0, 5.0]);
+        }
     }
 }

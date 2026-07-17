@@ -2,7 +2,9 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{
@@ -148,7 +150,10 @@ where
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOperation {
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOperation
+where
+    V::Type: DifferentiableType,
+{
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -158,11 +163,15 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOp
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())])
+        let input_type = inputs[0].r#type();
+        Ok(vec![MaybeZero::Zero(input_type.cotangent())])
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for OneLikeOperation {
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for OneLikeOperation
+where
+    V::Type: DifferentiableType,
+{
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -172,7 +181,8 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for OneLikeOpe
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())])
+        let input_type = inputs[0].r#type();
+        Ok(vec![MaybeZero::Zero(input_type.cotangent())])
     }
 }
 
@@ -212,6 +222,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> f
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for ZeroOperation<C::Type>
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<ZeroOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -235,6 +246,7 @@ where
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for OneOperation<C::Type>
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<OneOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -258,6 +270,7 @@ where
 /// and paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for ConstantOperation<C::Constant>
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<ConstantOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -281,6 +294,7 @@ where
 /// `zero_like` of the exemplar) and paired with a typed zero tangent regardless of the exemplar's tangent.
 impl<C: Context> DifferentiableOperation<C> for ZeroLikeOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<ZeroLikeOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -304,6 +318,7 @@ where
 /// `one_like` of the exemplar) and paired with a typed zero tangent regardless of the exemplar's tangent.
 impl<C: Context> DifferentiableOperation<C> for OneLikeOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<OneLikeOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -327,6 +342,7 @@ where
 /// value and paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context, F: Clone + Display> DifferentiableOperation<C> for FillOperation<C::Type, F>
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<FillOperation<C::Type, F>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -350,6 +366,7 @@ where
 /// paired with a typed zero tangent, since constants carry no tangent.
 impl<C: Context> DifferentiableOperation<C> for IotaOperation<C::Type>
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<IotaOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(

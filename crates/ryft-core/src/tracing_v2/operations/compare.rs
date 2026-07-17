@@ -13,6 +13,7 @@ use crate::tracing::{Tracer, TracingContext};
 /// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.
 impl<C: Context> DifferentiableOperation<C> for CompareOperation
 where
+    C::Type: crate::differentiation::DifferentiableType,
     C::Operation: From<CompareOperation>,
     CompareOperation: Operation<C::Type>,
 {

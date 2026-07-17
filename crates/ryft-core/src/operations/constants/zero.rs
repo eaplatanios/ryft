@@ -63,6 +63,11 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 
     #[inline]
+    fn is_zero(&self, output_index: usize) -> bool {
+        output_index == 0
+    }
+
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, ZERO_OPERATION_NAME)?
             .bracketed(|operation| operation.field("type", &self.r#type))
@@ -85,29 +90,6 @@ impl<T: Type, C: Domain<Type = T> + Zero<C::Value>> InterpretableOperation<C> fo
 impl<T: Type, C: Context<Type = T, Operation: From<ZeroOperation<T>>>> PartiallyEvaluatableOperation<C>
     for ZeroOperation<T>
 {
-}
-
-/// Represents [`Operation`]s that may be or may be carrying [`ZeroOperation`] payloads. [`MaybeZeroOperation`] says
-/// that a borrowed operation value can be inspected to determine whether it is a [`ZeroOperation`] (or a wrapper of
-/// one), without cloning, moving, allocating, or manufacturing placeholder operations. Structural zero-ness ordinarily
-/// flows *symbolically* through the differentiation transforms as [`MaybeZero`](crate::MaybeZero) values and never
-/// needs to be recognized from staged instructions. The one place zero-ness can be lost is an opaque program splice
-/// (i.e., a user-authored program replayed into an active trace, such as a `custom_vjp` backward program whose outputs
-/// include canonical zeros for non-differentiated inputs) and the splicing rule uses this trait to recover it with one
-/// local pass over the spliced program's output producers.
-pub trait MaybeZeroOperation<T: Type> {
-    /// Returns `true` if `self` is a [`ZeroOperation`] (or a wrapper of one).
-    fn is_zero_operation(&self) -> bool;
-}
-
-impl<T: Type, O> MaybeZeroOperation<T> for O
-where
-    for<'operation> &'operation ZeroOperation<T>: TryFrom<&'operation O>,
-{
-    #[inline]
-    fn is_zero_operation(&self) -> bool {
-        <&ZeroOperation<T>>::try_from(self).is_ok()
-    }
 }
 
 /// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`] is
@@ -198,6 +180,8 @@ mod tests {
 
         let operation = ZeroOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);
+        assert!(Operation::<DataType>::is_zero(&operation, 0));
+        assert!(!Operation::<DataType>::is_zero(&operation, 1));
         assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));

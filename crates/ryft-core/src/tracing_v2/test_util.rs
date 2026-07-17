@@ -36,6 +36,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::programs::types::Typed;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use crate::types::{Shape, Size};
 
@@ -226,38 +227,91 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_rejects_transpose_contributions_with_promoted_types() {
+    fn test_dense_differentiation_uses_widened_f8_differential_values() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+
+        let forward = context.jacfwd(|value| value.sin(), input.clone()).unwrap();
+        let forward_block = forward.iter_blocks().next().unwrap();
+        assert_eq!(forward_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(forward_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-9);
+
+        let reverse = context.jacrev(|value| value.sin(), input.clone()).unwrap();
+        let reverse_block = reverse.iter_blocks().next().unwrap();
+        assert_eq!(reverse_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(reverse_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-9);
+
+        let hessian = context.hessian(|value| value.sin(), input).unwrap();
+        let hessian_block = hessian.iter_blocks().next().unwrap();
+        assert_eq!(hessian_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(hessian_block.value().values()[0], -2.0f64.sin(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_jacrev_converts_promoted_cotangents_to_each_input_type() {
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let f32 = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
         let f64 = TestArray::new(ArrayType::scalar(DataType::F64), vec![3.0]);
 
-        assert_eq!(
-            context.jacrev(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap_err(),
-            DifferentiationError::InvalidCotangentType {
-                operation: "add",
-                input_index: 0,
-                expected: "f32[]".to_string(),
-                actual: "f64[]".to_string(),
-            },
-        );
-        assert_eq!(
-            context.jacrev(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap_err(),
-            DifferentiationError::InvalidCotangentType {
-                operation: "sub",
-                input_index: 0,
-                expected: "f32[]".to_string(),
-                actual: "f64[]".to_string(),
-            },
-        );
-        assert_eq!(
-            context.jacrev(|(left, right)| Ok(left * right), (f32, f64)).unwrap_err(),
-            DifferentiationError::InvalidCotangentType {
-                operation: "mul",
-                input_index: 1,
-                expected: "f32[]".to_string(),
-                actual: "f64[]".to_string(),
-            },
-        );
+        let add = context.jacrev(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap();
+        let add_blocks = add.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(add_blocks[0].value().r#type().data_type(), DataType::F32);
+        assert_eq!(add_blocks[1].value().r#type().data_type(), DataType::F64);
+        assert_abs_diff_eq!(add_blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(add_blocks[1].value().values()[0], 1.0, epsilon = 1e-9);
+
+        let sub = context.jacrev(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap();
+        let sub_blocks = sub.iter_blocks().collect::<Vec<_>>();
+        assert_abs_diff_eq!(sub_blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(sub_blocks[1].value().values()[0], -1.0, epsilon = 1e-9);
+
+        let mul = context.jacrev(|(left, right)| Ok(left * right), (f32, f64)).unwrap();
+        let mul_blocks = mul.iter_blocks().collect::<Vec<_>>();
+        assert_abs_diff_eq!(mul_blocks[0].value().values()[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(mul_blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_vjp_restores_each_elementwise_input_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let (output, pullback) = context
+            .vjp(
+                |(left, right)| Ok(left + right),
+                (
+                    TestArray::new(sharded_type.clone(), vec![1.0, 2.0]),
+                    TestArray::new(replicated_type.clone(), vec![3.0, 4.0]),
+                ),
+            )
+            .unwrap();
+        assert!(pullback.program().to_string().contains("reshard"));
+        let (left, right) = pullback.apply(TestArray::new(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
+
+        assert_eq!(left.r#type().as_ref(), &sharded_type);
+        assert_eq!(right.r#type().as_ref(), &replicated_type);
+    }
+
+    #[test]
+    fn test_dense_jacobians_unbroadcast_scalar_elementwise_inputs() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let primals = (TestArray::scalar(2.0), TestArray::vector(vec![3.0, 4.0]));
+        let forward = context.jacfwd(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals.clone()).unwrap();
+        let reverse = context.jacrev(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals).unwrap();
+
+        for jacobian in [forward, reverse] {
+            let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2]);
+            assert_eq!(blocks[0].value().values(), &[4.0, 5.0]);
+            assert_eq!(blocks[1].value().r#type().static_shape().unwrap().as_slice(), &[2, 2]);
+            assert_eq!(blocks[1].value().values(), &[2.0, 0.0, 0.0, 2.0]);
+        }
     }
 
     #[test]
@@ -1275,8 +1329,8 @@ mod tests {
     #[test]
     fn test_while_value_and_grad_computes_gradient_through_bounded_loop() {
         // Eager reverse mode through a *bounded* while loop whose bound does not bind: the doubling loop at `x = 1`
-        // runs three iterations, below the bound of 5, so the eager hybrid rule unrolls the loop in full (the bound
-        // only truncates once it is reached). The straight-line pushforward transposes, and locally `f(x) = 8 x`, so
+        // runs three iterations, below the bound of 5, so the eager rule executes all three iterations (the bound only
+        // truncates once it is reached). Linearization records a straight-line pushforward, and locally `f(x) = 8 x`, so
         // the value is 8 and the gradient is 8.
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
@@ -1298,8 +1352,8 @@ mod tests {
 
     #[test]
     fn test_while_value_and_grad_computes_gradient_through_unrolled_loop() {
-        // Eager reverse mode through an *unbounded* while loop: the hybrid JVP rule unrolls the doubling loop at
-        // `x = 1` (three iterations), so the pushforward is a straight-line linear program that transposes. Locally
+        // Eager reverse mode through an *unbounded* while loop: the JVP rule executes the doubling loop at `x = 1`
+        // (three iterations), so linearization records a straight-line linear program that transposes. Locally
         // `f(x) = 8 x`, so the value is 8 and the gradient is 8. JAX cannot do this even under eager execution,
         // because it always traces `while_loop`.
         let (while_operation, while_regions) = doubling_while_operation();
@@ -1322,9 +1376,9 @@ mod tests {
     #[test]
     fn test_while_vjp_computes_cotangents_through_bounded_loop() {
         // Eager `vjp` through a *bounded* while loop whose bound does not bind: the doubling loop at `x = 1` runs
-        // three iterations, below the bound of 5, so the eager hybrid rule unrolls the loop in full and transposes the
-        // straight-line pushforward into a reusable pullback (no `while` remains). The loop is locally `f(x) = 8 x`,
-        // so every output cotangent is scaled by 8.
+        // three iterations, below the bound of 5, so the eager rule executes the loop in full and linearization
+        // transposes the resulting straight-line pushforward into a reusable pullback (no `while` remains). The loop
+        // is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
@@ -1525,6 +1579,42 @@ mod tests {
             assert_eq!(blocks[0].value().values(), &[24.0]);
             assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
         }
+    }
+
+    #[test]
+    fn test_hessian_replays_scan_regions() {
+        // For `f(initial, values) = initial * product(values)` at `(1, [2, 3, 4])`, all same-variable second
+        // derivatives vanish. Mixed derivatives with `initial` are the products excluding the corresponding value,
+        // and mixed derivatives between values are `initial` times the remaining value. This exercises nested
+        // forward-over-reverse replay of the scan body rather than only first-order region replay.
+        let (scan, body) = product_scan_operation(false);
+        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .hessian(
+                move |(initial, values)| {
+                    let mut outputs = initial.context().bind(
+                        ArrayOperation::Scan(scan),
+                        vec![body.clone()],
+                        &[initial.clone(), values],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+
+        let blocks = hessian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].value().values(), &[0.0]);
+        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(blocks[2].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(
+            blocks[3].value().values(),
+            &[
+                0.0, 4.0, 3.0, //
+                4.0, 0.0, 2.0, //
+                3.0, 2.0, 0.0, //
+            ],
+        );
     }
 
     #[test]
