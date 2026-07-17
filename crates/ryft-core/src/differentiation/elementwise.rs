@@ -15,6 +15,7 @@ use crate::operations::manipulation::{Broadcast, ConvertElementType, Reshape, Tr
 use crate::operations::sharding::Reshard;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
+use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -217,61 +218,40 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Represents operands handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
+/// input primal and tangent arrive already converted and broadcast to the output tangent [`Type`](crate::Type), while
+/// the output primal stays at its own (possibly narrower) type so terms can reuse it when no widening is required.
+pub struct UnaryElementwiseJvpOperands<'a, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
+    /// Input primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    pub input_primal: V,
 
-/// Operands handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The input primal
-/// and tangent arrive already converted and broadcast to the tangent target type, while the primal output stays
-/// at its own (possibly narrower) type so terms can reuse it when no widening is required.
-pub(crate) struct UnaryTangentOperands<'a, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
-    /// Input primal converted and broadcast to the tangent target type.
-    pub input: V,
+    /// Live input tangent [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    pub input_tangent: V,
 
-    /// Live input tangent converted and broadcast to the tangent target type.
-    pub tangent: V,
+    /// Primal output [`Value`] of the operation, at its own [`Type`](crate::Type).
+    pub output_primal: &'a V,
 
-    /// Primal output of the operation, at its own type.
-    pub primal: &'a V,
-
-    /// Tangent target type of the primal output.
-    pub target: &'a T,
+    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    pub output_tangent_type: &'a T,
 }
 
-impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> UnaryTangentOperands<'_, T, V> {
-    /// Returns the primal output reused as a tangent coefficient when its type already equals the tangent
-    /// target, and otherwise recomputes the coefficient from the widened input via `recompute`. Reusing the primal
-    /// keeps rules like `exp` and `sqrt` from staging a duplicate primal computation in tangent programs, while the
-    /// widened recompute path preserves precision when the primal output lives in a narrower representation than its
-    /// tangent (e.g., an `f8e8m0fnu` primal with an `f32` tangent).
+// TODO(eaplatanios): Review from here onwards.
+
+impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> UnaryElementwiseJvpOperands<'_, T, V> {
+    /// Returns the primal output reused as a tangent coefficient when its type already equals the tangent target type,
+    /// and otherwise recomputes the coefficient from the widened input via `recompute`. Reusing the primal keeps rules
+    /// for operations like `exp` and `sqrt` from staging a duplicate primal computation in tangent programs, while the
+    /// widened recomputation path preserves precision when the primal output lives in a narrower representation than
+    /// its tangent (e.g., an `f8e8m0fnu` primal with an `f32` tangent).
     pub fn primal_coefficient(
         &self,
         recompute: impl FnOnce(&V) -> Result<V, ProgramError>,
     ) -> Result<V, DifferentiationError> {
-        if self.primal.r#type().as_ref() == self.target { Ok(self.primal.clone()) } else { Ok(recompute(&self.input)?) }
-    }
-}
-
-/// Operands handed to the per-side tangent terms of a binary elementwise JVP rule by [`binary_elementwise_jvp`].
-/// Primal accessors convert and broadcast lazily so a term only stages the conversions it actually consumes.
-pub(crate) struct BinaryTangentOperands<'a, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
-    /// Dual of the left operand.
-    left: &'a DifferentiationDual<V>,
-
-    /// Dual of the right operand.
-    right: &'a DifferentiationDual<V>,
-
-    /// Tangent target type of the primal output.
-    target: &'a T,
-}
-
-impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryTangentOperands<'_, T, V> {
-    /// Returns the left operand's primal converted and broadcast to the tangent target type.
-    pub fn left(&self) -> Result<V, DifferentiationError> {
-        self.left.primal().align_tangent(self.target)
-    }
-
-    /// Returns the right operand's primal converted and broadcast to the tangent target type.
-    pub fn right(&self) -> Result<V, DifferentiationError> {
-        self.right.primal().align_tangent(self.target)
+        if self.output_primal.r#type().as_ref() == self.output_tangent_type {
+            Ok(self.output_primal.clone())
+        } else {
+            Ok(recompute(&self.input_primal)?)
+        }
     }
 }
 
@@ -282,19 +262,20 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryTangentO
 ///
 /// # Parameters
 ///
-///   - `operation_name`: Canonical operation name used in the returned errors.
+///   - `operation`: Operation whose JVP rule is being evaluated.
 ///   - `inputs`: The operand duals passed to the JVP rule.
 ///   - `primal`: Computes the primal output from the operand primal.
-///   - `tangent`: Computes the live output tangent from the prepared [`UnaryTangentOperands`].
-pub(crate) fn unary_elementwise_jvp<T, V>(
-    operation_name: &str,
+///   - `tangent`: Computes the live output tangent from the prepared [`UnaryElementwiseJvpOperands`].
+pub(crate) fn unary_elementwise_jvp<T, V, O>(
+    operation: &O,
     inputs: &[DifferentiationDual<V>],
     primal: impl FnOnce(&V) -> Result<V, ProgramError>,
-    tangent: impl FnOnce(UnaryTangentOperands<'_, T, V>) -> Result<V, DifferentiationError>,
+    tangent: impl FnOnce(UnaryElementwiseJvpOperands<'_, T, V>) -> Result<V, DifferentiationError>,
 ) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError>
 where
     T: DifferentiableType,
     V: ElementwiseDerivativeAlignment<T>,
+    O: Operation<T>,
 {
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
@@ -304,21 +285,46 @@ where
         MaybeZero::Zero(_) => MaybeZero::Zero(target),
         MaybeZero::Value(_) if target.is_zero_space() => {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{operation_name}' output type {} has no tangent space", primal.r#type()),
+                message: format!("'{}' output type {} has no tangent space", operation.name(), primal.r#type()),
             }
             .into());
         }
         MaybeZero::Value(input_tangent) => {
-            let operands = UnaryTangentOperands {
-                input: input.primal().align_tangent(&target)?,
-                tangent: input_tangent.align_tangent(&target)?,
-                primal: &primal,
-                target: &target,
+            let operands = UnaryElementwiseJvpOperands {
+                input_primal: input.primal().align_tangent(&target)?,
+                input_tangent: input_tangent.align_tangent(&target)?,
+                output_primal: &primal,
+                output_tangent_type: &target,
             };
             MaybeZero::Value(tangent(operands)?)
         }
     };
     Ok(vec![DifferentiationDual::new(primal, output_tangent)?])
+}
+
+/// Operands handed to the per-side tangent terms of a binary elementwise JVP rule by [`binary_elementwise_jvp`].
+/// Primal accessors convert and broadcast lazily so a term only stages the conversions it actually consumes.
+pub(crate) struct BinaryElementwiseJvpOperands<'a, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
+    /// Primal [`Value`] of the left operand.
+    left_primal: &'a V,
+
+    /// Primal [`Value`] of the right operand.
+    right_primal: &'a V,
+
+    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    output_tangent_type: &'a T,
+}
+
+impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementwiseJvpOperands<'_, T, V> {
+    /// Returns the left operand's primal converted and broadcast to the tangent target type.
+    pub fn left_primal(&self) -> Result<V, DifferentiationError> {
+        self.left_primal.align_tangent(self.output_tangent_type)
+    }
+
+    /// Returns the right operand's primal converted and broadcast to the tangent target type.
+    pub fn right_primal(&self) -> Result<V, DifferentiationError> {
+        self.right_primal.align_tangent(self.output_tangent_type)
+    }
 }
 
 /// Runs the shared binary elementwise JVP scaffolding: computes the primal via `primal`, resolves the tangent target
@@ -329,23 +335,26 @@ where
 ///
 /// # Parameters
 ///
-///   - `operation_name`: Canonical operation name used in the returned errors.
+///   - `operation`: Operation whose JVP rule is being evaluated.
 ///   - `inputs`: The operand duals passed to the JVP rule.
 ///   - `primal`: Computes the primal output from the left and right operand primals.
-///   - `left_term`: Computes the left operand's tangent contribution from the prepared [`BinaryTangentOperands`] and
-///     the left operand's live tangent (already converted and broadcast to the tangent target type).
-///   - `right_term`: Computes the right operand's tangent contribution from the prepared [`BinaryTangentOperands`]
-///     and the right operand's live tangent (already converted and broadcast to the tangent target type).
-pub(crate) fn binary_elementwise_jvp<T, V>(
-    operation_name: &str,
+///   - `left_term`: Computes the left operand's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpOperands`] and the left operand's live tangent (already converted and broadcast to the
+///     tangent target type).
+///   - `right_term`: Computes the right operand's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpOperands`] and the right operand's live tangent (already converted and broadcast to the
+///     tangent target type).
+pub(crate) fn binary_elementwise_jvp<T, V, O>(
+    operation: &O,
     inputs: &[DifferentiationDual<V>],
     primal: impl FnOnce(&V, &V) -> Result<V, ProgramError>,
-    left_term: impl FnOnce(&BinaryTangentOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
-    right_term: impl FnOnce(&BinaryTangentOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    left_term: impl FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    right_term: impl FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
 ) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError>
 where
     T: DifferentiableType,
     V: std::ops::Add<Output = V> + ElementwiseDerivativeAlignment<T>,
+    O: Operation<T>,
 {
     check_count!("input", inputs, 2, ProgramError);
     let left = &inputs[0];
@@ -355,13 +364,17 @@ where
     if target.is_zero_space() {
         if left.tangent().as_value().is_some() || right.tangent().as_value().is_some() {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{operation_name}' output type {} has no tangent space", primal.r#type()),
+                message: format!("'{}' output type {} has no tangent space", operation.name(), primal.r#type()),
             }
             .into());
         }
         return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
     }
-    let operands = BinaryTangentOperands { left, right, target: &target };
+    let operands = BinaryElementwiseJvpOperands {
+        left_primal: left.primal(),
+        right_primal: right.primal(),
+        output_tangent_type: &target,
+    };
     let left_contribution = left
         .tangent()
         .as_value()
