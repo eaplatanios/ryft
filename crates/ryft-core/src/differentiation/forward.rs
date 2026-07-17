@@ -1546,18 +1546,23 @@ pub fn linearize<
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
+    use half::{bf16, f16};
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::operations::BooleanLike;
-    use crate::operations::differentiation::StopGradientOperation;
+    use crate::operations::differentiation::{StopGradient, StopGradientOperation};
     use crate::operations::math::{MulOperation, Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
-    use crate::tracing::Trace;
+    use crate::tests::TestArray;
+    use crate::tracing::{NestedTracingContext, Trace};
+    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
+    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::DataType;
 
     use super::*;
@@ -1585,6 +1590,29 @@ mod tests {
             Err(TypeError { message })
                 if message == "tangent type token does not match type zero required by primal type token",
         ));
+    }
+
+    #[test]
+    fn test_differentiation_context_skips_ruleless_operations_for_symbolic_zero_tangents() {
+        // `stop_gradient` severs the collective's tangent input. The differentiation context must therefore bind the
+        // primal collective without consulting its absent JVP rule, while preserving the live tangent of the other
+        // addition operand.
+        let (primal, tangent) = jvp(
+            |input| {
+                let severed = input.stop_gradient();
+                let mut outputs = severed.context().bind(
+                    CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
+                    Vec::new(),
+                    &[severed.clone()],
+                )?;
+                Ok(input + outputs.remove(0))
+            },
+            TestArray::scalar(2.0),
+            TestArray::scalar(1.0),
+        )
+        .unwrap();
+        assert_eq!(primal.values, vec![4.0]);
+        assert_eq!(tangent.values, vec![1.0]);
     }
 
     #[test]
@@ -1646,6 +1674,31 @@ mod tests {
                 Scalar::F64(0.0),
             ],
             "the fused outputs must be the primal outputs [3 * 2, 2, 3 * 2] followed by the tangents [2 * 1, 0, 0]",
+        );
+    }
+
+    #[test]
+    fn test_program_jvp_uses_the_primal_array_operation_family() {
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let (_, program) = NestedTracingContext::trace(
+            context,
+            |inputs: Vec<_>| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
+            vec![TestArray::vector(vec![1.0, 2.0, 3.0]).r#type],
+        )
+        .unwrap();
+        let program = program.into_simplified().unwrap().jvp().unwrap();
+
+        // The fused JVP remains in the ordinary primal operation family instead of introducing a capture-keyed
+        // linear operation family.
+        let _: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> = &program;
+        assert_eq!(program.input_ids().len(), 2);
+        assert_eq!(program.output_ids().len(), 2);
+        assert_eq!(
+            program.interpret_in_context(
+                &context,
+                vec![TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::vector(vec![1.0, 1.0, 1.0])],
+            ),
+            Ok(vec![TestArray::scalar(14.0), TestArray::scalar(12.0)]),
         );
     }
 
@@ -1742,6 +1795,34 @@ mod tests {
     }
 
     #[test]
+    fn test_program_linearize_restores_pruned_tangent_inputs() {
+        // `stop_gradient` disconnects `dy` from the tangent output while `y` remains live in the primal program.
+        // The split must restore the canonical `dy` boundary slot after partial-evaluation liveness pruning.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (_, program) = NestedTracingContext::trace(
+            context,
+            |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
+            vec![DataType::F64, DataType::F64],
+        )
+        .unwrap();
+        let linearization = program.into_simplified().unwrap().linearize().unwrap();
+        assert_eq!(linearization.primal().output_ids().len(), 1 + linearization.residual_count());
+        assert_eq!(linearization.tangent().input_ids().len(), 2 + linearization.residual_count());
+
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.3)])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![Scalar::from(1.0), Scalar::from(123.0)];
+        tangent_inputs.extend(residuals);
+        assert_eq!(
+            linearization.tangent().interpret_in_context(&context, tangent_inputs),
+            Ok(vec![Scalar::from(0.7f64.cos())]),
+        );
+    }
+
+    #[test]
     fn test_jvp() {
         // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals. For
         // `f(x) = sin(x)` at `x = 2` along the tangent `ẋ = 3`, the primal output is `sin(2)` and the tangent
@@ -1765,6 +1846,14 @@ mod tests {
         let (value, tangent) = jvp(|x| Ok(x.clone() * x), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
         assert_eq!(value, Scalar::from(z * z));
         assert_eq!(tangent, Scalar::from((z + z) * tangent_seed));
+
+        // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a primal without
+        // tracing the untaken branch.
+        let (value, tangent) =
+            jvp(|x| Ok(if x.boolean()? { x.clone() * x.sin()? } else { -x }), Scalar::from(0.7), Scalar::from(1.0))
+                .unwrap();
+        assert_abs_diff_eq!(value, 0.7 * 0.7f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
         // is `Scalar::Zero`, and output structural zeros materialize with the same descriptor.
@@ -1838,6 +1927,16 @@ mod tests {
             .unwrap_err(),
             DifferentiationError::EmptyInput,
         );
+
+        // The unified scalar domain supports both half-precision variants through their ordinary scalar operations.
+        assert_eq!(
+            jvp(|x| Ok(x.clone() + x), Scalar::BF16(bf16::from_f32(3.0)), Scalar::BF16(bf16::ONE)),
+            Ok((Scalar::BF16(bf16::from_f32(6.0)), Scalar::BF16(bf16::from_f32(2.0)))),
+        );
+        assert_eq!(
+            jvp(|x| Ok(x.clone() + x), Scalar::F16(f16::from_f32(3.0)), Scalar::F16(f16::ONE)),
+            Ok((Scalar::F16(f16::from_f32(6.0)), Scalar::F16(f16::from_f32(2.0)))),
+        );
     }
 
     #[test]
@@ -1906,6 +2005,19 @@ mod tests {
             "the untaken branch must never be traced: {program}",
         );
         assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 6.0, epsilon = 1e-9);
+
+        // Structured inputs preserve their leaf order through a reusable multi-input pushforward.
+        let function = |(a, b): (
+            LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+        )| Ok(a.clone() * b + a.sin()?);
+        let (_, pushforward) = linearize(function, (Scalar::from(0.5), Scalar::from(1.3))).unwrap();
+        assert_abs_diff_eq!(
+            pushforward.apply((Scalar::from(1.0), Scalar::from(0.0))).unwrap(),
+            1.3 + 0.5f64.cos(),
+            epsilon = 1e-9,
+        );
+        assert_abs_diff_eq!(pushforward.apply((Scalar::from(0.0), Scalar::from(1.0))).unwrap(), 0.5, epsilon = 1e-9,);
 
         // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
         assert_eq!(
