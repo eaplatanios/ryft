@@ -102,16 +102,13 @@ where
         let scanned_output_count = body_output_count - carry_count;
         let mut jvp_outputs = Vec::with_capacity(body_output_count);
         for index in 0..carry_count {
-            jvp_outputs.push(DifferentiationDual::from_boundary_tangent(
-                outputs[index].clone(),
-                outputs[carry_count + index].clone(),
-            ));
+            jvp_outputs.push(DifferentiationDual::new(outputs[index].clone(), outputs[carry_count + index].clone())?);
         }
         for index in 0..scanned_output_count {
-            jvp_outputs.push(DifferentiationDual::from_boundary_tangent(
+            jvp_outputs.push(DifferentiationDual::new(
                 outputs[2 * carry_count + index].clone(),
                 outputs[2 * carry_count + scanned_output_count + index].clone(),
-            ));
+            )?);
         }
         Ok(jvp_outputs)
     }
@@ -1117,7 +1114,7 @@ mod tests {
         // batch item runs its own cumulative product over the shared `xs = [2, 3, 4]`, and the stacked outputs
         // gain the scan axis in front of the batch axis.
         let (scan, scan_body) = product_scan();
-        let context = BatchingContext::new(TestEagerContext::new(), 3, None);
+        let context = BatchingContext::new(TestEagerContext::new(), 3, None, ShardingDimension::Replicated);
         let carries = {
             let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -1138,7 +1135,7 @@ mod tests {
         // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the logical
         // leading axis (physical axis 1 when the batch axis sits at 0), so every batch item scans its own row.
         let (scan, scan_body) = product_scan();
-        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::Replicated);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -1155,7 +1152,7 @@ mod tests {
         // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
         // outputs are identical.
         let (scan, scan_body) = product_scan();
-        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::Replicated);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]);
@@ -1173,7 +1170,7 @@ mod tests {
     fn test_scan_batching_threads_batched_carries_and_inputs() {
         // Batching both operands pairs batch item `i` of the carries with batch item `i` of the stacked inputs.
         let (scan, scan_body) = product_scan();
-        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::Replicated);
         let carries = {
             let value = TestArray::vector(vec![1.0, 10.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -1198,7 +1195,7 @@ mod tests {
         // batch item.
         let (scan, scan_body) = product_scan();
         let scan = scan.with_reverse(true);
-        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::Replicated);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
@@ -1231,12 +1228,7 @@ mod tests {
                     .unwrap();
             let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, vec![2.0, 3.0, 4.0]));
-            let context = BatchingContext::with_batch_dimension(
-                TestEagerContext::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::sharded(["x"]));
 
             let outputs = batch_scan(
                 &context,
@@ -1278,12 +1270,7 @@ mod tests {
                     .unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, Vec::new()));
-            let context = BatchingContext::with_batch_dimension(
-                TestEagerContext::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context = BatchingContext::new(TestEagerContext::new(), 2, None, ShardingDimension::sharded(["x"]));
 
             let outputs = batch_scan(
                 &context,
@@ -1335,8 +1322,7 @@ mod tests {
             let builder = parent.builder().clone();
             let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
             let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
-            let context =
-                BatchingContext::with_batch_dimension(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
             let carries = ArrayBatch::new(carry_type, parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
             let tracer_inputs =

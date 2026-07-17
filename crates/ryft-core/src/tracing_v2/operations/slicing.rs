@@ -206,7 +206,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -239,7 +239,7 @@ where
             let update_tangent = update.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.dynamic_update_slice(&update_tangent, &primal_starts)?)
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -265,7 +265,7 @@ where
                 MaybeZero::Value(tangent.slice(self.start_indices(), self.limit_indices(), self.strides())?)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -294,7 +294,7 @@ where
             let update_tangent = update.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.update_slice(&update_tangent, self.start_indices())?)
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -364,14 +364,14 @@ fn replace_sharding_dimension(
 
 /// Stacks per-item expansion results along a fresh leading batch axis of size `axis_size`: item `0` seeds the stacked
 /// accumulator with replicated placement and later items overwrite their slices via [`UpdateSlice`] at static item
-/// offsets. The completed accumulator is then resharded once to `batch_dimension`; keeping intermediate singleton
+/// offsets. The completed accumulator is then resharded once to `axis_sharding`; keeping intermediate singleton
 /// updates replicated avoids assigning a nontrivial mapped-axis sharding to an extent-one update. `interpret_item`
 /// produces the per-item result; an empty batch axis is rejected with a precise error naming `operation_name` because
 /// no batch item can seed the accumulator.
 pub(crate) fn stack_expansion_items<V, InterpretItemFn>(
     operation_name: &'static str,
     axis_size: usize,
-    batch_dimension: ShardingDimension,
+    axis_sharding: ShardingDimension,
     mut interpret_item: InterpretItemFn,
 ) -> Result<ArrayBatch<V>, BatchingError>
 where
@@ -386,7 +386,7 @@ where
             None => {
                 // Item `0` seeds the stacked accumulator by replication; later items overwrite their slices.
                 ArrayBatch::replicated(output_item)
-                    .broadcast_with_dimension(0, axis_size, ShardingDimension::Replicated)?
+                    .broadcast(0, axis_size, ShardingDimension::Replicated)?
                     .into_value()
             }
             Some(accumulator) => {
@@ -406,8 +406,8 @@ where
         });
     };
     let accumulator = match accumulator.r#type().sharding() {
-        Some(sharding) if sharding.dimensions().first() != Some(&batch_dimension) => {
-            accumulator.reshard(&replace_sharding_dimension(sharding, 0, batch_dimension)?)
+        Some(sharding) if sharding.dimensions().first() != Some(&axis_sharding) => {
+            accumulator.reshard(&replace_sharding_dimension(sharding, 0, axis_sharding)?)
         }
         _ => accumulator,
     };
@@ -442,15 +442,11 @@ where
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     }
     if axis_size == 0 {
-        let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Result<Vec<_>, BatchingError>>()?;
+        let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
         let mut output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
         check_count!("output", output_types, 1, ProgramError);
         let output = context.parent().zero(&output_types.remove(0))?;
-        return Ok(vec![ArrayBatch::replicated(output).broadcast_with_dimension(
-            0,
-            0,
-            context.batch_dimension().clone(),
-        )?]);
+        return Ok(vec![ArrayBatch::replicated(output).broadcast(0, 0, context.axis_sharding().clone())?]);
     }
     let aligned = inputs
         .iter()
@@ -471,7 +467,7 @@ where
             ArrayBatch::new(value.r#type().into_owned(), value, BatchAxis::new(0))
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
-    let stacked = stack_expansion_items(operation_name, axis_size, context.batch_dimension().clone(), |item| {
+    let stacked = stack_expansion_items(operation_name, axis_size, context.axis_sharding().clone(), |item| {
         let item_inputs = aligned
             .iter()
             .map(|input| expansion_item(operation_name, input, item))
@@ -535,10 +531,8 @@ where
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input =
-            inputs[0].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
-        let update =
-            inputs[1].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
+        let input = inputs[0].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
+        let update = inputs[1].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
         UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
@@ -658,10 +652,8 @@ where
             return Ok(vec![inputs[1].clone()]);
         }
         let axis_size = axis_size.expect("a mapped input pins the batch size");
-        let input =
-            inputs[0].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
-        let update =
-            inputs[1].match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())?;
+        let input = inputs[0].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
+        let update = inputs[1].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
         let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
@@ -830,7 +822,7 @@ mod tests {
         .unwrap();
         let outputs = SliceOperation::new(vec![1], vec![3])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input],
             )
@@ -843,7 +835,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = SliceOperation::new(vec![1], vec![3])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[uniform],
             )
@@ -861,7 +853,7 @@ mod tests {
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
         let outputs = strided
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input],
             )
@@ -920,7 +912,7 @@ mod tests {
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
@@ -938,7 +930,7 @@ mod tests {
         .unwrap();
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
@@ -965,12 +957,8 @@ mod tests {
             let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
-            let context = BatchingContext::with_batch_dimension(
-                EagerContext::<TestArray>::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context =
+                BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
                     input_type.clone(),
@@ -1017,7 +1005,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, ArrayBatch::replicated(index(1.0))],
             )
@@ -1034,7 +1022,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1053,7 +1041,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1.0, 3.0])],
             )
@@ -1070,7 +1058,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1.0, 2.0])],
             )
@@ -1089,7 +1077,7 @@ mod tests {
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, update, ArrayBatch::replicated(index(1.0))],
             )
@@ -1111,7 +1099,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1130,7 +1118,7 @@ mod tests {
         let uniform_update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )

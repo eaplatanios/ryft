@@ -120,7 +120,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let primal = Concatenate::concatenate(&primals, self.axis())?;
         let tangent = Concatenate::concatenate(&tangents, self.axis())?;
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -154,9 +154,7 @@ where
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let materialized = inputs
             .iter()
-            .map(|input| {
-                input.match_axis_with_dimension(batch_axis as isize, axis_size, context.batch_dimension().clone())
-            })
+            .map(|input| input.match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         ConcatenateOperation::new(lifted_axis).interpret_with_batch_axes(
@@ -243,7 +241,7 @@ mod tests {
         .unwrap();
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[first, second],
             )
@@ -262,7 +260,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[batched, uniform],
             )
@@ -275,7 +273,7 @@ mod tests {
         let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[left, right],
             )
@@ -309,12 +307,8 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
             let replicated = ArrayBatch::replicated(TestArray::new(replicated_type, vec![5.0]));
-            let context = BatchingContext::with_batch_dimension(
-                EagerContext::<TestArray>::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context =
+                BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::sharded(["x"]));
 
             let outputs = ConcatenateOperation::new(0)
                 .batch(&context, &crate::EmptyRegionDriver, &[mapped, replicated])

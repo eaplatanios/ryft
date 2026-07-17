@@ -626,8 +626,8 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
-            .collect())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 

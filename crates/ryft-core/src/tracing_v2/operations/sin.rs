@@ -47,7 +47,7 @@ where
                 MaybeZero::Value(coefficient * tangent.normalize_elementwise_tangent(&target)?)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

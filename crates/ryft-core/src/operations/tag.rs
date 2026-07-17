@@ -2,8 +2,8 @@ use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -116,6 +116,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
 
 impl<C: Context> DifferentiableOperation<C> for TagOperation
 where
+    C::Type: DifferentiableType,
     C::Operation: From<ZeroOperation<C::Type>> + From<TagOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -131,7 +132,7 @@ where
         let mut primal =
             context.bind(TagOperation::new(self.key()), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
-        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
+        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())?])
     }
 }
 

@@ -71,7 +71,7 @@ where
             let updates_tangent = updates.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

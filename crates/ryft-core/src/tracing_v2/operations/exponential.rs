@@ -47,7 +47,7 @@ where
                 MaybeZero::Value(coefficient * tangent.normalize_elementwise_tangent(&target)?)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -104,7 +104,7 @@ where
                     / input.primal().normalize_elementwise_tangent(&target)?,
             ),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -161,7 +161,7 @@ where
                 MaybeZero::Value(tangent.normalize_elementwise_tangent(&target)? / (denominator.clone() + denominator))
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

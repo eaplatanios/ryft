@@ -4,11 +4,10 @@ use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::broadcasting::Broadcastable;
 use crate::captures::CaptureReference;
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationTracer};
 use crate::macros::check_count;
 use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
 use crate::tracing::Tracer;
@@ -272,12 +271,11 @@ impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingT
 // A dual's Boolean view uses its primal's: `as_boolean` reinterprets the primal with a
 // structural zero tangent, and `boolean` decodes the primal — so branching on a dual in a
 // closure succeeds exactly when the primal is a concrete (eager) value and errors when it is a staged tracer.
-impl<C: Context<Value: BooleanLike>> BooleanLike for DifferentiationTracer<C> {
+impl<C: Context<Type: DifferentiableType, Value: BooleanLike>> BooleanLike for DifferentiationTracer<C> {
     #[inline]
     fn as_boolean(&self) -> Self {
         let primal = self.primal().as_boolean();
-        let tangent = MaybeZero::Zero(primal.r#type().into_owned());
-        Self::new(DifferentiationDual::new(primal, tangent), self.context().clone())
+        Self::new(DifferentiationDual::new_with_zero_tangent(primal), self.context().clone())
     }
 
     #[inline]

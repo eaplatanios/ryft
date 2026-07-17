@@ -190,7 +190,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(self.destination())),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -360,7 +360,12 @@ mod tests {
         }
         .unwrap();
         let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            2,
+            None,
+            crate::ShardingDimension::Replicated,
+        );
         let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

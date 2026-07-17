@@ -25,7 +25,6 @@ use crate::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::batching::{BatchingContext, BatchingDriver};
-use crate::differentiation::forward::validate_tangent;
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{TypeError, Typed};
@@ -366,8 +365,8 @@ where
             .iter()
             .cloned()
             .zip(tangent_outputs.iter().cloned())
-            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
-            .collect())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -476,8 +475,7 @@ where
             let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
             check_count!("output", initial_mask, 1, ProgramError);
             let mut extended_inputs = inputs.to_vec();
-            extended_inputs
-                .push(DifferentiationDual::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type.tangent())));
+            extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0)));
             // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
             // requested through the instruction-scoped driver over them.
             let mut outputs = driver.jvp_operation(
@@ -640,8 +638,8 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
-            .collect())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -734,15 +732,12 @@ where
             .drain(..)
             .zip(tangent_carries.drain(..))
             .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let body_region = body.entry_region_ref();
         let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
             input_duals,
             |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.lift(constant.clone())?)),
             |instruction, input_duals| {
-                for (index, dual) in input_duals.iter().enumerate() {
-                    validate_tangent(dual, "eager while body input", index)?;
-                }
                 let programs = instruction
                     .regions()
                     .iter()
@@ -760,9 +755,6 @@ where
                     driver.jvp_operation(instruction.operation(), programs, context, input_duals)?
                 };
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-                for (index, dual) in output_duals.iter().enumerate() {
-                    validate_tangent(dual, "eager while body output", index)?;
-                }
                 Ok(output_duals)
             },
         )?;
@@ -780,7 +772,7 @@ where
             .into_iter()
             .zip(tangent_carries)
             .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -1135,7 +1127,7 @@ where
         // staged broadcast); the batched body's outputs are already aligned to the state axes by the fixed point.
         for (element, state_axis) in state.iter_mut().zip(state_axes.iter()) {
             if !state_axis.is_replicated() && element.batch_axis().is_replicated() {
-                *element = element.broadcast_with_dimension(0, axis_size, context.batch_dimension().clone())?;
+                *element = element.broadcast(0, axis_size, context.axis_sharding().clone())?;
             }
         }
         let state_values = state.iter().map(|element| element.value().clone()).collect::<Vec<_>>();
@@ -1350,13 +1342,15 @@ mod tests {
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
     use crate::programs::{Program, ProgramBuilder, Value};
-    use crate::tracing::DomainTracingContext;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tracing::{DomainTracingContext, Trace};
     use crate::tracing_v2::operations::reduce::ReduceOperation;
+    use crate::tracing_v2::test_util::scalar_scale_branch;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
-    use crate::batching::BatchAxis;
+    use crate::batching::{Batch, BatchAxis, BatchingTracer};
 
     #[derive(Clone, Debug, Parameter, PartialEq)]
     enum TestValue {
@@ -1749,6 +1743,154 @@ mod tests {
             ),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
         );
+    }
+
+    #[test]
+    fn test_condition_region_batching_preserves_mapped_axis_sharding() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_sharding(physical_sharding)
+                .unwrap();
+            let operand = ArrayBatch::new(
+                physical_type.clone(),
+                TestArray::new(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let logical_type = operand.unbatched_type();
+            let (_, branch) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+                |inputs: Vec<_>| Ok(inputs),
+                vec![logical_type],
+            )
+            .unwrap();
+            let context = BatchingContext::new(
+                EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+            let predicate = ArrayBatch::replicated(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+
+            let outputs = context
+                .bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![branch.clone(), branch],
+                    &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+                )
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].batch().r#type(), Cow::Borrowed(&physical_type));
+        }
+    }
+
+    #[test]
+    fn test_batch_stages_replicated_condition_predicates() {
+        // A replicated *abstract* condition predicate under trace-time batching cannot be concretized to pick one
+        // branch (previously this surfaced a `Concretization` error), so the staged batching rule batches both
+        // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
+        // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
+        // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
+        let operand_atom = builder.borrow_mut().add_input(operand_type);
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let condition_count = program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "condition")
+            .count();
+        assert_eq!(condition_count, 1, "{program}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![3.0, 12.0, 27.0]);
+    }
+
+    #[test]
+    fn test_batch_normalizes_replicated_condition_branch_output_axes() {
+        // The two branches of a staged batched condition may disagree on their natural output batch axes: here the
+        // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
+        // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
+        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
+        let mut constant_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        constant_builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
+        let constant_branch = constant_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom =
+            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), constant_branch];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let rendered = program.to_string();
+        assert!(rendered.contains("broadcast"), "{rendered}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![7.0, 7.0, 7.0]);
     }
 
     use crate::operations::compare::ComparisonDirection;

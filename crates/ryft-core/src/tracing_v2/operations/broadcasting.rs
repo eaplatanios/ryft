@@ -251,7 +251,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.broadcast(tangent_type, self.output_axes())?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -427,7 +427,12 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            2,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let outputs = BroadcastOperation::new(logical_output_type, vec![0])
             .batch(&context, &crate::programs::regions::EmptyRegionDriver, &[input])

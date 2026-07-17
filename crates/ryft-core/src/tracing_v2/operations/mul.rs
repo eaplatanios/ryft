@@ -67,7 +67,7 @@ where
             .chain(right_term)
             .reduce(|left_term, right_term| left_term + right_term)
             .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

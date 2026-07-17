@@ -100,7 +100,7 @@ where
             }
             (None, None) => MaybeZero::Zero(target),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

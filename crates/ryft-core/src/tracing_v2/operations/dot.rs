@@ -641,25 +641,23 @@ where
         let mixed_axis_size = || axis_size.expect("a mapped input pins the batch size");
         let aligned_inputs: Vec<crate::batching::ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
-            (Some(_), None) => vec![
-                inputs[0].clone(),
-                inputs[1].broadcast_with_dimension(0, mixed_axis_size(), context.batch_dimension().clone())?,
-            ],
-            (None, Some(_)) => vec![
-                inputs[0].broadcast_with_dimension(0, mixed_axis_size(), context.batch_dimension().clone())?,
-                inputs[1].clone(),
-            ],
+            (Some(_), None) => {
+                vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size(), context.axis_sharding().clone())?]
+            }
+            (None, Some(_)) => {
+                vec![inputs[0].broadcast(0, mixed_axis_size(), context.axis_sharding().clone())?, inputs[1].clone()]
+            }
         };
         let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
                 message: "'dot' batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
             })?;
-        let batch_dimension = crate::batching::ArrayBatch::sharding_for_inputs(inputs)?;
+        let axis_sharding = crate::batching::ArrayBatch::sharding_for_inputs(inputs)?;
         let lifted_op = DotOperation::new(lifted_dimensions).with_output_sharding(lift_output_sharding(
             self.output_sharding.as_ref(),
             output_axis,
-            batch_dimension,
+            axis_sharding,
         )?);
         lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
@@ -716,7 +714,7 @@ where
             .chain(right_term)
             .reduce(|left_term, right_term| left_term + right_term)
             .map_or_else(|| MaybeZero::Zero(tangent_type), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -877,18 +875,18 @@ pub fn lift_dot_dimensions(
     }
 }
 
-/// Lifts an optional requested output sharding through one batching level by inserting `batch_dimension` at the new
-/// output batch axis. `batch_dimension` is the [`ShardingDimension`] derived from the batched inputs' mapped axis
+/// Lifts an optional requested output sharding through one batching level by inserting `axis_sharding` at the new
+/// output batch axis. `axis_sharding` is the [`ShardingDimension`] derived from the batched inputs' mapped axis
 /// (see [`ArrayBatch::sharding_for_inputs`](crate::ArrayBatch::sharding_for_inputs)), so the batched
 /// dimension carries the same sharding as the operands' mapped axis, mirroring JAX's `get_sharding_for_vmap`.
 fn lift_output_sharding(
     output_sharding: Option<&Sharding>,
     output_axis: Option<usize>,
-    batch_dimension: ShardingDimension,
+    axis_sharding: ShardingDimension,
 ) -> Result<Option<Sharding>, ProgramError> {
     match (output_sharding, output_axis) {
         (Some(output_sharding), Some(axis)) => output_sharding
-            .with_inserted_dimension(axis, batch_dimension)
+            .with_inserted_dimension(axis, axis_sharding)
             .map(Some)
             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() }.into()),
         (Some(output_sharding), None) => Ok(Some(output_sharding.clone())),
@@ -1059,11 +1057,16 @@ fn for_each_multi_index(extents: &[usize], mut action: impl FnMut(&[usize])) {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::batching::{Batch, BatchAxis};
+    use crate::contexts::EagerContext;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -1521,7 +1524,7 @@ mod tests {
         let builder = context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 4, 8]));
         let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
-        let batching_context = BatchingContext::new(context.clone(), 2, None);
+        let batching_context = BatchingContext::new(context.clone(), 2, None, ShardingDimension::Replicated);
         let lhs = {
             let value = context.tracer(lhs_atom, None);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -1584,8 +1587,7 @@ mod tests {
             let rhs_atom = builder.borrow_mut().add_input(rhs_type);
             let lhs = ArrayBatch::new(lhs_type, parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
             let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
-            let context =
-                BatchingContext::with_batch_dimension(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
 
             let outputs = DotOperation::matmul().batch(&context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
 
@@ -1608,6 +1610,31 @@ mod tests {
                 program.output_types()[0].sharding().unwrap().dimensions(),
                 &[ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated(),],
             );
+        }
+    }
+
+    #[test]
+    fn test_dot_batching_lifts_dimension_numbers() {
+        // x has shape [3, 4]; outer batch over axis 0 produces per-item rank-1 vectors. Inside,
+        // we want every per-item vector dotted with itself, giving a per-item scalar; batch
+        // over the leading axis then yields a length-3 vector of dot products.
+        let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data);
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
+        for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
+            assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
         }
     }
 

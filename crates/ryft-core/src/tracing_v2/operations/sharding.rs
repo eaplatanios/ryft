@@ -88,7 +88,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(self.sharding())),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -109,10 +109,10 @@ where
         ArrayBatch::common_batch_size(inputs)?;
         let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
-                let batch_dimension = ArrayBatch::sharding_for_inputs(inputs)?;
+                let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
                 let lifted = self
                     .sharding()
-                    .with_inserted_dimension(batch_axis, batch_dimension)
+                    .with_inserted_dimension(batch_axis, axis_sharding)
                     .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
                 (lifted, Some(batch_axis))
             }
@@ -166,7 +166,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(self.sharding())),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

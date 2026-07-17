@@ -138,7 +138,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(self.output_shape().clone())?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -160,7 +160,7 @@ where
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input_shape = inputs[0].unbatched_type()?.shape().clone();
+        let input_shape = inputs[0].unbatched_type().shape().clone();
         let Some((_, lifted_output_shape, k_out)) =
             lift_reshape_shapes(&input_shape, self.output_shape(), k_in, axis_size)
         else {
@@ -174,5 +174,44 @@ where
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
         lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(k_out)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::batching::{Batch, BatchAxis};
+    use crate::contexts::EagerContext;
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
+    use crate::types::DataType;
+
+    use super::*;
+
+    #[test]
+    fn test_reshape_batching_lifts_input_and_output_shapes() {
+        // x has shape [2, 6]; outer batch over axis 0 yields per-item rank-1 vectors of size 6,
+        // which we reshape to per-item [2, 3]. The combined effect should be a [2, 2, 3] tensor
+        // whose leading axis is the original batch dimension.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(2, 6, x_data.clone());
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
+        );
+        // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
+        assert_eq!(output.values, x_data);
     }
 }

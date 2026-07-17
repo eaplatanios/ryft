@@ -26,7 +26,7 @@ mod tests {
 
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::DifferentiationError;
+    use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
@@ -557,9 +557,9 @@ mod tests {
         let integer = TestArray::new(ArrayType::scalar(DataType::I32), vec![2.0]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), integer).unwrap_err(),
-            DifferentiationError::NonDifferentiableDenseLeaf {
-                transform: "jacfwd",
-                role: "input",
+            DifferentiationError::NonDifferentiableParameter {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
                 r#type: "i32[]".to_string(),
             },
@@ -568,10 +568,9 @@ mod tests {
         let complex = TestArray::new(ArrayType::scalar(DataType::C64), vec![2.0]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), complex.clone()).unwrap_err(),
-            DifferentiationError::ComplexDenseLeaf {
-                transform: "jacfwd",
-                holomorphic_transform: "jacfwd_holomorphic",
-                role: "input",
+            DifferentiationError::ComplexParameter {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
                 r#type: "c64[]".to_string(),
             },
@@ -581,9 +580,9 @@ mod tests {
 
         assert_eq!(
             context.jacrev_holomorphic(|x| Ok(x), TestArray::scalar(2.0)).unwrap_err(),
-            DifferentiationError::NonComplexDenseLeaf {
-                transform: "jacrev_holomorphic",
-                role: "input",
+            DifferentiationError::NonComplexParameter {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
                 r#type: "f64[]".to_string(),
             },
@@ -597,10 +596,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             complex_output_error,
-            DifferentiationError::ComplexDenseLeaf {
-                transform: "jacrev",
-                holomorphic_transform: "jacrev_holomorphic",
-                role: "output",
+            DifferentiationError::ComplexParameter {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Output,
                 path: "$".to_string(),
                 r#type: "c64[]".to_string(),
             },
@@ -610,9 +608,9 @@ mod tests {
         let dynamic = TestArray::new(dynamic_type, vec![1.0]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), dynamic).unwrap_err(),
-            DifferentiationError::NonFiniteDenseLeaf {
-                transform: "jacfwd",
-                role: "input",
+            DifferentiationError::NonFiniteCoordinateSpace {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
                 r#type: "f64[*]".to_string(),
             },
@@ -626,9 +624,9 @@ mod tests {
                     TestArray::scalar(1.0),
                 )
                 .unwrap_err(),
-            DifferentiationError::NonFiniteDenseLeaf {
-                transform: "jacfwd",
-                role: "output",
+            DifferentiationError::NonFiniteCoordinateSpace {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Output,
                 path: "$".to_string(),
                 r#type: "f64[*]".to_string(),
             },
@@ -637,9 +635,9 @@ mod tests {
         let dynamic = TestArray::new(dynamic_type, vec![1.0]);
         assert_eq!(
             context.jacrev(|input| Ok(input.context().lift(TestArray::scalar(1.0))?), dynamic).unwrap_err(),
-            DifferentiationError::NonFiniteDenseLeaf {
-                transform: "jacrev",
-                role: "input",
+            DifferentiationError::NonFiniteCoordinateSpace {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
                 r#type: "f64[*]".to_string(),
             },

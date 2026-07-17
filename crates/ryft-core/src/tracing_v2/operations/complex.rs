@@ -45,7 +45,7 @@ where
                     .complex(&imaginary_tangent.clone().materialize(context)?)?,
             ),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -81,6 +81,7 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for ConjugateOperation
 where
+    C::Type: DifferentiableType,
     C::Value: Conjugate,
     ConjugateOperation: Operation<C::Type>,
 {
@@ -98,7 +99,7 @@ where
             MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.conjugate()?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -147,7 +148,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -200,7 +201,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

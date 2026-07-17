@@ -170,8 +170,8 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
         Ok(outputs
             .into_iter()
             .zip(tangents)
-            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
-            .collect())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -239,7 +239,7 @@ where
         .iter()
         .map(|input| match input.batch_axis_position() {
             Some(_) => input.move_axis(0),
-            None => input.broadcast_with_dimension(0, axis_size, context.batch_dimension().clone()),
+            None => input.broadcast(0, axis_size, context.axis_sharding().clone()),
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (operation, operation_regions) = make_operation(Some(axis_size))?;
@@ -529,8 +529,8 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(output_tangents)
-            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
-            .collect())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 

@@ -391,9 +391,15 @@ mod tests {
     use indoc::indoc;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::math::{Cos, Sin};
     use crate::programs::Program;
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
+    use crate::types::{ArrayType, DataType};
+
+    use super::*;
 
     #[test]
     fn float_ext_matches_scalar_intrinsics() {
@@ -414,5 +420,29 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_zero_batching_yields_replicated_output() {
+        // End-to-end: a batched function that stages `ZeroOperation` produces a replicated zero
+        // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
+        // zero-input operation and that the post-trace replay materializes the same zero for
+        // every batch item through the replicated broadcast path.
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| {
+                    let zero_op =
+                        ArrayOperation::<TestArray>::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64)));
+                    let zero = x.context().bind(zero_op, Vec::new(), &[])?.into_iter().next().unwrap();
+                    Ok(x + zero)
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
     }
 }

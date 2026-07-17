@@ -329,7 +329,7 @@ where
             let output_tangent_type = primal.r#type().tangent();
             MaybeZero::Value(tangents.remove(0).normalize_elementwise_tangent(&output_tangent_type)?)
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

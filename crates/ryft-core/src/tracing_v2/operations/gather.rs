@@ -44,7 +44,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -158,7 +158,12 @@ mod tests {
 
         let outputs = operation
             .batch(
-                &crate::BatchingContext::new(EagerContext::<TestArray>::new(), 0, None),
+                &crate::BatchingContext::new(
+                    EagerContext::<TestArray>::new(),
+                    0,
+                    None,
+                    crate::ShardingDimension::Replicated,
+                ),
                 &crate::EmptyRegionDriver,
                 &[operand, indices],
             )

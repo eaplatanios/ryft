@@ -209,7 +209,7 @@ where
                 MaybeZero::Value(tangent.convert_element_type(output_tangent_type.element_type())?)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

@@ -262,7 +262,7 @@ where
                 MaybeZero::Value(stage_collective(context, &self.axis_name, self.kind, tangent)?)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -604,17 +604,26 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
+    use crate::axes::AxisIndex;
+    use crate::batching::{
+        ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
+    };
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
+    use crate::types::{Shape, Size};
 
     use super::*;
 
     /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
     /// contains every operation the collective batching rule may bind (notably `FillOperation` for `PMean`).
     fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<TestArray, ArrayOperation<TestArray>>> {
-        BatchingContext::new(EagerContext::new(), axis_size, Some("i".to_string()))
+        BatchingContext::new(
+            EagerContext::new(),
+            axis_size,
+            Some("i".to_string()),
+            crate::ShardingDimension::Replicated,
+        )
     }
 
     #[test]
@@ -753,5 +762,100 @@ mod tests {
             .unwrap();
         assert_eq!(value.values, vec![2.0]);
         assert_eq!(gradient.values, vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
+    }
+
+    #[test]
+    fn test_nested_batch_named_axes_route_collectives_to_matching_level() {
+        // The inner `psum` targets the *outer* named axis, so each inner batch item must reduce over the
+        // outer batch items: column sums of [[1, 2], [3, 4]].
+        let x = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            vec![1.0, 2.0, 3.0, 4.0],
+        );
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |scalar| scalar.collective("outer", CollectiveKind::PSum),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("inner"),
+                    )?)
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::named("outer"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
+        assert_eq!(output.values, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_batch_axis_index_produces_per_item_indices() {
+        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |item| item.context().axis_index("i"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            )
+            .unwrap();
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.values, vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
+        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
+        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
+        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
+        // vary over inner items). The inner output is therefore declared replicated, and the
+        // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
+        let x = TestArray::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |scalar| scalar.context().axis_index("o"),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::replicated(),
+                        BatchAxisSpecification::named("i"),
+                    )?)
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("o"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.values, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_batch_axis_index_rejects_unbound_axis() {
+        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |item| item.context().axis_index("j"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            );
+        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 }

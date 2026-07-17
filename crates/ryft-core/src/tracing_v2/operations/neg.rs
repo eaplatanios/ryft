@@ -1,7 +1,9 @@
 use std::ops::Neg;
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::math::NegOperation;
 use crate::partial::PartialValue;
@@ -33,6 +35,7 @@ where
 
 impl<C: Context> DifferentiableOperation<C> for NegOperation
 where
+    C::Type: DifferentiableType,
     C::Value: Neg<Output = C::Value>,
     NegOperation: Operation<C::Type>,
 {
@@ -46,7 +49,7 @@ where
         let primal = -inputs[0].primal().clone();
         // A negated structural zero stays a structural zero, keeping `Neg(zero)` out of the tangent program.
         let tangent = inputs[0].tangent().clone().map(|tangent| -tangent);
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

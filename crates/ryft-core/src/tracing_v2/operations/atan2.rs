@@ -81,7 +81,7 @@ where
                 MaybeZero::Value(numerator / denominator)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

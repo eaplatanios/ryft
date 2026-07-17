@@ -57,7 +57,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(self.permutation())?),
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -99,5 +99,42 @@ where
         };
         let lifted_op = TransposeOperation::new(lifted_permutation);
         lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::batching::{Batch, BatchAxis};
+    use crate::contexts::EagerContext;
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
+    use crate::types::{DataType, Shape, Size};
+
+    use super::*;
+
+    #[test]
+    fn test_transpose_batching_lifts_permutation() {
+        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-item rank-2 matrices,
+        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
+        // tensor, leaving the batch axis (originally axis 0) in place.
+        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
+        let x = TestArray {
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
+            values: x_data,
+        };
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
+            .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)])),
+        );
+        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
+        assert_eq!(output.values[0], 0.0);
+        assert_eq!(output.values[1 * 3], 1.0);
     }
 }

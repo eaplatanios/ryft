@@ -591,7 +591,7 @@ where
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
                 };
-                Ok(vec![DifferentiationDual::new(primal, tangent)])
+                Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
             kind @ (ReductionKind::Max | ReductionKind::Min) => {
                 // Stage the argmax mask from the operand primal capture-free: `compare` the operand primal against the
@@ -612,7 +612,7 @@ where
                         MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)
                     }
                 };
-                Ok(vec![DifferentiationDual::new(primal, tangent)])
+                Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
             kind => Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -757,6 +757,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::programs::types::Typed;
+    use crate::sharding::ShardingDimension;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
@@ -1026,7 +1027,7 @@ mod tests {
         let input = ArrayBatch::replicated(TestArray::matrix(2, 3, vec![1.0; 6]));
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1049,7 +1050,7 @@ mod tests {
         .unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1069,7 +1070,7 @@ mod tests {
         .unwrap();
         let outputs = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1238,6 +1239,7 @@ mod tests {
             EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             3,
             Some("data".to_string()),
+            ShardingDimension::Replicated,
         );
         let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
             .batch(&context, &crate::EmptyRegionDriver, &[input])

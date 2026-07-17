@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::BatchingTracer;
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationTracer;
+use crate::differentiation::{DifferentiableType, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::BooleanLike;
@@ -140,7 +140,7 @@ impl<C: Context> WhilePredicate for Tracer<C> {}
 impl WhilePredicate for CaptureReference<ArrayType> {}
 
 impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C> where C::Value: BooleanLike {}
-impl<C: Context> WhilePredicate for DifferentiationTracer<C> where C::Value: BooleanLike {}
+impl<C: Context<Type: DifferentiableType>> WhilePredicate for DifferentiationTracer<C> where C::Value: BooleanLike {}
 
 /// [`Operation`] that repeatedly applies a body [`Region`](crate::Region) to a loop-carried state while a condition
 /// [`Region`](crate::Region) over that same state produces a true scalar Boolean predicate. The condition and body
