@@ -183,10 +183,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let primal = ArrayType::new(F8E8M0FNU, Shape::new(vec![Size::Static(4)]))
-            .with_sharding(
-                Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::sharded(["x"])], Vec::<&str>::new())
-                    .unwrap(),
-            )
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap()
             .with_layout(Layout::Strided(StridedLayout::new(vec![1])))
             .with_memory(Memory::Host { pinned: true });
@@ -223,19 +220,18 @@ mod tests {
         let unreduced = plain
             .clone()
             .with_sharding(
-                Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         let reduced = plain
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh,
-                    vec![ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    ["x"],
-                    Vec::<&str>::new(),
-                )
-                .unwrap(),
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(unreduced.cotangent(), reduced.clone());
@@ -263,14 +259,12 @@ mod tests {
             MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::with_manual_axes(
-            mesh,
-            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
-            ["model"],
-            Vec::<&str>::new(),
-            ["manual"],
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["model"])
+            .unwrap()
+            .with_varying_manual_axes(["manual"])
+            .unwrap();
         let primal = ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
             .with_sharding(sharding.clone())
             .unwrap();
@@ -287,14 +281,13 @@ mod tests {
             MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::with_manual_axes(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
-            ["model"],
-            Vec::<&str>::new(),
-            ["manual"],
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["model"])
+                .unwrap()
+                .with_varying_manual_axes(["manual"])
+                .unwrap();
 
         // The cotangent swaps the unreduced and reduced sets and keeps all other state unchanged.
         let cotangent = sharding.cotangent();

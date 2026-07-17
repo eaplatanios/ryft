@@ -257,15 +257,7 @@ impl Concatenate for ArrayType {
             }
         }
         let output_sharding = output_sharding
-            .map(|sharding| {
-                Sharding::with_manual_axes(
-                    sharding.mesh().clone(),
-                    sharding.dimensions().to_vec(),
-                    sharding.unreduced_axes().iter().cloned().collect::<Vec<_>>(),
-                    sharding.reduced_axes().iter().cloned().collect::<Vec<_>>(),
-                    varying_manual_axes,
-                )
-            })
+            .map(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
         ArrayType::new(first.data_type(), Shape::new(dimensions))
@@ -482,13 +474,12 @@ mod tests {
         let varying = |axis: &str| {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
+                    Sharding::new(
                         mesh.clone(),
                         vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                        Vec::<&str>::new(),
-                        Vec::<&str>::new(),
-                        [axis],
                     )
+                    .unwrap()
+                    .with_varying_manual_axes([axis])
                     .unwrap(),
                 )
                 .unwrap()

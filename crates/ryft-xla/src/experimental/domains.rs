@@ -1472,7 +1472,7 @@ impl TryFrom<PersistentShardingV1> for Sharding {
     type Error = XlaDomainError;
 
     fn try_from(value: PersistentShardingV1) -> Result<Self, Self::Error> {
-        Sharding::with_manual_axes(
+        Sharding::new(
             LogicalMesh::try_from(value.mesh)?,
             value
                 .dimensions
@@ -1483,10 +1483,10 @@ impl TryFrom<PersistentShardingV1> for Sharding {
                     PersistentShardingDimensionV1::Unconstrained => ShardingDimension::Unconstrained,
                 })
                 .collect(),
-            value.unreduced_axes,
-            value.reduced_axes,
-            value.varying_manual_axes,
         )
+        .and_then(|sharding| sharding.with_unreduced_axes(value.unreduced_axes))
+        .and_then(|sharding| sharding.with_reduced_axes(value.reduced_axes))
+        .and_then(|sharding| sharding.with_varying_manual_axes(value.varying_manual_axes))
         .map_err(|error| persistent_error(error.to_string()))
     }
 }

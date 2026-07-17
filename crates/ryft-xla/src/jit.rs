@@ -648,14 +648,11 @@ fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType
             let mut extended_dims = vec![ryft_core::sharding::ShardingDimension::replicated()];
             extended_dims.extend(existing.dimensions().iter().cloned());
             Some(
-                ryft_core::sharding::Sharding::with_manual_axes(
-                    existing.mesh().clone(),
-                    extended_dims,
-                    existing.unreduced_axes().clone(),
-                    existing.reduced_axes().clone(),
-                    existing.varying_manual_axes().clone(),
-                )
-                .map_err(|error| XlaDomainError::Array(error.into()))?,
+                ryft_core::sharding::Sharding::new(existing.mesh().clone(), extended_dims)
+                    .and_then(|sharding| sharding.with_unreduced_axes(existing.unreduced_axes().clone()))
+                    .and_then(|sharding| sharding.with_reduced_axes(existing.reduced_axes().clone()))
+                    .and_then(|sharding| sharding.with_varying_manual_axes(existing.varying_manual_axes().clone()))
+                    .map_err(|error| XlaDomainError::Array(error.into()))?,
             )
         }
         None => None,

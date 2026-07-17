@@ -444,14 +444,10 @@ mod tests {
         ])
         .unwrap();
         // [4] sharded over `x` and unreduced over the manual axis `m`.
-        let sharding = Sharding::with_manual_axes(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            ["m"],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_unreduced_axes(["m"])
+            .unwrap();
         let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();

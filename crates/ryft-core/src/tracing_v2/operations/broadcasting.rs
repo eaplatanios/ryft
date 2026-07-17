@@ -384,7 +384,12 @@ mod tests {
     fn test_lift_broadcast_preserves_memory_and_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
-            .with_sharding(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap())
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
             .unwrap()
             .with_memory(Memory::Host { pinned: true });
 

@@ -6811,14 +6811,10 @@ mod tests {
         let replicated = test_vector_type(4).with_sharding(Sharding::replicated(manual_mesh.clone(), 1)).unwrap();
         let manually_sharded = test_vector_type(4)
             .with_sharding(
-                Sharding::with_manual_axes(
-                    manual_mesh,
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<String>::new(),
-                    Vec::<String>::new(),
-                    ["x"],
-                )
-                .unwrap(),
+                Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         assert!(!broadcast_changes_explicit_sharding(&replicated, &manually_sharded, &[0]));

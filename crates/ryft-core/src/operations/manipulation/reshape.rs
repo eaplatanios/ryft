@@ -252,15 +252,12 @@ impl Reshape for ArrayType {
             // regrouped, so they pass through unchanged while only the per-dimension placement is recomputed (JAX's
             // `_reshape_unreduced_rule` / `_reshape_reduced_rule` likewise propagate them as-is).
             Some(
-                Sharding::with_manual_axes(
-                    sharding.mesh().clone(),
-                    output_sharding_dimensions,
-                    sharding.unreduced_axes().clone(),
-                    sharding.reduced_axes().clone(),
-                    sharding.varying_manual_axes().clone(),
-                )
-                .map(|sharding| sharding.without_auto_axes())
-                .map_err(|_| TypeError { message: "'reshape' produced an invalid output sharding".to_string() })?,
+                Sharding::new(sharding.mesh().clone(), output_sharding_dimensions)
+                    .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                    .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                    .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                    .map(|sharding| sharding.without_auto_axes())
+                    .map_err(|_| TypeError { message: "'reshape' produced an invalid output sharding".to_string() })?,
             )
         } else {
             None
@@ -501,31 +498,26 @@ mod tests {
         .unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    ["r"],
-                    Vec::<&str>::new(),
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["r"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
             input_type.reshape(Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)])),
             Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
+                    Sharding::new(
                         mesh,
                         vec![
                             ShardingDimension::sharded(["x"]),
                             ShardingDimension::replicated(),
                             ShardingDimension::replicated(),
                         ],
-                        Vec::<&str>::new(),
-                        ["r"],
-                        Vec::<&str>::new(),
                     )
+                    .unwrap()
+                    .with_reduced_axes(["r"])
                     .unwrap(),
                 )
                 .unwrap())
@@ -567,14 +559,10 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(6)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
 
@@ -582,14 +570,10 @@ mod tests {
             input_type.reshape(Shape::new(vec![Size::Static(3), Size::Static(4)])),
             Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(4)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
-                        mesh,
-                        vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-                        Vec::<&str>::new(),
-                        Vec::<&str>::new(),
-                        ["x"],
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()],)
+                        .unwrap()
+                        .with_varying_manual_axes(["x"])
+                        .unwrap(),
                 )
                 .unwrap())
         );

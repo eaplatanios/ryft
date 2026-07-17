@@ -1166,8 +1166,10 @@ mod tests {
     #[test]
     fn test_shard_map_transpose_dualizes_boundary_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_sharding =
-            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let tangent_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
@@ -1207,8 +1209,10 @@ mod tests {
     #[test]
     fn test_shard_map_zero_transpose_uses_cotangent_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_sharding =
-            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let tangent_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();

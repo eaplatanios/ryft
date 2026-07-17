@@ -221,13 +221,10 @@ impl Transpose for Sharding {
                     .ok_or(ShardingError::DimensionOutOfBounds { dimension: *axis, rank: self.rank() })?;
                 dimensions.push(dimension.clone());
             }
-            Sharding::with_manual_axes(
-                self.mesh().clone(),
-                dimensions,
-                self.unreduced_axes().clone(),
-                self.reduced_axes().clone(),
-                self.varying_manual_axes().clone(),
-            )
+            Sharding::new(self.mesh().clone(), dimensions)?
+                .with_unreduced_axes(self.unreduced_axes().clone())?
+                .with_reduced_axes(self.reduced_axes().clone())?
+                .with_varying_manual_axes(self.varying_manual_axes().clone())
         };
         permute_dimensions().map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -413,13 +410,12 @@ mod tests {
         ])
         .unwrap();
         // Input dimensions are sharded over `x` and `y`; the reduced manual axis `r` rides along untouched.
-        let input_sharding = Sharding::with_manual_axes(
+        let input_sharding = Sharding::new(
             mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"]), ShardingDimension::replicated()],
-            Vec::<&str>::new(),
-            ["r"],
-            Vec::<&str>::new(),
         )
+        .unwrap()
+        .with_reduced_axes(["r"])
         .unwrap();
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]))
@@ -431,17 +427,16 @@ mod tests {
         let expected =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
+                    Sharding::new(
                         mesh,
                         vec![
                             ShardingDimension::replicated(),
                             ShardingDimension::sharded(["x"]),
                             ShardingDimension::sharded(["y"]),
                         ],
-                        Vec::<&str>::new(),
-                        ["r"],
-                        Vec::<&str>::new(),
                     )
+                    .unwrap()
+                    .with_reduced_axes(["r"])
                     .unwrap(),
                 )
                 .unwrap();

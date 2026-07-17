@@ -346,15 +346,11 @@ fn update_slice_output_sharding(
         .union(update_sharding.varying_manual_axes())
         .cloned()
         .collect::<Vec<_>>();
-    Sharding::with_manual_axes(
-        operand_sharding.mesh().clone(),
-        operand_sharding.dimensions().to_vec(),
-        operand_sharding.unreduced_axes().iter().cloned().collect::<Vec<_>>(),
-        operand_sharding.reduced_axes().iter().cloned().collect::<Vec<_>>(),
-        varying_manual_axes,
-    )
-    .map(Some)
-    .map_err(|error| TypeError { message: error.to_string() })
+    operand_sharding
+        .clone()
+        .with_varying_manual_axes(varying_manual_axes)
+        .map(Some)
+        .map_err(|error| TypeError { message: error.to_string() })
 }
 
 impl Slice for ArrayType {
@@ -2121,14 +2117,11 @@ mod tests {
         ])
         .unwrap();
         // [4, 4] sharded over `x` on axis 0 and unreduced over the manual axis `m`.
-        let sharding = Sharding::with_manual_axes(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            ["m"],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["m"])
+                .unwrap();
         let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
@@ -2197,10 +2190,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap())
             .unwrap();
         let update = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-            .with_sharding(
-                Sharding::with_manual_axes(mesh.clone(), dimensions(), Vec::<&str>::new(), Vec::<&str>::new(), ["m"])
-                    .unwrap(),
-            )
+            .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap().with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         let output = (&operand).update_slice(&update, &[0, 0]).unwrap();
         assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));

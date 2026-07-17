@@ -623,14 +623,12 @@ impl ArrayType {
         let Some(sharding) = &self.sharding else {
             return self.clone();
         };
-        let stripped = Sharding::with_manual_axes(
-            sharding.mesh().clone(),
-            sharding.dimensions().to_vec(),
-            Vec::<String>::new(),
-            Vec::<String>::new(),
-            sharding.varying_manual_axes().clone(),
-        )
-        .expect("clearing reduction-state axes preserves a valid sharding");
+        let stripped = sharding
+            .clone()
+            .with_unreduced_axes(Vec::<String>::new())
+            .expect("clearing unreduced axes preserves a valid sharding")
+            .with_reduced_axes(Vec::<String>::new())
+            .expect("clearing reduced axes preserves a valid sharding");
         self.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
     }
 
@@ -1102,8 +1100,14 @@ mod tests {
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let sharding =
-            Sharding::with_manual_axes(mesh, vec![ShardingDimension::sharded(["a"])], ["x"], ["y"], ["m"]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap()
+            .with_reduced_axes(["y"])
+            .unwrap()
+            .with_varying_manual_axes(["m"])
+            .unwrap();
         let sharded = ArrayType::new(F32, Shape::new(vec![Size::Static(8)])).with_sharding(sharding.clone()).unwrap();
 
         // `sharding` exposes the attached sharding, and the accessors surface its reduction-axis sets.
@@ -1178,14 +1182,10 @@ mod tests {
         assert_eq!(t5.shape, Shape::new(vec![2.into(), 3.into()]));
 
         let m0 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let s0 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["x"],
-        )
-        .unwrap();
+        let s0 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
         let t6 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s0).unwrap();
         let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
         let s1 = t7.sharding().unwrap();
@@ -1259,13 +1259,12 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])));
         let t8 = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
+                Sharding::new(
                     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
                     vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
                 )
+                .unwrap()
+                .with_varying_manual_axes(["x"])
                 .unwrap(),
             )
             .unwrap();

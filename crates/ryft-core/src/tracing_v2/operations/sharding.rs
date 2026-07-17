@@ -241,8 +241,10 @@ mod tests {
         let mesh = mesh();
         // The input is unreduced along the manual axis `m`, so its cotangent must be distributed like the input: the
         // dual sharding (reduced along `m`).
-        let input_sharding =
-            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["m"]).unwrap();
+        let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["m"])
+            .unwrap();
         let input = TestArray::new(vector_type(8).with_sharding(input_sharding.clone()).unwrap(), vec![1.0; 8]);
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 

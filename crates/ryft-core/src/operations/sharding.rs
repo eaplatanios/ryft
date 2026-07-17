@@ -139,14 +139,11 @@ impl Operation<ArrayType> for ReshardOperation {
         // orthogonal to the requested placement, so it is carried over rather than taken from the target.
         let varying_manual_axes =
             input.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
-        let sharding = Sharding::with_manual_axes(
-            self.sharding.mesh().clone(),
-            self.sharding.dimensions().to_vec(),
-            self.sharding.unreduced_axes().clone(),
-            self.sharding.reduced_axes().clone(),
-            varying_manual_axes,
-        )
-        .map_err(|error| TypeError { message: error.to_string() })?;
+        let sharding = self
+            .sharding
+            .clone()
+            .with_varying_manual_axes(varying_manual_axes)
+            .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![
             ArrayType::new(input.data_type(), input.shape().clone())
                 .with_layout(input.layout().cloned())
@@ -377,26 +374,18 @@ mod tests {
         // carries them over.
         let input = vector_type(8)
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["m"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes(["m"])
+                    .unwrap(),
             )
             .unwrap();
         let expected = vector_type(8)
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["m"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["m"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![expected]));

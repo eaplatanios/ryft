@@ -1578,14 +1578,14 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
                         );
                     }
 
-                    let normalized_sharding = Sharding::with_manual_axes(
-                        sharding.mesh().clone(),
-                        dimensions,
-                        sharding.unreduced_axes().clone(),
-                        sharding.reduced_axes().clone(),
-                        varying_manual_axes,
-                    )
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+                    let normalized_sharding = Sharding::new(sharding.mesh().clone(), dimensions)
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
+                        .with_unreduced_axes(sharding.unreduced_axes().clone())
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
+                        .with_reduced_axes(sharding.reduced_axes().clone())
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
+                        .with_varying_manual_axes(varying_manual_axes)
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
                     let normalized_type = batch
                         .r#type
@@ -2163,14 +2163,10 @@ mod tests {
                 let varying_manual_axes = (axis_type == MeshAxisType::Manual
                     && matches!(axis_sharding, ShardingDimension::Sharded(_)))
                 .then_some("x");
-                let sharding = Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![axis_sharding, ShardingDimension::replicated()],
-                    Vec::<String>::new(),
-                    Vec::<String>::new(),
-                    varying_manual_axes,
-                )
-                .unwrap();
+                let sharding = Sharding::new(mesh.clone(), vec![axis_sharding, ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes(varying_manual_axes)
+                    .unwrap();
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
                     .with_sharding(sharding)
                     .unwrap()
@@ -2229,14 +2225,10 @@ mod tests {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let logical_sharding = if axis_type == MeshAxisType::Manual {
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated()],
-                    Vec::<String>::new(),
-                    Vec::<String>::new(),
-                    ["x"],
-                )
-                .unwrap()
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap()
             } else {
                 Sharding::replicated(mesh.clone(), 1)
             };
@@ -2258,14 +2250,11 @@ mod tests {
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )
                 .unwrap();
-            let expected_sharding = Sharding::with_manual_axes(
-                mesh,
-                vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let expected_sharding =
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
             let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
                 .with_sharding(expected_sharding)
                 .unwrap();

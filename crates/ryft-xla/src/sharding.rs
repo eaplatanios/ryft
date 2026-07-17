@@ -154,12 +154,10 @@ mod tests {
             MeshAxis::new("y", 6, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::with_unreduced_axes(
-            mesh,
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            ["y"],
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["y"])
+            .unwrap();
         let context = MlirContext::new();
         assert_eq!(
             sharding.to_mlir(context.unknown_location()).unwrap().to_string(),

@@ -1514,7 +1514,7 @@ mod tests {
     fn test_custom_vjp_transpose_preserves_structural_zero_outputs() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let primal_type = ArrayType::scalar(DataType::F64)
-            .with_sharding(Sharding::with_unreduced_axes(mesh, Vec::new(), ["x"]).unwrap())
+            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let tangent_type = primal_type.tangent();
         let cotangent_type = primal_type.cotangent();

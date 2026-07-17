@@ -655,11 +655,17 @@ impl Gather for ArrayType {
                 ),
                 None => (Vec::new(), Vec::new(), Vec::new()),
             };
-            let sharding =
-                Sharding::with_manual_axes(mesh, placement, unreduced_axes, reduced_axes, varying_manual_axes)
-                    .map_err(|error| TypeError {
-                        message: format!("'{GATHER_OPERATION_NAME}' output sharding construction failed: {error}"),
-                    })?;
+            let map_sharding_error = |error| TypeError {
+                message: format!("'{GATHER_OPERATION_NAME}' output sharding construction failed: {error}"),
+            };
+            let sharding = Sharding::new(mesh, placement)
+                .map_err(&map_sharding_error)?
+                .with_unreduced_axes(unreduced_axes)
+                .map_err(&map_sharding_error)?
+                .with_reduced_axes(reduced_axes)
+                .map_err(&map_sharding_error)?
+                .with_varying_manual_axes(varying_manual_axes)
+                .map_err(map_sharding_error)?;
             Some(sharding.without_auto_axes())
         } else {
             None

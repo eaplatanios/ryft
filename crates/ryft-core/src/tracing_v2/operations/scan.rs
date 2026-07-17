@@ -1214,14 +1214,10 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let logical_type =
                 ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-            let carry_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                .unwrap()
+                .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
                 ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
@@ -1257,14 +1253,10 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let logical_type =
                 ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-            let carry_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                .unwrap()
+                .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
                 ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
@@ -1310,14 +1302,10 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let logical_type =
                 ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-            let carry_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                .unwrap()
+                .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
             let parent = TracingContext::<TestArray, TestOperation>::new();

@@ -352,14 +352,11 @@ fn replace_sharding_dimension(
 ) -> Result<Sharding, BatchingError> {
     let mut dimensions = sharding.dimensions().to_vec();
     dimensions[index] = dimension;
-    Sharding::with_manual_axes(
-        sharding.mesh().clone(),
-        dimensions,
-        sharding.unreduced_axes().clone(),
-        sharding.reduced_axes().clone(),
-        sharding.varying_manual_axes().clone(),
-    )
-    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+    Sharding::new(sharding.mesh().clone(), dimensions)
+        .and_then(|updated| updated.with_unreduced_axes(sharding.unreduced_axes().clone()))
+        .and_then(|updated| updated.with_reduced_axes(sharding.reduced_axes().clone()))
+        .and_then(|updated| updated.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
 }
 
 /// Stacks per-item expansion results along a fresh leading batch axis of size `axis_size`: item `0` seeds the stacked
@@ -943,14 +940,11 @@ mod tests {
     fn test_update_slice_batching_preserves_materialized_batch_placement() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let physical_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let physical_sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]))
                 .with_sharding(physical_sharding.clone())
                 .unwrap();

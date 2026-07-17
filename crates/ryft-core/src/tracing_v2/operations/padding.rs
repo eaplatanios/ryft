@@ -351,14 +351,11 @@ mod tests {
     fn test_pad_batching_expansion_preserves_batch_placement() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let physical_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let physical_sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]))
                 .with_sharding(physical_sharding)
                 .unwrap();
@@ -370,14 +367,10 @@ mod tests {
             .unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
-                        mesh,
-                        vec![ShardingDimension::sharded(["x"])],
-                        Vec::<String>::new(),
-                        Vec::<String>::new(),
-                        (axis_type == MeshAxisType::Manual).then_some("x"),
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
+                        .unwrap()
+                        .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                        .unwrap(),
                 )
                 .unwrap();
             let padding =
@@ -405,14 +398,11 @@ mod tests {
     fn test_pad_batching_expands_an_empty_batch() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let physical_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let physical_sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
             let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]))
                 .with_sharding(physical_sharding.clone())
                 .unwrap();
@@ -420,14 +410,10 @@ mod tests {
                 ArrayBatch::new(input_type.clone(), TestArray::new(input_type, Vec::new()), BatchAxis::new(0)).unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]))
                 .with_sharding(
-                    Sharding::with_manual_axes(
-                        mesh,
-                        vec![ShardingDimension::sharded(["x"])],
-                        Vec::<String>::new(),
-                        Vec::<String>::new(),
-                        (axis_type == MeshAxisType::Manual).then_some("x"),
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
+                        .unwrap()
+                        .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                        .unwrap(),
                 )
                 .unwrap();
             let padding =

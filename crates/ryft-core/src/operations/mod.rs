@@ -358,38 +358,26 @@ mod tests {
         .unwrap();
         let first = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         let second = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["y"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["y"])
+                    .unwrap(),
             )
             .unwrap();
         let third = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh,
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["z"],
-                )
-                .unwrap(),
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["z"])
+                    .unwrap(),
             )
             .unwrap();
         let output = Operation::<ArrayType>::infer_output_types(&operation, &[first, second, third], &[]).unwrap();

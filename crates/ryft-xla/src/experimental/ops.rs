@@ -700,7 +700,12 @@ mod tests {
     fn test_jit_call_zero_transpose_uses_cotangent_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
-            .with_sharding(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap())
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
             .unwrap();
         let expected = tangent_type.cotangent();
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();

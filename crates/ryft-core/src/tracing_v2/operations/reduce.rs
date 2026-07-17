@@ -212,14 +212,11 @@ fn reduce_sharding(
                 .enumerate()
                 .filter_map(|(axis, dimension)| (!reduce_mask[axis]).then(|| dimension.clone()))
                 .collect::<Vec<_>>();
-            Sharding::with_manual_axes(
-                sharding.mesh().clone(),
-                dimensions,
-                sharding.unreduced_axes().clone(),
-                sharding.reduced_axes().clone(),
-                sharding.varying_manual_axes().clone(),
-            )
-            .map_err(|error| TypeError { message: format!("'{op}' output sharding construction failed: {error}") })
+            Sharding::new(sharding.mesh().clone(), dimensions)
+                .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                .map_err(|error| TypeError { message: format!("'{op}' output sharding construction failed: {error}") })
         })
         .transpose()
 }
@@ -793,28 +790,20 @@ mod tests {
         .unwrap();
         let input = array_type(&[2, 3], DataType::F64)
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    ["r"],
-                    Vec::<&str>::new(),
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["r"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
             reduce_abstract(&input, &[0], ReductionKind::Sum, "reduce_sum"),
             Ok(array_type(&[3], DataType::F64)
                 .with_sharding(
-                    Sharding::with_manual_axes(
-                        mesh,
-                        vec![ShardingDimension::replicated()],
-                        Vec::<&str>::new(),
-                        ["r"],
-                        Vec::<&str>::new(),
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                        .unwrap()
+                        .with_reduced_axes(["r"])
+                        .unwrap(),
                 )
                 .unwrap()),
         );
@@ -838,8 +827,10 @@ mod tests {
             )
             .unwrap();
         // A matching unreduced output (deferring the `x` reduction) is accepted.
-        let unreduced =
-            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let unreduced = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
         let operation = ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone());
         assert_eq!(operation.output_sharding(), Some(&unreduced));
         assert_eq!(
@@ -851,7 +842,10 @@ mod tests {
         assert!(!ReduceOperation::new(vec![0], ReductionKind::Sum).to_string().contains("output_sharding="));
 
         // Requesting an unreduced axis that did not shard a summed-over dimension is rejected.
-        let wrong = Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["y"]).unwrap();
+        let wrong = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["y"])
+            .unwrap();
         assert_eq!(
             ReduceOperation::new(vec![0], ReductionKind::Sum)
                 .with_output_sharding(wrong)
@@ -890,7 +884,10 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let unreduced = Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap();
+        let unreduced = Sharding::new(mesh, vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
 
         // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
         // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.

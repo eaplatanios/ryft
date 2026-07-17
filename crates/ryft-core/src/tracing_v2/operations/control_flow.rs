@@ -1749,14 +1749,11 @@ mod tests {
     fn test_condition_region_batching_preserves_mapped_axis_sharding() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let physical_sharding = Sharding::with_manual_axes(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
-            )
-            .unwrap();
+            let physical_sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
             let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
                 .with_sharding(physical_sharding)
                 .unwrap();

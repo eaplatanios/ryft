@@ -1426,7 +1426,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let coordinate_type = ArrayType::scalar(F32)
-            .with_sharding(Sharding::with_unreduced_axes(mesh, Vec::new(), ["x"]).unwrap())
+            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let value_type = coordinate_type.cotangent();
         let basis = <ArrayType as DenseDifferentiableType<TestContext>>::basis(

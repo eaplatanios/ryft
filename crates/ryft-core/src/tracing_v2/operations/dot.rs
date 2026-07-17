@@ -492,16 +492,12 @@ fn dot_abstract(
         };
         let reduced_axes = merged_axes(Sharding::reduced_axes);
         let varying_manual_axes = merged_axes(Sharding::varying_manual_axes);
-        let sharding = Sharding::with_manual_axes(
-            mesh.clone(),
-            placement,
-            Vec::<String>::new(),
-            reduced_axes,
-            varying_manual_axes,
-        )
-        .map_err(|error| TypeError {
-            message: format!("'{DOT_OPERATION_NAME}' output sharding construction failed: {error}"),
-        })?;
+        let sharding = Sharding::new(mesh.clone(), placement)
+            .and_then(|output| output.with_reduced_axes(reduced_axes))
+            .and_then(|output| output.with_varying_manual_axes(varying_manual_axes))
+            .map_err(|error| TypeError {
+                message: format!("'{DOT_OPERATION_NAME}' output sharding construction failed: {error}"),
+            })?;
         Some(sharding.without_auto_axes())
     } else {
         None
@@ -1307,12 +1303,10 @@ mod tests {
         // Unreduced operands are rejected: the pending reduction must be discharged before the contraction.
         let unreduced_lhs = plain_array(&[4, 8])
             .with_sharding(
-                Sharding::with_unreduced_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-                    ["k"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["k"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -1324,14 +1318,10 @@ mod tests {
         // axes are unioned into the output sharding.
         let reduced_lhs = plain_array(&[4, 8])
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-                    Vec::<&str>::new(),
-                    ["k"],
-                    Vec::<&str>::new(),
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["k"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -1339,14 +1329,10 @@ mod tests {
             Ok(vec![
                 plain_array(&[4, 16])
                     .with_sharding(
-                        Sharding::with_manual_axes(
-                            mesh,
-                            vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-                            Vec::<&str>::new(),
-                            ["k"],
-                            Vec::<&str>::new(),
-                        )
-                        .unwrap(),
+                        Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()],)
+                            .unwrap()
+                            .with_reduced_axes(["k"])
+                            .unwrap(),
                     )
                     .unwrap()
             ]),
@@ -1439,12 +1425,11 @@ mod tests {
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]);
         // Identically sharded contracting dimensions plus a matching unreduced set produce an unreduced output.
-        let unreduced = Sharding::with_unreduced_axes(
-            mesh.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-            ["k"],
-        )
-        .unwrap();
+        let unreduced =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["k"])
+                .unwrap();
         let operation = DotOperation::matmul().with_output_sharding(unreduced.clone());
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
@@ -1465,12 +1450,11 @@ mod tests {
         );
 
         // The unreduced set must equal the axes that shard the contracting dimensions.
-        let mismatched = Sharding::with_unreduced_axes(
-            mesh.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-            ["n"],
-        )
-        .unwrap();
+        let mismatched =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["n"])
+                .unwrap();
         let operation = DotOperation::matmul().with_output_sharding(mismatched);
         assert_eq!(
             operation.infer_output_types(&[lhs, rhs], &[]),
@@ -1562,17 +1546,16 @@ mod tests {
 
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let lhs_sharding = Sharding::with_manual_axes(
+            let lhs_sharding = Sharding::new(
                 mesh.clone(),
                 vec![
                     ShardingDimension::sharded(["x"]),
                     ShardingDimension::replicated(),
                     ShardingDimension::replicated(),
                 ],
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-                (axis_type == MeshAxisType::Manual).then_some("x"),
             )
+            .unwrap()
+            .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
             .unwrap();
             let lhs_type =
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]))
