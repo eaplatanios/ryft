@@ -92,9 +92,9 @@ use crate::programs::regions::{
 };
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::ShardingDimension;
+use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Size};
+use crate::types::{ArrayType, Shape, Size};
 
 /// Represents batching-related errors.
 ///
@@ -123,10 +123,10 @@ pub enum BatchingError {
     MisalignedBatchAxes { message: String },
 
     #[error("batch axis {axis} of array type {type} has dynamic size")]
-    DynamicBatchAxis { r#type: ArrayType, axis: isize },
+    DynamicBatchAxis { r#type: Box<ArrayType>, axis: isize },
 
     #[error("batch axis {axis} is out of bounds for array type {type}")]
-    BatchAxisOutOfBounds { r#type: ArrayType, axis: isize },
+    BatchAxisOutOfBounds { r#type: Box<ArrayType>, axis: isize },
 
     #[error("{message}")]
     UnsupportedOperation { message: String },
@@ -342,7 +342,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let rank = r#type.rank() as isize;
         let batch_axis = match batch_axis.into().axis() {
             Some(axis) if (-rank..rank).contains(&axis) => BatchAxis::new(if axis < 0 { axis + rank } else { axis }),
-            Some(axis) => return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }),
+            Some(axis) => return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type), axis }),
             None => BatchAxis::replicated(),
         };
         Ok(Self { r#type, value, batch_axis })
@@ -391,17 +391,52 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             .r#type
             .dimension(axis)
             .value()
-            .ok_or_else(|| BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis })?;
+            .ok_or_else(|| BatchingError::DynamicBatchAxis { r#type: Box::new(self.r#type.clone()), axis })?;
         Ok(Some(size))
     }
 
     /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
-    #[inline]
-    pub fn unbatched_type(&self) -> Result<ArrayType, BatchingError> {
+    pub fn unbatched_type(&self) -> ArrayType {
         let Some(axis) = self.batch_axis_position() else {
-            return Ok(self.r#type.clone());
+            return self.r#type.clone();
         };
-        Ok(self.r#type.without_dimension(axis)?.0)
+
+        // This is a logical transform view, not an ordinary rank-changing array operation. In particular, explicit
+        // placement on the transform-owned mapped dimension describes how the batch is distributed; it is not part
+        // of each batch item's placement. `ArrayType::without_dimension` correctly rejects dropping such placement
+        // information for regular array dimensions, and so it cannot be used for these batching-specific semantics.
+        let mut dimensions = self.r#type.shape().dimensions().to_vec();
+        dimensions.remove(axis);
+        let sharding = self.r#type.sharding().map(|sharding| {
+            let mut sharding_dimensions = sharding.dimensions().to_vec();
+            let removed_dimension = sharding_dimensions.remove(axis);
+            let mut varying_manual_axes = sharding.varying_manual_axes().clone();
+
+            // Manual axes remain semantically visible after their ranked dimension is removed because values may
+            // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
+            // dimension itself, which is outside the logical per-item type).
+            if let ShardingDimension::Sharded(axis_names) = removed_dimension {
+                varying_manual_axes.extend(
+                    axis_names.into_iter().filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
+                );
+            }
+
+            Sharding {
+                mesh: sharding.mesh().clone(),
+                dimensions: sharding_dimensions,
+                unreduced_axes: sharding.unreduced_axes().clone(),
+                reduced_axes: sharding.reduced_axes().clone(),
+                varying_manual_axes,
+            }
+        });
+
+        ArrayType {
+            data_type: self.r#type.data_type(),
+            shape: Shape::new(dimensions),
+            layout: None,
+            sharding,
+            memory: self.r#type.memory(),
+        }
     }
 
     /// Computes and validates the common batch size across `inputs`, returning `None` when no input is batched.
@@ -417,8 +452,8 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         })
     }
 
-    /// Returns a copy of this _replicated_ [`ArrayBatch`] broadcast to gain a singleton batch axis of size `axis_size`
-    /// at `axis`. This is the analogue of JAX's `batching.broadcast` and is the canonical building block for mixed
+    /// Returns a copy of this _replicated_ [`ArrayBatch`] broadcast to gain a batch axis of size `axis_size` at `axis`.
+    /// This is the analogue of JAX's `batching.broadcast` and is the canonical building block for mixed
     /// batched/replicated primitive rules (e.g., the batching rule of the `dot` operation) and for lifting replicated
     /// residuals during linearization. It returns an error if called on an already-batched value, since such callers
     /// are expected to dispatch the replicated case explicitly (the blanket elementwise [`BatchableOperation`]
@@ -429,7 +464,14 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///   - `axis`: Possibly-negative position of the inserted batch axis in the output, normalized against the
     ///     physical output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Size of the inserted batch axis.
-    pub fn broadcast(&self, axis: isize, axis_size: usize) -> Result<Self, BatchingError>
+    ///   - `axis_sharding`: Sharding placement assigned to the inserted batch axis when the value carries
+    ///     sharding metadata.
+    pub fn broadcast(
+        &self,
+        axis: isize,
+        axis_size: usize,
+        axis_sharding: ShardingDimension,
+    ) -> Result<Self, BatchingError>
     where
         V: Broadcast,
     {
@@ -441,13 +483,20 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         }
         // The insertion position is normalized against the physical output rank (i.e., the per-item rank plus the
         // inserted batch dimension). Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
-        let per_item_type = self.unbatched_type()?;
+        let per_item_type = self.unbatched_type();
         let output_rank = per_item_type.rank() as isize + 1;
         if !(-output_rank..output_rank).contains(&axis) {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type: self.r#type.clone(), axis });
+            return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis });
         }
         let position = (if axis < 0 { axis + output_rank } else { axis }) as usize;
-        let physical_type = per_item_type.with_inserted_dimension(position, Size::Static(axis_size))?;
+        let mut physical_type = per_item_type.with_inserted_dimension(position, Size::Static(axis_size))?;
+        if let Some(sharding) = per_item_type.sharding() {
+            physical_type.sharding = Some(
+                sharding
+                    .with_inserted_dimension(position, axis_sharding)
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
+            );
+        }
         let output_axes = (0..per_item_type.rank())
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
@@ -477,7 +526,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         // Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
         let rank = self.r#type.rank() as isize;
         if !(-rank..rank).contains(&axis) {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type: self.r#type.clone(), axis });
+            return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis });
         }
         let position = (if axis < 0 { axis + rank } else { axis }) as usize;
         if current_axis == position {
@@ -499,12 +548,22 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///   - `axis`: Possibly-negative position the batch axis should occupy in the output, normalized against the
     ///     physical output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Size of the batch axis.
+    ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated value must be broadcast.
     #[inline]
-    pub fn match_axis(&self, axis: isize, axis_size: usize) -> Result<Self, BatchingError>
+    pub fn match_axis(
+        &self,
+        axis: isize,
+        axis_size: usize,
+        axis_sharding: ShardingDimension,
+    ) -> Result<Self, BatchingError>
     where
         V: Broadcast + Transpose,
     {
-        if self.batch_axis().is_replicated() { self.broadcast(axis, axis_size) } else { self.move_axis(axis) }
+        if self.batch_axis().is_replicated() {
+            self.broadcast(axis, axis_size, axis_sharding)
+        } else {
+            self.move_axis(axis)
+        }
     }
 
     /// Returns a copy of this [`ArrayBatch`] aligned to the provided output `batch_axis`. A mapped value is moved to
@@ -513,8 +572,19 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// into a replicated declaration without an explicit reduction and that direction returns
     /// [`BatchingError::MismatchedOutputAxes`]. Signed declarations are normalized against the resulting physical
     /// rank. [`Batch::batch`] uses this function to realize the caller's declared `output_batch_axes`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `batch_axis`: Requested mapped axis, or a replicated declaration if the output must remain replicated.
+    ///   - `axis_size`: Size of the batch axis.
+    ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated output must be broadcast.
     #[inline]
-    pub fn align_axis(&self, batch_axis: BatchAxis, axis_size: usize) -> Result<Self, BatchingError>
+    pub fn align_axis(
+        &self,
+        batch_axis: BatchAxis,
+        axis_size: usize,
+        axis_sharding: ShardingDimension,
+    ) -> Result<Self, BatchingError>
     where
         V: Broadcast + Transpose,
     {
@@ -523,7 +593,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         match (self.batch_axis.axis(), batch_axis.axis()) {
             (None, None) => Ok(self.clone()),
             (Some(_), Some(axis)) => self.move_axis(axis),
-            (None, Some(axis)) => self.broadcast(axis, axis_size),
+            (None, Some(axis)) => self.broadcast(axis, axis_size, axis_sharding),
             (Some(_), None) => {
                 Err(BatchingError::MismatchedOutputAxes { expected: batch_axis, actual: self.batch_axis() })
             }
@@ -532,14 +602,39 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
 
     /// Returns the [`ShardingDimension`] to place on the batch axis that batching introduces in each output, derived
     /// from how the provided batched inputs shard their own batch axis. Every input that is actually mapped on a batch
-    /// axis and carries a [`Sharding`](crate::Sharding) contributes the [`ShardingDimension`] of that axis. Replicated
-    /// inputs and inputs without a sharding contribute nothing. All contributing inputs must agree, otherwise the
-    /// output batch axis has no well-defined sharding and this returns [`BatchingError::MisalignedBatchAxes`].
-    /// When nothing pins the axis the result is [`ShardingDimension::Replicated`], leaving the new batch dimension
-    /// replicated. The dimensions are read from the inputs as given, before batching realigns or broadcasts them, so a
-    /// replicated input that later gains a singleton batch axis does not spuriously disagree with a genuinely batched
-    /// input.
+    /// axis and carries a [`Sharding`] contributes the [`ShardingDimension`] of that axis. Replicated inputs and inputs
+    /// without a sharding contribute nothing. Replicated and unconstrained mapped dimensions can be normalized to a
+    /// concrete sharded placement contributed by another mapped input. Distinct concrete sharded placements remain
+    /// ambiguous and return [`BatchingError::MisalignedBatchAxes`]. When nothing pins the axis the result is
+    /// [`ShardingDimension::Replicated`], leaving the new batch dimension replicated. The dimensions are read from the
+    /// inputs as given, before batching realigns or broadcasts them, so a replicated input that later gains a singleton
+    /// batch axis does not spuriously disagree with a genuinely batched input.
     pub fn sharding_for_inputs(inputs: &[Self]) -> Result<ShardingDimension, ProgramError> {
+        // A `ShardingDimension` identifies mesh axes only by name, so equal dimensions are meaningful only when their
+        // owning shardings use the same mesh. Establish that common mesh before combining any dimension placements.
+        // Replicated batches and values without sharding metadata do not constrain it.
+        inputs
+            .iter()
+            .filter_map(|input| {
+                input.batch_axis_position()?;
+                Some(input.r#type.sharding()?.mesh())
+            })
+            .try_fold(None, |mesh, current_mesh| -> Result<_, ProgramError> {
+                match mesh {
+                    Some(mesh) if mesh != current_mesh => Err(BatchingError::MisalignedBatchAxes {
+                        message: format!("mismatched batch axis sharding meshes: {mesh:?} vs {current_mesh:?}"),
+                    }
+                    .into()),
+                    Some(mesh) => Ok(Some(mesh)),
+                    None => Ok(Some(current_mesh)),
+                }
+            })?;
+
+        // Join the mapped-axis placements from least to most specific. An unconstrained dimension accepts any concrete
+        // decision, and a replicated dimension can be normalized to a sharded placement. Matching sharded placements
+        // agree, but two different sharded placements are ambiguous because neither input provides a principled choice
+        // of target placement. Keeping this join order-independent is important because input ordering is semantic only
+        // to the operation, not to batch-placement selection.
         let dimension = inputs
             .iter()
             .filter_map(|input| Some(input.r#type().sharding()?.dimensions()[input.batch_axis_position()?].clone()))
@@ -547,15 +642,22 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
                 None,
                 |folded_dimension, current_dimension| -> Result<Option<ShardingDimension>, ProgramError> {
                     match folded_dimension {
-                        Some(folded_dimension) if folded_dimension != current_dimension => {
-                            Err(BatchingError::MisalignedBatchAxes {
-                                message: format!(
-                                    "mismatched batch axis sharding: {folded_dimension} vs {current_dimension}"
-                                ),
-                            }
-                            .into())
+                        Some(folded_dimension) if folded_dimension == current_dimension => Ok(Some(folded_dimension)),
+                        Some(ShardingDimension::Unconstrained) => Ok(Some(current_dimension)),
+                        Some(folded_dimension) if current_dimension == ShardingDimension::Unconstrained => {
+                            Ok(Some(folded_dimension))
                         }
-                        _ => Ok(Some(current_dimension)),
+                        Some(ShardingDimension::Replicated) => Ok(Some(current_dimension)),
+                        Some(folded_dimension) if current_dimension == ShardingDimension::Replicated => {
+                            Ok(Some(folded_dimension))
+                        }
+                        Some(folded_dimension) => Err(BatchingError::MisalignedBatchAxes {
+                            message: format!(
+                                "mismatched batch axis sharding: {folded_dimension} vs {current_dimension}"
+                            ),
+                        }
+                        .into()),
+                        None => Ok(Some(current_dimension)),
                     }
                 },
             )?;
@@ -695,7 +797,7 @@ where
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<BatchAxis>), BatchingError>
     {
-        region.batched(context.axis_size(), input_axes, output_axes_policy)
+        region.batched(context.axis_size(), context.axis_sharding().clone(), input_axes, output_axes_policy)
     }
 }
 
@@ -762,15 +864,14 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
 // implementations do not have to be written for elementwise primitives (e.g., `ZeroLike`, `OneLike`, `Add`, `Sub`,
 // `Mul`, `Div`, `Neg`, `Sin`, `Cos`, `Select`, etc.). Operations with non-trivial axis arithmetic (e.g., `Dot`,
 // `Transpose`, `Reshape`, etc.) keep their explicit implementations. Coherence is preserved because none of those
-// types implement `ElementwiseOperation`.
-//
-// The rule follows JAX's `defbroadcasting` policy where every input is broadcast to the common batched physical shape
-// before the operation is applied, so the value-level primitive only ever sees inputs that agree on shape. When no
-// input is mapped there is no batch axis to thread, and so the inputs are interpreted as given and every output is
-// replicated. Otherwise, the common batch axis is the first mapped input's position, every mapped input is
-// realigned to it with a staged `TransposeOperation`, and every input is then broadcast to the common per-item shape
-// with the batch axis inserted at that position. Operands whose per-item shapes are not broadcast-compatible are left
-// at their batch-axis-inserted shapes so the operation surfaces its own shape error.
+// types implement `ElementwiseOperation`. The rule follows JAX's `defbroadcasting` policy where every input is
+// broadcast to the common batched physical shape before the operation is applied, so the value-level primitive only
+// ever sees inputs that agree on shape. When no input is mapped there is no batch axis to thread, and so the inputs
+// are interpreted as given and every output is replicated. Otherwise, mapped inputs retain the first mapped input's
+// physical position when that position is valid for every mapped operand. For mixed ranks where it is not, they are
+// temporarily realigned to leading physical axis `0`. Every input is then broadcast to the common per-item shape with
+// the batch axis inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their
+// batch-axis-inserted shapes so the operation surfaces its own shape error.
 impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseOperation + InterpretableOperation<C>>
     BatchableOperation<C> for O
 {
@@ -784,20 +885,47 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
 
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
-        let Some(batch_axis) = input_axes.iter().find_map(BatchAxis::axis) else {
+        let Some(output_batch_axis) = input_axes.iter().find_map(BatchAxis::axis) else {
             let physical_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let output_count = Operation::infer_output_types(self, physical_types.as_slice(), &[])?.len();
             return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
         };
 
-        // The stored batch axes are canonical since `ArrayBatch::new` normalized them and so the common axis is also
-        // a valid nonnegative physical position for the index arithmetic below.
-        let batch_axis_position = batch_axis as usize;
+        // Preserve the first mapped input's natural position when every mapped input can represent it. Otherwise, use
+        // a leading internal axis, which is valid regardless of differences in logical per-item rank, and restore the
+        // natural output position after interpretation.
+        let output_batch_axis_position = usize::try_from(output_batch_axis).expect("stored batch axes are canonical");
+        let batch_axis_position = if inputs
+            .iter()
+            .all(|input| input.batch_axis().is_replicated() || output_batch_axis_position < input.r#type().rank())
+        {
+            output_batch_axis_position
+        } else {
+            0
+        };
+        let batch_axis = isize::try_from(batch_axis_position).expect("a physical array rank fits in isize");
 
-        // Realign every mapped input's batch axis to the common position, then broadcast every input
-        // to the common batched physical shape.
+        // Realign every mapped input's batch axis to the common position, then broadcast every input to the common
+        // batched physical shape.
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let unbatched_types = inputs.iter().map(|input| input.unbatched_type()).collect::<Result<Vec<_>, _>>()?;
+        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
+        let unbatched_types = inputs
+            .iter()
+            .map(|input| {
+                let mut unbatched_type = input.unbatched_type();
+                if let (Some(sharding), ShardingDimension::Sharded(axis_names)) =
+                    (unbatched_type.sharding.as_mut(), &axis_sharding)
+                {
+                    let varying_manual_axes = axis_names
+                        .iter()
+                        .filter(|name| sharding.mesh().axis_type(name.as_str()) == Some(MeshAxisType::Manual))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    sharding.varying_manual_axes.extend(varying_manual_axes);
+                }
+                unbatched_type
+            })
+            .collect::<Vec<_>>();
         let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
         // The common per-item shape every input broadcasts to, or `None` when the per-item shapes are not
@@ -814,8 +942,15 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
                 // against numeric branches), with the batch axis inserted at `batch_axis`.
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
-                let physical_type =
+                let mut physical_type =
                     target_type.with_inserted_dimension(batch_axis_position, Size::Static(axis_size))?;
+                if let Some(sharding) = target_type.sharding() {
+                    physical_type.sharding = Some(
+                        sharding
+                            .with_inserted_dimension(batch_axis_position, axis_sharding.clone())
+                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
+                    );
+                }
                 if physical_type == *input.r#type() {
                     return Ok(input.clone());
                 }
@@ -846,7 +981,10 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
         let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_count = Operation::infer_output_types(self, input_types.as_slice(), &[])?.len();
         let output_batch_axes = vec![BatchAxis::new(batch_axis); output_count];
-        self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)
+        self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)?
+            .into_iter()
+            .map(|output| output.move_axis(output_batch_axis))
+            .collect()
     }
 }
 
@@ -938,13 +1076,23 @@ pub struct BatchingContext<C> {
     /// Optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
     /// to address this axis by name.
     axis_name: Option<String>,
+
+    /// Sharding placement of the transform-owned mapped dimension.
+    axis_sharding: ShardingDimension,
 }
 
 impl<C> BatchingContext<C> {
     /// Creates a new [`BatchingContext`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `parent`: [`Context`] into which batched operations are lifted.
+    ///   - `axis_size`: Size of the transform-owned mapped dimension.
+    ///   - `axis_name`: Optional name through which operations such as collectives can address the mapped dimension.
+    ///   - `axis_sharding`: Sharding placement of the transform-owned mapped dimension.
     #[inline]
-    pub fn new(parent: C, axis_size: usize, axis_name: Option<String>) -> Self {
-        Self { parent, axis_size, axis_name }
+    pub fn new(parent: C, axis_size: usize, axis_name: Option<String>, axis_sharding: ShardingDimension) -> Self {
+        Self { parent, axis_size, axis_name, axis_sharding }
     }
 
     /// Returns the [`Context`] that this [`BatchingContext`] is nested into.
@@ -964,6 +1112,12 @@ impl<C> BatchingContext<C> {
     #[inline]
     pub fn axis_name(&self) -> Option<&str> {
         self.axis_name.as_deref()
+    }
+
+    /// Returns the sharding placement of the transform-owned mapped dimension.
+    #[inline]
+    pub fn axis_sharding(&self) -> &ShardingDimension {
+        &self.axis_sharding
     }
 
     /// Replays `region` [`Instruction`](crate::Instruction) by [`Instruction`](crate::Instruction) through this
@@ -1125,9 +1279,7 @@ impl<C: Context<Type = ArrayType>> Typed for BatchingTracer<C> {
 
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
-        // The logical (i.e., per-item) type is the physical type with the mapped batch axis removed. `unbatched_type
-        // only fails on an out-of-bounds axis, which `ArrayBatch::new` rejects at construction, so it cannot fail here.
-        Cow::Owned(self.batch.unbatched_type().expect("a valid `ArrayBatch` has an in-bounds batch axis"))
+        Cow::Owned(self.batch.unbatched_type())
     }
 }
 
@@ -1173,11 +1325,13 @@ impl<
     /// # Parameters
     ///
     ///   - `axis_size`: Size of the new batch axis.
+    ///   - `axis_sharding`: Sharding placement assigned to every newly materialized batch axis.
     ///   - `input_batch_axes`: [`BatchAxis`] for each input (i.e., argument) of this [`Program`].
     ///   - `output_axes_policy`: [`ProgramBatchingOutputAxesPolicy`] for packaging the batched program outputs.
     pub fn batched(
         &self,
         axis_size: usize,
+        axis_sharding: ShardingDimension,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError> {
@@ -1192,7 +1346,7 @@ impl<
         // builder through its parent trace) must be created *inside* this scope so it is dropped before the builder is
         // recovered below; leaving it in the enclosing scope leaks a builder clone past the recovery.
         let (output_atom_ids, output_axes) = {
-            let batching_context = BatchingContext::new(parent_context, axis_size, None);
+            let batching_context = BatchingContext::new(parent_context, axis_size, None, axis_sharding.clone());
             let inputs = self
                 .input_types()
                 .iter()
@@ -1209,10 +1363,18 @@ impl<
                                 .or_else(|| physical_rank.checked_sub(axis.unsigned_abs()))
                                 .filter(|&axis| axis < physical_rank)
                                 .ok_or_else(|| BatchingError::BatchAxisOutOfBounds {
-                                    r#type: unbatched_type.clone(),
+                                    r#type: Box::new(unbatched_type.clone()),
                                     axis,
                                 })?;
-                            unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?
+                            let mut batched_type =
+                                unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?;
+                            if let Some(sharding) = unbatched_type.sharding() {
+                                batched_type.sharding =
+                                    Some(sharding.with_inserted_dimension(position, axis_sharding.clone()).map_err(
+                                        |error| BatchingError::MisalignedBatchAxes { message: error.to_string() },
+                                    )?);
+                            }
+                            batched_type
                         }
                         None => unbatched_type.clone(),
                     };
@@ -1268,7 +1430,8 @@ impl<
 
                 // Move naturally mapped outputs or broadcast naturally replicated outputs while they are still live
                 // tracers, then report the normalized physical position stored by `ArrayBatch`.
-                let output = output.align_axis(target_batch_axis, axis_size)?;
+                let output =
+                    output.align_axis(target_batch_axis, axis_size, batching_context.axis_sharding().clone())?;
                 output_axes.push(output.batch_axis());
                 output_atom_ids.push(output.into_value().atom_id()?);
             }
@@ -1290,15 +1453,24 @@ impl<
     O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
 {
-    /// Batches this [`Program`] over the provided input axes.
+    /// Batches this [`Program`] over the provided input axes. Refer to [`RegionRef::batched`] for the complete
+    /// transformation semantics.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_size`: Size of the new batch axis.
+    ///   - `axis_sharding`: Sharding placement assigned to every newly materialized batch axis.
+    ///   - `input_batch_axes`: [`BatchAxis`] for each program input.
+    ///   - `output_axes_policy`: Policy controlling how the transformed program packages its output batch axes.
     #[inline]
     pub fn batched(
         &self,
         axis_size: usize,
+        axis_sharding: ShardingDimension,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
-        self.entry_region_ref().batched(axis_size, input_batch_axes, output_axes_policy)
+        self.entry_region_ref().batched(axis_size, axis_sharding, input_batch_axes, output_axes_policy)
     }
 }
 
@@ -1363,8 +1535,61 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
         // Create a `BatchingContext`, construct the batched function input, and invoke the function with it. Binds
         // inside the closure fold through the receiver directly and so, an eager context interprets each immediately,
         // while a staging context stages it into the enclosing trace, whose own drain surfaces any deferred error.
-        let context = BatchingContext::new(self.clone(), batch_size, batch_axis.name().map(String::from));
-        let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
+        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs.as_slice())?;
+        let context =
+            BatchingContext::new(self.clone(), batch_size, batch_axis.name().map(String::from), axis_sharding);
+        let inputs = inputs
+            .into_iter()
+            .map(|batch| {
+                // Every mapped input with sharding metadata must use the common batch placement selected above. A
+                // replicated batch or an input without sharding metadata imposes no physical placement to normalize.
+                let normalization = batch.batch_axis_position().and_then(|position| {
+                    let sharding = batch.r#type.sharding()?;
+                    (sharding.dimensions().get(position) != Some(context.axis_sharding()))
+                        .then(|| (position, sharding.clone()))
+                });
+                let batch = if let Some((position, sharding)) = normalization {
+                    let axis_sharding = context.axis_sharding().clone();
+                    let mut dimensions = sharding.dimensions().to_vec();
+                    dimensions[position] = axis_sharding.clone();
+                    let mut varying_manual_axes = sharding.varying_manual_axes().clone();
+
+                    // A manual mesh axis remains semantically visible while it carries the mapped dimension,
+                    // so record it in the rank-independent varying set as well as in the dimension placement.
+                    if let ShardingDimension::Sharded(axis_names) = axis_sharding {
+                        varying_manual_axes.extend(
+                            axis_names
+                                .into_iter()
+                                .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
+                        );
+                    }
+
+                    let normalized_sharding = Sharding::with_manual_axes(
+                        sharding.mesh().clone(),
+                        dimensions,
+                        sharding.unreduced_axes().clone(),
+                        sharding.reduced_axes().clone(),
+                        varying_manual_axes,
+                    )
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+
+                    let normalized_type = batch
+                        .r#type
+                        .clone()
+                        .with_sharding(normalized_sharding)
+                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+
+                    // Use an identity-shaped value broadcast instead of changing only `ArrayBatch`'s stored type. The
+                    // value capability can therefore realize or stage the placement transition for the active backend.
+                    let output_axes = (0..batch.r#type.rank()).collect::<Vec<_>>();
+                    let value = batch.value.clone().broadcast(normalized_type.clone(), output_axes.as_slice())?;
+                    ArrayBatch::new(normalized_type, value, batch.batch_axis)?
+                } else {
+                    batch
+                };
+                Ok(BatchingTracer::new(context.clone(), batch))
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
         let input = I::To::<BatchingTracer<Self>>::from_parameters(input_structure, inputs)?;
         let output = function(input)?;
 
@@ -1386,7 +1611,10 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
             .into_parameters()
             .zip(output_batch_axis_values)
             .map(|(output, output_batch_axis)| {
-                Ok(output.into_batch().align_axis(output_batch_axis, batch_size)?.into_value())
+                Ok(output
+                    .into_batch()
+                    .align_axis(output_batch_axis, batch_size, context.axis_sharding().clone())?
+                    .into_value())
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
 
@@ -1460,18 +1688,77 @@ pub fn batch<
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
-    use crate::operations::math::AddOperation;
+    use crate::axes::AxisIndex;
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::LinearizationTracer;
+    use crate::operations::constants::OneLike;
+    use crate::operations::control_flow::ConditionOperation;
+    use crate::operations::manipulation::Transpose;
+    use crate::operations::math::{AddOperation, NegOperation, Sin};
+    use crate::parameters::Placeholder;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
-    use crate::tracing::Trace;
-    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing::{DomainTracingContext, Trace};
+    use crate::tracing_v2::operations::{Collective, CollectiveKind};
+    use crate::tracing_v2::test_util::scalar_scale_branch;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
+
+    #[test]
+    fn test_batching_error_conversions_normalize_round_trips() {
+        // A batching error that crossed into the kernel as a custom payload converts back to itself, and a
+        // `BatchingError::Program` converts back to the program error it carries, so round trips never nest.
+        let batching = BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 };
+        let program = ProgramError::from(batching.clone());
+        assert!(matches!(
+            program.downcast_custom::<BatchingError>(),
+            Some(BatchingError::MismatchedBatchSizes { expected: 4, actual: 5 }),
+        ));
+        assert_eq!(BatchingError::from(program), batching);
+
+        let program = ProgramError::EscapedProgramBuilder;
+        let batching = BatchingError::from(program.clone());
+        assert_eq!(batching, BatchingError::Program(ProgramError::EscapedProgramBuilder));
+        assert_eq!(ProgramError::from(batching), program);
+    }
+
+    #[test]
+    fn test_batch_axis() {
+        assert_eq!(BatchAxis::default(), BatchAxis::replicated());
+        assert!(BatchAxis::replicated().is_replicated());
+        assert!(!BatchAxis::new(2).is_replicated());
+        assert_eq!(BatchAxis::replicated().axis(), None);
+        assert_eq!(BatchAxis::new(2).axis(), Some(2));
+        assert_eq!(BatchAxis::from(None), BatchAxis::replicated());
+        assert_eq!(BatchAxis::from(Some(3)), BatchAxis::new(3));
+        assert_eq!(BatchAxis::from(3), BatchAxis::new(3));
+        assert_ne!(BatchAxis::new(0), BatchAxis::new(1));
+        assert_eq!(format!("{:?}", BatchAxis::new(1)), "BatchAxis(Some(1))");
+    }
+
+    #[test]
+    fn test_batch_axis_specification() {
+        assert_eq!(BatchAxisSpecification::from(None), BatchAxisSpecification::default());
+        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::sized(4));
+        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::sized(4));
+        assert_eq!(BatchAxisSpecification::new(4, "i"), BatchAxisSpecification::new(4, "i").clone());
+        assert_ne!(BatchAxisSpecification::sized(4), BatchAxisSpecification::sized(5));
+        assert_ne!(BatchAxisSpecification::named("i"), BatchAxisSpecification::named("j"));
+        assert_ne!(BatchAxisSpecification::named("i"), BatchAxisSpecification::default());
+        assert_eq!(
+            format!("{:?}", BatchAxisSpecification::named("i")),
+            "BatchAxisSpecification { size: None, name: Some(\"i\") }",
+        );
+    }
 
     #[test]
     fn test_array_batch() {
@@ -1485,17 +1772,14 @@ mod tests {
         assert_eq!(batched.value(), &matrix);
         assert_eq!(*batched.r#type(), matrix_type);
         assert_eq!(batched.batch_size(), Ok(Some(2)));
-        assert_eq!(batched.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+        assert_eq!(batched.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         assert_eq!(batched.to_string(), "batch[f64[2, 3], axis=0]([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])");
         assert_eq!(batched.into_value(), matrix);
 
         // A different mapped axis reads the batch size and per-item type from that axis instead.
         let batched_axis_one = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(1)).unwrap();
         assert_eq!(batched_axis_one.batch_size(), Ok(Some(3)));
-        assert_eq!(
-            batched_axis_one.unbatched_type(),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))),
-        );
+        assert_eq!(batched_axis_one.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
 
         // Negative axes follow Python/JAX indexing and are normalized once at construction.
         // `-1` denotes the final physical axis and the stored metadata is the canonical nonnegative position.
@@ -1507,14 +1791,14 @@ mod tests {
         // `new` rejects an out-of-bounds mapped axis.
         assert_eq!(
             ArrayBatch::new(matrix_type.clone(), matrix, Some(2)),
-            Err(BatchingError::BatchAxisOutOfBounds { r#type: matrix_type, axis: 2 }),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: 2 }),
         );
 
         let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let matrix_type = matrix.r#type().into_owned();
         assert_eq!(
             ArrayBatch::new(matrix_type.clone(), matrix, BatchAxis::new(-3)),
-            Err(BatchingError::BatchAxisOutOfBounds { r#type: matrix_type, axis: -3 }),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: -3 }),
         );
 
         // `replicated` shares the value unchanged across the batch: no mapped axis, no batch size, and the per-item
@@ -1525,7 +1809,7 @@ mod tests {
         assert_eq!(replicated.batch_axis(), BatchAxis::replicated());
         assert_eq!(*replicated.r#type(), vector_type);
         assert_eq!(replicated.batch_size(), Ok(None));
-        assert_eq!(replicated.unbatched_type(), Ok(vector_type));
+        assert_eq!(replicated.unbatched_type(), vector_type);
         assert_eq!(replicated.to_string(), "batch[f64[3], replicated]([1.0, 2.0, 3.0])");
         assert_eq!(replicated.into_value(), vector);
     }
@@ -1561,18 +1845,18 @@ mod tests {
     fn test_array_batch_broadcast() {
         // Broadcasting a replicated vector to gain a leading batch axis of size 2 replicates it across the batch.
         let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        let broadcasted = replicated.broadcast(0, 2).unwrap();
+        let broadcasted = replicated.broadcast(0, 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(0));
         assert_eq!(
             *broadcasted.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
         );
         assert_eq!(broadcasted.value(), &TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
-        assert_eq!(broadcasted.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+        assert_eq!(broadcasted.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
 
         // Broadcasting to a trailing batch axis keeps the per-item dimensions before it in place.
         // The input's own axis stays at position 0 and the size-2 batch axis is inserted at position 1.
-        let broadcasted = replicated.broadcast(1, 2).unwrap();
+        let broadcasted = replicated.broadcast(1, 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *broadcasted.r#type(),
@@ -1583,7 +1867,10 @@ mod tests {
         // Broadcasting rejects an already-batched value.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         let batched = ArrayBatch::new(vector_type, TestArray::vector(vec![1.0, 2.0]), Some(0)).unwrap();
-        assert!(matches!(batched.broadcast(0, 2), Err(BatchingError::MisalignedBatchAxes { .. })));
+        assert!(matches!(
+            batched.broadcast(0, 2, ShardingDimension::Replicated),
+            Err(BatchingError::MisalignedBatchAxes { .. }),
+        ));
     }
 
     #[test]
@@ -1601,7 +1888,7 @@ mod tests {
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
         assert_eq!(*moved.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
         assert_eq!(moved.value(), &TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
-        assert_eq!(moved.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+        assert_eq!(moved.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         assert_eq!(moved.batch_size(), Ok(Some(2)));
 
         // A replicated value has no mapped axis, so moving to any axis is a no-op.
@@ -1619,7 +1906,7 @@ mod tests {
             Some(0),
         )
         .unwrap();
-        let matched = batched.match_axis(1, 2).unwrap();
+        let matched = batched.match_axis(1, 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(matched.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *matched.r#type(),
@@ -1629,7 +1916,7 @@ mod tests {
 
         // `match_axis` on a replicated value broadcasts it to gain a batch axis there (like `broadcast`).
         let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        let matched = replicated.match_axis(0, 2).unwrap();
+        let matched = replicated.match_axis(0, 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(matched.batch_axis(), BatchAxis::new(0));
         assert_eq!(matched.value(), &TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
     }
@@ -1644,11 +1931,11 @@ mod tests {
         .unwrap();
 
         // Aligning a batched value to the axis it already maps returns it unchanged.
-        assert_eq!(batched.align_axis(BatchAxis::new(0), 2).unwrap(), batched);
+        assert_eq!(batched.align_axis(BatchAxis::new(0), 2, ShardingDimension::Replicated).unwrap(), batched);
 
         // Aligning to a different mapped position stages a transpose (like `move_axis`). [2, 3] mapped at 0 becomes
         // [3, 2] mapped at 1. The equivalent negative declaration is normalized against the physical output rank.
-        let aligned = batched.align_axis(BatchAxis::new(-1), 2).unwrap();
+        let aligned = batched.align_axis(BatchAxis::new(-1), 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *aligned.r#type(),
@@ -1658,23 +1945,30 @@ mod tests {
 
         // Aligning a replicated value to a replicated declaration returns it unchanged.
         let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        assert_eq!(replicated.align_axis(BatchAxis::replicated(), 2).unwrap(), replicated);
+        assert_eq!(
+            replicated.align_axis(BatchAxis::replicated(), 2, ShardingDimension::Replicated).unwrap(),
+            replicated,
+        );
 
         // A mapped output declaration instantiates a naturally replicated value by broadcasting it across the batch.
-        let aligned = replicated.align_axis(BatchAxis::new(-1), 2).unwrap();
+        let aligned = replicated.align_axis(BatchAxis::new(-1), 2, ShardingDimension::Replicated).unwrap();
         assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
         assert_eq!(aligned.value(), &TestArray::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
 
         // The reverse presence change remains invalid: collapsing a mapped output requires an explicit reduction.
         assert_eq!(
-            batched.align_axis(BatchAxis::replicated(), 2),
+            batched.align_axis(BatchAxis::replicated(), 2, ShardingDimension::Replicated),
             Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::replicated(), actual: BatchAxis::new(0) }),
         );
     }
 
     #[test]
     fn test_array_batch_sharding_for_inputs() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
         let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
@@ -1701,21 +1995,261 @@ mod tests {
             ShardingDimension::replicated()
         );
 
-        // Batched inputs that disagree on their mapped-axis sharding are rejected.
+        // A replicated mapped dimension is explicitly normalized to the concrete sharded placement contributed
+        // by another mapped input.
         let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_sharding(Sharding::replicated(mesh, 2))
+            .with_sharding(Sharding::replicated(mesh.clone(), 2))
             .unwrap();
         let other = {
             let value = replicated_type;
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let error = ArrayBatch::sharding_for_inputs(&[batched, other]).unwrap_err();
+        assert_eq!(
+            ArrayBatch::sharding_for_inputs(&[batched.clone(), other.clone()]).unwrap(),
+            ShardingDimension::sharded(["x"]),
+        );
+        assert_eq!(
+            ArrayBatch::sharding_for_inputs(&[other, batched.clone()]).unwrap(),
+            ShardingDimension::sharded(["x"]),
+        );
+
+        // Two distinct concrete placements remain ambiguous and are rejected.
+        let differently_sharded_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_sharding(
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()])
+                        .unwrap(),
+                )
+                .unwrap();
+        let differently_sharded =
+            ArrayBatch::new(differently_sharded_type.clone(), differently_sharded_type, BatchAxis::new(0)).unwrap();
+        let error = ArrayBatch::sharding_for_inputs(&[batched, differently_sharded]).unwrap_err();
         assert!(matches!(
             error.downcast_custom::<BatchingError>(),
             Some(BatchingError::MisalignedBatchAxes { message })
                 if message.contains("mismatched batch axis sharding"),
         ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_array_batch_supports_explicitly_sharded_mapped_axis() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            2,
+            None,
+            ShardingDimension::Replicated,
+        );
+        for (batch_axis, dimensions) in [vec![2, 3, 4], vec![3, 2, 4], vec![3, 4, 2]].into_iter().enumerate() {
+            let mut sharding_dimensions = vec![ShardingDimension::replicated(); 3];
+            sharding_dimensions[batch_axis] = ShardingDimension::sharded(["x"]);
+            let physical_type =
+                ArrayType::new(DataType::F64, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+                    .with_sharding(Sharding::new(mesh.clone(), sharding_dimensions).unwrap())
+                    .unwrap();
+            let batch = ArrayBatch::new(
+                physical_type.clone(),
+                TestArray::new(physical_type.clone(), (0..24).map(f64::from).collect()),
+                BatchAxis::from_position(batch_axis),
+            )
+            .unwrap();
+            let mut logical_dimensions = physical_type.shape().dimensions().to_vec();
+            logical_dimensions.remove(batch_axis);
+
+            assert_eq!(
+                batch.unbatched_type(),
+                ArrayType::new(DataType::F64, Shape::new(logical_dimensions))
+                    .with_sharding(Sharding::replicated(mesh.clone(), 2))
+                    .unwrap(),
+            );
+
+            let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[batch.clone(), batch]).unwrap();
+            assert_eq!(outputs[0].r#type(), Cow::Borrowed(&physical_type));
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::from_position(batch_axis));
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_elementwise_batch_normalizes_replicated_and_sharded_mapped_axes() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let make_type = |axis_sharding| {
+                let varying_manual_axes = (axis_type == MeshAxisType::Manual
+                    && matches!(axis_sharding, ShardingDimension::Sharded(_)))
+                .then_some("x");
+                let sharding = Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![axis_sharding, ShardingDimension::replicated()],
+                    Vec::<String>::new(),
+                    Vec::<String>::new(),
+                    varying_manual_axes,
+                )
+                .unwrap();
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                    .with_sharding(sharding)
+                    .unwrap()
+            };
+            let sharded_type = make_type(ShardingDimension::sharded(["x"]));
+            let replicated_type = make_type(ShardingDimension::replicated());
+            let sharded = ArrayBatch::new(
+                sharded_type.clone(),
+                TestArray::new(sharded_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let replicated = ArrayBatch::new(
+                replicated_type.clone(),
+                TestArray::new(replicated_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let context = BatchingContext::new(
+                EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+
+            let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[sharded, replicated]).unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].r#type(), Cow::Borrowed(&sharded_type));
+            assert_eq!(outputs[0].value().values(), &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_normalizes_mapped_input_sharding_before_tracing() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let sharded = TestArray::new(sharded_type.clone(), vec![1.0, 2.0]);
+        let replicated = TestArray::new(replicated_type, vec![3.0, 4.0]);
+
+        let output = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(_sharded, normalized)| Ok(normalized),
+                (sharded, replicated),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type(), Cow::Borrowed(&sharded_type));
+        assert_eq!(output.values(), &[3.0, 4.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_region_batching_preserves_mapped_axis_sharding() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let logical_sharding = if axis_type == MeshAxisType::Manual {
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::replicated()],
+                    Vec::<String>::new(),
+                    Vec::<String>::new(),
+                    ["x"],
+                )
+                .unwrap()
+            } else {
+                Sharding::replicated(mesh.clone(), 1)
+            };
+            let logical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+                .with_sharding(logical_sharding)
+                .unwrap();
+            let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+                |inputs: Vec<_>| Ok(inputs),
+                vec![logical_type],
+            )
+            .unwrap();
+
+            let (batched, output_axes) = program
+                .entry_region_ref()
+                .batched(
+                    2,
+                    ShardingDimension::sharded(["x"]),
+                    &[BatchAxis::new(1)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap();
+            let expected_sharding = Sharding::with_manual_axes(
+                mesh,
+                vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+                .with_sharding(expected_sharding)
+                .unwrap();
+
+            assert_eq!(batched.input_types(), &[expected_type.clone()]);
+            assert_eq!(batched.output_types(), &[expected_type]);
+            assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_condition_region_batching_preserves_mapped_axis_sharding() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding = Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                (axis_type == MeshAxisType::Manual).then_some("x"),
+            )
+            .unwrap();
+            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_sharding(physical_sharding)
+                .unwrap();
+            let operand = ArrayBatch::new(
+                physical_type.clone(),
+                TestArray::new(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let logical_type = operand.unbatched_type();
+            let (_, branch) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+                |inputs: Vec<_>| Ok(inputs),
+                vec![logical_type],
+            )
+            .unwrap();
+            let context = BatchingContext::new(
+                EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+                2,
+                None,
+                ShardingDimension::sharded(["x"]),
+            );
+            let predicate = ArrayBatch::replicated(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+
+            let outputs = context
+                .bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![branch.clone(), branch],
+                    &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+                )
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].batch().r#type(), Cow::Borrowed(&physical_type));
+        }
     }
 
     #[test]
@@ -1731,7 +2265,12 @@ mod tests {
 
         // Batching rules always receive the active `BatchingContext`, with the physical work running
         // through its parent context.
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            2,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
@@ -1754,6 +2293,27 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
+        // Physical mapped-axis positions are canonicalized independently of operand rank. The rank-3 left operand
+        // maps its trailing axis while the rank-1 right operand maps its only axis; their logical per-item shapes are
+        // `[3, 4]` and scalar, respectively. The output is restored to the first mapped input's trailing axis.
+        let left_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let left = make_batch(&left_type, (1..=24).map(f64::from).collect(), Some(2));
+        let right = make_batch(&right_type, vec![10.0, 20.0], Some(0));
+        let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(2));
+        assert_eq!(
+            outputs[0].value(),
+            &TestArray::new(
+                left_type,
+                vec![
+                    11.0, 22.0, 13.0, 24.0, 15.0, 26.0, 17.0, 28.0, 19.0, 30.0, 21.0, 32.0, 23.0, 34.0, 25.0, 36.0,
+                    27.0, 38.0, 29.0, 40.0, 31.0, 42.0, 33.0, 44.0,
+                ],
+            ),
+        );
+
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
@@ -1771,7 +2331,12 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
 
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            3,
+            None,
+            ShardingDimension::Replicated,
+        );
         let outputs = AddOperation.interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -1799,8 +2364,9 @@ mod tests {
 
         // A mapped input at axis 0 turns the program into one over `[2, 3]`-shaped physical inputs that squares each
         // row, with the output naturally mapped on the same axis.
-        let (batched, output_axes) =
-            program.batched(2, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural).unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let outputs = batched.interpret(vec![input]).unwrap();
@@ -1808,8 +2374,9 @@ mod tests {
 
         // A negative input axis is normalized against the physical input rank. Mapping the final axis consumes a
         // `[3, 2]` physical value and preserves that canonical axis through the elementwise body.
-        let (batched, output_axes) =
-            program.batched(2, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural).unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         let input = TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         let outputs = batched.interpret(vec![input]).unwrap();
@@ -1818,7 +2385,12 @@ mod tests {
         // A replicated input keeps its logical `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
         // output across the batch so the batched program still produces one `[2, 3]` output per item.
         let (batched, output_axes) = program
-            .batched(2, &[BatchAxis::replicated()], ProgramBatchingOutputAxesPolicy::AlignAllTo(0))
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(0),
+            )
             .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let outputs = batched.interpret(vec![TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
@@ -1827,14 +2399,23 @@ mod tests {
         // Signed output policies normalize after accounting for the inserted batch dimension. `-1` places the
         // instantiated batch axis last.
         let (batched, output_axes) = program
-            .batched(2, &[BatchAxis::replicated()], ProgramBatchingOutputAxesPolicy::AlignAllTo(-1))
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(-1),
+            )
             .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(1)]);
         let outputs = batched.interpret(vec![TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(outputs, vec![TestArray::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0])]);
 
         // A mismatched `input_batch_axes` count is rejected.
-        assert!(program.batched(2, &[], ProgramBatchingOutputAxesPolicy::Natural).is_err());
+        assert!(
+            program
+                .batched(2, ShardingDimension::Replicated, &[], ProgramBatchingOutputAxesPolicy::Natural)
+                .is_err(),
+        );
     }
 
     #[test]
@@ -1958,5 +2539,763 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, BatchingError::EmptyBatch);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_uses_one_packed_array_value() {
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| Ok(x.clone() * x.clone() + x.sin()?),
+                TestArray::vector(vec![0.0, 1.0, 2.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        for (actual, expected) in output.values.iter().zip([0.0, 1.0 + 1.0f64.sin(), 4.0 + 2.0f64.sin()]) {
+            assert_abs_diff_eq!(*actual, expected, epsilon = 1e-9);
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_broadcasts_scalar_constants_inside_packed_operations() {
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| Ok(x.clone() + x.one_like()),
+                TestArray::vector(vec![2.0, 4.0, 6.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_maps_structured_packed_inputs_and_outputs() {
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
+                (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.0.values, vec![3.0, 7.0]);
+        assert_eq!(output.1.values, vec![2.0, 12.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_named_axis_psum_reduces_over_batch() {
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| x.collective("i", CollectiveKind::PSum),
+                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::named("i"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::scalar(DataType::F64));
+        assert_eq!(output.values, vec![6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_axis_index_produces_per_item_indices() {
+        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |item| item.context().axis_index("i"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.values, vec![0.0, 1.0, 2.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
+        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
+        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
+        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
+        // vary over inner items). The inner output is therefore declared replicated (`out_axes = replicated`), and the
+        // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
+        let x = TestArray::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |scalar| scalar.context().axis_index("o"),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::replicated(),
+                        BatchAxisSpecification::named("i"),
+                    )?)
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("o"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.values, vec![0.0, 1.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_axis_index_rejects_unbound_axis() {
+        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |item| item.context().axis_index("j"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            );
+        assert_eq!(
+            result.unwrap_err(),
+            BatchingError::Axis(crate::axes::AxisError::UnboundAxisName { name: "j".to_string() }),
+        );
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_named_axes_route_collectives_to_matching_level() {
+        // The inner `psum` targets the *outer* named axis, so each inner batch item must reduce over the
+        // outer batch items: column sums of [[1, 2], [3, 4]].
+        let x = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            vec![1.0, 2.0, 3.0, 4.0],
+        );
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |scalar| scalar.collective("outer", CollectiveKind::PSum),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxisSpecification::named("inner"),
+                    )?)
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::named("outer"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
+        assert_eq!(output.values, vec![4.0, 6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_value_and_grad_flows_through_batch_staged_broadcast() {
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+
+        // The scalar input is replicated inside the batch, so the elementwise batching rule
+        // stages a `Broadcast` on the differentiated value; the gradient must flow back
+        // through the broadcast's transpose rule (a sum-reduction over the batch axis).
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let y = context.lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |(item, shift)| Ok(item * shift),
+                        (y, x),
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.values[0], 20.0, epsilon = 1e-9);
+        assert_eq!(gradient.values, vec![10.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_composes_with_context_jvp() {
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| {
+                    let context = x.context().clone();
+                    ForwardModeDifferentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
+                        .map_err(ProgramError::from)
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.0.values, vec![4.0, 9.0]);
+        assert_eq!(output.1.values, vec![4.0, 6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_composes_with_context_value_and_grad() {
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| {
+                    let context = x.context().clone();
+                    Ok(context
+                        .value_and_gradient(|y| y.clone() * y, x)
+                        .expect("scalar value_and_gradient should succeed"))
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.0.values, vec![4.0, 9.0]);
+        assert_eq!(output.1.values, vec![4.0, 6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_context_batch_composes_inside_jvp() {
+        let (primal, tangent): (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(
+                |x| {
+                    let context = x.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )?)
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+                TestArray::vector(vec![1.0, 1.0]),
+            )
+            .unwrap();
+
+        assert_eq!(primal.values, vec![4.0, 9.0]);
+        assert_eq!(tangent.values, vec![4.0, 6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_context_batch_composes_inside_value_and_grad() {
+        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+
+        let (value, gradient): (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+            )
+            .unwrap();
+
+        assert_eq!(value.values, vec![13.0]);
+        assert_eq!(gradient.values, vec![4.0, 6.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_elementwise_batch_unary_op() {
+        // A unary elementwise op over a single batched operand preserves elementwise semantics and reports the
+        // operand's batch axis on its single output. `NegOperation` is elementwise, so its batching rule is the
+        // blanket elementwise `BatchableOperation` impl.
+        let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            3,
+            None,
+            ShardingDimension::Replicated,
+        );
+        let outputs = NegOperation.batch(&context, &crate::EmptyRegionDriver, &[batched]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_over_dot_lifts_dimension_numbers() {
+        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+
+        // x has shape [3, 4]; outer batch over axis 0 produces per-item rank-1 vectors. Inside,
+        // we want every per-item vector dotted with itself, giving a per-item scalar; batch
+        // over the leading axis then yields a length-3 vector of dot products.
+        let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data);
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
+        for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
+            assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_over_transpose_lifts_permutation() {
+        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-item rank-2 matrices,
+        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
+        // tensor, leaving the batch axis (originally axis 0) in place.
+        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
+        let x = TestArray {
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
+            values: x_data,
+        };
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
+            .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)])),
+        );
+        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
+        assert_eq!(output.values[0], 0.0);
+        assert_eq!(output.values[1 * 3], 1.0);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_broadcasts_replicated_input_with_in_axes_none() {
+        // x is a [4]-vector mapped on axis 0 (batch items), y is a replicated scalar that should be
+        // added to every batch item. The output should be element-wise `x + y` over the 4 batch items.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let y = TestArray::scalar(10.0);
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(left, right)| Ok(left + right),
+                (x, y),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.values, vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_with_axis_size_validates_mapped_batch_size() {
+        // With explicit axis_size = Some(4), the batch size is pinned. A mapped input of size 4
+        // must agree, and the batch size flows through to subsequent operations.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(4))
+            .unwrap();
+        assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_rejects_dynamic_batch_axis() {
+        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: batch has no
+        // way to determine the batch size.
+        let dynamic_input = TestArray {
+            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
+            values: vec![1.0, 2.0, 3.0],
+        };
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), dynamic_input, BatchAxis::new(0), BatchAxis::new(0), None);
+        assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_with_mismatched_axis_size_rejects_mapped_input() {
+        // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
+        let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(5));
+        assert!(matches!(result, Err(BatchingError::MismatchedBatchSizes { expected: 5, actual: 4 })));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_repositions_output_with_out_axes() {
+        // Outer batch over axis 0 of a [3, 4] matrix: each batch item returns its row unchanged.
+        // out_axes=Some(1) requests that the batch axis end up at position 1 of the rank-2
+        // output, which forces a transpose to swap the axes.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|row| Ok(row), x, BatchAxis::new(0), BatchAxis::new(1), None)
+            .unwrap();
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
+        // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
+        // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
+        for j in 0..3 {
+            for i in 0..4 {
+                assert_eq!(output.values[i * 3 + j], x_data[j * 4 + i]);
+            }
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_with_mixed_in_axes_propagates_broadcast() {
+        // Outer batch over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
+        // second inner batch maps that row's batch axis 0 while broadcasting a captured `bias`
+        // scalar to every inner batch item. The combined output is x + bias broadcasted.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(3, 4, x_data.clone());
+        let bias = TestArray::scalar(0.5);
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(row, bias_inner)| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |(scalar, bias_inner)| Ok(scalar + bias_inner),
+                        (row, bias_inner),
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
+                        None,
+                    )?)
+                },
+                (x, bias),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),);
+        let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
+        for (actual, expected) in output.values.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_nested_batch_over_reshape_lifts_input_and_output_shapes() {
+        use crate::operations::manipulation::Reshape;
+
+        // x has shape [2, 6]; outer batch over axis 0 yields per-item rank-1 vectors of size 6,
+        // which we reshape to per-item [2, 3]. The combined effect should be a [2, 2, 3] tensor
+        // whose leading axis is the original batch dimension.
+        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
+        let x = TestArray::matrix(2, 6, x_data.clone());
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
+        );
+        // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
+        assert_eq!(output.values, x_data);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_stages_replicated_condition_predicates() {
+        // A replicated *abstract* condition predicate under trace-time batching cannot be concretized to pick one
+        // branch (previously this surfaced a `Concretization` error), so the staged batching rule batches both
+        // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
+        // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
+        // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
+        let operand_atom = builder.borrow_mut().add_input(operand_type);
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let condition_count = program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "condition")
+            .count();
+        assert_eq!(condition_count, 1, "{program}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![3.0, 12.0, 27.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_normalizes_replicated_condition_branch_output_axes() {
+        // The two branches of a staged batched condition may disagree on their natural output batch axes: here the
+        // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
+        // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
+        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
+        let mut constant_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        constant_builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
+        let constant_branch = constant_builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom =
+            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), constant_branch];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let rendered = program.to_string();
+        assert!(rendered.contains("broadcast"), "{rendered}");
+        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![7.0, 7.0, 7.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_lifts_batch_varying_condition_via_select() {
+        // A runtime-predicate Condition inside batch with a batch-varying predicate: each batch item
+        // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
+        // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
+        // batch-varying branch evaluates both branches over the operand axes and combines per batch item
+        // via `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
+        let predicate = TestArray::new(
+            ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)])),
+            vec![1.0, 0.0, 1.0, 0.0],
+        );
+        let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
+
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(pred, operand)| {
+                    let condition = ConditionOperation::new();
+                    let op = ArrayOperation::Condition(condition);
+                    let outputs = pred.context().bind(
+                        op,
+                        vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+                        &[pred.clone(), operand.clone()],
+                    )?;
+                    Ok(outputs.into_iter().next().unwrap())
+                },
+                (predicate, operand),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        // Expected per-item: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
+        assert_eq!(output.values, vec![2.0, 6.0, 6.0, 12.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_over_zero_operation_yields_replicated_output() {
+        // End-to-end: a batched function that stages `ZeroOperation` produces a replicated zero
+        // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
+        // zero-input operation and that the post-trace replay materializes the same zero for
+        // every batch item through the replicated broadcast path.
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| {
+                    let zero_op = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(
+                        ArrayType::scalar(DataType::F64),
+                    ));
+                    let zero = x.context().bind(zero_op, Vec::new(), &[])?.into_iter().next().unwrap();
+                    Ok(x + zero)
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_broadcasts_a_single_axis_to_every_leaf() {
+        // A single `BatchAxis` for `in_axes`/`out_axes` broadcasts into the whole input/output parameter structure
+        // (JAX's `in_axes=0`), so both leaves of the pair are mapped on axis 0 without spelling out the structure.
+        let x = TestArray::vector(vec![1.0, 3.0]);
+        let y = TestArray::vector(vec![2.0, 4.0]);
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
+                (x, y),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.0.values, vec![3.0, 7.0]);
+        assert_eq!(output.1.values, vec![2.0, 12.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_broadcasts_mapped_inputs_with_mixed_per_item_ranks() {
+        // x is mapped with per-item shape [3]; y is mapped with a per-item scalar shape. The
+        // elementwise rule broadcasts y's per-item scalar across the common per-item shape, so
+        // each batch item computes `row + shift` with its own shift.
+        let x = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let y = TestArray::vector(vec![10.0, 20.0]);
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|(row, shift)| Ok(row + shift), (x, y), BatchAxis::new(0), BatchAxis::new(0), None)
+            .unwrap();
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
+        assert_eq!(output.values, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_batch_broadcasts_scalar_replicated_operands_to_full_shape() {
+        // A replicated scalar constant added to a mapped [3, 4] input: the elementwise rule
+        // materializes a `BroadcastOperation` to the full common batched shape so the staged
+        // add receives shape-congruent operands — required for backends such as XLA whose
+        // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
+        let input_atom = builder.borrow_mut().add_input(input_type);
+        let input_tracer = parent.tracer(input_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |x| {
+                let bias = x.context().lift(TestArray::scalar(1.0))?;
+                Ok(x + bias)
+            },
+            input_tracer,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<TestArray, TestArray>(vec![output_atom], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, 4] .
+                let %1:f64[] = const
+                    %2:f64[3, 4] = broadcast [output_type=f64[3, 4], output_axes=[]] %1
+                    %3:f64[3, 4] = add %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let input = TestArray::matrix(3, 4, (0..12).map(|value| value as f64).collect());
+        let output = program.interpret(input).unwrap();
+        assert_eq!(output.values, (0..12).map(|value| value as f64 + 1.0).collect::<Vec<_>>());
     }
 }

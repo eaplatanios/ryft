@@ -20,7 +20,7 @@ pub enum BroadcastingError {
     IncompatibleShapes { lhs: Shape, rhs: Shape },
 
     #[error("failed to broadcast due to incompatible shardings; lhs={lhs:?}, rhs={rhs:?}")]
-    IncompatibleShardings { lhs: Option<Sharding>, rhs: Option<Sharding> },
+    IncompatibleShardings { lhs: Option<Box<Sharding>>, rhs: Option<Box<Sharding>> },
 
     #[error(
         "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, so \
@@ -344,7 +344,10 @@ fn broadcast_sharding(
         (None, Some(right)) => right.mesh().clone(),
         (Some(left), Some(right)) if left.mesh() == right.mesh() => left.mesh().clone(),
         (Some(left), Some(right)) => {
-            return Err(BroadcastingError::IncompatibleShardings { lhs: Some(left.clone()), rhs: Some(right.clone()) });
+            return Err(BroadcastingError::IncompatibleShardings {
+                lhs: Some(Box::new(left.clone())),
+                rhs: Some(Box::new(right.clone())),
+            });
         }
     };
 
@@ -361,16 +364,16 @@ fn broadcast_sharding(
         let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
         let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         };
         if let ShardingDimension::Sharded(axis_names) = dimension {
             for axis_name in axis_names {
                 if !used_axes.insert(axis_name.clone()) {
                     return Err(BroadcastingError::IncompatibleShardings {
-                        lhs: lhs_sharding.cloned(),
-                        rhs: rhs_sharding.cloned(),
+                        lhs: lhs_sharding.cloned().map(Box::new),
+                        rhs: rhs_sharding.cloned().map(Box::new),
                     });
                 }
             }
@@ -385,8 +388,8 @@ fn broadcast_sharding(
         (Some(left), Some(right)) if left.unreduced_axes() == right.unreduced_axes() => left.unreduced_axes().clone(),
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
@@ -398,8 +401,8 @@ fn broadcast_sharding(
         (Some(left), Some(right)) if left.reduced_axes() == right.reduced_axes() => left.reduced_axes().clone(),
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
@@ -413,8 +416,8 @@ fn broadcast_sharding(
         }
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
