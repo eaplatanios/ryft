@@ -1,9 +1,3 @@
-/// Elementwise addition linearization and differentiation rules.
-pub mod add;
-
-/// Elementwise two-argument arc-tangent differentiation rules.
-pub mod atan2;
-
 /// N-dimensional broadcast differentiation and batching rules.
 pub mod broadcasting;
 
@@ -19,12 +13,6 @@ pub mod compare;
 /// Complex-number construction, conjugation, and part-extraction differentiation rules.
 pub mod complex;
 
-/// Elementwise cosine differentiation rules.
-pub mod cos;
-
-/// Elementwise exponential, log, and square-root differentiation rules.
-pub mod exponential;
-
 /// Value-level identity helpers and built-in scalar constant traits.
 pub mod constants;
 
@@ -33,9 +21,6 @@ pub mod control_flow;
 
 /// Higher-order custom-derivative operations (`custom_jvp` / `custom_vjp`).
 pub mod custom_derivatives;
-
-/// Elementwise division differentiation rules.
-pub mod div;
 
 /// Generalized dot product (tensor contraction) primitive.
 pub mod dot;
@@ -48,12 +33,6 @@ pub mod logical;
 
 /// Memory-space transfer primitive.
 pub mod memory;
-
-/// Elementwise multiplication differentiation rules.
-pub mod mul;
-
-/// Elementwise negation.
-pub mod neg;
 
 /// Edge and interior padding differentiation and batching rules.
 pub mod padding;
@@ -82,17 +61,11 @@ pub mod select;
 /// Resharding and sharding-constraint differentiation and batching rules.
 pub mod sharding;
 
-/// Elementwise sine differentiation rules.
-pub mod sin;
-
 /// Static and dynamic slicing differentiation and batching rules.
 pub mod slicing;
 
 /// Gradient-severing `stop_gradient` differentiation rule.
 pub mod stop_gradient;
-
-/// Elementwise subtraction linearization and differentiation rules.
-pub mod sub;
 
 /// N-dimensional axis-permutation differentiation and batching rules.
 pub mod transpose;

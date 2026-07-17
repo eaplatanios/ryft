@@ -609,15 +609,146 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for NegOperat
     }
 }
 
+/// Lowers complex sine or cosine through real operations while preserving an exact zero component for a zero real
+/// input. The direct StableHLO complex trigonometric operations can evaluate a mathematically zero product as
+/// `0 * inf`, yielding NaN when the imaginary component is large enough to overflow the hyperbolic factor.
+///
+/// # Parameters
+///
+///   - `input`: Complex tensor whose elementwise sine or cosine is lowered.
+///   - `output_type`: Inferred complex output type, used to construct same-shaped real constants.
+///   - `sine`: If `true`, lowers sine; otherwise, lowers cosine.
+///   - `block`: Destination block for the StableHLO decomposition.
+///   - `context`: MLIR context that owns all emitted types and attributes.
+///   - `location`: Source location attached to emitted operations.
+fn lower_complex_sine_or_cosine<'b, 'c: 'b, 't: 'c, B, L>(
+    input: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    sine: bool,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let part_data_type = match output_type.data_type() {
+        DataType::C64 => DataType::F32,
+        DataType::C128 => DataType::F64,
+        _ => unreachable!(),
+    };
+    let part_type = ArrayType::new(part_data_type, output_type.shape().clone());
+    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+    let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
+
+    let real = block.append_operation(stable_hlo::real(input, location)?)?;
+    let real = real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?;
+    let imaginary = imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let real_is_zero = block.append_operation(stable_hlo::compare(
+        real,
+        zero,
+        stable_hlo::ComparisonDirection::Equal,
+        stable_hlo::ComparisonType::Float,
+        location,
+    )?)?;
+    let real_is_zero = real_is_zero.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let real_sine = block.append_operation(stable_hlo::sine(real, Accuracy::Default, location)?)?;
+    let real_sine = real_sine.result(0).expect("stablehlo.sine should return one result").as_ref();
+    let real_cosine = block.append_operation(stable_hlo::cosine(real, Accuracy::Default, location)?)?;
+    let real_cosine = real_cosine.result(0).expect("stablehlo.cosine should return one result").as_ref();
+    let negative_imaginary = block.append_operation(stable_hlo::negate(imaginary, location)?)?;
+    let negative_imaginary = negative_imaginary.result(0).expect("stablehlo.negate should return one result").as_ref();
+    let positive_exponential_minus_one =
+        block.append_operation(stable_hlo::exponential_minus_one(imaginary, Accuracy::Default, location)?)?;
+    let positive_exponential_minus_one = positive_exponential_minus_one
+        .result(0)
+        .expect("stablehlo.exponential_minus_one should return one result")
+        .as_ref();
+    let negative_exponential_minus_one =
+        block.append_operation(stable_hlo::exponential_minus_one(negative_imaginary, Accuracy::Default, location)?)?;
+    let negative_exponential_minus_one = negative_exponential_minus_one
+        .result(0)
+        .expect("stablehlo.exponential_minus_one should return one result")
+        .as_ref();
+    let sinh_numerator = block.append_operation(stable_hlo::subtract(
+        positive_exponential_minus_one,
+        negative_exponential_minus_one,
+        location,
+    )?)?;
+    let sinh_numerator = sinh_numerator.result(0).expect("stablehlo.subtract should return one result").as_ref();
+    let sinh = block.append_operation(stable_hlo::divide(sinh_numerator, two, location)?)?;
+    let sinh = sinh.result(0).expect("stablehlo.divide should return one result").as_ref();
+    let cosh_without_two = block.append_operation(stable_hlo::add(
+        positive_exponential_minus_one,
+        negative_exponential_minus_one,
+        location,
+    )?)?;
+    let cosh_without_two = cosh_without_two.result(0).expect("stablehlo.add should return one result").as_ref();
+    let cosh_numerator = block.append_operation(stable_hlo::add(cosh_without_two, two, location)?)?;
+    let cosh_numerator = cosh_numerator.result(0).expect("stablehlo.add should return one result").as_ref();
+    let cosh = block.append_operation(stable_hlo::divide(cosh_numerator, two, location)?)?;
+    let cosh = cosh.result(0).expect("stablehlo.divide should return one result").as_ref();
+
+    let (real_result, imaginary_result) = if sine {
+        // Mask the overflowing factor before multiplication as well as selecting the final complex result. Some XLA
+        // optimization paths otherwise speculate the unselected `0 * inf` expression and preserve its NaN.
+        let safe_cosh = block.append_operation(stable_hlo::select(real_is_zero, zero, cosh, location)?)?;
+        let safe_cosh = safe_cosh.result(0).expect("stablehlo.select should return one result").as_ref();
+        let real_result = block.append_operation(stable_hlo::multiply(real_sine, safe_cosh, location)?)?;
+        let real_result = real_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let imaginary_result = block.append_operation(stable_hlo::multiply(real_cosine, sinh, location)?)?;
+        let imaginary_result =
+            imaginary_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        (real_result, imaginary_result)
+    } else {
+        let real_result = block.append_operation(stable_hlo::multiply(real_cosine, cosh, location)?)?;
+        let real_result = real_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let negative_real_sine = block.append_operation(stable_hlo::negate(real_sine, location)?)?;
+        let negative_real_sine =
+            negative_real_sine.result(0).expect("stablehlo.negate should return one result").as_ref();
+        let safe_sinh = block.append_operation(stable_hlo::select(real_is_zero, zero, sinh, location)?)?;
+        let safe_sinh = safe_sinh.result(0).expect("stablehlo.select should return one result").as_ref();
+        let imaginary_result =
+            block.append_operation(stable_hlo::multiply(negative_real_sine, safe_sinh, location)?)?;
+        let imaginary_result =
+            imaginary_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        (real_result, imaginary_result)
+    };
+    let ordinary_result = block.append_operation(stable_hlo::complex(real_result, imaginary_result, location)?)?;
+    let ordinary_result = ordinary_result.result(0).expect("stablehlo.complex should return one result").as_ref();
+    let zero_real_result = if sine {
+        block.append_operation(stable_hlo::complex(zero, imaginary_result, location)?)?
+    } else {
+        block.append_operation(stable_hlo::complex(real_result, zero, location)?)?
+    };
+    let zero_real_result = zero_real_result.result(0).expect("stablehlo.complex should return one result").as_ref();
+    let result =
+        block.append_operation(stable_hlo::select(real_is_zero, zero_real_result, ordinary_result, location)?)?;
+    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+}
+
 impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+            return Ok(vec![lower_complex_sine_or_cosine(
+                input_values[0],
+                &output_types[0],
+                true,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
         let result =
             lowerer
                 .block
@@ -631,10 +762,20 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CosOperat
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+            return Ok(vec![lower_complex_sine_or_cosine(
+                input_values[0],
+                &output_types[0],
+                false,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::cosine(
             input_values[0],
             Accuracy::Default,
@@ -5170,6 +5311,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
         XlaOperation::Sin(_) => {
+            if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+                return Ok(vec![lower_complex_sine_or_cosine(
+                    input_values[0],
+                    &output_types[0],
+                    true,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?]);
+            }
             let result = lowerer.block.append_operation(stable_hlo::sine(
                 input_values[0],
                 Accuracy::Default,
@@ -5178,6 +5329,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
         XlaOperation::Cos(_) => {
+            if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+                return Ok(vec![lower_complex_sine_or_cosine(
+                    input_values[0],
+                    &output_types[0],
+                    false,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?]);
+            }
             let result = lowerer.block.append_operation(stable_hlo::cosine(
                 input_values[0],
                 Accuracy::Default,
@@ -7654,6 +7815,29 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.compare").count(), 1);
         assert_eq!(stablehlo.matches("stablehlo.select").count(), 1);
         assert!(stablehlo.contains("tensor<8x2x3xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_complex_sine_and_cosine() {
+        let complex_type = ArrayType::scalar(DataType::C64);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(complex_type);
+        let sine = builder.add_instruction(XlaOperation::Sin(SinOperation), Vec::new(), vec![input]).unwrap()[0];
+        let cosine = builder.add_instruction(XlaOperation::Cos(CosOperation), Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sine, cosine],
+                vec![Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.exponential_minus_one").count(), 4, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 4, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
     }
 
     #[test]

@@ -100,9 +100,9 @@ macro_rules! check_gradient {
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             $crate::backends::scalars::Scalar::C128(_) => {
-                // Both perturbation steps are built as `c128` values (binary `Scalar` arithmetic requires
-                // same-variant operands), and the two central differences estimate the two real partials that
-                // assemble the conjugate steepest-ascent gradient.
+                // Both perturbation steps are built as `c128` values so the central differences remain in the complex
+                // tangent space. The two differences estimate the real partials that assemble the conjugate
+                // steepest-ascent gradient.
                 let real_step = $crate::operations::complex::Complex::complex(
                     &$crate::backends::scalars::Scalar::from(step),
                     &$crate::backends::scalars::Scalar::from(0.0),

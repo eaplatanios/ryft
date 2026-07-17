@@ -233,7 +233,7 @@ mod tests {
     use ryft_core::operations::control_flow::SelectCondition;
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{Concatenate, Pad, Reshape, Slice, Transpose, UpdateSlice};
-    use ryft_core::operations::math::{Abs, Cos, Sin};
+    use ryft_core::operations::math::{Abs, Atan2, Cos, Sin};
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -389,6 +389,16 @@ mod tests {
         for (observed, input) in read_f32s(&a.cos().unwrap()).iter().zip([1.0f32, 2.0, 3.0, 4.0]) {
             assert!((observed - input.cos()).abs() < 1e-5);
         }
+
+        // Complex sine and cosine preserve their mathematically exact zero component even when the hyperbolic factor
+        // overflows. A naive `0 * inf` decomposition would produce a NaN here.
+        let extreme = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 1000.0));
+        let sine = read_c64s(&extreme.sin().unwrap())[0];
+        assert_eq!(sine.re, 0.0);
+        assert!(sine.im.is_infinite() && sine.im.is_sign_positive());
+        let cosine = read_c64s(&extreme.cos().unwrap())[0];
+        assert!(cosine.re.is_infinite() && cosine.re.is_sign_positive());
+        assert_eq!(cosine.im, 0.0);
     }
 
     #[test]
@@ -717,8 +727,8 @@ mod tests {
         assert_eq!(read_f32s(&input_cotangents[0]), vec![2.0, 8.0, 18.0]);
     }
 
-    /// The `with_aux` reverse-mode form over concrete arrays: auxiliary outputs are returned alongside the value and
-    /// seeded with zero cotangents, so they do not contribute to the gradient.
+    /// Complex elementary operations and their holomorphic or real-output gradients execute through the XLA eager
+    /// domain using the same principal-value and cotangent conventions as the scalar reference backend.
     #[test]
     fn test_eager_complex_gradients() {
         use ryft_core::operations::complex::{Conjugate, Real};
@@ -735,6 +745,23 @@ mod tests {
         let (value, gradient) = domain.value_and_gradient_holomorphic(|x| x.clone() * x, x.clone()).unwrap();
         assert_c64_close(read_c64s(&value)[0], z * z);
         assert_c64_close(read_c64s(&gradient)[0], z + z);
+
+        // Complex `atan2(y, x)` uses XLA's principal value and its two holomorphic partial derivatives away from
+        // singularities and branch cuts.
+        let y = num_complex::Complex::new(0.7f32, -0.2f32);
+        let x_value = num_complex::Complex::new(-0.3f32, 0.4f32);
+        let y_array = c64_scalar(&client, &mesh, y);
+        let x_array = c64_scalar(&client, &mesh, x_value);
+        let (value, (y_gradient, x_gradient)) =
+            domain.value_and_gradient_holomorphic(|(y, x)| y.atan2(&x), (y_array, x_array)).unwrap();
+        let denominator = x_value * x_value + y * y;
+        let imaginary_unit = num_complex::Complex::new(0.0f32, 1.0f32);
+        assert_c64_close(
+            read_c64s(&value)[0],
+            -imaginary_unit * ((x_value + imaginary_unit * y) / denominator.sqrt()).ln(),
+        );
+        assert_c64_close(read_c64s(&y_gradient)[0], x_value / denominator);
+        assert_c64_close(read_c64s(&x_gradient)[0], -y / denominator);
 
         // ℂ → ℝ gradient of |z|² = Re(z · z̄) through the plain entry point, exercising the `conjugate` (lowered as
         // `complex(real, -imag)`), `real`, and `complex` StableHLO lowerings in the pullback: the gradient is 2·z̄.

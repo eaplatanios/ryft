@@ -35,7 +35,7 @@ use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOper
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Exp,
     ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub,
-    SubOperation,
+    SubOperation, validate_floating_or_complex_input_types, validate_numeric_input_types,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -812,10 +812,14 @@ impl Neg for Scalar {
             return Self::encode_low_precision_float(r#type, -Self::decode_low_precision_float(r#type, bits));
         }
         Ok(match *self {
-            Scalar::I8(value) => Scalar::I8(-value),
-            Scalar::I16(value) => Scalar::I16(-value),
-            Scalar::I32(value) => Scalar::I32(-value),
-            Scalar::I64(value) => Scalar::I64(-value),
+            Scalar::I8(value) => Scalar::I8(value.wrapping_neg()),
+            Scalar::I16(value) => Scalar::I16(value.wrapping_neg()),
+            Scalar::I32(value) => Scalar::I32(value.wrapping_neg()),
+            Scalar::I64(value) => Scalar::I64(value.wrapping_neg()),
+            Scalar::U8(value) => Scalar::U8(value.wrapping_neg()),
+            Scalar::U16(value) => Scalar::U16(value.wrapping_neg()),
+            Scalar::U32(value) => Scalar::U32(value.wrapping_neg()),
+            Scalar::U64(value) => Scalar::U64(value.wrapping_neg()),
             // The low-precision variants were already handled through `low_precision_float_parts` before this
             // match, which must nevertheless remain exhaustive.
             Scalar::F4E2M1FN(_)
@@ -851,36 +855,47 @@ impl std::ops::Neg for Scalar {
     }
 }
 
-// TODO(eaplatanios): Support data type promotion / broadcasting.
+/// Promotes two numeric scalars to the common data type used by a binary arithmetic operation.
+fn promote_scalar_arithmetic_operands(
+    left: &Scalar,
+    right: &Scalar,
+    operation_name: &str,
+) -> Result<(Scalar, Scalar), ProgramError> {
+    let input_types = [left.r#type().into_owned(), right.r#type().into_owned()];
+    validate_numeric_input_types(&input_types, operation_name)?;
+    let target = DataType::promoted(&input_types).map_err(|error| TypeError { message: error.to_string() })?;
+    Ok((left.convert_element_type(target)?, right.convert_element_type(target)?))
+}
+
 /// Implements a fallible binary arithmetic capability (e.g., [`Add`]) together with its panicking [`std::ops`]
-/// counterpart for [`Scalar`]. Same-variant numeric operands compute in their payload type (with the low-precision
-/// floating-point variants computing through their decoded `f64` values and re-encoding the result); any other
-/// combination returns a [`TypeError`].
+/// counterpart for [`Scalar`]. Numeric operands are first promoted to their common [`DataType`]. Integer operations
+/// use deterministic two's-complement wrapping semantics, while low-precision floating-point operations compute
+/// through decoded `f64` values and re-encode the result.
 macro_rules! impl_binary_arithmetic_for_scalar {
-    ($trait:ident, $method:ident, $operator:tt) => {
+    ($trait:ident, $method:ident, $integer_method:ident, $operator:tt) => {
         impl $trait for Scalar {
             #[inline]
             fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+                let (left, right) = promote_scalar_arithmetic_operands(self, rhs, stringify!($method))?;
                 if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
-                    (self.low_precision_float_parts(), rhs.low_precision_float_parts())
+                    (left.low_precision_float_parts(), right.low_precision_float_parts())
                 {
-                    if left_type == right_type {
-                        return Scalar::encode_low_precision_float(
-                            left_type,
-                            Scalar::decode_low_precision_float(left_type, left_bits)
-                                $operator Scalar::decode_low_precision_float(right_type, right_bits),
-                        );
-                    }
+                    debug_assert_eq!(left_type, right_type);
+                    return Scalar::encode_low_precision_float(
+                        left_type,
+                        Scalar::decode_low_precision_float(left_type, left_bits)
+                            $operator Scalar::decode_low_precision_float(right_type, right_bits),
+                    );
                 }
-                Ok(match (*self, *rhs) {
-                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
-                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
-                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
-                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left $operator right),
-                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left $operator right),
-                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left $operator right),
-                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
-                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
+                Ok(match (left, right) {
+                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left.$integer_method(right)),
+                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left.$integer_method(right)),
+                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left.$integer_method(right)),
+                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left.$integer_method(right)),
+                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left.$integer_method(right)),
+                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left.$integer_method(right)),
+                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left.$integer_method(right)),
+                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left.$integer_method(right)),
                     (Scalar::BF16(left), Scalar::BF16(right)) => Scalar::BF16(left $operator right),
                     (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(left $operator right),
                     (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left $operator right),
@@ -913,10 +928,141 @@ macro_rules! impl_binary_arithmetic_for_scalar {
     };
 }
 
-impl_binary_arithmetic_for_scalar!(Add, add, +);
-impl_binary_arithmetic_for_scalar!(Sub, sub, -);
-impl_binary_arithmetic_for_scalar!(Mul, mul, *);
-impl_binary_arithmetic_for_scalar!(Div, div, /);
+impl_binary_arithmetic_for_scalar!(Add, add, wrapping_add, +);
+impl_binary_arithmetic_for_scalar!(Sub, sub, wrapping_sub, -);
+impl_binary_arithmetic_for_scalar!(Mul, mul, wrapping_mul, *);
+
+/// Divides two finite complex scalars after scaling both operands by the denominator's largest component. The common
+/// scaling leaves the quotient unchanged while preventing avoidable overflow in the direct norm-squared formula.
+macro_rules! divide_complex_scalars {
+    ($left:expr, $right:expr) => {{
+        let left = $left;
+        let right = $right;
+        let direct = left / right;
+        // Preserve `num_complex`'s ordinary rounding and non-finite-value behavior. Recompute only finite inputs whose
+        // direct norm-squared formula overflowed to a non-finite result despite a nonzero denominator.
+        if direct.re.is_finite() && direct.im.is_finite()
+            || !left.re.is_finite()
+            || !left.im.is_finite()
+            || !right.re.is_finite()
+            || !right.im.is_finite()
+            || right.re == 0.0 && right.im == 0.0
+        {
+            direct
+        } else if right.im == 0.0 {
+            Complex::new(left.re / right.re, left.im / right.re)
+        } else if right.re == 0.0 {
+            Complex::new(left.im / right.im, -left.re / right.im)
+        } else {
+            // Normalize by the denominator rather than by all four components. Including the numerator in this scale
+            // can round a much smaller, nonzero denominator to zero even though the mathematically correct quotient is
+            // merely large or infinite.
+            let scale = right.re.abs().max(right.im.abs());
+            let left = Complex::new(left.re / scale, left.im / scale);
+            let right = Complex::new(right.re / scale, right.im / scale);
+            if right.re.abs() >= right.im.abs() {
+                let ratio = right.im / right.re;
+                let denominator = right.re + right.im * ratio;
+                Complex::new((left.re + left.im * ratio) / denominator, (left.im - left.re * ratio) / denominator)
+            } else {
+                let ratio = right.re / right.im;
+                let denominator = right.im + right.re * ratio;
+                Complex::new((left.re * ratio + left.im) / denominator, (left.im * ratio - left.re) / denominator)
+            }
+        }
+    }};
+}
+
+impl Div for Scalar {
+    fn div(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+        let (left, right) = promote_scalar_arithmetic_operands(self, rhs, "div")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (left.low_precision_float_parts(), right.low_precision_float_parts())
+        {
+            debug_assert_eq!(left_type, right_type);
+            return Scalar::encode_low_precision_float(
+                left_type,
+                Scalar::decode_low_precision_float(left_type, left_bits)
+                    / Scalar::decode_low_precision_float(right_type, right_bits),
+            );
+        }
+
+        macro_rules! divide_signed_integer {
+            ($left:expr, $right:expr, $variant:ident, $data_type:ident, $primitive:ty) => {{
+                if $right == 0 {
+                    return Err(TypeError {
+                        message: format!(
+                            "cannot divide an integer scalar of data type {} by zero",
+                            DataType::$data_type
+                        ),
+                    }
+                    .into());
+                }
+                if $left == <$primitive>::MIN && $right == -1 {
+                    return Err(TypeError {
+                        message: format!(
+                            "cannot divide the minimum integer scalar of data type {} by -1",
+                            DataType::$data_type,
+                        ),
+                    }
+                    .into());
+                }
+                Scalar::$variant($left / $right)
+            }};
+        }
+
+        macro_rules! divide_unsigned_integer {
+            ($left:expr, $right:expr, $variant:ident, $data_type:ident) => {{
+                if $right == 0 {
+                    return Err(TypeError {
+                        message: format!(
+                            "cannot divide an integer scalar of data type {} by zero",
+                            DataType::$data_type
+                        ),
+                    }
+                    .into());
+                }
+                Scalar::$variant($left / $right)
+            }};
+        }
+
+        Ok(match (left, right) {
+            (Scalar::I8(left), Scalar::I8(right)) => divide_signed_integer!(left, right, I8, I8, i8),
+            (Scalar::I16(left), Scalar::I16(right)) => divide_signed_integer!(left, right, I16, I16, i16),
+            (Scalar::I32(left), Scalar::I32(right)) => divide_signed_integer!(left, right, I32, I32, i32),
+            (Scalar::I64(left), Scalar::I64(right)) => divide_signed_integer!(left, right, I64, I64, i64),
+            (Scalar::U8(left), Scalar::U8(right)) => divide_unsigned_integer!(left, right, U8, U8),
+            (Scalar::U16(left), Scalar::U16(right)) => divide_unsigned_integer!(left, right, U16, U16),
+            (Scalar::U32(left), Scalar::U32(right)) => divide_unsigned_integer!(left, right, U32, U32),
+            (Scalar::U64(left), Scalar::U64(right)) => divide_unsigned_integer!(left, right, U64, U64),
+            (Scalar::BF16(left), Scalar::BF16(right)) => Scalar::BF16(left / right),
+            (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(left / right),
+            (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left / right),
+            (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left / right),
+            (Scalar::C64(left), Scalar::C64(right)) => Scalar::C64(divide_complex_scalars!(left, right)),
+            (Scalar::C128(left), Scalar::C128(right)) => Scalar::C128(divide_complex_scalars!(left, right)),
+            (left, right) => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot apply `div` to scalars of data types {} and {}",
+                        left.r#type(),
+                        right.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl std::ops::Div for Scalar {
+    type Output = Scalar;
+
+    #[inline]
+    fn div(self, rhs: Scalar) -> Scalar {
+        Div::div(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
 
 /// Implements a fallible binary logical capability (e.g., [`And`]) together with its panicking [`std::ops`]
 /// counterpart (e.g., [`std::ops::BitAnd`]) for [`Scalar`]. Boolean operands combine logically and same-variant
@@ -1001,8 +1147,6 @@ impl std::ops::Not for Scalar {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Sin for Scalar {
     /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point and complex variants support sine
     /// (the complex sine being the analytic continuation `sin(z)`); any other variant returns a [`TypeError`].
@@ -1015,8 +1159,28 @@ impl Sin for Scalar {
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
             Scalar::F32(value) => Scalar::F32(value.sin()),
             Scalar::F64(value) => Scalar::F64(value.sin()),
-            Scalar::C64(value) => Scalar::C64(value.sin()),
-            Scalar::C128(value) => Scalar::C128(value.sin()),
+            Scalar::C64(value) => {
+                let expm1_imaginary = value.im.exp_m1();
+                let expm1_negative_imaginary = (-value.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let imaginary = value.re.cos() * sinh_imaginary;
+                Scalar::C64(Complex::new(
+                    if value.re == 0.0 { 0.0 } else { value.re.sin() * cosh_imaginary },
+                    imaginary,
+                ))
+            }
+            Scalar::C128(value) => {
+                let expm1_imaginary = value.im.exp_m1();
+                let expm1_negative_imaginary = (-value.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let imaginary = value.re.cos() * sinh_imaginary;
+                Scalar::C128(Complex::new(
+                    if value.re == 0.0 { 0.0 } else { value.re.sin() * cosh_imaginary },
+                    imaginary,
+                ))
+            }
             other => {
                 return Err(TypeError {
                     message: format!("cannot compute the sine of a scalar of data type {}", other.r#type()),
@@ -1039,8 +1203,22 @@ impl Cos for Scalar {
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
             Scalar::F32(value) => Scalar::F32(value.cos()),
             Scalar::F64(value) => Scalar::F64(value.cos()),
-            Scalar::C64(value) => Scalar::C64(value.cos()),
-            Scalar::C128(value) => Scalar::C128(value.cos()),
+            Scalar::C64(value) => {
+                let expm1_imaginary = value.im.exp_m1();
+                let expm1_negative_imaginary = (-value.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let real = value.re.cos() * cosh_imaginary;
+                Scalar::C64(Complex::new(real, if value.re == 0.0 { 0.0 } else { -value.re.sin() * sinh_imaginary }))
+            }
+            Scalar::C128(value) => {
+                let expm1_imaginary = value.im.exp_m1();
+                let expm1_negative_imaginary = (-value.im).exp_m1();
+                let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
+                let cosh_imaginary = (expm1_imaginary + expm1_negative_imaginary + 2.0) / 2.0;
+                let real = value.re.cos() * cosh_imaginary;
+                Scalar::C128(Complex::new(real, if value.re == 0.0 { 0.0 } else { -value.re.sin() * sinh_imaginary }))
+            }
             other => {
                 return Err(TypeError {
                     message: format!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
@@ -1201,12 +1379,14 @@ impl Sqrt for Scalar {
 }
 
 impl Atan2 for Scalar {
-    /// Computes the elementwise two-argument arc tangent `atan2(self, x)` for this [`Scalar`]. Only same-variant
-    /// floating-point operand pairs are supported; any other combination returns a [`TypeError`].
+    /// Computes the elementwise two-argument arc tangent `atan2(self, x)` for this [`Scalar`]. Floating-point and
+    /// complex operands are promoted to a common data type; any other combination returns a [`TypeError`]. Complex
+    /// results use the principal value `-i · log((x + i · self) / sqrt(x² + self²))`.
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+        validate_floating_or_complex_input_types(&[self.r#type().into_owned(), x.r#type().into_owned()], "atan2")?;
+        let (y, x) = promote_scalar_arithmetic_operands(self, x, "atan2")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
-            (self.low_precision_float_parts(), x.low_precision_float_parts())
-            && left_type == right_type
+            (y.low_precision_float_parts(), x.low_precision_float_parts())
         {
             return Self::encode_low_precision_float(
                 left_type,
@@ -1214,11 +1394,21 @@ impl Atan2 for Scalar {
                     .atan2(Self::decode_low_precision_float(right_type, right_bits)),
             );
         }
-        Ok(match (*self, *x) {
+        Ok(match (y, x) {
             (Scalar::BF16(y), Scalar::BF16(x)) => Scalar::BF16(bf16::from_f32(y.to_f32().atan2(x.to_f32()))),
             (Scalar::F16(y), Scalar::F16(x)) => Scalar::F16(f16::from_f32(y.to_f32().atan2(x.to_f32()))),
             (Scalar::F32(y), Scalar::F32(x)) => Scalar::F32(y.atan2(x)),
             (Scalar::F64(y), Scalar::F64(x)) => Scalar::F64(y.atan2(x)),
+            (Scalar::C64(y), Scalar::C64(x)) => {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + y * y).sqrt();
+                Scalar::C64(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
+            }
+            (Scalar::C128(y), Scalar::C128(x)) => {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + y * y).sqrt();
+                Scalar::C128(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
+            }
             (y, x) => {
                 return Err(TypeError {
                     message: format!(
@@ -1236,16 +1426,17 @@ impl Atan2 for Scalar {
 impl Abs for Scalar {
     /// Computes the elementwise absolute value of this [`Scalar`]: the magnitude `|z|` (with a real result) for the
     /// complex variants, and `|x|` for the signed-integer and floating-point variants. Any other variant returns a
-    /// [`TypeError`].
+    /// [`TypeError`]. The minimum value of a signed-integer variant has no positive counterpart in the same type and
+    /// therefore wraps to itself, matching two's-complement integer absolute-value semantics without panicking.
     fn abs(&self) -> Result<Self, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).abs());
         }
         Ok(match self {
-            Scalar::I8(value) => Scalar::I8(value.abs()),
-            Scalar::I16(value) => Scalar::I16(value.abs()),
-            Scalar::I32(value) => Scalar::I32(value.abs()),
-            Scalar::I64(value) => Scalar::I64(value.abs()),
+            Scalar::I8(value) => Scalar::I8(value.wrapping_abs()),
+            Scalar::I16(value) => Scalar::I16(value.wrapping_abs()),
+            Scalar::I32(value) => Scalar::I32(value.wrapping_abs()),
+            Scalar::I64(value) => Scalar::I64(value.wrapping_abs()),
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().abs())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().abs())),
             Scalar::F32(value) => Scalar::F32(value.abs()),
@@ -1612,7 +1803,7 @@ mod tests {
                 |carry| {
                     let operation = WhileOperation::new();
                     let regions = vec![scalar_less_than_eight_condition(), scalar_doubling_body()];
-                    Ok(carry.context().bind(operation, regions, &[carry.clone()])?.remove(0))
+                    Ok(carry.context().bind(operation, regions, std::slice::from_ref(&carry))?.remove(0))
                 },
                 Scalar::from(1.0),
                 Scalar::from(1.0),
@@ -1859,18 +2050,43 @@ mod tests {
 
     #[test]
     fn test_scalar_arithmetic() {
-        // Same-variant arithmetic computes in the payload type, through both the fallible capabilities and the
-        // `std::ops` operator sugar layered on top of them.
+        // Arithmetic computes in the promoted payload type, through both the fallible capabilities and the `std::ops`
+        // operator sugar layered on top of them.
         assert_eq!(Add::add(&Scalar::from(2i32), &Scalar::from(3i32)), Ok(Scalar::from(5i32)));
+        assert_eq!(Add::add(&Scalar::from(1.5f32), &Scalar::from(1.5f64)), Ok(Scalar::from(3.0f64)));
+        assert_eq!(Add::add(&Scalar::from(-1i8), &Scalar::from(2u8)), Ok(Scalar::from(1i16)));
         assert_eq!(Scalar::from(2.0) + Scalar::from(3.0), Scalar::from(5.0));
         assert_eq!(Scalar::from(2.0) - Scalar::from(3.0), Scalar::from(-1.0));
         assert_eq!(Scalar::from(2.0) * Scalar::from(3.0), Scalar::from(6.0));
         assert_eq!(Scalar::from(7i64) / Scalar::from(2i64), Scalar::from(3i64));
         assert_eq!(-Scalar::from(2.0), Scalar::from(-2.0));
 
-        // Mismatched variants, and negation of unsigned integers, surface `TypeError`s.
-        assert!(Add::add(&Scalar::from(1.5f32), &Scalar::from(1.5f64)).is_err());
-        assert!(Neg::neg(&Scalar::from(2u8)).is_err());
+        // Fixed-width integer negation, addition, subtraction, and multiplication wrap deterministically.
+        assert_eq!(Neg::neg(&Scalar::from(i8::MIN)), Ok(Scalar::from(i8::MIN)));
+        assert_eq!(Neg::neg(&Scalar::from(1u8)), Ok(Scalar::from(u8::MAX)));
+        assert_eq!(Add::add(&Scalar::from(i8::MAX), &Scalar::from(1i8)), Ok(Scalar::from(i8::MIN)));
+        assert_eq!(Sub::sub(&Scalar::from(i8::MIN), &Scalar::from(1i8)), Ok(Scalar::from(i8::MAX)));
+        assert_eq!(Mul::mul(&Scalar::from(i8::MAX), &Scalar::from(2i8)), Ok(Scalar::from(-2i8)));
+
+        // Fallible integer division reports exceptional inputs instead of panicking.
+        assert_eq!(
+            Div::div(&Scalar::from(1i32), &Scalar::from(0i32)),
+            Err(ProgramError::Type(TypeError {
+                message: "cannot divide an integer scalar of data type i32 by zero".to_string(),
+            })),
+        );
+        assert_eq!(
+            Div::div(&Scalar::from(i32::MIN), &Scalar::from(-1i32)),
+            Err(ProgramError::Type(TypeError {
+                message: "cannot divide the minimum integer scalar of data type i32 by -1".to_string(),
+            })),
+        );
+
+        // Non-numeric scalars remain outside the arithmetic operation family.
+        assert_eq!(
+            Add::add(&Scalar::from(true), &Scalar::from(true)),
+            Err(ProgramError::Type(TypeError { message: "'add' does not support input data type bool".to_string() })),
+        );
     }
 
     #[test]
@@ -1941,6 +2157,10 @@ mod tests {
         // The absolute value covers signed integers, floating-point values, and complex magnitudes (with a real
         // result).
         assert_eq!(Scalar::from(-2i32).abs(), Ok(Scalar::from(2i32)));
+        assert_eq!(Scalar::from(i8::MIN).abs(), Ok(Scalar::from(i8::MIN)));
+        assert_eq!(Scalar::from(i16::MIN).abs(), Ok(Scalar::from(i16::MIN)));
+        assert_eq!(Scalar::from(i32::MIN).abs(), Ok(Scalar::from(i32::MIN)));
+        assert_eq!(Scalar::from(i64::MIN).abs(), Ok(Scalar::from(i64::MIN)));
         assert_eq!(Scalar::from(-2.5f64).abs(), Ok(Scalar::from(2.5f64)));
         assert_eq!(Scalar::from(Complex::new(3.0f32, 4.0f32)).abs(), Ok(Scalar::from(5.0f32)));
 
@@ -1948,7 +2168,7 @@ mod tests {
         assert!(Scalar::from(true).sin().is_err());
         assert!(Scalar::from(1i32).exp().is_err());
         assert!(Scalar::from(true).abs().is_err());
-        assert!(Scalar::from(1.0f32).atan2(&Scalar::from(1.0f64)).is_err());
+        assert_eq!(Scalar::from(1.0f32).atan2(&Scalar::from(1.0f64)), Ok(Scalar::from(std::f64::consts::FRAC_PI_4)),);
     }
 
     #[test]
@@ -1978,14 +2198,16 @@ mod tests {
         assert_eq!(left - right, Scalar::from(Complex::new(-2.0f64, 3.0f64)));
         assert_eq!(left * right, Scalar::from(Complex::new(5.0f64, 5.0f64)));
         assert_eq!(-left, Scalar::from(Complex::new(-1.0f64, -2.0f64)));
+        assert_abs_diff_eq!((left / right) * right, left, epsilon = 1e-15);
         assert_eq!(
-            (left / right) * right,
-            Scalar::from(Complex::new(1.0f64, 2.0f64) / Complex::new(3.0f64, -1.0f64) * Complex::new(3.0f64, -1.0f64)),
+            Div::div(&Scalar::from(Complex::new(1.0e308f64, 0.0)), &Scalar::from(Complex::new(1.0e308f64, 0.0)),),
+            Ok(Scalar::from(Complex::new(1.0f64, 0.0))),
         );
 
-        // The complex sine and cosine are the analytic continuations computed by `num_complex`.
-        assert_eq!(left.sin(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).sin())));
-        assert_eq!(left.cos(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).cos())));
+        // Complex sine and cosine implement the analytic continuations. Their cancellation-resistant hyperbolic
+        // decomposition can round its final component differently from `num_complex` by one ulp.
+        assert_abs_diff_eq!(left.sin().unwrap(), Scalar::from(Complex::new(1.0f64, 2.0f64).sin()), epsilon = 1e-15,);
+        assert_abs_diff_eq!(left.cos().unwrap(), Scalar::from(Complex::new(1.0f64, 2.0f64).cos()), epsilon = 1e-15,);
 
         // Constants and Boolean-ness: zero/one carry a zero imaginary part, and a complex scalar is truthy exactly
         // when it is not the complex zero.
@@ -2006,8 +2228,8 @@ mod tests {
         // Complex scalars are unordered.
         assert_eq!(left.partial_cmp(&right), None);
 
-        // Mixed-variant arithmetic is rejected like every other unequal-variant pair.
-        assert!(Add::add(&left, &Scalar::from(1.0f64)).is_err());
+        // Mixed real and complex arithmetic promotes the real operand into the complex field.
+        assert_eq!(Add::add(&left, &Scalar::from(1.0f64)), Ok(Scalar::from(Complex::new(2.0f64, 2.0f64))),);
     }
 
     #[test]
