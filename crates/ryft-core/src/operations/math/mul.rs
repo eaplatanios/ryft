@@ -1,24 +1,32 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::ops::{Add as StandardAdd, Mul as StandardMul};
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::sharding::Sharding;
+use crate::programs::{MaybeZero, ProgramError};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
 
-/// [`Operation`] that multiplies two values and typically supports broadcasting semantics for arrays.
+/// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting their
+/// shapes. Its bilinear reduction-state rule permits one unreduced operand only when the other operand is reduced over
+/// exactly the same mesh axes.
 #[derive(Clone, Debug, Default)]
 pub struct MulOperation;
 
@@ -42,6 +50,7 @@ impl Operation<DataType> for MulOperation {
         _region_interfaces: &[RegionInterface<DataType>],
     ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
+        super::validate_numeric_input_types(input_types, MUL_OPERATION_NAME)?;
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
             message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
         })
@@ -71,14 +80,15 @@ impl ElementwiseOperation for MulOperation {
     }
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
-        // state by the bilinear rule (this is also what JAX does with its `_mul_ur_rule` implementation; refer to
-        // https://blog.ezyang.com/2026/01/jax-sharding-type-system/ for more information on that) rather than the
-        // congruent rule that generic elementwise broadcasting applies. The reduction state is combined independently
-        // of the per-dimension placement, so the placement is broadcast with that state stripped (otherwise the shared
-        // broadcast would reject a legitimate unreduced/reduced pairing) and the recomputed state is reattached
-        // afterward.
+        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
+        // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
+        // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
+        // and the recomputed state is reattached afterward.
         check_count!("input", input_types, 2, TypeError);
+        super::validate_numeric_input_types(
+            &[input_types[0].data_type(), input_types[1].data_type()],
+            MUL_OPERATION_NAME,
+        )?;
         let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
         let output = self.broadcast_output_type(&stripped)?;
         let left_unreduced = input_types[0].unreduced_axes();
@@ -121,11 +131,14 @@ impl ElementwiseOperation for MulOperation {
             (true, true) => BTreeSet::new(),
         };
 
-        // Plain reduced axes must agree when both operands carry them (either operand may leave the set unset), and any
-        // axis that just became unreduced is dropped from the reduced set since the product now tracks it as unreduced.
-        let mut output_reduced = if left_reduced.is_empty() {
+        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
+        // partial-sum-times-reduced case above; a one-sided marker without a matching unreduced operand would
+        // incorrectly propagate reduction state from only one input.
+        let mut output_reduced = if left_reduced == right_reduced {
+            left_reduced.clone()
+        } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
             right_reduced.clone()
-        } else if right_reduced.is_empty() || left_reduced == right_reduced {
+        } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
             left_reduced.clone()
         } else {
             return Err(TypeError {
@@ -141,14 +154,12 @@ impl ElementwiseOperation for MulOperation {
             return Ok(vec![output]);
         }
         let sharding = output.sharding().expect("bilinear reduction state implies a sharded output");
-        let rebuilt = Sharding::with_manual_axes(
-            sharding.mesh().clone(),
-            sharding.dimensions().to_vec(),
-            output_unreduced,
-            output_reduced,
-            sharding.varying_manual_axes().clone(),
-        )
-        .map_err(|error| TypeError { message: error.to_string() })?;
+        let rebuilt = sharding
+            .clone()
+            .with_unreduced_axes(output_unreduced)
+            .map_err(|error| TypeError { message: error.to_string() })?
+            .with_reduced_axes(output_reduced)
+            .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
     }
 }
@@ -171,19 +182,131 @@ where
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for MulOperation where C::Operation: From<MulOperation> {}
 
+impl<C: Context> DifferentiableOperation<C> for MulOperation
+where
+    C::Type: DifferentiableType,
+    C::Value: StandardAdd<Output = C::Value> + StandardMul<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
+    MulOperation: Operation<C::Type>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let left = &inputs[0];
+        let right = &inputs[1];
+        let primal = left.primal().clone() * right.primal().clone();
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'mul' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
+        let left_term = left
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    right.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
+        let right_term = right
+            .tangent()
+            .as_value()
+            .map(|tangent| {
+                Ok::<_, DifferentiationError>(
+                    left.primal().normalize_elementwise_tangent(&target)?
+                        * tangent.normalize_elementwise_tangent(&target)?,
+                )
+            })
+            .transpose()?;
+        let tangent = left_term
+            .into_iter()
+            .chain(right_term)
+            .reduce(|left_term, right_term| left_term + right_term)
+            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Transposes multiplication when exactly one operand is linear and the other is a known runtime value.
+/// Multiplication by that known value is self-adjoint under Ryft's bilinear cotangent pairing. The contribution is
+/// unbroadcast to the linear operand's exact cotangent descriptor, while the known operand receives a structural zero.
+impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation<V, O> for MulOperation
+where
+    V::Type: DifferentiableType,
+    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    MulOperation: Operation<V::Type>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let (linear_index, known_index) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
+            (true, false) => (0, 1),
+            (false, true) => (1, 0),
+            (true, true) => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "bilinear `mul` with two linear operands cannot be transposed".to_string(),
+                }
+                .into());
+            }
+            (false, false) => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "`mul` with no linear operand cannot be transposed".to_string(),
+                }
+                .into());
+            }
+        };
+        let target = inputs[linear_index].r#type().cotangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "'mul' linear input has no cotangent space".to_string(),
+            }
+            .into());
+        }
+        let contribution = match &outputs[0] {
+            MaybeZero::Zero(_) => MaybeZero::Zero(target),
+            MaybeZero::Value(output_cotangent) => {
+                let known_value =
+                    inputs[known_index].as_known().expect("the selected known operand carries its pullback value");
+                let output_type = output_cotangent.r#type();
+                let contribution = known_value
+                    .normalize_elementwise_tangent(output_type.as_ref())?
+                    .binary(output_cotangent, MulOperation);
+                MaybeZero::Value(contribution.unbroadcast_elementwise_cotangent(&target)?)
+            }
+        };
+        let mut contributions =
+            inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect::<Vec<_>>();
+        contributions[linear_index] = contribution;
+        Ok(contributions)
+    }
+}
+
 /// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to [`std::ops::Mul`]
 /// that [`MulOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
 /// panicking. Value types additionally provide [`std::ops::Mul`] as ergonomic (albeit panicking) sugar layered on top
 /// of this capability.
 pub trait Mul: Sized {
-    /// Multiplies `self` by `rhs`, returning a [`ProgramError`] if something goes wrong.
-    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError>;
+    /// Multiplies `self` by `right`, returning a [`ProgramError`] if something goes wrong.
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError>;
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<MulOperation>>>> Mul for V {
     #[inline]
-    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(MulOperation, Vec::new(), &[self.clone(), rhs.clone()])?.remove(0))
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+        Ok(self.dispatch_domain().bind(MulOperation, Vec::new(), &[self.clone(), right.clone()])?.remove(0))
     }
 }
 
@@ -193,17 +316,21 @@ define_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operati
 mod tests {
     use std::collections::BTreeSet;
 
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
+    use crate::differentiation::gradient_holomorphic;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, check_gradient};
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -225,9 +352,9 @@ mod tests {
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Scalar::from(2.0), Scalar::from(3.5)],
+                &[Scalar::from(2.0f32), Scalar::from(3.5f64)],
             ),
-            Ok(vec![Scalar::from(7.0)]),
+            Ok(vec![Scalar::from(7.0f64)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
@@ -271,26 +398,18 @@ mod tests {
         .unwrap();
         let left = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         let right = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh,
-                    vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["y"],
-                )
-                .unwrap(),
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["y"])
+                    .unwrap(),
             )
             .unwrap();
         let output =
@@ -331,6 +450,22 @@ mod tests {
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
             Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
         );
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
+            let expected =
+                TypeError { message: format!("'{MUL_OPERATION_NAME}' does not support input data type {input_type}") };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&operation, &[input_type, input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(
+                    &operation,
+                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
+                    &[],
+                ),
+                Err(expected),
+            );
+        }
         let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
             &[
@@ -365,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_combines_unreduced_and_reduced_operands_bilinearly() {
+    fn test_mul_type_inference() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -375,21 +510,20 @@ mod tests {
         let unreduced = |axis: &str| {
             vector_type()
                 .with_sharding(
-                    Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::replicated()], [axis]).unwrap(),
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                        .unwrap()
+                        .with_unreduced_axes([axis])
+                        .unwrap(),
                 )
                 .unwrap()
         };
         let reduced = |axis: &str| {
             vector_type()
                 .with_sharding(
-                    Sharding::with_manual_axes(
-                        mesh.clone(),
-                        vec![ShardingDimension::replicated()],
-                        Vec::<&str>::new(),
-                        [axis],
-                        Vec::<&str>::new(),
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                        .unwrap()
+                        .with_reduced_axes([axis])
+                        .unwrap(),
                 )
                 .unwrap()
         };
@@ -441,5 +575,98 @@ mod tests {
         .unwrap();
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
+
+        // A reduced operand cannot be multiplied by an otherwise replicated operand because the result would inherit
+        // a reduction marker that does not describe both inputs.
+        assert_eq!(
+            <MulOperation as Operation<ArrayType>>::infer_output_types(
+                &MulOperation,
+                &[reduced("x"), vector_type()],
+                &[],
+            ),
+            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes") }),
+        );
+    }
+
+    #[test]
+    fn test_mul_batching() {
+        crate::operations::math::tests::assert_binary_batching(MulOperation, &[1.0, -2.0], 3.0, &[3.0, -6.0]);
+    }
+
+    #[test]
+    fn test_mul_differentiation() {
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = context
+            .jvp(
+                |(left, right)| Ok(left * right),
+                (Scalar::from(2.0), Scalar::from(5.0)),
+                (Scalar::from(3.0), Scalar::from(-1.0)),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(primal, 10.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 13.0, epsilon = 1e-9);
+        fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
+            input.clone() * input
+        }
+        check_gradient!(square, 0.7, 1e-6, 1e-6);
+        let input = Complex::new(0.7f64, -0.3);
+        assert_eq!(gradient_holomorphic(square, Scalar::from(input)), Ok(Scalar::from(input * 2.0)));
+
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[] = mul %0 %1
+                    %5:f64[] = mul %1 %2
+                    %6:f64[] = mul %0 %3
+                    %7:f64[] = add %5 %6
+                in (%4, %7)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_mul_transposition() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let residual = builder.add_input(scalar_type.clone());
+        let tangent = builder.add_input(scalar_type);
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
+        let program = builder
+            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        assert_eq!(pullback.output_ids().len(), 1);
+        assert_eq!(
+            pullback.interpret(vec![TestArray::scalar(1.0), TestArray::scalar(4.0)]),
+            Ok(vec![TestArray::scalar(4.0)]),
+        );
+
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let residual = builder.add_input(vector_type.clone());
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
+        let program = builder
+            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![
+                TestArray::new(vector_type.clone(), vec![2.0, 3.0, 4.0]),
+                TestArray::new(vector_type, vec![1.0, 2.0, 3.0]),
+            ]),
+            Ok(vec![TestArray::scalar(20.0)]),
+        );
     }
 }

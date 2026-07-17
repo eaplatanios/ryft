@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::ops::{Div, Mul};
+use std::ops::{Div, Mul, Neg};
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -9,7 +9,10 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::ElementwiseOperation;
-use crate::operations::complex::{Conjugate, Real};
+use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
+use crate::operations::constants::{OneLike, ZeroLike};
+use crate::operations::control_flow::{Select, SelectCondition};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -18,14 +21,47 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
+/// Infers the result [`DataType`] of an absolute-value operation for one input element type.
+fn infer_abs_output_data_type(input_type: DataType) -> Result<DataType, TypeError> {
+    match input_type {
+        DataType::I8
+        | DataType::I16
+        | DataType::I32
+        | DataType::I64
+        | DataType::F4E2M1FN
+        | DataType::F6E2M3FN
+        | DataType::F6E3M2FN
+        | DataType::F8E3M4
+        | DataType::F8E4M3
+        | DataType::F8E4M3FN
+        | DataType::F8E4M3FNUZ
+        | DataType::F8E4M3B11FNUZ
+        | DataType::F8E5M2
+        | DataType::F8E5M2FNUZ
+        | DataType::F8E8M0FNU
+        | DataType::BF16
+        | DataType::F16
+        | DataType::F32
+        | DataType::F64 => Ok(input_type),
+        DataType::C64 => Ok(DataType::F32),
+        DataType::C128 => Ok(DataType::F64),
+        input_type => Err(TypeError {
+            message: format!("cannot compute the absolute value of a value of data type {input_type}"),
+        }),
+    }
+}
+
 /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|` on
-/// complex operands with a real result) while preserving all other type metadata. This is the analogue of
-/// [JAX's `lax.abs`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.abs.html).
+/// complex operands with a real result) while preserving all other type metadata. Inputs that still represent partial
+/// sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial-sum semantics.
+/// Unsigned-integer, Boolean, token, and structural-zero inputs are rejected because absolute value is not defined for
+/// them by this operation family.
 #[derive(Clone, Debug, Default)]
 pub struct AbsOperation;
 
@@ -49,11 +85,7 @@ impl Operation<DataType> for AbsOperation {
         _region_interfaces: &[RegionInterface<DataType>],
     ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        Ok(vec![match &input_types[0] {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other.clone(),
-        }])
+        Ok(vec![infer_abs_output_data_type(input_types[0])?])
     }
 }
 
@@ -70,12 +102,9 @@ impl Operation<ArrayType> for AbsOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
+        super::validate_no_unreduced_inputs(input_types, ABS_OPERATION_NAME)?;
         Ok(vec![ArrayType {
-            data_type: match input_types[0].data_type() {
-                DataType::C64 => DataType::F32,
-                DataType::C128 => DataType::F64,
-                other => other,
-            },
+            data_type: infer_abs_output_data_type(input_types[0].data_type())?,
             ..input_types[0].clone()
         }])
     }
@@ -111,11 +140,23 @@ where
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Operation: From<AbsOperation> {}
 
-// TODO(eaplatanios): Review this implementation.
 impl<C: Context> DifferentiableOperation<C> for AbsOperation
 where
     C::Type: DifferentiableType,
-    C::Value: Abs + Conjugate + Real + Mul<Output = C::Value> + Div<Output = C::Value>,
+    C::Value: Abs
+        + Compare<Output = C::Value>
+        + Complex
+        + Conjugate
+        + Imaginary
+        + Real
+        + Select<Condition = <C::Value as SelectCondition>::Condition>
+        + SelectCondition
+        + ZeroLike
+        + OneLike
+        + Neg<Output = C::Value>
+        + Mul<Output = C::Value>
+        + Div<Output = C::Value>
+        + ElementwiseDifferentiableValue<C::Type>,
     AbsOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -124,25 +165,53 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The real derivative is `d|x| = (x / |x|) · dx` (i.e., `sign(x) · dx` and undefined at zero), and the complex
-        // magnitude is a ℂ → ℝ map with `d|z| = Re(z̄ · dz) / |z|`, so the complex branch routes the tangent through
-        // `conjugate` and `real` while the real branch reuses the primal directly. A structural zero tangent stays
-        // symbolic, retyped to the (real) output type.
+        // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ
+        // map with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`; at the
+        // complex origin, replace the zero denominator with one so the zero numerator yields zero. These conventions
+        // keep the rule finite and stable under higher-order transforms. A structural zero tangent stays symbolic,
+        // retyped to the real output's tangent type.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().abs()?;
+        let target = primal.r#type().tangent();
+        if target.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'abs' output type {} has no tangent space", primal.r#type()),
+            }
+            .into());
+        }
         let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent().unwrap()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(target),
             MaybeZero::Value(tangent) => {
-                let numerator = if input.primal().r#type().is_complex() {
-                    (input.primal().conjugate()? * tangent.clone()).real()?
+                if input.primal().r#type().is_complex() {
+                    let denominator = primal.normalize_elementwise_tangent(&target)?;
+                    let zero = denominator.zero_like();
+                    let one = denominator.one_like();
+                    let denominator_is_zero =
+                        denominator.compare(&zero, ComparisonDirection::Equal)?.select_condition()?;
+                    let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
+                    // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
+                    // algebraically equivalent but can overflow even when the final directional derivative is finite.
+                    let conjugate = input.primal().conjugate()?;
+                    let coefficient =
+                        (conjugate.real()? / denominator.clone()).complex(&(conjugate.imaginary()? / denominator))?;
+                    let input_target = input.primal().r#type().tangent();
+                    MaybeZero::Value(
+                        (tangent.normalize_elementwise_tangent(&input_target)? * coefficient)
+                            .real()?
+                            .normalize_elementwise_tangent(&target)?,
+                    )
                 } else {
-                    input.primal().clone() * tangent.clone()
-                };
-                MaybeZero::Value(numerator / primal.clone())
+                    let input = input.primal().normalize_elementwise_tangent(&target)?;
+                    let tangent = tangent.normalize_elementwise_tangent(&target)?;
+                    let zero = input.zero_like();
+                    let nonnegative =
+                        input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
+                    MaybeZero::Value(C::Value::select(&nonnegative, &tangent, &-tangent.clone())?)
+                }
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 
@@ -191,7 +260,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
     use crate::parameters::Placeholder;
@@ -200,6 +269,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::{TestArray, check_gradient};
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -215,6 +285,10 @@ mod tests {
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
             Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::I32], &[]),
+            Ok(vec![DataType::I32]),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
@@ -261,14 +335,10 @@ mod tests {
         let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
             .with_sharding(
-                Sharding::with_manual_axes(
-                    mesh,
-                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
-                )
-                .unwrap(),
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(
@@ -285,6 +355,28 @@ mod tests {
             ),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
         );
+
+        for input_type in [
+            DataType::Token,
+            DataType::Zero,
+            DataType::Boolean,
+            DataType::I1,
+            DataType::I2,
+            DataType::I4,
+            DataType::U32,
+        ] {
+            let expected = TypeError {
+                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
+            };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&operation, &[input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(input_type)], &[]),
+                Err(expected),
+            );
+        }
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -341,18 +433,45 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_abs_derivative() {
-        // d|x| = sign(x) away from the kink at zero is +1 above zero and -1 below zero.
+    fn test_abs_type_inference() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&AbsOperation, &[input], &[]),
+            Err(TypeError { message: "'abs' does not support unreduced operands".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_abs_batching() {
+        crate::operations::math::tests::assert_unary_batching(AbsOperation, &[0.5, -2.0], &[0.5, 2.0]);
+    }
+
+    #[test]
+    fn test_abs_differentiation() {
+        // The real rule uses +1 at and above zero and -1 below zero.
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.7f64)).unwrap(), 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.0f64)).unwrap(), 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(-0.7f64)).unwrap(), -1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Scalar::from(0.0f64),).unwrap(),
+            0.0,
+            epsilon = 1e-9,
+        );
         check_gradient!(|x| x.abs().unwrap(), 0.7, 1e-6, 1e-6);
         check_gradient!(|x| x.abs().unwrap(), -2.5, 1e-6, 1e-6);
 
-        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With d|z| = Re(z̄ · dz) / |z|,
-        // the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction), the reverse-mode
-        // counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
+        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
+        // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
+        // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Scalar::from(z)).unwrap();
         assert_eq!(value, Scalar::from(z.norm()));
@@ -360,5 +479,68 @@ mod tests {
         let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
         assert!((actual - expected).norm() < 1e-12, "expected {expected} but got {actual}");
         check_gradient!(|z| z.abs().unwrap(), z, 1e-6, 1e-6);
+
+        // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
+        // zero tangent and gradient at the origin.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(
+            context.jvp(
+                |z| z.abs(),
+                Scalar::from(ComplexNumber::new(0.0f64, 0.0f64)),
+                Scalar::from(ComplexNumber::new(1.0f64, 2.0f64)),
+            ),
+            Ok((Scalar::from(0.0f64), Scalar::from(0.0f64))),
+        );
+        assert_eq!(
+            gradient(|z| z.abs().unwrap(), Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
+            Ok(Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
+        );
+
+        // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
+        // directional derivative `Re((conj(z) / |z|) * dz)`.
+        assert_eq!(
+            context.jvp(
+                |z| z.abs(),
+                Scalar::from(ComplexNumber::new(1e308f64, 0.0)),
+                Scalar::from(ComplexNumber::new(2.0f64, 0.0)),
+            ),
+            Ok((Scalar::from(1e308f64), Scalar::from(2.0f64))),
+        );
+
+        // The coefficient and tangent are computed in the widened differential representation.
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+
+        let (_, tangent) = context.jvp(|input| input.abs(), primal, input_tangent).unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(tangent.values(), &[3.0]);
+
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(AbsOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = abs %0
+                    %3:f64[] = zero_like %0
+                    %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
+                    %5:f64[] = neg %1
+                    %6:f64[] = select %4 %1 %5
+                in (%2, %6)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_abs_transposition() {
+        crate::operations::math::tests::assert_rejects_nonlinear_transposition(AbsOperation, ABS_OPERATION_NAME, 1);
     }
 }

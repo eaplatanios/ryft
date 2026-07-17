@@ -93,7 +93,7 @@ macro_rules! check_builders {
         let reference = $reference;
         let mut result = ::std::result::Result::Ok(());
         for other in $others {
-            if !std::rc::Rc::ptr_eq(reference, other) {
+            if !::std::rc::Rc::ptr_eq(reference, other) {
                 result = ::std::result::Result::Err($crate::ProgramError::MismatchedProgramBuilders);
                 break;
             }
@@ -103,7 +103,7 @@ macro_rules! check_builders {
     ($reference:expr, $other:expr $(,)?) => {{
         let reference = $reference;
         let other = $other;
-        if std::rc::Rc::ptr_eq(reference, other) {
+        if ::std::rc::Rc::ptr_eq(reference, other) {
             ::std::result::Result::Ok(())
         } else {
             ::std::result::Result::Err($crate::ProgramError::MismatchedProgramBuilders)
@@ -111,30 +111,30 @@ macro_rules! check_builders {
     }};
 }
 
-/// Defines one elementwise [`Operation`](crate::Operation) together with the structural implementations that every
-/// elementwise operation shares: the unit operation struct with a [`Display`](std::fmt::Display) implementation that
-/// writes the operation name, type-preserving [`Operation`](crate::Operation) implementations over both
-/// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType) metadata, the
-/// [`ElementwiseOperation`](crate::ElementwiseOperation) implementation, eager
-/// [`InterpretableOperation`](crate::InterpretableOperation) dispatch through the paired value-level capability trait,
-/// the [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) fold-or-residualize default, and the
-/// capability trait itself with its dispatch-domain staging blanket. The operation's actual semantics stay with its
-/// module. Concrete value capability implementations, derivative rules, and tests must be written by hand next to the
-/// macro invocation.
+// TODO(eaplatanios): Review this macro.
+/// Defines the structural implementations shared by elementwise operations. The generated base includes the unit
+/// operation struct, its [`Display`](std::fmt::Display), [`Operation`](crate::Operation),
+/// [`ElementwiseOperation`](crate::ElementwiseOperation), [`InterpretableOperation`](crate::InterpretableOperation),
+/// and [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations. The combined
+/// `@unary` and `@binary` forms also generate the paired value-level capability trait; the `@unary_base` and
+/// `@binary_base` forms leave that trait to [`crate::define_elementwise_capability!`] so an operation module can place
+/// its differentiation and transposition implementations before the capability API.
 ///
 /// # Parameters
 ///
-///   - `@unary` / `@binary`: Selects the operation arity to stamp out. `@unary` produces a one-input, type-preserving
-///     operation whose generated capability method has the shape `fn(&self) -> Result<Self, ProgramError>`, while
-///     `@binary` produces a two-input operation whose [`DataType`](crate::DataType) inference broadcasts/promotes the
-///     two operand types and whose generated capability method has the shape
-///     `fn(&self, rhs: &Self) -> Result<Self, ProgramError>`.
+///   - `@unary` / `@binary`: Generates both the base operation and its capability trait for the selected arity.
+///   - `@unary_base` / `@binary_base`: Generates only the base operation for the selected arity.
 ///   - `$(#[$operation_documentation])*`: Documentation attributes attached to the generated operation struct.
 ///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
 ///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
 ///   - `$method`: Identifier of the generated capability trait method (e.g., `sin`).
+///   - `validate = $validator`: Optional hook that validates scalar [`DataType`](crate::DataType) inputs before type
+///     inference and array element types before array broadcasting.
+///   - `validate_array = $array_validator`: Optional hook that validates complete
+///     [`ArrayType`](crate::ArrayType) inputs before array broadcasting, for rules that depend on metadata beyond the
+///     element type.
 #[macro_export]
 macro_rules! define_elementwise_operation {
     (
@@ -142,7 +142,52 @@ macro_rules! define_elementwise_operation {
         $(#[$operation_documentation:meta])*
         $operation:ident, $name:ident,
         $(#[$capability_documentation:meta])*
-        $capability:ident, $method:ident $(,)?
+        $capability:ident, $method:ident
+        $(, validate = $validator:path)?
+        $(, validate_array = $array_validator:path)? $(,)?
+    ) => {
+        $crate::define_elementwise_operation!(
+            @unary_base
+            $(#[$operation_documentation])*
+            $operation, $name, $capability, $method
+            $(, validate = $validator)?
+            $(, validate_array = $array_validator)?,
+        );
+        $crate::define_elementwise_capability!(
+            @unary
+            $(#[$capability_documentation])*
+            $capability, $method, $operation,
+        );
+    };
+    (
+        @binary
+        $(#[$operation_documentation:meta])*
+        $operation:ident, $name:ident,
+        $(#[$capability_documentation:meta])*
+        $capability:ident, $method:ident
+        $(, validate = $validator:path)?
+        $(, validate_array = $array_validator:path)? $(,)?
+    ) => {
+        $crate::define_elementwise_operation!(
+            @binary_base
+            $(#[$operation_documentation])*
+            $operation, $name, $capability, $method
+            $(, validate = $validator)?
+            $(, validate_array = $array_validator)?,
+        );
+        $crate::define_elementwise_capability!(
+            @binary
+            $(#[$capability_documentation])*
+            $capability, $method, $operation,
+        );
+    };
+    (
+        @unary_base
+        $(#[$operation_documentation:meta])*
+        $operation:ident, $name:ident,
+        $capability:ident, $method:ident
+        $(, validate = $validator:path)?
+        $(, validate_array = $array_validator:path)? $(,)?
     ) => {
         $(#[$operation_documentation])*
         #[derive(Clone, Debug, Default)]
@@ -168,7 +213,8 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone()])
+                $($validator(input_types, $name)?;)?
+                Ok(vec![input_types[0]])
             }
         }
 
@@ -184,6 +230,9 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                $crate::check_count!("input", input_types, 1, TypeError);
+                $($validator(&[input_types[0].data_type()], $name)?;)?
+                $($array_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -216,33 +265,14 @@ macro_rules! define_elementwise_operation {
         {
         }
 
-        $(#[$capability_documentation])*
-        pub trait $capability: Sized {
-            /// Computes this operation elementwise for this value, returning a [`ProgramError`](crate::ProgramError)
-            /// if something goes wrong (e.g., when this operation does not support the value's
-            /// [`DataType`](crate::DataType)).
-            fn $method(&self) -> Result<Self, $crate::ProgramError>;
-        }
-
-        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
-            $capability for V
-        {
-            #[inline]
-            fn $method(&self) -> Result<Self, $crate::ProgramError> {
-                Ok($crate::Context::bind(
-                    &$crate::Value::dispatch_domain(self),
-                    $operation, Vec::new(),
-                    std::slice::from_ref(self),
-                )?.remove(0))
-            }
-        }
     };
     (
-        @binary
+        @binary_base
         $(#[$operation_documentation:meta])*
         $operation:ident, $name:ident,
-        $(#[$capability_documentation:meta])*
-        $capability:ident, $method:ident $(,)?
+        $capability:ident, $method:ident
+        $(, validate = $validator:path)?
+        $(, validate_array = $array_validator:path)? $(,)?
     ) => {
         $(#[$operation_documentation])*
         #[derive(Clone, Debug, Default)]
@@ -268,6 +298,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
+                $($validator(input_types, $name)?;)?
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
                     .map_err(|_| $crate::TypeError {
@@ -288,6 +319,9 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                $crate::check_count!("input", input_types, 2, TypeError);
+                $($validator(&[input_types[0].data_type(), input_types[1].data_type()], $name)?;)?
+                $($array_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -320,25 +354,76 @@ macro_rules! define_elementwise_operation {
         {
         }
 
+    };
+}
+
+// TODO(eaplatanios): Review this macro.
+/// Defines the value-level capability trait paired with an elementwise operation and its dispatch-domain blanket
+/// implementation. This macro is separate from [`define_elementwise_operation!`] so operation modules can place
+/// differentiation and transposition implementations before the capability API while retaining shared boilerplate.
+///
+/// # Parameters
+///
+///   - `@unary` / `@binary`: Selects whether the capability consumes only `self` or also a right-hand-side value.
+///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
+///   - `$capability`: Identifier of the generated value-level capability trait.
+///   - `$method`: Identifier of the generated capability method.
+///   - `$operation`: Unit-struct operation bound through the value's dispatch domain.
+#[macro_export]
+macro_rules! define_elementwise_capability {
+    (
+        @unary
+        $(#[$capability_documentation:meta])*
+        $capability:ident, $method:ident, $operation:ident $(,)?
+    ) => {
         $(#[$capability_documentation])*
         pub trait $capability: Sized {
-            /// Computes this operation elementwise for this value and `rhs`, returning a
-            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
-            /// support the values' [`DataType`](crate::DataType)s).
-            fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError>;
+            /// Computes this operation elementwise for this value, returning a [`ProgramError`](crate::ProgramError)
+            /// if something goes wrong (e.g., when this operation does not support the value's
+            /// [`DataType`](crate::DataType)).
+            fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
         impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
             $capability for V
         {
             #[inline]
-            fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError> {
+            fn $method(&self) -> Result<Self, $crate::ProgramError> {
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
                     $operation,
                     Vec::new(),
-                    &[self.clone(), rhs.clone()],
-                )?.remove(0))
+                    ::std::slice::from_ref(self),
+                )?
+                .remove(0))
+            }
+        }
+    };
+    (
+        @binary
+        $(#[$capability_documentation:meta])*
+        $capability:ident, $method:ident, $operation:ident $(,)?
+    ) => {
+        $(#[$capability_documentation])*
+        pub trait $capability: Sized {
+            /// Computes this operation elementwise for this value and `right`, returning a
+            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
+            /// support the values' [`DataType`](crate::DataType)s).
+            fn $method(&self, right: &Self) -> Result<Self, $crate::ProgramError>;
+        }
+
+        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
+            $capability for V
+        {
+            #[inline]
+            fn $method(&self, right: &Self) -> Result<Self, $crate::ProgramError> {
+                Ok($crate::Context::bind(
+                    &$crate::Value::dispatch_domain(self),
+                    $operation,
+                    Vec::new(),
+                    &[self.clone(), right.clone()],
+                )?
+                .remove(0))
             }
         }
     };
@@ -390,7 +475,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
                     .expect($message)
                     .remove(0)
             }
@@ -405,7 +490,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
                     .expect($message)
                     .remove(0)
             }
@@ -420,7 +505,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone()])
+                $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
                     .expect($message)
                     .remove(0)
             }
@@ -431,8 +516,8 @@ macro_rules! define_tracer_operator {
             type Output = Self;
 
             #[inline]
-            fn $method(self, rhs: Self) -> Self {
-                self.binary(&rhs, $operation)
+            fn $method(self, right: Self) -> Self {
+                self.binary(&right, $operation)
             }
         }
 
@@ -444,8 +529,8 @@ macro_rules! define_tracer_operator {
             type Output = Self;
 
             #[inline]
-            fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), rhs.clone()])
+            fn $method(self, right: Self) -> Self {
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -459,8 +544,8 @@ macro_rules! define_tracer_operator {
             type Output = Self;
 
             #[inline]
-            fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), rhs.clone()])
+            fn $method(self, right: Self) -> Self {
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -474,8 +559,8 @@ macro_rules! define_tracer_operator {
             type Output = Self;
 
             #[inline]
-            fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), rhs.clone()])
+            fn $method(self, right: Self) -> Self {
+                $crate::Context::bind(self.context(), $operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
                     .remove(0)
             }
