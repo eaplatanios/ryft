@@ -635,6 +635,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::LinearizationTracer;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLikeOperation, ZeroLikeOperation};
     use crate::operations::math::{AddOperation, MulOperation, SubOperation};
@@ -642,7 +643,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -838,6 +839,29 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_eager_unbounded_while_linearization_and_transposition_follow_the_executed_iterations() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestTracer = LinearizationTracer<TestContext>;
+
+        let context = TestContext::new();
+        let function = |state: TestTracer| {
+            let mut outputs = state.context().bind(
+                ArrayOperation::While(WhileOperation::new()),
+                vec![greater_than_zero_condition(), subtract_one_body()],
+                &[state.clone()],
+            )?;
+            Ok(outputs.remove(0))
+        };
+        let (output, pushforward) = context.linearize(function, TestArray::scalar(3.5)).unwrap();
+        assert_eq!(output, TestArray::scalar(-0.5));
+        assert_eq!(pushforward.apply(TestArray::scalar(2.0)), Ok(TestArray::scalar(2.0)));
+
+        let (output, pullback) = context.vjp(function, TestArray::scalar(3.5)).unwrap();
+        assert_eq!(output, TestArray::scalar(-0.5));
+        assert_eq!(pullback.apply(TestArray::scalar(2.0)), Ok(TestArray::scalar(2.0)));
     }
 
     /// With a *loop-invariant known* state element, a `while` partially evaluates by folding that element's value into

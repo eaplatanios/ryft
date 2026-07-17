@@ -798,14 +798,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
-    use crate::operations::math::AddOperation;
+    use crate::operations::math::{AddOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -826,6 +827,17 @@ mod tests {
         program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
+    }
+
+    /// Builds a scalar branch that returns whether its input is greater than zero.
+    fn boolean_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let zero = builder.add_constant(TestArray::scalar(0.0));
+        let output = builder
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -994,6 +1006,64 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_condition_linearization_replays_the_selected_branch() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestTracer = LinearizationTracer<TestContext>;
+
+        for (predicate, expected_value, expected_tangent) in
+            [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
+        {
+            let (value, pushforward) = TestContext::new()
+                .linearize(
+                    move |input: TestTracer| {
+                        let predicate = input.context().lift(TestArray::new(
+                            ArrayType::scalar(DataType::Boolean),
+                            vec![if predicate { 1.0 } else { 0.0 }],
+                        ))?;
+                        let mut outputs = input.context().bind(
+                            ArrayOperation::Condition(ConditionOperation::new()),
+                            vec![
+                                scalar_branch(ArrayOperation::Add(AddOperation)),
+                                scalar_branch(ArrayOperation::Sin(SinOperation)),
+                            ],
+                            &[predicate, input.clone()],
+                        )?;
+                        Ok(outputs.remove(0))
+                    },
+                    TestArray::scalar(0.7),
+                )
+                .unwrap();
+            assert_eq!(value, TestArray::scalar(expected_value));
+            assert_eq!(pushforward.apply(TestArray::scalar(1.5)), Ok(TestArray::scalar(expected_tangent)));
+        }
+    }
+
+    #[test]
+    fn test_condition_jvp_preserves_zero_space_output_tangents() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestTracer = DifferentiationTracer<TestContext>;
+
+        let (primal, tangent) = TestContext::new()
+            .jvp(
+                |input: TestTracer| {
+                    let predicate =
+                        input.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                    let mut outputs = input.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![boolean_branch(), boolean_branch()],
+                        &[predicate, input.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(2.0),
+                TestArray::scalar(3.0),
+            )
+            .unwrap();
+        assert_eq!(primal, TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+        assert_eq!(tangent, TestArray::new(ArrayType::scalar(DataType::Zero), vec![0.0]));
     }
 
     /// A known-symbolic predicate splits known branch results from residual branch work without dropping an

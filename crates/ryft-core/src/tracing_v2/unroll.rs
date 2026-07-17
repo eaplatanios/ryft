@@ -240,3 +240,90 @@ where
         completed_iterations += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::contexts::{Context, EagerContext};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::math::AddOperation;
+    use crate::parameters::Placeholder;
+    use crate::programs::{Program, ProgramBuilder};
+    use crate::tracing::{NestedTracingContext, Tracer};
+    use crate::types::DataType;
+
+    use super::*;
+
+    type TestProgram = Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>;
+
+    /// Builds nested unbounded loops. The inner loop doubles its state to at least 100, while each outer iteration adds
+    /// the inner result to the incoming state until that state reaches 5000.
+    fn nested_while() -> (WhileOperation, Vec<TestProgram>) {
+        fn condition(threshold: f64) -> TestProgram {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let carry = builder.add_input(DataType::F64);
+            let threshold = builder.add_constant(Scalar::from(threshold));
+            let predicate = builder
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![carry, threshold],
+                )
+                .unwrap()[0];
+            builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
+        }
+
+        let mut inner_body_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let inner_carry = inner_body_builder.add_input(DataType::F64);
+        let doubled = inner_body_builder
+            .add_instruction(AddOperation, Vec::new(), vec![inner_carry, inner_carry])
+            .unwrap()[0];
+        let inner_body = inner_body_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut outer_body_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let inner_condition = outer_body_builder.import_region(condition(100.0).entry_region_ref());
+        let inner_body = outer_body_builder.import_region(inner_body.entry_region_ref());
+        let outer_carry = outer_body_builder.add_input(DataType::F64);
+        let inner_output = outer_body_builder
+            .add_instruction(WhileOperation::new(), vec![inner_condition, inner_body], vec![outer_carry])
+            .unwrap()[0];
+        let next = outer_body_builder
+            .add_instruction(AddOperation, Vec::new(), vec![outer_carry, inner_output])
+            .unwrap()[0];
+        let outer_body = outer_body_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![next], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        (WhileOperation::new(), vec![condition(5000.0), outer_body])
+    }
+
+    #[test]
+    fn test_unroll_concretizable_whiles_unrolls_nested_loops() {
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let inputs = vec![Scalar::from(1.5)];
+        let (_, program) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs: Vec<Tracer<_>>| {
+                let (operation, regions) = nested_while();
+                inputs[0].context().bind(operation, regions, &[inputs[0].clone()])
+            },
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let program = program.into_simplified().unwrap();
+        let expected = program.interpret(inputs.clone()).unwrap();
+
+        let unrolled = unroll_concretizable_whiles(&context, program, inputs.clone()).unwrap();
+        assert!(
+            unrolled
+                .instructions()
+                .iter()
+                .all(|instruction| <&WhileOperation>::try_from(instruction.operation()).is_err()),
+        );
+        assert_eq!(unrolled.interpret(inputs), Ok(expected));
+    }
+}

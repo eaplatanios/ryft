@@ -1,0 +1,1492 @@
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
+use ryft_macros::Parameterized;
+
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DerivativeTransform, DifferentiableOperation, DifferentiableType, DifferentiationError,
+    DifferentiationParameterRole, LinearizationTracer, TransposableOperation,
+};
+use crate::macros::check_count;
+use crate::operations::constants::ZeroOperation;
+use crate::operations::differentiation::CoordinateBasisOperation;
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, TransposeOperation};
+use crate::operations::math::AddOperation;
+use crate::parameters::ParameterizedFamily;
+use crate::parameters::{Parameter, ParameterPath, Parameterized};
+use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::regions::RegionRef;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::{ProgramError, Value};
+use crate::sharding::ShardingDimension;
+use crate::tracing::TracingContext;
+use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+use crate::types::{ArrayType, Shape, Size, StaticShape};
+
+use super::DenseDifferentiate;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Number of packed derivative-program replays on the current test thread.
+    static PACKED_REPLAY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Dense Jacobian of a structured function, represented as the Cartesian product of its output and input leaves.
+///
+/// `I` and `O` retain the input and output type trees. Derivative values are stored in deterministic
+/// output-major/input-minor order and remain parameters so that the complete Jacobian can cross tracing and
+/// compilation boundaries or participate in higher-order transforms.
+///
+/// The physical representation of a block is defined by [`DenseDifferentiableType`]. For [`ArrayType`], the block for
+/// an output leaf with shape `O` and an input leaf with shape `I` has shape `O ++ I`.
+#[derive(Parameterized, Clone, Debug)]
+#[ryft(crate = "crate::parameters")]
+pub struct Jacobian<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> {
+    /// Type tree of the differentiated inputs.
+    input_types: I,
+
+    /// Type tree of the differentiated outputs.
+    output_types: O,
+
+    /// Derivative values in output-major/input-minor order.
+    values: Vec<V>,
+
+    /// Descriptor-family marker. The input and output fields use `T` only through their bounds.
+    _type: PhantomData<fn() -> T>,
+}
+
+impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> Jacobian<T, V, I, O> {
+    /// Constructs a [`Jacobian`] from its input/output type trees and derivative values.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_types`: Type tree of the differentiated inputs.
+    ///   - `output_types`: Type tree of the differentiated outputs.
+    ///   - `values`: Derivative values in output-major/input-minor order. Its length must equal the Cartesian product
+    ///     of the input and output leaf counts.
+    pub(super) fn new(input_types: I, output_types: O, values: Vec<V>) -> Result<Self, ProgramError> {
+        let expected_count =
+            input_types.parameter_count().checked_mul(output_types.parameter_count()).ok_or_else(|| {
+                ProgramError::InvalidArgument { message: "jacobian block count overflows usize".to_string() }
+            })?;
+        if values.len() != expected_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("jacobian requires {expected_count} derivative values but got {}", values.len()),
+            });
+        }
+        Ok(Self { input_types, output_types, values, _type: PhantomData })
+    }
+
+    /// Returns the type tree of the differentiated inputs.
+    #[inline]
+    pub fn input_types(&self) -> &I {
+        &self.input_types
+    }
+
+    /// Returns the type tree of the differentiated outputs.
+    #[inline]
+    pub fn output_types(&self) -> &O {
+        &self.output_types
+    }
+
+    /// Returns the derivative values in output-major/input-minor order.
+    #[inline]
+    pub fn values(&self) -> &[V] {
+        self.values.as_slice()
+    }
+
+    /// Consumes this [`Jacobian`] and returns its derivative values in output-major/input-minor order.
+    #[inline]
+    pub fn into_values(self) -> Vec<V> {
+        self.values
+    }
+
+    /// Returns borrowed views of all derivative blocks in output-major/input-minor order.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = JacobianBlock<'_, T, V>> {
+        let input_count = self.input_types.parameter_count();
+        self.output_types
+            .named_parameters()
+            .enumerate()
+            .flat_map(move |(output_index, (output_path, output_type))| {
+                self.input_types.named_parameters().enumerate().map(move |(input_index, (input_path, input_type))| {
+                    JacobianBlock {
+                        output_path: output_path.clone(),
+                        output_type,
+                        input_path,
+                        input_type,
+                        value: &self.values[output_index * input_count + input_index],
+                    }
+                })
+            })
+    }
+
+    /// Returns the derivative block for the specified output and input paths, or `None` if either path is absent.
+    pub fn block(&self, output_path: &ParameterPath, input_path: &ParameterPath) -> Option<JacobianBlock<'_, T, V>> {
+        let (output_index, (_, output_type)) =
+            self.output_types.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
+        let input_count = self.input_types.parameter_count();
+        let (input_index, (_, input_type)) =
+            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == input_path)?;
+        Some(JacobianBlock {
+            output_path: output_path.clone(),
+            output_type,
+            input_path: input_path.clone(),
+            input_type,
+            value: &self.values[output_index * input_count + input_index],
+        })
+    }
+}
+
+/// Borrowed view of one output/input block in a [`Jacobian`].
+#[derive(Debug)]
+pub struct JacobianBlock<'a, T: Type, V> {
+    /// Path of the differentiated output leaf.
+    output_path: ParameterPath,
+
+    /// Type of the differentiated output leaf.
+    output_type: &'a T,
+
+    /// Path of the differentiated input leaf.
+    input_path: ParameterPath,
+
+    /// Type of the differentiated input leaf.
+    input_type: &'a T,
+
+    /// Derivative value for this output/input pair.
+    value: &'a V,
+}
+
+impl<'a, T: Type, V> Clone for JacobianBlock<'a, T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            output_path: self.output_path.clone(),
+            output_type: self.output_type,
+            input_path: self.input_path.clone(),
+            input_type: self.input_type,
+            value: self.value,
+        }
+    }
+}
+
+impl<'a, T: Type, V> JacobianBlock<'a, T, V> {
+    /// Returns the path of the differentiated output leaf.
+    #[inline]
+    pub fn output_path(&self) -> &ParameterPath {
+        &self.output_path
+    }
+
+    /// Returns the type of the differentiated output leaf.
+    #[inline]
+    pub fn output_type(&self) -> &'a T {
+        self.output_type
+    }
+
+    /// Returns the path of the differentiated input leaf.
+    #[inline]
+    pub fn input_path(&self) -> &ParameterPath {
+        &self.input_path
+    }
+
+    /// Returns the type of the differentiated input leaf.
+    #[inline]
+    pub fn input_type(&self) -> &'a T {
+        self.input_type
+    }
+
+    /// Returns the derivative value for this output/input pair.
+    #[inline]
+    pub fn value(&self) -> &'a V {
+        self.value
+    }
+}
+
+/// Type-family capability required to materialize dense derivatives through one packed program replay.
+///
+/// [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values, but they do not state that a
+/// leaf has a finite coordinate space, that several directions can be represented by one value, or how packed replay
+/// results become public derivative blocks. Implementations of this trait provide only those representation-specific
+/// operations. The Jacobian algorithms retain ownership of structure traversal, differentiation, ordering, and result
+/// construction.
+///
+/// `ArrayType` currently provides the sole implementation. `DataType` remains usable as Jacobian metadata, but scalar
+/// operation families do not yet have a packed batching representation and therefore intentionally do not implement
+/// this capability.
+pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
+    /// Packed value used during one multi-direction derivative replay.
+    type PackedValue;
+
+    /// Returns the finite coordinate count of `type`, reporting the leaf path when it cannot be enumerated.
+    ///
+    /// # Parameters
+    ///
+    ///   - `r#type`: Type of the leaf whose coordinates will be enumerated.
+    ///   - `transform`: Derivative transform requesting the coordinate space, used in diagnostics.
+    ///   - `role`: Whether the parameter belongs to the transform's input or output structure.
+    ///   - `path`: Path of the leaf within that structure.
+    fn coordinate_count(
+        r#type: &Self,
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: &ParameterPath,
+    ) -> Result<usize, DifferentiationError>;
+
+    /// Stages one leaf fragment of a packed global coordinate basis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active execution or staging context in which basis construction must remain.
+    ///   - `coordinate_type`: Type whose finite coordinates are represented by this basis fragment.
+    ///   - `value_type`: Type of the basis values. Forward bases use the primal tangent type, while reverse bases use
+    ///     the coordinate type's cotangent type.
+    ///   - `coordinate_offset`: First global basis coordinate belonging to the leaf.
+    ///   - `basis_size`: Total number of packed directions across the complete differentiated structure.
+    fn basis(
+        context: &C,
+        coordinate_type: &Self,
+        value_type: &Self,
+        coordinate_offset: usize,
+        basis_size: usize,
+    ) -> Result<Self::PackedValue, DifferentiationError>;
+
+    /// Represents one replay input that is identical for every packed direction.
+    fn replicated(value: C::Value) -> Self::PackedValue;
+
+    /// Replays `region` once for all packed inputs while preserving its complete nested-region arena.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active context in which the transformed derivative program is replayed.
+    ///   - `region`: Borrowed derivative-program entry region, including access to its owning region arena.
+    ///   - `batch_size`: Number of packed coordinate directions.
+    ///   - `inputs`: Packed program inputs in the derivative region's declared order.
+    fn replay(
+        context: &C,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        batch_size: usize,
+        inputs: Vec<Self::PackedValue>,
+    ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
+
+    /// Validates the physical type of one forward-mode dense derivative block.
+    ///
+    /// # Parameters
+    ///
+    ///   - `block_type`: Physical type of the materialized derivative value.
+    ///   - `output_type`: Type of the differentiated output leaf.
+    ///   - `input_type`: Input-leaf type whose coordinate axes follow the output axes in the block.
+    fn validate_forward_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<(), DifferentiationError>;
+
+    /// Validates the physical type of one reverse-mode dense derivative block.
+    ///
+    /// # Parameters
+    ///
+    ///   - `block_type`: Physical type of the materialized derivative value.
+    ///   - `output_type`: Type of the differentiated output leaf whose coordinate axes prefix the block.
+    ///   - `input_type`: Type of the differentiated input leaf whose cotangent type supplies the block values.
+    fn validate_reverse_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<(), DifferentiationError>;
+
+    /// Validates the physical type of one forward-over-reverse dense Hessian block.
+    ///
+    /// # Parameters
+    ///
+    ///   - `block_type`: Physical type of the materialized second-derivative value.
+    ///   - `output_type`: Type of the differentiated output leaf whose coordinate axes prefix the block.
+    ///   - `first_input_type`: First input-leaf type whose cotangent supplies the block values.
+    ///   - `second_input_type`: Second input-leaf type whose coordinate axes suffix the block.
+    fn validate_hessian_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        first_input_type: &Self,
+        second_input_type: &Self,
+    ) -> Result<(), DifferentiationError>;
+
+    /// Extracts one forward-mode output/input block from a packed pushforward output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `packed`: Packed pushforward result for one output leaf.
+    ///   - `batch_size`: Total number of packed input directions.
+    ///   - `coordinate_offset`: First packed direction belonging to `input_type`.
+    ///   - `input_type`: Differentiated input-leaf type.
+    ///   - `output_type`: Differentiated output-leaf type.
+    fn forward_block(
+        packed: &Self::PackedValue,
+        batch_size: usize,
+        coordinate_offset: usize,
+        input_type: &Self,
+        output_type: &Self,
+    ) -> Result<C::Value, DifferentiationError>;
+
+    /// Extracts one reverse-mode output/input block from a packed pullback output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `packed`: Packed pullback result for one input leaf.
+    ///   - `batch_size`: Total number of packed output directions.
+    ///   - `coordinate_offset`: First packed direction belonging to `output_type`.
+    ///   - `output_type`: Differentiated output-leaf type.
+    ///   - `input_type`: Differentiated input-leaf type.
+    fn reverse_block(
+        packed: &Self::PackedValue,
+        batch_size: usize,
+        coordinate_offset: usize,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<C::Value, DifferentiationError>;
+}
+
+impl<C> DenseDifferentiableType<C> for ArrayType
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast + Reshape + Slice + Transpose,
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<CoordinateBasisOperation<ArrayType>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
+{
+    type PackedValue = ArrayBatch<C::Value>;
+
+    fn coordinate_count(
+        r#type: &Self,
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: &ParameterPath,
+    ) -> Result<usize, DifferentiationError> {
+        let shape = r#type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+            transform,
+            role,
+            path: path.to_string(),
+            r#type: r#type.to_string(),
+        })?;
+        if shape.dimensions().contains(&0) {
+            return Ok(0);
+        }
+        shape.dimensions().iter().copied().try_fold(1usize, |count, size| {
+            count.checked_mul(size).ok_or_else(|| DifferentiationError::CoordinateCountOverflow {
+                transform,
+                role,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            })
+        })
+    }
+
+    fn basis(
+        context: &C,
+        coordinate_type: &Self,
+        value_type: &Self,
+        coordinate_offset: usize,
+        basis_size: usize,
+    ) -> Result<Self::PackedValue, DifferentiationError> {
+        if coordinate_type.shape() != value_type.shape() {
+            return Err(TypeError {
+                message: format!(
+                    "coordinate basis type {coordinate_type} and value type {value_type} have different shapes",
+                ),
+            }
+            .into());
+        }
+        let expected_type = value_type.with_inserted_dimension(0, Size::Static(basis_size))?;
+        let mut outputs = context.bind(
+            CoordinateBasisOperation::new(value_type.clone(), coordinate_offset, basis_size),
+            Vec::new(),
+            &[],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        let value = outputs.remove(0);
+        if value.r#type().as_ref() != &expected_type {
+            return Err(TypeError {
+                message: format!(
+                    "coordinate basis for leaf type {value_type} has type {} but expected {expected_type}",
+                    value.r#type(),
+                ),
+            }
+            .into());
+        }
+        Ok(ArrayBatch::new(expected_type, value, Some(0)).map_err(ProgramError::from)?)
+    }
+
+    #[inline]
+    fn replicated(value: C::Value) -> Self::PackedValue {
+        ArrayBatch::replicated(value)
+    }
+
+    fn replay(
+        context: &C,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        batch_size: usize,
+        inputs: Vec<Self::PackedValue>,
+    ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
+        #[cfg(test)]
+        PACKED_REPLAY_COUNT.with(|count| count.set(count.get() + 1));
+        Ok(BatchingContext::new(context.clone(), batch_size, None, ShardingDimension::Replicated)
+            .batch_region(region, inputs)
+            .map_err(ProgramError::from)?)
+    }
+
+    fn validate_forward_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<(), DifferentiationError> {
+        let output_tangent_type = output_type.tangent();
+        if output_tangent_type.is_zero_space() {
+            return Err(TypeError {
+                message: format!("forward Jacobian output type {output_type} has no tangent type"),
+            }
+            .into());
+        }
+        validate_array_block_type(
+            DerivativeTransform::JacobianForward,
+            block_type,
+            &output_tangent_type,
+            &[],
+            &[input_type],
+        )
+    }
+
+    fn validate_reverse_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<(), DifferentiationError> {
+        let input_cotangent_type = input_type.cotangent();
+        if input_cotangent_type.is_zero_space() {
+            return Err(TypeError {
+                message: format!("reverse Jacobian input type {input_type} has no cotangent type"),
+            }
+            .into());
+        }
+        validate_array_block_type(
+            DerivativeTransform::JacobianReverse,
+            block_type,
+            &input_cotangent_type,
+            &[output_type],
+            &[],
+        )
+    }
+
+    fn validate_hessian_block_type(
+        block_type: &Self,
+        output_type: &Self,
+        first_input_type: &Self,
+        second_input_type: &Self,
+    ) -> Result<(), DifferentiationError> {
+        let first_input_cotangent_type = first_input_type.cotangent();
+        if first_input_cotangent_type.is_zero_space() {
+            return Err(
+                TypeError { message: format!("hessian input type {first_input_type} has no cotangent type") }.into()
+            );
+        }
+        validate_array_block_type(
+            DerivativeTransform::Hessian,
+            block_type,
+            &first_input_cotangent_type,
+            &[output_type],
+            &[second_input_type],
+        )
+    }
+
+    fn forward_block(
+        packed: &Self::PackedValue,
+        batch_size: usize,
+        coordinate_offset: usize,
+        input_type: &Self,
+        output_type: &Self,
+    ) -> Result<C::Value, DifferentiationError> {
+        let input_shape =
+            static_shape(input_type, DerivativeTransform::JacobianForward, DifferentiationParameterRole::Input)?;
+        let output_shape =
+            static_shape(output_type, DerivativeTransform::JacobianForward, DifferentiationParameterRole::Output)?;
+        let output_tangent_type = output_type.tangent();
+        if output_tangent_type.is_zero_space() {
+            return Err(TypeError {
+                message: format!("forward Jacobian output type {output_type} has no tangent type"),
+            }
+            .into());
+        }
+        let value =
+            basis_range_value(packed, batch_size, coordinate_offset, input_shape.dimensions(), &output_tangent_type)?;
+        let permutation = (input_shape.rank()..input_shape.rank() + output_shape.rank())
+            .chain(0..input_shape.rank())
+            .collect::<Vec<_>>();
+        let value = value.transpose(permutation)?;
+        Ok(value)
+    }
+
+    fn reverse_block(
+        packed: &Self::PackedValue,
+        batch_size: usize,
+        coordinate_offset: usize,
+        output_type: &Self,
+        input_type: &Self,
+    ) -> Result<C::Value, DifferentiationError> {
+        let output_shape =
+            static_shape(output_type, DerivativeTransform::JacobianReverse, DifferentiationParameterRole::Output)?;
+        let input_cotangent_type = input_type.cotangent();
+        if input_cotangent_type.is_zero_space() {
+            return Err(TypeError {
+                message: format!("reverse Jacobian input type {input_type} has no cotangent type"),
+            }
+            .into());
+        }
+        let value =
+            basis_range_value(packed, batch_size, coordinate_offset, output_shape.dimensions(), &input_cotangent_type)?;
+        Ok(value)
+    }
+}
+
+#[derive(Copy, Clone)]
+enum DenseMode {
+    Forward,
+    ForwardHolomorphic,
+    Reverse,
+    ReverseHolomorphic,
+}
+
+impl DenseMode {
+    fn transform(self) -> DerivativeTransform {
+        match self {
+            Self::Forward | Self::ForwardHolomorphic => DerivativeTransform::JacobianForward,
+            Self::Reverse | Self::ReverseHolomorphic => DerivativeTransform::JacobianReverse,
+        }
+    }
+
+    fn is_holomorphic(self) -> bool {
+        matches!(self, Self::ForwardHolomorphic | Self::ReverseHolomorphic)
+    }
+
+    fn permits_complex_input(self) -> bool {
+        matches!(self, Self::ForwardHolomorphic | Self::Reverse | Self::ReverseHolomorphic)
+    }
+
+    fn permits_complex_output(self) -> bool {
+        matches!(self, Self::Forward | Self::ForwardHolomorphic | Self::ReverseHolomorphic)
+    }
+}
+
+fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
+    types: &S,
+    mode: DenseMode,
+    role: DifferentiationParameterRole,
+) -> Result<(), DifferentiationError> {
+    for (path, r#type) in types.named_parameters() {
+        let differential_type = match mode {
+            DenseMode::Forward | DenseMode::ForwardHolomorphic => r#type.tangent(),
+            DenseMode::Reverse | DenseMode::ReverseHolomorphic => r#type.cotangent(),
+        };
+        if differential_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableParameter {
+                transform: mode.transform(),
+                role,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            });
+        }
+        if mode.is_holomorphic() && !r#type.is_complex() {
+            return Err(DifferentiationError::NonComplexParameter {
+                transform: mode.transform(),
+                role,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            });
+        }
+        let permits_complex = if role == DifferentiationParameterRole::Input {
+            mode.permits_complex_input()
+        } else {
+            mode.permits_complex_output()
+        };
+        if !mode.is_holomorphic() && r#type.is_complex() && !permits_complex {
+            return Err(DifferentiationError::ComplexParameter {
+                transform: mode.transform(),
+                role,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn coordinate_offsets<C: Context, S: Parameterized<C::Type>>(
+    types: &S,
+    mode: DenseMode,
+    role: DifferentiationParameterRole,
+) -> Result<Vec<usize>, DifferentiationError>
+where
+    C::Type: DenseDifferentiableType<C>,
+{
+    let mut offsets = Vec::new();
+    offsets.push(0usize);
+    for (path, r#type) in types.named_parameters() {
+        let count = C::Type::coordinate_count(r#type, mode.transform(), role, &path)?;
+        offsets.push(offsets.last().copied().unwrap().checked_add(count).ok_or_else(|| {
+            DifferentiationError::CoordinateCountOverflow {
+                transform: mode.transform(),
+                role,
+                path: path.to_string(),
+                r#type: r#type.to_string(),
+            }
+        })?);
+    }
+    Ok(offsets)
+}
+
+pub(super) fn jacfwd_in<C, F, I, O>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
+where
+    C: Context,
+    C::Type: DenseDifferentiableType<C>,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+        >,
+    I::ParameterStructure: Debug + PartialEq,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    O::To<C::Value>: Parameterized<C::Value, To<C::Value> = O::To<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<ZeroOperation<C::Type>>,
+    I::To<C::Type>: Clone + Parameterized<C::Type>,
+    O::To<C::Type>: Clone + Parameterized<C::Type>,
+{
+    let mode = if holomorphic { DenseMode::ForwardHolomorphic } else { DenseMode::Forward };
+    let input_structure = primals.parameter_structure();
+    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_types = I::To::<C::Type>::from_parameters(
+        input_structure.clone(),
+        input_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    validate_types(&input_types, mode, DifferentiationParameterRole::Input)?;
+    let primals = I::from_parameters(input_structure, input_values)?;
+    let (output, pushforward) = context.linearize(function, primals)?;
+    let output_structure = output.parameter_structure();
+    let output_values = output.into_parameters().collect::<Vec<_>>();
+    let output_types = O::To::<C::Type>::from_parameters(
+        output_structure,
+        output_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    validate_types(&output_types, mode, DifferentiationParameterRole::Output)?;
+
+    let input_offsets = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
+    let _ = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
+    let batch_size = input_offsets.last().copied().unwrap();
+    let (program, residuals) = pushforward.into_parts();
+    let program_input_types = program.input_types();
+    let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "pushforward program consumes {} inputs which is fewer than its {} residuals",
+            program_input_types.len(),
+            residuals.len(),
+        ))
+    })?;
+    if tangent_input_count != input_types.parameter_count() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "pushforward program consumes {tangent_input_count} tangent inputs but the differentiated input has {} \
+             leaves",
+            input_types.parameter_count(),
+        ))
+        .into());
+    }
+    for (index, (program_input_type, (path, input_type))) in
+        program_input_types[..tangent_input_count].iter().zip(input_types.named_parameters()).enumerate()
+    {
+        let tangent_type = input_type.tangent();
+        if tangent_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableParameter {
+                transform: mode.transform(),
+                role: DifferentiationParameterRole::Input,
+                path: path.to_string(),
+                r#type: input_type.to_string(),
+            });
+        }
+        if program_input_type != &tangent_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward tangent input {index} has type {program_input_type} but the differentiated input leaf \
+                 has tangent type {tangent_type}",
+            ))
+            .into());
+        }
+    }
+    let mut packed_inputs = input_types
+        .named_parameters()
+        .enumerate()
+        .map(|(index, (path, r#type))| {
+            let tangent_type = r#type.tangent();
+            if tangent_type.is_zero_space() {
+                return Err(DifferentiationError::NonDifferentiableParameter {
+                    transform: mode.transform(),
+                    role: DifferentiationParameterRole::Input,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            C::Type::basis(context, r#type, &tangent_type, input_offsets[index], batch_size)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
+    let packed_outputs = C::Type::replay(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    check_count!("output", packed_outputs, output_types.parameter_count(), ProgramError);
+
+    let mut values = Vec::new();
+    for (output_index, output_type) in output_types.parameters().enumerate() {
+        for (input_index, input_type) in input_types.parameters().enumerate() {
+            let value = C::Type::forward_block(
+                &packed_outputs[output_index],
+                batch_size,
+                input_offsets[input_index],
+                input_type,
+                output_type,
+            )?;
+            C::Type::validate_forward_block_type(value.r#type().as_ref(), output_type, input_type)?;
+            values.push(value);
+        }
+    }
+    Ok(Jacobian::new(input_types, output_types, values)?)
+}
+
+pub(super) fn jacrev_in<C, F, I, O>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
+where
+    C: Context,
+    C::Type: DenseDifferentiableType<C>,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+        >,
+    I::ParameterStructure: Debug + PartialEq,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    O::To<C::Value>: Parameterized<C::Value, To<C::Value> = O::To<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<C>>
+        + TransposableOperation<C::Constant, C::Operation>
+        + From<ZeroOperation<C::Type>>
+        + From<AddOperation>,
+    I::To<C::Type>: Clone + Parameterized<C::Type>,
+    O::To<C::Type>: Clone + Parameterized<C::Type>,
+{
+    let mode = if holomorphic { DenseMode::ReverseHolomorphic } else { DenseMode::Reverse };
+    let input_structure = primals.parameter_structure();
+    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_types = I::To::<C::Type>::from_parameters(
+        input_structure.clone(),
+        input_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    validate_types(&input_types, mode, DifferentiationParameterRole::Input)?;
+    let primals = I::from_parameters(input_structure, input_values)?;
+    let (output, pullback) = context.vjp(function, primals)?;
+    let output_structure = output.parameter_structure();
+    let output_values = output.into_parameters().collect::<Vec<_>>();
+    let output_types = O::To::<C::Type>::from_parameters(
+        output_structure,
+        output_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    validate_types(&output_types, mode, DifferentiationParameterRole::Output)?;
+
+    let _ = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
+    let output_offsets = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
+    let batch_size = output_offsets.last().copied().unwrap();
+    let (program, residuals) = pullback.into_parts();
+    let program_input_types = program.input_types();
+    let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "pullback program consumes {} inputs which is fewer than its {} residuals",
+            program_input_types.len(),
+            residuals.len(),
+        ))
+    })?;
+    if cotangent_input_count != output_types.parameter_count() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "pullback program consumes {cotangent_input_count} cotangent inputs but the differentiated output has {} \
+             leaves",
+            output_types.parameter_count(),
+        ))
+        .into());
+    }
+    let mut packed_inputs = output_types
+        .named_parameters()
+        .enumerate()
+        .map(|(index, (path, r#type))| {
+            let cotangent_type = r#type.cotangent();
+            if cotangent_type.is_zero_space() {
+                return Err(DifferentiationError::NonDifferentiableParameter {
+                    transform: mode.transform(),
+                    role: DifferentiationParameterRole::Output,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            if program_input_types[index] != cotangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback cotangent input {index} has type {} but output leaf {path} has cotangent type \
+                     {cotangent_type}",
+                    program_input_types[index],
+                ))
+                .into());
+            }
+            C::Type::basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
+    let packed_outputs = C::Type::replay(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    check_count!("output", packed_outputs, input_types.parameter_count(), ProgramError);
+
+    let mut values = Vec::new();
+    for (output_index, output_type) in output_types.parameters().enumerate() {
+        for (input_index, input_type) in input_types.parameters().enumerate() {
+            let value = C::Type::reverse_block(
+                &packed_outputs[input_index],
+                batch_size,
+                output_offsets[output_index],
+                output_type,
+                input_type,
+            )?;
+            C::Type::validate_reverse_block_type(value.r#type().as_ref(), output_type, input_type)?;
+            values.push(value);
+        }
+    }
+    Ok(Jacobian::new(input_types, output_types, values)?)
+}
+
+pub(super) fn jacfwd_with_aux_in<C, F, I, O, A>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError>
+where
+    C: Context,
+    C::Type: DenseDifferentiableType<C>,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<C::Type>: Clone + Parameterized<C::Type>,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    O::To<C::Value>: Parameterized<C::Value, To<C::Value> = O::To<C::Value>>,
+    O::To<C::Type>: Clone + Parameterized<C::Type>,
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<ZeroOperation<C::Type>>,
+{
+    let auxiliary = RefCell::new(None);
+    let jacobian = jacfwd_in(
+        context,
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            Ok(output)
+        },
+        primals,
+        holomorphic,
+    )?;
+    let auxiliary = auxiliary
+        .into_inner()
+        .ok_or_else(|| ProgramError::MalformedProgram("jacfwd_with_aux did not evaluate its function".to_string()))?;
+    Ok((jacobian, auxiliary))
+}
+
+pub(super) fn jacrev_with_aux_in<C, F, I, O, A>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError>
+where
+    C: Context,
+    C::Type: DenseDifferentiableType<C>,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<C::Type>: Clone + Parameterized<C::Type>,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    O::To<C::Value>: Parameterized<C::Value, To<C::Value> = O::To<C::Value>>,
+    O::To<C::Type>: Clone + Parameterized<C::Type>,
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<C>>
+        + TransposableOperation<C::Constant, C::Operation>
+        + From<ZeroOperation<C::Type>>
+        + From<AddOperation>,
+{
+    let auxiliary = RefCell::new(None);
+    let jacobian = jacrev_in(
+        context,
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            Ok(output)
+        },
+        primals,
+        holomorphic,
+    )?;
+    let auxiliary = auxiliary
+        .into_inner()
+        .ok_or_else(|| ProgramError::MalformedProgram("jacrev_with_aux did not evaluate its function".to_string()))?;
+    Ok((jacobian, auxiliary))
+}
+
+fn materialize_auxiliary<C, A>(auxiliary: A) -> Result<A::To<C::Value>, DifferentiationError>
+where
+    C: Context,
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+{
+    let structure = auxiliary.parameter_structure();
+    let values = auxiliary
+        .into_parameters()
+        .map(|tracer| {
+            let (primal, _) = tracer.into_dual().into_parts();
+            match primal.into_value()?.value().clone() {
+                PartialValue::Known(value) => Ok(value),
+                PartialValue::Unknown(r#type) => Err(ProgramError::MalformedProgram(format!(
+                    "auxiliary output has unknown primal type {type} but depends only on known primal inputs",
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(A::To::<C::Value>::from_parameters(structure, values)?)
+}
+
+fn validate_array_block_type(
+    transform: DerivativeTransform,
+    block_type: &ArrayType,
+    value_type: &ArrayType,
+    prefix_coordinate_types: &[&ArrayType],
+    suffix_coordinate_types: &[&ArrayType],
+) -> Result<(), DifferentiationError> {
+    let mut expected_type = value_type.clone().with_layout(None);
+    let mut prefix_index = 0;
+    for coordinate_type in prefix_coordinate_types {
+        for size in static_shape(coordinate_type, transform, DifferentiationParameterRole::Derivative)?.dimensions() {
+            expected_type = expected_type.with_inserted_dimension(prefix_index, Size::Static(*size))?;
+            prefix_index += 1;
+        }
+    }
+    for coordinate_type in suffix_coordinate_types {
+        for size in static_shape(coordinate_type, transform, DifferentiationParameterRole::Derivative)?.dimensions() {
+            let rank = expected_type.rank();
+            expected_type = expected_type.with_inserted_dimension(rank, Size::Static(*size))?;
+        }
+    }
+    let block_type_without_layout = block_type.clone().with_layout(None);
+    if block_type_without_layout != expected_type {
+        return Err(TypeError {
+            message: format!("derivative block has type {block_type} but expected {expected_type}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn static_shape(
+    r#type: &ArrayType,
+    transform: DerivativeTransform,
+    role: DifferentiationParameterRole,
+) -> Result<StaticShape, DifferentiationError> {
+    r#type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+        transform,
+        role,
+        path: ParameterPath::root().to_string(),
+        r#type: r#type.to_string(),
+    })
+}
+
+fn basis_range_value<V>(
+    batch: &ArrayBatch<V>,
+    batch_size: usize,
+    basis_offset: usize,
+    basis_shape: &[usize],
+    expected_item_type: &ArrayType,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
+{
+    let aligned = batch.match_axis(0, batch_size, ShardingDimension::Replicated)?;
+    let actual_item_type = aligned.unbatched_type();
+    if actual_item_type.clone().with_layout(None) != expected_item_type.clone().with_layout(None) {
+        return Err(TypeError {
+            message: format!(
+                "batched derivative output has per-item type {actual_item_type} but expected {expected_item_type}",
+            ),
+        }
+        .into());
+    }
+    let item_shape = expected_item_type.static_shape().ok_or_else(|| TypeError {
+        message: format!(
+            "jacobian or hessian materialization requires a fully static array shape but got {expected_item_type}"
+        ),
+    })?;
+    let basis_count = if basis_shape.contains(&0) {
+        0
+    } else {
+        basis_shape.iter().try_fold(1usize, |count, size| {
+            count.checked_mul(*size).ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("coordinate basis shape {basis_shape:?} overflows usize"),
+            })
+        })?
+    };
+    let physical_type = aligned.r#type();
+    let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
+        message: format!(
+            "jacobian or hessian materialization requires a fully static array shape but got {physical_type}"
+        ),
+    })?;
+    let mut start_indices = vec![0; physical_shape.rank()];
+    start_indices[0] = basis_offset;
+    let mut limit_indices = physical_shape.dimensions().to_vec();
+    limit_indices[0] = basis_offset.checked_add(basis_count).ok_or_else(|| ProgramError::InvalidArgument {
+        message: "coordinate basis range overflows usize".to_string(),
+    })?;
+    let strides = vec![1; limit_indices.len()];
+    let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
+    let reshaped_shape =
+        Shape::new(basis_shape.iter().chain(item_shape.dimensions()).copied().map(Size::Static).collect());
+    sliced.reshape(reshaped_shape)
+}
+
+/// Materializes the complete forward-mode Jacobian, recovering the active context from `primals`.
+pub fn jacfwd<V, F, I, O>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
+where
+    V: Value,
+    V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+    I: Parameterized<
+            V,
+            To<V> = I,
+            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<V::Type>: Clone + Parameterized<V::Type>,
+    O: Parameterized<
+            LinearizationTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        >,
+    O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+    O::To<V::Type>: Clone + Parameterized<V::Type>,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + PartiallyEvaluatableOperation<
+            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+        > + From<ZeroOperation<V::Type>>,
+{
+    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+        return Err(DifferentiationError::EmptyInput);
+    };
+    context.jacfwd(function, primals)
+}
+
+/// Materializes the complete reverse-mode Jacobian, recovering the active context from `primals`.
+pub fn jacrev<V, F, I, O>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
+where
+    V: Value,
+    V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+    I: Parameterized<
+            V,
+            To<V> = I,
+            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<V::Type>: Clone + Parameterized<V::Type>,
+    O: Parameterized<
+            LinearizationTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        >,
+    O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+    O::To<V::Type>: Clone + Parameterized<V::Type>,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + PartiallyEvaluatableOperation<
+            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
+        + From<ZeroOperation<V::Type>>
+        + From<AddOperation>,
+{
+    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+        return Err(DifferentiationError::EmptyInput);
+    };
+    context.jacrev(function, primals)
+}
+
+/// Materializes a holomorphic forward-mode Jacobian, recovering the active context from `primals`.
+pub fn jacfwd_holomorphic<V, F, I, O>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
+where
+    V: Value,
+    V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+    I: Parameterized<
+            V,
+            To<V> = I,
+            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<V::Type>: Clone + Parameterized<V::Type>,
+    O: Parameterized<
+            LinearizationTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        >,
+    O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+    O::To<V::Type>: Clone + Parameterized<V::Type>,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + PartiallyEvaluatableOperation<
+            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+        > + From<ZeroOperation<V::Type>>,
+{
+    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+        return Err(DifferentiationError::EmptyInput);
+    };
+    context.jacfwd_holomorphic(function, primals)
+}
+
+/// Materializes a holomorphic reverse-mode Jacobian, recovering the active context from `primals`.
+pub fn jacrev_holomorphic<V, F, I, O>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
+where
+    V: Value,
+    V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+    I: Parameterized<
+            V,
+            To<V> = I,
+            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+    I::To<V::Type>: Clone + Parameterized<V::Type>,
+    O: Parameterized<
+            LinearizationTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+        >,
+    O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+    O::To<V::Type>: Clone + Parameterized<V::Type>,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + PartiallyEvaluatableOperation<
+            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
+        + From<ZeroOperation<V::Type>>
+        + From<AddOperation>,
+{
+    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+        return Err(DifferentiationError::EmptyInput);
+    };
+    context.jacrev_holomorphic(function, primals)
+}
+
+macro_rules! define_forward_jacobian_with_aux {
+    ($name:ident, $method:ident, $documentation:literal) => {
+        #[doc = $documentation]
+        pub fn $name<V, F, I, O, A>(
+            function: F,
+            primals: I,
+        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError>
+        where
+            V: Value,
+            V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+            V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+            I: Parameterized<
+                    V,
+                    To<V> = I,
+                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+                    ParameterStructure: Debug + PartialEq,
+                >,
+            I::To<V::Type>: Clone + Parameterized<V::Type>,
+            O: Parameterized<
+                    LinearizationTracer<V::ExecutionDomain>,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+                >,
+            O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+            O::To<V::Type>: Clone + Parameterized<V::Type>,
+            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
+            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
+            <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + From<ZeroOperation<V::Type>>,
+        {
+            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+                return Err(DifferentiationError::EmptyInput);
+            };
+            context.$method(function, primals)
+        }
+    };
+}
+
+define_forward_jacobian_with_aux!(
+    jacfwd_with_aux,
+    jacfwd_with_aux,
+    "Materializes a forward-mode Jacobian and auxiliary outputs, recovering the active context from `primals`."
+);
+define_forward_jacobian_with_aux!(
+    jacfwd_holomorphic_with_aux,
+    jacfwd_holomorphic_with_aux,
+    "Materializes a holomorphic forward-mode Jacobian and auxiliary outputs, recovering the active context from \
+     `primals`."
+);
+
+macro_rules! define_reverse_jacobian_with_aux {
+    ($name:ident, $method:ident, $documentation:literal) => {
+        #[doc = $documentation]
+        pub fn $name<V, F, I, O, A>(
+            function: F,
+            primals: I,
+        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError>
+        where
+            V: Value,
+            V::ExecutionDomain: Context<Type = V::Type, Value = V>,
+            V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+            I: Parameterized<
+                    V,
+                    To<V> = I,
+                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+                    ParameterStructure: Debug + PartialEq,
+                >,
+            I::To<V::Type>: Clone + Parameterized<V::Type>,
+            O: Parameterized<
+                    LinearizationTracer<V::ExecutionDomain>,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+                >,
+            O::To<V>: Parameterized<V, To<V> = O::To<V>>,
+            O::To<V::Type>: Clone + Parameterized<V::Type>,
+            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
+            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
+            <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                + TransposableOperation<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                > + From<ZeroOperation<V::Type>>
+                + From<AddOperation>,
+        {
+            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+                return Err(DifferentiationError::EmptyInput);
+            };
+            context.$method(function, primals)
+        }
+    };
+}
+
+define_reverse_jacobian_with_aux!(
+    jacrev_with_aux,
+    jacrev_with_aux,
+    "Materializes a reverse-mode Jacobian and auxiliary outputs, recovering the active context from `primals`."
+);
+define_reverse_jacobian_with_aux!(
+    jacrev_holomorphic_with_aux,
+    jacrev_holomorphic_with_aux,
+    "Materializes a holomorphic reverse-mode Jacobian and auxiliary outputs, recovering the active context from \
+     `primals`."
+);
+
+#[cfg(test)]
+mod tests {
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{
+        DerivativeTransform, DifferentiableType, DifferentiationError, DifferentiationParameterRole,
+    };
+    use crate::parameters::{ParameterPath, Parameterized};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
+    use crate::types::DataType::{F32, F64};
+    use crate::types::{ArrayType, DataType, Shape, Size};
+
+    use super::{
+        DenseDifferentiableType, DenseDifferentiate, DenseMode, Jacobian, PACKED_REPLAY_COUNT, coordinate_offsets,
+    };
+
+    #[test]
+    fn test_jacobian_parameterization_with_data_types() {
+        let jacobian = Jacobian::new((F32, vec![F64, F32]), F64, vec![1.0_f32, 2.0, 3.0]).unwrap();
+        assert_eq!(jacobian.parameter_count(), 3);
+        assert_eq!(jacobian.values(), &[1.0, 2.0, 3.0]);
+
+        let reparameterized =
+            <Jacobian<DataType, f64, _, _>>::from_parameters(jacobian.parameter_structure(), [4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(reparameterized.input_types(), &(F32, vec![F64, F32]));
+        assert_eq!(reparameterized.output_types(), &F64);
+        assert_eq!(reparameterized.values(), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_jacobian_blocks_with_array_types() {
+        let input_types = (ArrayType::scalar(F32), ArrayType::new(F32, Shape::new(vec![2.into()])));
+        let output_types = ArrayType::new(F32, Shape::new(vec![3.into()]));
+        let jacobian = Jacobian::new(input_types.clone(), output_types.clone(), vec![10_i32, 20]).unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].output_path(), &ParameterPath::root());
+        assert_eq!(blocks[0].input_path().to_string(), "$.0");
+        assert_eq!(blocks[0].output_type(), &output_types);
+        assert_eq!(blocks[0].input_type(), &input_types.0);
+        assert_eq!(*blocks[0].value(), 10);
+        assert_eq!(blocks[1].input_path().to_string(), "$.1");
+        assert_eq!(*blocks[1].value(), 20);
+
+        let second_input_path = blocks[1].input_path().clone();
+        assert_eq!(*jacobian.block(&ParameterPath::root(), &second_input_path).unwrap().value(), 20);
+        assert!(jacobian.block(&ParameterPath::root(), &ParameterPath::root().field("missing")).is_none());
+    }
+
+    #[test]
+    fn test_dense_type_validation_reports_block_and_coordinate_overflow_errors() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+
+        let error = <ArrayType as DenseDifferentiableType<TestContext>>::validate_forward_block_type(
+            &ArrayType::new(F32, Shape::new(vec![Size::Static(2)])),
+            &ArrayType::scalar(F32),
+            &ArrayType::scalar(F32),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "derivative block has type f32[2] but expected f32[]");
+
+        let input_types = (ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX)])), ArrayType::scalar(F32));
+        assert_eq!(
+            coordinate_offsets::<TestContext, _>(
+                &input_types,
+                DenseMode::Forward,
+                DifferentiationParameterRole::Input,
+            )
+            .unwrap_err(),
+            DifferentiationError::CoordinateCountOverflow {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
+                path: "$.1".to_string(),
+                r#type: "f32[]".to_string(),
+            },
+        );
+
+        let empty_input_types =
+            ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(usize::MAX), Size::Static(0)]));
+        assert_eq!(
+            coordinate_offsets::<TestContext, _>(
+                &empty_input_types,
+                DenseMode::Forward,
+                DifferentiationParameterRole::Input,
+            )
+            .unwrap(),
+            vec![0, 0],
+        );
+    }
+
+    #[test]
+    fn test_dense_array_basis_uses_the_requested_value_type() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let coordinate_type = ArrayType::scalar(F32)
+            .with_sharding(Sharding::with_unreduced_axes(mesh, Vec::new(), ["x"]).unwrap())
+            .unwrap();
+        let value_type = coordinate_type.cotangent();
+        let basis = <ArrayType as DenseDifferentiableType<TestContext>>::basis(
+            &TestContext::new(),
+            &coordinate_type,
+            &value_type,
+            0,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(basis.unbatched_type(), value_type);
+    }
+
+    #[test]
+    fn test_dense_array_block_validation_uses_transform_value_types() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+
+        let output_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2)]));
+        let input_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
+        let wrong_block_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+
+        <ArrayType as DenseDifferentiableType<TestContext>>::validate_forward_block_type(
+            &wrong_block_type,
+            &output_type,
+            &input_type,
+        )
+        .unwrap();
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<TestContext>>::validate_reverse_block_type(
+                &wrong_block_type,
+                &output_type,
+                &input_type,
+            )
+            .unwrap_err()
+            .to_string(),
+            "derivative block has type f64[2, 3] but expected f32[2, 3]",
+        );
+
+        let first_input_type = ArrayType::scalar(F32);
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<TestContext>>::validate_hessian_block_type(
+                &wrong_block_type,
+                &output_type,
+                &first_input_type,
+                &input_type,
+            )
+            .unwrap_err()
+            .to_string(),
+            "derivative block has type f64[2, 3] but expected f32[2, 3]",
+        );
+    }
+
+    #[test]
+    fn test_jacfwd_replays_all_coordinate_directions_in_one_packed_batch() {
+        PACKED_REPLAY_COUNT.with(|count| count.set(0));
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let jacobian = context.jacfwd(|input| Ok(input), TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
+
+        assert_eq!(PACKED_REPLAY_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(jacobian.iter_blocks().next().unwrap().value().values().len(), 9);
+    }
+}

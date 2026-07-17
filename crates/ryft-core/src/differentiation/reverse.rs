@@ -1864,12 +1864,11 @@ mod tests {
 
     #[test]
     fn test_pullback_apply_preserves_non_copy_structured_cotangents() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let function = |(left, right): (
             LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
             LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| Ok(left * right);
-        let (_, pullback) = context.vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
+        let (_, pullback) = vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
         assert_eq!(pullback.apply(TestArray::scalar(4.0)), Ok((TestArray::scalar(8.0), TestArray::scalar(12.0))),);
     }
 

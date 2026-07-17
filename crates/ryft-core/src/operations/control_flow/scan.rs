@@ -1252,6 +1252,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::LinearizationTracer;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{AddOperation, MulOperation};
@@ -1259,7 +1260,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Memory};
 
     use super::*;
@@ -1525,6 +1526,48 @@ mod tests {
                 in (%2, %3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_scan_linearization_and_transposition_preserve_carry_derivatives() {
+        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestTracer = LinearizationTracer<TestContext>;
+
+        let context = TestContext::new();
+        let function = |(carry, values): (TestTracer, TestTracer)| {
+            let mut outputs = carry.context().bind(
+                ArrayOperation::Scan(ScanOperation::new(1, 3)),
+                vec![product_body()],
+                &[carry.clone(), values],
+            )?;
+            Ok((outputs.remove(0), outputs.remove(0)))
+        };
+        let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
+        let (outputs, pushforward) = context.linearize(function, primals.clone()).unwrap();
+        assert_eq!(outputs, (TestArray::scalar(24.0), TestArray::vector(vec![2.0, 6.0, 24.0])));
+        assert_eq!(
+            pushforward.apply((TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0]))),
+            Ok((TestArray::scalar(24.0), TestArray::vector(vec![2.0, 6.0, 24.0]))),
+        );
+
+        let (final_carry, pullback) = context
+            .vjp(
+                |(carry, values): (TestTracer, TestTracer)| {
+                    let mut outputs = carry.context().bind(
+                        ArrayOperation::Scan(ScanOperation::new(1, 3)),
+                        vec![product_body()],
+                        &[carry.clone(), values],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                primals,
+            )
+            .unwrap();
+        assert_eq!(final_carry, TestArray::scalar(24.0));
+        assert_eq!(
+            pullback.apply(TestArray::scalar(1.0)),
+            Ok((TestArray::scalar(24.0), TestArray::vector(vec![12.0, 8.0, 6.0]))),
         );
     }
 
