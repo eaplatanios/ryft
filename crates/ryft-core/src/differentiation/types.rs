@@ -256,6 +256,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_tangent() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::with_manual_axes(
+            mesh,
+            vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
+            ["model"],
+            Vec::<&str>::new(),
+            ["manual"],
+        )
+        .unwrap();
+        let primal = ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+
+        // Forward tangents follow the primal data flow, so every sharding component remains unchanged.
+        assert_eq!(primal.tangent().sharding(), Some(&sharding));
+    }
+
+    #[test]
     fn test_sharding_cotangent() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
