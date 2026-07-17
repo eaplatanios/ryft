@@ -7,7 +7,6 @@ use ryft_macros::Parameter;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
-use crate::errors::Error;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::programs::types::{Type, TypeError, Typed};
@@ -164,8 +163,9 @@ impl Shape {
         }
     }
 
-    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any of its dimensions is
-    /// dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays with this [`Shape`]. A statically zero dimension makes the result
+    /// exactly zero even when another dimension is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
+    /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         if self.dimensions.contains(&Size::Static(0)) {
@@ -579,8 +579,9 @@ impl ArrayType {
         self.shape.dimension(index)
     }
 
-    /// Returns the number of elements in arrays of this [`ArrayType`] or `Ok(None)` if any dimension in [`Self::shape`]
-    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays of this [`ArrayType`]. A statically zero dimension makes the result
+    /// exactly zero even when another dimension is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
+    /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         self.shape.element_count()
@@ -915,7 +916,7 @@ mod tests {
         assert_eq!(Shape::new(vec![Size::Static(usize::MAX), Size::Static(0)]).element_count(), Ok(Some(0)));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), Ok(None));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), Ok(None));
-        assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(None));
+        assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(Some(0)));
         assert_eq!(
             Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
             Err(TypeError { message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX) }),

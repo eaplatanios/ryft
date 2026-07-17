@@ -121,6 +121,24 @@ impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
 
 /// Value-level capability for converting a value's numeric element type.
 pub trait ConvertElementType: Sized {
+    /// Promotes this value's elements to `data_type`. Unlike [`Self::convert_element_type`], this method rejects
+    /// conversions that are not permitted by the element-type promotion lattice.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element data type to which the returned value is promoted.
+    fn promote_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>
+    where
+        Self: Typed,
+        Self::Type: ElementType,
+    {
+        self.r#type()
+            .element_type()
+            .promote_to(data_type)
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        self.convert_element_type(data_type)
+    }
+
     /// Converts this value's elements to `data_type`.
     ///
     /// # Parameters
@@ -185,7 +203,7 @@ where
         let primal_type = primal.r#type();
         let output_tangent_type = primal_type.tangent();
         let tangent = match (inputs[0].tangent(), output_tangent_type) {
-            (_, None) => MaybeZero::Zero(primal_type.into_owned()),
+            (_, None) => MaybeZero::Zero(primal_type.tangent_slot()),
             (MaybeZero::Zero(_), Some(tangent_type)) => MaybeZero::Zero(tangent_type),
             (MaybeZero::Value(tangent), Some(tangent_type)) => {
                 MaybeZero::Value(tangent.convert_element_type(tangent_type.element_type())?)

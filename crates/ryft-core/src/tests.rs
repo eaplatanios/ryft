@@ -340,9 +340,11 @@ impl<O: crate::programs::operations::Operation<ArrayType>> One<TestArray> for Ea
 
 impl<O: crate::programs::operations::Operation<ArrayType>> Fill<Scalar, TestArray> for EagerContext<TestArray, O> {
     fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
-        // `TestArray` stores `f64` elements, so any fill value that widens to `f64` is representable and complex
-        // fill values surface the cast's promotion error.
-        let Scalar::F64(value) = value.cast(DataType::F64)? else { unreachable!("a cast to f64 yields an f64 scalar") };
+        // `TestArray` stores `f64` elements, so any fill value that promotes to `f64` is representable. Using the
+        // promotion-checked conversion prevents a complex imaginary part from being discarded.
+        let Scalar::F64(value) = value.promote_element_type(DataType::F64)? else {
+            unreachable!("promotion to f64 yields an f64 scalar")
+        };
         Ok(TestArray { r#type: r#type.clone(), values: vec![value; TestArray::materialized_element_count(r#type)?] })
     }
 }
@@ -2081,11 +2083,10 @@ mod linearization_tests {
 
     #[test]
     fn test_jvp_runs_eager_nested_unbounded_while() {
-        // Forward mode through *nested* data-dependent loops under an eager receiver: the `while` JVP rule runs the
-        // outer loop at the concrete duals and unrolls the inner loop at each iteration's concrete carries, so
-        // neither loop needs an iteration bound. The primal must match the traced program's own eager
-        // interpretation, and because every operation on the branch taken at `x = 1.5` (adds and doublings) is
-        // linear in the carry, the pushforward of a unit tangent is exactly `f(1.5) / 1.5`.
+        // Forward mode through *nested* data-dependent loops under an eager receiver: each `while` JVP rule runs its
+        // loop directly at the concrete duals, so neither loop needs an iteration bound. The primal must match the
+        // traced program's own eager interpretation, and because every operation on the branch taken at `x = 1.5`
+        // (adds and doublings) is linear in the carry, the pushforward of a unit tangent is exactly `f(1.5) / 1.5`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let input_values = vec![Scalar::from(1.5)];
         let (_, program) = NestedTracingContext::trace(
@@ -4089,6 +4090,22 @@ mod array_linearization_tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
+    /// Builds a branch mapping one floating-point scalar to the Boolean predicate `x > 0`.
+    fn boolean_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        use crate::operations::compare::{CompareOperation, ComparisonDirection};
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+        use crate::types::DataType;
+
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let zero = builder.add_constant(TestArray::scalar(0.0));
+        let output = builder
+            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
     /// Stages `condition(predicate, x*2+1, sin(x))` over the closure inputs `[predicate, x]`, the shared body of every
     /// condition equivalence closure. The predicate is the scalar-boolean first input and carries no tangent; the
     /// scalar operand `x` flows into the selected branch.
@@ -4108,18 +4125,20 @@ mod array_linearization_tests {
     /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)` computes
     /// the analytic primal and tangent outputs.
     ///
-    /// The condition's predicate is a scalar-boolean operand whose tangent input is dead (Boolean predicates have
-    /// no tangent space), so the partial-evaluation split prunes it and the reassembling
-    /// [`assert_array_forward_equivalent`] harness — which assumes every input tangent survives into the tangent
-    /// sub-program — does not apply. Interpreting the whole JVP program directly at `(primals ++ tangents)`
-    /// instead proves the rule end to end, exactly as the scalar front end verifies its Boolean-codomain rules.
+    /// The condition's predicate is a scalar-boolean operand with no tangent space. Direct JVP therefore ignores its
+    /// supplied tangent placeholder and uses a structural zero, while the partial-evaluation split prunes the dead
+    /// predicate tangent from the tangent sub-program. The reassembling [`assert_array_forward_equivalent`] harness —
+    /// which assumes every input tangent survives — does not apply, so the whole JVP program is also interpreted
+    /// directly at `(primals ++ tangents)` to prove the staged rule end to end.
     fn assert_condition_forward_equivalent_to_jvp(predicate: bool, x: f64, dx: f64) {
         use crate::types::DataType;
 
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let predicate_value = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![predicate as u8 as f64]);
-        let predicate_tangent = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let error = domain
+        let predicate_tangent = TestArray::new(ArrayType::scalar(DataType::Zero), vec![0.0]);
+        let reference_primals = vec![TestArray::scalar(if predicate { 2.0 * x + 1.0 } else { x.sin() })];
+        let reference_tangents = vec![TestArray::scalar(if predicate { 2.0 * dx } else { x.cos() * dx })];
+        let (direct_primals, direct_tangents) = domain
             .jvp(
                 |inputs: Vec<ArrayJvpTracer>| {
                     let condition = crate::operations::control_flow::ConditionOperation::new();
@@ -4132,16 +4151,9 @@ mod array_linearization_tests {
                 vec![predicate_value.clone(), TestArray::scalar(x)],
                 vec![predicate_tangent.clone(), TestArray::scalar(dx)],
             )
-            .unwrap_err();
-        assert_eq!(
-            error,
-            crate::differentiation::DifferentiationError::Program(ProgramError::MalformedProgram(
-                "JVP input 0 has live tangent type bool[] but primal type bool[] has no tangent space".to_string(),
-            )),
-        );
-
-        let reference_primals = vec![TestArray::scalar(if predicate { 2.0 * x + 1.0 } else { x.sin() })];
-        let reference_tangents = vec![TestArray::scalar(if predicate { 2.0 * dx } else { x.cos() * dx })];
+            .unwrap();
+        assert_eq!(direct_primals, reference_primals);
+        assert_eq!(direct_tangents, reference_tangents);
 
         let (_, primal_program) = NestedTracingContext::trace(
             domain.clone(),
@@ -4172,6 +4184,35 @@ mod array_linearization_tests {
 
         // Predicate false: the sine branch is taken, so the directional derivative is `cos(x) * dx`.
         assert_condition_forward_equivalent_to_jvp(false, 0.7, 1.5);
+    }
+
+    #[test]
+    fn test_condition_jvp_preserves_zero_space_output_tangents() {
+        use crate::operations::control_flow::ConditionOperation;
+        use crate::types::DataType;
+
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let (primal, tangent) = context
+            .jvp(
+                |input: ArrayJvpTracer| {
+                    let predicate =
+                        input.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                    let mut outputs = input.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![boolean_branch(), boolean_branch()],
+                        &[predicate, input.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                TestArray::scalar(2.0),
+                TestArray::scalar(3.0),
+            )
+            .unwrap();
+
+        assert_eq!(primal.r#type().as_ref(), &ArrayType::scalar(DataType::Boolean));
+        assert_eq!(primal.values(), &[1.0]);
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::Zero));
+        assert_eq!(tangent.values(), &[0.0]);
     }
 
     /// Builds the cumulative-product scan body `[carry, x] -> [carry * x, carry * x]`. Its single `Mul` linearizes

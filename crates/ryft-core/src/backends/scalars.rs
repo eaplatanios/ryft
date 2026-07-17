@@ -31,6 +31,7 @@ use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, 
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
+use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Exp,
     ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub,
@@ -65,6 +66,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
+    ConvertElementType(ConvertElementTypeOperation),
     Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),
@@ -93,7 +95,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Print(PrintOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
-    CustomVjpTangent(CustomVjpTangentOperation),
+    CustomVjpTangent(CustomVjpTangentOperation<DataType>),
     Rematerialize(RematerializeOperation),
 }
 
@@ -247,11 +249,11 @@ impl Scalar {
 
     /// Decodes the raw bit representation of a low-precision floating-point scalar into the exact `f64` value it
     /// denotes, driven by a per-format table of exponent/mantissa widths, biases, NaN encodings, and infinity
-    /// support. `f8e8m0fnu` is handled separately because it is a bias-127 power-of-two exponent with no sign or
-    /// mantissa bits.
+    /// support. `f8e8m0fnu` is handled separately because its finite values are bias-127 powers of two with no sign or
+    /// mantissa bits and `0xff` is its sole NaN encoding.
     fn decode_low_precision_float(r#type: DataType, bits: u8) -> f64 {
         if r#type == DataType::F8E8M0FNU {
-            return 2.0f64.powi(i32::from(bits) - 127);
+            return if bits == 0xff { f64::NAN } else { 2.0f64.powi(i32::from(bits) - 127) };
         }
         let (total_bits, exponent_bits, mantissa_bits, bias, nan_bits, has_infinity) = match r#type {
             DataType::F4E2M1FN => (4, 2, 1, 1, None, false),
@@ -322,7 +324,7 @@ impl Scalar {
             DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ => (0xff, Some(0x80)),
             DataType::F8E5M2 => (0xff, Some(0x7d)),
             DataType::F8E5M2FNUZ => (0xff, Some(0x80)),
-            DataType::F8E8M0FNU => (0xff, None),
+            DataType::F8E8M0FNU => (0xff, Some(0xff)),
             // This is a private helper whose callers only ever pass a low-precision floating-point data type
             // (they branch on `low_precision_float_parts` first), so reaching another data type is an internal
             // invariant violation rather than a recoverable error.
@@ -1341,83 +1343,102 @@ impl Compare for Scalar {
     }
 }
 
-// TODO(eaplatanios): Introduce a `Cast` trait if we do not have one already and also support it for arrays.
-impl Scalar {
-    /// Casts this [`Scalar`] to `target`, converting the carried numeric value. Only value-level type *promotion*
-    /// (widening) casts are supported: `self`'s [`DataType`] must equal or be promotable to `target`, which is
-    /// exactly what the eager value semantics need in order to match an operation's promoting type inference (for
-    /// example, promoting a `select` branch to the promotion of the two branch data types). A cast to the same data
-    /// type is the identity, and a non-promotable `target` is a [`TypeError`].
-    ///
-    /// Every such widening promotion is exact through an `f64` intermediate: an integer promotion target only ever
-    /// has sources that fit exactly in an `f64` (the only integers that do not, large `I64`/`U64` values, promote to
-    /// `F64` rather than to an integer target), and a floating-point target adopts the intended, possibly rounding,
-    /// promotion semantics. Complex promotions widen per component: a complex source widens to a wider complex
-    /// target, and a real source promotes to a complex target with a zero imaginary part.
-    pub fn cast(&self, target: DataType) -> Result<Scalar, ProgramError> {
+impl ConvertElementType for Scalar {
+    fn convert_element_type(&self, target: DataType) -> Result<Self, ProgramError> {
+        macro_rules! convert_real {
+            ($value:expr) => {{
+                let value = $value;
+                match target {
+                    DataType::Boolean => Scalar::Bool(value as f64 != 0.0),
+                    DataType::I8 => Scalar::I8(value as i8),
+                    DataType::I16 => Scalar::I16(value as i16),
+                    DataType::I32 => Scalar::I32(value as i32),
+                    DataType::I64 => Scalar::I64(value as i64),
+                    DataType::U8 => Scalar::U8(value as u8),
+                    DataType::U16 => Scalar::U16(value as u16),
+                    DataType::U32 => Scalar::U32(value as u32),
+                    DataType::U64 => Scalar::U64(value as u64),
+                    DataType::BF16 => Scalar::BF16(bf16::from_f64(value as f64)),
+                    DataType::F16 => Scalar::F16(f16::from_f64(value as f64)),
+                    DataType::F32 => Scalar::F32(value as f32),
+                    DataType::F64 => Scalar::F64(value as f64),
+                    DataType::C64 => Scalar::C64(Complex::new(value as f32, 0.0)),
+                    DataType::C128 => Scalar::C128(Complex::new(value as f64, 0.0)),
+                    data_type
+                        if matches!(
+                            data_type,
+                            DataType::F4E2M1FN
+                                | DataType::F6E2M3FN
+                                | DataType::F6E3M2FN
+                                | DataType::F8E3M4
+                                | DataType::F8E4M3
+                                | DataType::F8E4M3FN
+                                | DataType::F8E4M3FNUZ
+                                | DataType::F8E4M3B11FNUZ
+                                | DataType::F8E5M2
+                                | DataType::F8E5M2FNUZ
+                                | DataType::F8E8M0FNU
+                        ) =>
+                    {
+                        return Self::encode_low_precision_float(data_type, value as f64);
+                    }
+                    other => {
+                        return Err(TypeError {
+                            message: format!("cannot convert scalar to unsupported data type {other}"),
+                        }
+                        .into());
+                    }
+                }
+            }};
+        }
+
         let source = self.r#type().into_owned();
         if source == target {
             return Ok(*self);
         }
-        if !source.is_promotable_to(target) {
+        if source == DataType::Token || target == DataType::Token {
             return Err(
-                TypeError { message: format!("cannot promote scalar of data type {source} to {target}") }.into()
+                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
             );
         }
-        let value = match self {
-            Scalar::Bool(value) => f64::from(*value),
-            Scalar::I8(value) => *value as f64,
-            Scalar::I16(value) => *value as f64,
-            Scalar::I32(value) => *value as f64,
-            Scalar::I64(value) => *value as f64,
-            Scalar::U8(value) => *value as f64,
-            Scalar::U16(value) => *value as f64,
-            Scalar::U32(value) => *value as f64,
-            Scalar::U64(value) => *value as f64,
-            Scalar::BF16(value) => value.to_f64(),
-            Scalar::F16(value) => value.to_f64(),
-            Scalar::F32(value) => *value as f64,
-            Scalar::F64(value) => *value,
-            Scalar::C64(value) => {
-                // The promotion lattice admits only the wider complex type as a widening target for a `C64` source
-                // (the same-type case returned above), so this widens per component.
-                return Ok(Scalar::C128(Complex::new(value.re as f64, value.im as f64)));
-            }
-            Scalar::C128(_) => {
-                // A `C128` source has no widening target other than itself, which the same-type case above already
-                // handled, so `is_promotable_to` has rejected the cast before this point.
-                return Err(
-                    TypeError { message: format!("cannot promote scalar of data type {source} to {target}") }.into()
-                );
-            }
-            other => {
-                return Err(TypeError {
-                    message: format!("cannot promote scalar of data type {} to {target}", other.r#type()),
+        let converted = if let Some((data_type, bits)) = self.low_precision_float_parts() {
+            convert_real!(Self::decode_low_precision_float(data_type, bits))
+        } else {
+            match self {
+                Scalar::Bool(value) => convert_real!(u8::from(*value)),
+                Scalar::I8(value) => convert_real!(*value),
+                Scalar::I16(value) => convert_real!(*value),
+                Scalar::I32(value) => convert_real!(*value),
+                Scalar::I64(value) => convert_real!(*value),
+                Scalar::U8(value) => convert_real!(*value),
+                Scalar::U16(value) => convert_real!(*value),
+                Scalar::U32(value) => convert_real!(*value),
+                Scalar::U64(value) => convert_real!(*value),
+                Scalar::BF16(value) => convert_real!(value.to_f64()),
+                Scalar::F16(value) => convert_real!(value.to_f64()),
+                Scalar::F32(value) => convert_real!(*value),
+                Scalar::F64(value) => convert_real!(*value),
+                Scalar::C64(value) => match target {
+                    DataType::C64 => return Ok(*self),
+                    DataType::C128 => return Ok(Scalar::C128(Complex::new(value.re as f64, value.im as f64))),
+                    DataType::Boolean => return Ok(Scalar::Bool(value.re != 0.0 || value.im != 0.0)),
+                    _ => convert_real!(value.re),
+                },
+                Scalar::C128(value) => match target {
+                    DataType::C64 => return Ok(Scalar::C64(Complex::new(value.re as f32, value.im as f32))),
+                    DataType::C128 => return Ok(*self),
+                    DataType::Boolean => return Ok(Scalar::Bool(value.re != 0.0 || value.im != 0.0)),
+                    _ => convert_real!(value.re),
+                },
+                other => {
+                    return Err(TypeError {
+                        message: format!("cannot convert scalar of data type {} to {target}", other.r#type()),
+                    }
+                    .into());
                 }
-                .into());
             }
         };
-        Ok(match target {
-            DataType::I8 => Scalar::I8(value as i8),
-            DataType::I16 => Scalar::I16(value as i16),
-            DataType::I32 => Scalar::I32(value as i32),
-            DataType::I64 => Scalar::I64(value as i64),
-            DataType::U8 => Scalar::U8(value as u8),
-            DataType::U16 => Scalar::U16(value as u16),
-            DataType::U32 => Scalar::U32(value as u32),
-            DataType::U64 => Scalar::U64(value as u64),
-            DataType::BF16 => Scalar::BF16(bf16::from_f64(value)),
-            DataType::F16 => Scalar::F16(f16::from_f64(value)),
-            DataType::F32 => Scalar::F32(value as f32),
-            DataType::F64 => Scalar::F64(value),
-            DataType::C64 => Scalar::C64(Complex::new(value as f32, 0.0)),
-            DataType::C128 => Scalar::C128(Complex::new(value, 0.0)),
-            other => {
-                return Err(
-                    TypeError { message: format!("cannot cast scalar to unsupported data type {other}") }.into()
-                );
-            }
-        })
+        Ok(converted)
     }
 }
 
@@ -1434,7 +1455,7 @@ impl Select for Scalar {
         let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
             .map_err(|error| TypeError { message: error.to_string() })?;
         let selected = if *condition { on_true } else { on_false };
-        selected.cast(target)
+        selected.convert_element_type(target)
     }
 }
 
@@ -1612,11 +1633,11 @@ mod tests {
         assert_eq!(token.zero_like(), token);
         assert_eq!(token.one_like(), token);
 
-        // The token data type has no zero or one constant, and a same-type cast is the identity.
+        // The token data type has no zero or one constant, and a same-type conversion is the identity.
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert!(context.zero(&DataType::Token).is_err());
         assert!(context.one(&DataType::Token).is_err());
-        assert_eq!(token.cast(DataType::Token), Ok(token));
+        assert_eq!(token.convert_element_type(DataType::Token), Ok(token));
     }
 
     #[test]
@@ -1665,7 +1686,7 @@ mod tests {
             assert_eq!(scalar.to_string(), "1");
             assert_eq!(scalar.boolean(), Ok(true));
             assert_eq!(scalar.one_like(), scalar);
-            assert_eq!(scalar.cast(r#type), Ok(scalar));
+            assert_eq!(scalar.convert_element_type(r#type), Ok(scalar));
         }
 
         // Construction validates the four-bit format and rejects non-low-precision data types, while equality
@@ -1674,6 +1695,31 @@ mod tests {
         assert!(Scalar::from_low_precision_float_bits(DataType::F32, 0).is_err());
         assert_eq!(Scalar::F8E4M3(0), Scalar::F8E4M3(0x80));
         assert_ne!(Scalar::F8E4M3(0x79), Scalar::F8E4M3(0x79));
+    }
+
+    #[test]
+    fn test_scalar_f8e8m0fnu_nan_encoding() {
+        let nan = Scalar::from_low_precision_float_bits(DataType::F8E8M0FNU, 0xff).unwrap();
+
+        // `0xff` is the format's sole NaN encoding, so it follows ordinary floating-point equality and ordering
+        // semantics after exact widening.
+        assert_ne!(nan, nan);
+        assert_eq!(nan.partial_cmp(&nan), None);
+        assert_eq!(nan.compare(&nan, ComparisonDirection::Equal), Ok(Scalar::Bool(false)));
+        assert_eq!(nan.compare(&nan, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
+        let Scalar::F64(widened) = nan.convert_element_type(DataType::F64).unwrap() else {
+            panic!("expected an f64 scalar")
+        };
+        assert!(widened.is_nan());
+
+        // Explicit narrowing canonicalizes any NaN payload to `0xff`; the format's existing zero and negation
+        // restrictions remain unchanged.
+        assert!(matches!(
+            Scalar::from(f64::NAN).convert_element_type(DataType::F8E8M0FNU),
+            Ok(Scalar::F8E8M0FNU(0xff)),
+        ));
+        assert!(Scalar::from(0.0).convert_element_type(DataType::F8E8M0FNU).is_err());
+        assert!(Neg::neg(&Scalar::F8E8M0FNU(0x7f)).is_err());
     }
 
     #[test]
@@ -1982,39 +2028,40 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_cast_promotes_widening_and_rejects_narrowing() {
-        // A cast to the same data type is the identity.
-        assert_eq!(Scalar::from(2.5f32).cast(DataType::F32), Ok(Scalar::from(2.5f32)));
-
-        // Widening promotions convert the carried value exactly: float widening, integer-to-float, integer widening,
-        // and Boolean-to-numeric.
-        assert_eq!(Scalar::from(2.5f32).cast(DataType::F64), Ok(Scalar::from(2.5f64)));
-        assert_eq!(Scalar::from(3i32).cast(DataType::F64), Ok(Scalar::from(3.0f64)));
-        assert_eq!(Scalar::from(3i16).cast(DataType::I32), Ok(Scalar::from(3i32)));
-        assert_eq!(Scalar::from(true).cast(DataType::U16), Ok(Scalar::from(1u16)));
-        assert_eq!(Scalar::from(f16::from_f32(1.5)).cast(DataType::F32), Ok(Scalar::from(1.5f32)));
-
-        // Real sources promote to complex targets with a zero imaginary part, and complex sources widen per
-        // component.
-        assert_eq!(Scalar::from(1.5f32).cast(DataType::C64), Ok(Scalar::from(Complex::new(1.5f32, 0.0f32))));
-        assert_eq!(Scalar::from(3i16).cast(DataType::C128), Ok(Scalar::from(Complex::new(3.0f64, 0.0f64))));
+    fn test_scalar_convert_element_type() {
+        // Same-type conversions are the identity, while widening conversions preserve values across floating-point,
+        // integer, Boolean, and complex representations.
+        assert_eq!(Scalar::from(2.5f32).convert_element_type(DataType::F32), Ok(Scalar::from(2.5f32)));
+        assert_eq!(Scalar::from(2.5f32).convert_element_type(DataType::F64), Ok(Scalar::from(2.5f64)));
+        assert_eq!(Scalar::from(3i16).convert_element_type(DataType::I32), Ok(Scalar::from(3i32)));
+        assert_eq!(Scalar::from(true).convert_element_type(DataType::U16), Ok(Scalar::from(1u16)));
         assert_eq!(
-            Scalar::from(Complex::new(1.5f32, -2.0f32)).cast(DataType::C128),
+            Scalar::from(Complex::new(1.5f32, -2.0f32)).convert_element_type(DataType::C128),
             Ok(Scalar::from(Complex::new(1.5f64, -2.0f64))),
         );
 
-        // Narrowing (non-promotable) casts are rejected rather than silently truncating.
+        // Explicit conversions also support narrowing and complex-to-real conversion.
+        assert_eq!(Scalar::from(2.5f64).convert_element_type(DataType::F32), Ok(Scalar::from(2.5f32)));
         assert_eq!(
-            Scalar::from(2.5f64).cast(DataType::I32),
-            Err(TypeError { message: "cannot promote scalar of data type f64 to i32".to_string() }.into()),
+            Scalar::from(Complex::new(1.5f64, -2.0f64)).convert_element_type(DataType::F32),
+            Ok(Scalar::from(1.5f32)),
         );
         assert_eq!(
-            Scalar::from(Complex::new(1.5f64, 0.0f64)).cast(DataType::C64),
-            Err(TypeError { message: "cannot promote scalar of data type c128 to c64".to_string() }.into()),
+            Scalar::from(Complex::new(0.0f64, -2.0f64)).convert_element_type(DataType::Boolean),
+            Ok(Scalar::from(true)),
+        );
+    }
+
+    #[test]
+    fn test_scalar_promote_element_type() {
+        assert_eq!(Scalar::from(2.5f32).promote_element_type(DataType::F64), Ok(Scalar::from(2.5f64)));
+        assert_eq!(
+            Scalar::from(2.5f64).promote_element_type(DataType::I32),
+            Err(TypeError { message: "cannot promote type `f64` to type `i32`".to_string() }.into()),
         );
         assert_eq!(
-            Scalar::from(Complex::new(1.5f32, 0.0f32)).cast(DataType::F64),
-            Err(TypeError { message: "cannot promote scalar of data type c64 to f64".to_string() }.into()),
+            Scalar::from(Complex::new(1.5f32, -2.0f32)).promote_element_type(DataType::F64),
+            Err(TypeError { message: "cannot promote type `c64` to type `f64`".to_string() }.into()),
         );
     }
 

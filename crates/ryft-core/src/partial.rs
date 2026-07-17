@@ -1614,10 +1614,10 @@ impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// core it delegates to and must be used instead with a [`StagingContext`] to fold known work into an enclosing
     /// trace.
     ///
-    /// Partial evaluation classifies each [`Atom`] as *known* (i.e., computable _now_ from the provided values) or
-    /// *unknown* (i.e., dependent on a runtime input), folds the known subcomputation away, and carves the remaining
-    /// unknown subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values
-    /// it actually needs. During partial evaluation, each instruction is first offered to its own
+    /// Partial evaluation classifies each [`Atom`](crate::Atom) as *known* (i.e., computable _now_ from the provided
+    /// values) or *unknown* (i.e., dependent on a runtime input), folds the known subcomputation away, and carves the
+    /// remaining unknown subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the
+    /// known values it actually needs. During partial evaluation, each instruction is first offered to its own
     /// [`PartiallyEvaluatableOperation::partially_evaluate`] implementation, which may override the default behavior.
     /// For example, a `condition` with a concretizable known predicate calls
     /// [`PartialEvaluationContext::inline_program`] to inline its selected branch in place of the operation, so that

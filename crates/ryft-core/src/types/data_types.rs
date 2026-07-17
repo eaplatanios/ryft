@@ -63,13 +63,14 @@ pub enum DataTypeError {
 /// arrows on that branch starting at the type of that operand. When only `i64` and `u64` are involved, the result
 /// defaults to [`DataType::F64`] because no wider integer type exists.
 ///
-/// Note that the diagram intentionally omits [`DataType::Token`] and the 4-bit, 6-bit, and 8-bit floating-point types.
-/// That is because those types do not support automatic promotion at all and explicit casting should be used instead,
-/// when necessary.
+/// The diagram intentionally omits [`DataType::Token`], [`DataType::Zero`], and the 4-bit, 6-bit, and 8-bit
+/// floating-point types because they have no promotion edges to other types. The specialized floating-point types can
+/// still participate in explicit element-type conversion where supported. Tokens and zero-space values cannot as they
+/// do not represent ordinary scalar data, and [`DataType::Zero`] has only its unique zero value.
 ///
 /// The matrix below shows the result of [`DataType::promoted`] for each pair of [`DataType`]s that support promotion.
-/// Note that it also intentionally omits [`DataType::Token`] and the 4-bit, 6-bit, and 8-bit floating-point types as
-/// only the diagonal entries would be populated for those.
+/// The matrix likewise omits [`DataType::Token`], [`DataType::Zero`], and the 4-bit, 6-bit, and 8-bit floating-point
+/// types because only their diagonal entries would be populated.
 ///
 /// <style>
 /// .tp-matrix-wrap {
@@ -685,15 +686,22 @@ pub enum DataTypeError {
 /// the lattice. However, one of them may still become the final result when it is already present in the expression
 /// alongside another compatible custom floating-point type from the same disconnected group.
 ///
-/// The type promotion logic is implemented in [`DataType::is_promotable_to`]. Note that these type promotion rules only
-/// apply for automatic promotions. If you want to convert between [`DataType`]s violating these rules, you can still
-/// do so explicitly using casting. `ryft` requires you to be explicit in such cases due to the risks around loss of
-/// precision in arbitrary data type conversions.
+/// The type promotion logic is implemented in [`DataType::is_promotable_to`]. These rules govern automatic promotion.
+/// Ordinary scalar types may also support explicit element-type conversion between pairs that do not promote. Such
+/// conversions remain explicit because they may lose precision. [`DataType::Token`] and [`DataType::Zero`] are not
+/// ordinary scalar representations and cannot be converted to or from other types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum DataType {
     /// [`DataType`] that represents token values that are threaded between side-effecting operations.
     /// This type is only used for values that contain a single token (i.e., that represent scalar values).
     Token,
+
+    /// Zero-information [`DataType`] with exactly one possible value: _zero_. It represents the trivial differential
+    /// space used by tangents and cotangents of non-differentiable values. Unlike [`MaybeZero`](crate::MaybeZero),
+    /// which records that a value in a potentially nontrivial differential space is statically known to be zero, this
+    /// type describes a space in which no nonzero value can exist. It is not a numeric type and does not participate
+    /// in automatic promotion or ordinary element-type conversion.
+    Zero,
 
     /// Boolean [`DataType`] that represents `true`/`false` values and can be promoted to numeric [`DataType`]s whose
     /// value sets can represent both boolean values.
@@ -914,14 +922,13 @@ pub enum DataType {
     ///   - Bit Encoding: S0E8M0 (0 bits for the sign, 8 bits for the exponent, and 0 bits for the mantissa).
     ///   - Exponent Bias: 127.
     ///   - Infinity Values: Not supported.
-    ///   - Not-a-Number (NaN) Values: Not supported.
+    ///   - Not-a-Number (NaN) Values: The exponent encoding with all bits set to `1` (i.e., `0xff`) is the sole NaN.
     ///   - Denormalized: Not supported.
     ///
-    /// The value of a number in this representation can be computed as:
-    /// `2^(E - 127)`.
+    /// The value of a finite number in this representation can be computed as: `2^(E - 127)`.
     ///
-    /// The `FNU` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
-    /// only represent finite values and that it has no sign bit.
+    /// The `FNU` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling finite-only
+    /// arithmetic, the distinguished NaN encoding, and the absence of a sign bit.
     F8E8M0FNU,
 
     /// [`DataType`] that represents 16-bit floating-point values. This is not a
@@ -1011,8 +1018,9 @@ pub enum DataType {
 
 impl DataType {
     /// All [`DataType`] values.
-    const ALL: [Self; 33] = [
+    const ALL: [Self; 34] = [
         Self::Token,
+        Self::Zero,
         Self::Boolean,
         Self::I1,
         Self::I2,
@@ -1054,38 +1062,39 @@ impl DataType {
     const fn index(self) -> usize {
         match self {
             Self::Token => 0,
-            Self::Boolean => 1,
-            Self::I1 => 2,
-            Self::I2 => 3,
-            Self::I4 => 4,
-            Self::I8 => 5,
-            Self::I16 => 6,
-            Self::I32 => 7,
-            Self::I64 => 8,
-            Self::U1 => 9,
-            Self::U2 => 10,
-            Self::U4 => 11,
-            Self::U8 => 12,
-            Self::U16 => 13,
-            Self::U32 => 14,
-            Self::U64 => 15,
-            Self::F4E2M1FN => 16,
-            Self::F6E2M3FN => 17,
-            Self::F6E3M2FN => 18,
-            Self::F8E3M4 => 19,
-            Self::F8E4M3 => 20,
-            Self::F8E4M3FN => 21,
-            Self::F8E4M3FNUZ => 22,
-            Self::F8E4M3B11FNUZ => 23,
-            Self::F8E5M2 => 24,
-            Self::F8E5M2FNUZ => 25,
-            Self::F8E8M0FNU => 26,
-            Self::BF16 => 27,
-            Self::F16 => 28,
-            Self::F32 => 29,
-            Self::F64 => 30,
-            Self::C64 => 31,
-            Self::C128 => 32,
+            Self::Zero => 1,
+            Self::Boolean => 2,
+            Self::I1 => 3,
+            Self::I2 => 4,
+            Self::I4 => 5,
+            Self::I8 => 6,
+            Self::I16 => 7,
+            Self::I32 => 8,
+            Self::I64 => 9,
+            Self::U1 => 10,
+            Self::U2 => 11,
+            Self::U4 => 12,
+            Self::U8 => 13,
+            Self::U16 => 14,
+            Self::U32 => 15,
+            Self::U64 => 16,
+            Self::F4E2M1FN => 17,
+            Self::F6E2M3FN => 18,
+            Self::F6E3M2FN => 19,
+            Self::F8E3M4 => 20,
+            Self::F8E4M3 => 21,
+            Self::F8E4M3FN => 22,
+            Self::F8E4M3FNUZ => 23,
+            Self::F8E4M3B11FNUZ => 24,
+            Self::F8E5M2 => 25,
+            Self::F8E5M2FNUZ => 26,
+            Self::F8E8M0FNU => 27,
+            Self::BF16 => 28,
+            Self::F16 => 29,
+            Self::F32 => 30,
+            Self::F64 => 31,
+            Self::C64 => 32,
+            Self::C128 => 33,
         }
     }
 }
@@ -1106,6 +1115,7 @@ impl DataTypePromotionNode {
     /// All [`DataTypePromotionNode`] values.
     const ALL: [Self; DataType::COUNT + 1] = [
         Self::DataType(DataType::Token),
+        Self::DataType(DataType::Zero),
         Self::DataType(DataType::Boolean),
         Self::DataType(DataType::I1),
         Self::DataType(DataType::I2),
@@ -1169,7 +1179,7 @@ static DATA_TYPE_PROMOTION_UPPER_BOUNDS_BITMASKS: [u64; DataTypePromotionNode::C
         let node = DataTypePromotionNode::ALL[index];
         bitmasks[index] = node.bitmask()
             | match node {
-                DataTypePromotionNode::DataType(DataType::Token) => 0,
+                DataTypePromotionNode::DataType(DataType::Token) | DataTypePromotionNode::DataType(DataType::Zero) => 0,
                 DataTypePromotionNode::DataType(DataType::Boolean) => {
                     DataTypePromotionNode::DataType(DataType::U1).bitmask()
                 }
@@ -1397,6 +1407,7 @@ impl Display for DataType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             DataType::Token => "token",
+            DataType::Zero => "zero",
             DataType::Boolean => "bool",
             DataType::I1 => "i1",
             DataType::I2 => "i2",
@@ -1468,6 +1479,8 @@ mod tests {
 
     #[test]
     fn test_data_type_promoted() {
+        assert_eq!(DataType::promoted(&[DataType::Zero]), Ok(DataType::Zero));
+        assert_eq!(DataType::promoted(&[DataType::Zero, DataType::Zero]), Ok(DataType::Zero));
         assert_eq!(DataType::promoted(&[DataType::Boolean]), Ok(DataType::Boolean));
         assert_eq!(DataType::promoted(&[DataType::I2]), Ok(DataType::I2));
         assert_eq!(DataType::promoted(&[DataType::F8E3M4]), Ok(DataType::F8E3M4));
@@ -1513,6 +1526,11 @@ mod tests {
         assert_eq!(DataType::promoted(&[DataType::F64, DataType::F16, DataType::BF16]), Ok(DataType::F64));
         assert_eq!(DataType::promoted(&[DataType::BF16, DataType::F64, DataType::F16]), Ok(DataType::F64));
         assert!(matches!(DataType::promoted(&[]), Err(DataTypeError::EmptyPromotionInput { .. }),));
+        assert!(matches!(
+            DataType::promoted(&[DataType::Zero, DataType::Boolean]),
+            Err(DataTypeError::InvalidPromotion { message, .. })
+                if message == "cannot promote types `zero` and `bool` to a common type",
+        ));
         assert!(matches!(
             DataType::promoted(&[DataType::F8E3M4, DataType::F32]),
             Err(DataTypeError::InvalidPromotion { message, .. })
@@ -1564,6 +1582,7 @@ mod tests {
 
     #[test]
     fn test_data_type_promote_to() {
+        assert_eq!(DataType::Zero.promote_to(DataType::Zero), Ok(DataType::Zero));
         assert_eq!(DataType::Boolean.promote_to(DataType::Boolean), Ok(DataType::Boolean));
         assert_eq!(DataType::Boolean.promote_to(DataType::U1), Ok(DataType::U1));
         assert_eq!(DataType::I1.promote_to(DataType::I2), Ok(DataType::I2));
@@ -1576,6 +1595,16 @@ mod tests {
         assert_eq!(DataType::U8.promote_to(DataType::I16), Ok(DataType::I16));
         assert_eq!(DataType::BF16.promote_to(DataType::F32), Ok(DataType::F32));
         assert_eq!(DataType::F64.promote_to(DataType::C128), Ok(DataType::C128));
+        assert!(matches!(
+            DataType::Zero.promote_to(DataType::Boolean),
+            Err(DataTypeError::InvalidPromotion { message, .. })
+                if message == "cannot promote type `zero` to type `bool`",
+        ));
+        assert!(matches!(
+            DataType::Boolean.promote_to(DataType::Zero),
+            Err(DataTypeError::InvalidPromotion { message, .. })
+                if message == "cannot promote type `bool` to type `zero`",
+        ));
         assert!(matches!(
             DataType::Boolean.promote_to(DataType::I1),
             Err(DataTypeError::InvalidPromotion { message, .. })
@@ -1626,6 +1655,9 @@ mod tests {
 
     #[test]
     fn test_data_type_promotable_to() {
+        assert!(DataType::Zero.is_promotable_to(DataType::Zero));
+        assert!(!DataType::Zero.is_promotable_to(DataType::Boolean));
+        assert!(!DataType::Boolean.is_promotable_to(DataType::Zero));
         assert!(DataType::Boolean.is_promotable_to(DataType::U1));
         assert!(DataType::Boolean.is_promotable_to(DataType::BF16));
         assert!(DataType::Boolean.is_promotable_to(DataType::C128));
@@ -1668,6 +1700,7 @@ mod tests {
     #[test]
     fn test_data_type_to_string() {
         assert_eq!(DataType::Token.to_string(), "token");
+        assert_eq!(DataType::Zero.to_string(), "zero");
         assert_eq!(DataType::Boolean.to_string(), "bool");
         assert_eq!(DataType::U4.to_string(), "u4");
         assert_eq!(DataType::I64.to_string(), "i64");
