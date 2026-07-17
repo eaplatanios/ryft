@@ -1579,12 +1579,9 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
                     }
 
                     let normalized_sharding = Sharding::new(sharding.mesh().clone(), dimensions)
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
-                        .with_unreduced_axes(sharding.unreduced_axes().clone())
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
-                        .with_reduced_axes(sharding.reduced_axes().clone())
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?
-                        .with_varying_manual_axes(varying_manual_axes)
+                        .and_then(|normalized| normalized.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                        .and_then(|normalized| normalized.with_reduced_axes(sharding.reduced_axes().clone()))
+                        .and_then(|normalized| normalized.with_varying_manual_axes(varying_manual_axes))
                         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
                     let normalized_type = batch
