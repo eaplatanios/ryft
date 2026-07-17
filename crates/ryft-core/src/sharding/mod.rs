@@ -544,8 +544,14 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &unreduced_axes {
-            self.ensure_known_axis(axis_name)?;
-            if self.dimension_uses_axis(axis_name) || self.reduced_axes.contains(axis_name) {
+            if !self.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if self.dimensions.iter().any(|dimension| match dimension {
+                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+            }) || self.reduced_axes.contains(axis_name)
+            {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -563,8 +569,14 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let reduced_axes = reduced_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &reduced_axes {
-            self.ensure_known_axis(axis_name)?;
-            if self.dimension_uses_axis(axis_name) || self.unreduced_axes.contains(axis_name) {
+            if !self.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if self.dimensions.iter().any(|dimension| match dimension {
+                ShardingDimension::Sharded(axis_names) => axis_names.contains(axis_name),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+            }) || self.unreduced_axes.contains(axis_name)
+            {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -582,7 +594,9 @@ impl Sharding {
     ) -> Result<Self, ShardingError> {
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect::<BTreeSet<_>>();
         for axis_name in &varying_manual_axes {
-            self.ensure_known_axis(axis_name)?;
+            if !self.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
             if self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
                 return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
             }
@@ -595,22 +609,6 @@ impl Sharding {
         }
         self.varying_manual_axes = varying_manual_axes;
         Ok(self)
-    }
-
-    /// Returns whether `axis_name` is used by one of this sharding's ranked dimensions.
-    fn dimension_uses_axis(&self, axis_name: &str) -> bool {
-        self.dimensions.iter().any(|dimension| match dimension {
-            ShardingDimension::Sharded(axis_names) => axis_names.iter().any(|name| name == axis_name),
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-        })
-    }
-
-    /// Returns an error if `axis_name` does not belong to this sharding's mesh.
-    fn ensure_known_axis(&self, axis_name: &str) -> Result<(), ShardingError> {
-        if !self.mesh.axis_indices.contains_key(axis_name) {
-            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.to_string() });
-        }
-        Ok(())
     }
 
     /// Creates a new _fully-replicated_ [`Sharding`] for an array with rank `rank`. All dimensions in the resulting
