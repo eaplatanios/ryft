@@ -296,7 +296,7 @@ mod tests {
         let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input.clone(), padding_value],
             )
@@ -309,7 +309,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform, ArrayBatch::replicated(TestArray::scalar(0.0))],
             )
@@ -325,7 +325,7 @@ mod tests {
         .unwrap();
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying.clone()],
             )
@@ -338,7 +338,7 @@ mod tests {
         let uniform_input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform_input, batch_varying],
             )
@@ -383,8 +383,8 @@ mod tests {
             let padding =
                 ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, vec![8.0, 9.0]), BatchAxis::new(0))
                     .unwrap();
-            let context =
-                BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()
@@ -433,8 +433,8 @@ mod tests {
             let padding =
                 ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, Vec::new()), BatchAxis::new(0))
                     .unwrap();
-            let context =
-                BatchingContext::new(EagerContext::<TestArray>::new(), 0, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 0)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()

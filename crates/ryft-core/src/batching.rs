@@ -1082,17 +1082,29 @@ pub struct BatchingContext<C> {
 }
 
 impl<C> BatchingContext<C> {
-    /// Creates a new [`BatchingContext`].
+    /// Creates a new [`BatchingContext`] with an unnamed and [`ShardingDimension::Replicated`] mapped axis.
     ///
     /// # Parameters
     ///
     ///   - `parent`: [`Context`] into which batched operations are lifted.
     ///   - `axis_size`: Size of the transform-owned mapped dimension.
-    ///   - `axis_name`: Optional name through which operations such as collectives can address the mapped dimension.
-    ///   - `axis_sharding`: Sharding placement of the transform-owned mapped dimension.
     #[inline]
-    pub fn new(parent: C, axis_size: usize, axis_name: Option<String>, axis_sharding: ShardingDimension) -> Self {
-        Self { parent, axis_size, axis_name, axis_sharding }
+    pub fn new(parent: C, axis_size: usize) -> Self {
+        Self { parent, axis_size, axis_name: None, axis_sharding: ShardingDimension::Replicated }
+    }
+
+    /// Sets the optional name through which [`Operation`]s such as collectives can address the mapped axis/dimension.
+    #[inline]
+    pub fn with_axis_name<A: Into<Option<String>>>(mut self, axis_name: A) -> Self {
+        self.axis_name = axis_name.into();
+        self
+    }
+
+    /// Sets the sharding placement of the transform-owned mapped axis/dimension.
+    #[inline]
+    pub fn with_axis_sharding(mut self, axis_sharding: ShardingDimension) -> Self {
+        self.axis_sharding = axis_sharding;
+        self
     }
 
     /// Returns the [`Context`] that this [`BatchingContext`] is nested into.
@@ -1346,7 +1358,8 @@ impl<
         // builder through its parent trace) must be created *inside* this scope so it is dropped before the builder is
         // recovered below; leaving it in the enclosing scope leaks a builder clone past the recovery.
         let (output_atom_ids, output_axes) = {
-            let batching_context = BatchingContext::new(parent_context, axis_size, None, axis_sharding.clone());
+            let batching_context =
+                BatchingContext::new(parent_context, axis_size).with_axis_sharding(axis_sharding.clone());
             let inputs = self
                 .input_types()
                 .iter()
@@ -1536,8 +1549,9 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
         // inside the closure fold through the receiver directly and so, an eager context interprets each immediately,
         // while a staging context stages it into the enclosing trace, whose own drain surfaces any deferred error.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs.as_slice())?;
-        let context =
-            BatchingContext::new(self.clone(), batch_size, batch_axis.name().map(String::from), axis_sharding);
+        let context = BatchingContext::new(self.clone(), batch_size)
+            .with_axis_name(batch_axis.name().map(String::from))
+            .with_axis_sharding(axis_sharding);
         let inputs = inputs
             .into_iter()
             .map(|batch| {
@@ -2029,12 +2043,7 @@ mod tests {
     #[test]
     fn test_array_batch_preserves_explicit_mapped_axis_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            2,
-            None,
-            ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
         for (batch_axis, dimensions) in [vec![2, 3, 4], vec![3, 2, 4], vec![3, 4, 2]].into_iter().enumerate() {
             let mut sharding_dimensions = vec![ShardingDimension::replicated(); 3];
             sharding_dimensions[batch_axis] = ShardingDimension::sharded(["x"]);
@@ -2063,6 +2072,19 @@ mod tests {
     }
 
     #[test]
+    fn test_batching_context() {
+        let context = BatchingContext::new("parent", 4);
+        assert_eq!(context.parent(), &"parent");
+        assert_eq!(context.axis_size(), 4);
+        assert_eq!(context.axis_name(), None);
+        assert_eq!(context.axis_sharding(), &ShardingDimension::Replicated);
+
+        let context = context.with_axis_name("items".to_string()).with_axis_sharding(ShardingDimension::sharded(["x"]));
+        assert_eq!(context.axis_name(), Some("items"));
+        assert_eq!(context.axis_sharding(), &ShardingDimension::sharded(["x"]));
+    }
+
+    #[test]
     fn test_elementwise_operation_batch() {
         // The blanket `BatchableOperation` for elementwise operations lifts `interpret` over the mapped batch axis.
         // It realigns every mapped operand onto the common axis, broadcasts replicated operands across the batch,
@@ -2075,12 +2097,7 @@ mod tests {
 
         // Batching rules always receive the active `BatchingContext`, with the physical work running
         // through its parent context.
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            2,
-            None,
-            ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
 
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
@@ -2172,12 +2189,8 @@ mod tests {
                 BatchAxis::new(0),
             )
             .unwrap();
-            let context = BatchingContext::new(
-                EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[sharded, replicated]).unwrap();
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -2195,12 +2208,7 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
 
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            3,
-            None,
-            ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3);
         let outputs = AddOperation.interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

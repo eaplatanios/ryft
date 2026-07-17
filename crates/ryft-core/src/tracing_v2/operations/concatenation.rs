@@ -241,7 +241,7 @@ mod tests {
         .unwrap();
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[first, second],
             )
@@ -260,7 +260,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[batched, uniform],
             )
@@ -273,7 +273,7 @@ mod tests {
         let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[left, right],
             )
@@ -307,8 +307,8 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
             let replicated = ArrayBatch::replicated(TestArray::new(replicated_type, vec![5.0]));
-            let context =
-                BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = ConcatenateOperation::new(0)
                 .batch(&context, &crate::EmptyRegionDriver, &[mapped, replicated])

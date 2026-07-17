@@ -618,12 +618,7 @@ mod tests {
     /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
     /// contains every operation the collective batching rule may bind (notably `FillOperation` for `PMean`).
     fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<TestArray, ArrayOperation<TestArray>>> {
-        BatchingContext::new(
-            EagerContext::new(),
-            axis_size,
-            Some("i".to_string()),
-            crate::ShardingDimension::Replicated,
-        )
+        BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
 
     #[test]

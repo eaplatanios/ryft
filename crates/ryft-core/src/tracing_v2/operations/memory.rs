@@ -360,12 +360,7 @@ mod tests {
         }
         .unwrap();
         let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            2,
-            None,
-            crate::ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
         let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

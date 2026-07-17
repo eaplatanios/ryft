@@ -621,6 +621,35 @@ mod tests {
         assert_eq!(read_f32s(&tangent), vec![0.0]);
     }
 
+    /// Batching a complex absolute value preserves the mapped axis's physical sharding while changing the element
+    /// type from `c64` to `f32` and computing each complex magnitude independently.
+    #[test]
+    fn test_eager_batch_abs_preserves_mapped_axis_sharding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = cpu_mesh_with_axis_size(&client, 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let values = [
+            num_complex::Complex::new(3.0f32, 4.0),
+            num_complex::Complex::new(5.0f32, 12.0),
+            num_complex::Complex::new(8.0f32, 15.0),
+            num_complex::Complex::new(7.0f32, 24.0),
+        ];
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap();
+
+        let output: Array<'_> = batch(|input| input.abs(), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        let expected_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        assert_eq!(output.r#type().as_ref(), &expected_type);
+        for (actual, expected) in read_f64_coordinates(&output).into_iter().zip([5.0, 13.0, 17.0, 25.0]) {
+            assert!((actual - expected).abs() < 1e-5, "expected {expected} but got {actual}");
+        }
+    }
+
     /// Top-level reverse mode over concrete arrays: `value_and_gradient` of `f(x) = sum(x * x)` at `x = [1, 2, 3]`
     /// returns the scalar value `14` and the gradient `2x` with the pullback replayed through the eager engine.
     #[test]

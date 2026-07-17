@@ -430,7 +430,7 @@ where
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
         #[cfg(test)]
         PACKED_REPLAY_COUNT.with(|count| count.set(count.get() + 1));
-        Ok(BatchingContext::new(context.clone(), batch_size, None, ShardingDimension::Replicated)
+        Ok(BatchingContext::new(context.clone(), batch_size)
             .batch_region(region, inputs)
             .map_err(ProgramError::from)?)
     }

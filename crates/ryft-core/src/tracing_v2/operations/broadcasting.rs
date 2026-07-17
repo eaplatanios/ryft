@@ -427,12 +427,7 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            2,
-            None,
-            ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
 
         let outputs = BroadcastOperation::new(logical_output_type, vec![0])
             .batch(&context, &crate::programs::regions::EmptyRegionDriver, &[input])

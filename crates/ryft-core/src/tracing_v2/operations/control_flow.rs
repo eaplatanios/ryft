@@ -1772,12 +1772,8 @@ mod tests {
                 vec![logical_type],
             )
             .unwrap();
-            let context = BatchingContext::new(
-                EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-                2,
-                None,
-                ShardingDimension::sharded(["x"]),
-            );
+            let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let predicate = ArrayBatch::replicated(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
 
             let outputs = context

@@ -158,12 +158,7 @@ mod tests {
 
         let outputs = operation
             .batch(
-                &crate::BatchingContext::new(
-                    EagerContext::<TestArray>::new(),
-                    0,
-                    None,
-                    crate::ShardingDimension::Replicated,
-                ),
+                &crate::BatchingContext::new(EagerContext::<TestArray>::new(), 0),
                 &crate::EmptyRegionDriver,
                 &[operand, indices],
             )

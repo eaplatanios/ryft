@@ -80,12 +80,10 @@ where
 }
 
 /// Partition-aware transpose rule for [`DivOperation`]. Division is linear in its numerator but nonlinear in its
-/// denominator, so in a valid pushforward the numerator is the linear operand and the denominator is a known runtime
-/// value (rules such as the logarithm, square-root, and absolute-value forward-mode rules stage exactly this
-/// `tangent / known` shape). The transpose of `x ↦ x / k` is `x̄ ↦ x̄ / k` — dividing by a known factor is
-/// self-adjoint, like scaling by one — with the known denominator's value read from its pullback value atom. A
-/// linear denominator reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error because `k / x`
-/// is not a linear map.
+/// denominator, so a division in a linear program may only have a linear numerator and a known runtime denominator.
+/// The transpose of `x ↦ x / k` is `x̄ ↦ x̄ / k` — dividing by a known factor is self-adjoint, like scaling by one —
+/// with the known denominator's value read from its pullback value atom. A linear denominator reports an
+/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error because `k / x` is not a linear map.
 impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation<V, O> for DivOperation
 where
     DivOperation: Operation<V::Type>,

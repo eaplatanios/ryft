@@ -1524,7 +1524,7 @@ mod tests {
         let builder = context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 4, 8]));
         let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
-        let batching_context = BatchingContext::new(context.clone(), 2, None, ShardingDimension::Replicated);
+        let batching_context = BatchingContext::new(context.clone(), 2);
         let lhs = {
             let value = context.tracer(lhs_atom, None);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -1587,7 +1587,7 @@ mod tests {
             let rhs_atom = builder.borrow_mut().add_input(rhs_type);
             let lhs = ArrayBatch::new(lhs_type, parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
             let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
-            let context = BatchingContext::new(parent.clone(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = DotOperation::matmul().batch(&context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
 

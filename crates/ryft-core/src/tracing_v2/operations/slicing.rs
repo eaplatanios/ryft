@@ -822,7 +822,7 @@ mod tests {
         .unwrap();
         let outputs = SliceOperation::new(vec![1], vec![3])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input],
             )
@@ -835,7 +835,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = SliceOperation::new(vec![1], vec![3])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform],
             )
@@ -853,7 +853,7 @@ mod tests {
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
         let outputs = strided
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input],
             )
@@ -912,7 +912,7 @@ mod tests {
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
@@ -930,7 +930,7 @@ mod tests {
         .unwrap();
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
@@ -957,8 +957,8 @@ mod tests {
             let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
-            let context =
-                BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::sharded(["x"]));
+            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
                     input_type.clone(),
@@ -1005,7 +1005,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, ArrayBatch::replicated(index(1.0))],
             )
@@ -1022,7 +1022,7 @@ mod tests {
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1041,7 +1041,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1.0, 3.0])],
             )
@@ -1058,7 +1058,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1.0, 2.0])],
             )
@@ -1077,7 +1077,7 @@ mod tests {
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update, ArrayBatch::replicated(index(1.0))],
             )
@@ -1099,7 +1099,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1118,7 +1118,7 @@ mod tests {
         let uniform_update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )

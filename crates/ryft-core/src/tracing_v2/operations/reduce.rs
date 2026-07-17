@@ -757,7 +757,6 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::programs::types::Typed;
-    use crate::sharding::ShardingDimension;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
@@ -1027,7 +1026,7 @@ mod tests {
         let input = ArrayBatch::replicated(TestArray::matrix(2, 3, vec![1.0; 6]));
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1050,7 +1049,7 @@ mod tests {
         .unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1070,7 +1069,7 @@ mod tests {
         .unwrap();
         let outputs = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None, ShardingDimension::Replicated),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1235,12 +1234,8 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let context = BatchingContext::new(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            3,
-            Some("data".to_string()),
-            ShardingDimension::Replicated,
-        );
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3)
+            .with_axis_name("data".to_string());
         let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
             .batch(&context, &crate::EmptyRegionDriver, &[input])
             .unwrap();
