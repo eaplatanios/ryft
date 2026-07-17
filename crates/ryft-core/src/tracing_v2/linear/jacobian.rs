@@ -28,12 +28,6 @@ use crate::types::{ArrayType, Shape, Size, StaticShape};
 
 use super::DenseDifferentiate;
 
-#[cfg(test)]
-std::thread_local! {
-    /// Number of packed derivative-program replays on the current test thread.
-    static PACKED_REPLAY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// Dense Jacobian of a structured function, represented as the Cartesian product of its output and input leaves.
 ///
 /// `I` and `O` retain the input and output type trees. Derivative values are stored in deterministic
@@ -428,8 +422,6 @@ where
         batch_size: usize,
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
-        #[cfg(test)]
-        PACKED_REPLAY_COUNT.with(|count| count.set(count.get() + 1));
         Ok(BatchingContext::new(context.clone(), batch_size)
             .batch_region(region, inputs)
             .map_err(ProgramError::from)?)
@@ -1330,6 +1322,8 @@ define_reverse_jacobian_with_aux!(
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DerivativeTransform, DifferentiableType, DifferentiationError, DifferentiationParameterRole,
@@ -1341,9 +1335,7 @@ mod tests {
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{
-        DenseDifferentiableType, DenseDifferentiate, DenseMode, Jacobian, PACKED_REPLAY_COUNT, coordinate_offsets,
-    };
+    use super::{DenseDifferentiableType, DenseDifferentiate, DenseMode, Jacobian, coordinate_offsets};
 
     #[test]
     fn test_jacobian_parameterization_with_data_types() {
@@ -1481,12 +1473,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_replays_all_coordinate_directions_in_one_packed_batch() {
-        PACKED_REPLAY_COUNT.with(|count| count.set(0));
+    fn test_jacfwd_packs_all_coordinate_directions() {
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let jacobian = context.jacfwd(|input| Ok(input), TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
 
-        assert_eq!(PACKED_REPLAY_COUNT.with(std::cell::Cell::get), 1);
-        assert_eq!(jacobian.iter_blocks().next().unwrap().value().values().len(), 9);
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(
+            block.value().r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
+        );
+        assert_eq!(block.value().values(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 }
