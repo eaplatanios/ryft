@@ -21,7 +21,7 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
-use crate::programs::types::Typed;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 
@@ -48,14 +48,30 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     /// Creates a new [`DifferentiationDual`], canonicalizing its tangent representation from the primal's tangent type.
     /// A live tangent remains live when the primal has a nontrivial tangent space, while structural zeros and all
     /// tangents of primals with a zero tangent space use a [`MaybeZero::Zero`] carrying the canonical tangent type.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if a live `tangent` does not have the tangent type required by `primal`.
     #[inline]
-    pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Self {
+    pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, TypeError> {
         let tangent_type = primal.r#type().tangent();
         let tangent = match tangent.into() {
-            MaybeZero::Value(tangent) if !tangent_type.is_zero_space() => MaybeZero::Value(tangent),
-            _ => MaybeZero::Zero(tangent_type),
+            MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
+            MaybeZero::Value(tangent) => {
+                if tangent.r#type().as_ref() != &tangent_type {
+                    return Err(TypeError {
+                        message: format!(
+                            "tangent type {} does not match type {} required by primal type {}",
+                            tangent.r#type(),
+                            tangent_type,
+                            primal.r#type(),
+                        ),
+                    });
+                }
+                if tangent_type.is_zero_space() { MaybeZero::Zero(tangent_type) } else { MaybeZero::Value(tangent) }
+            }
         };
-        Self { primal, tangent }
+        Ok(Self { primal, tangent })
     }
 
     /// Creates a new [`DifferentiationDual`] with a [`MaybeZero::Zero`] tangent carrying the primal's concrete
@@ -64,7 +80,7 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     #[inline]
     pub fn new_with_zero_tangent(primal: V) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().tangent());
-        Self::new(primal, tangent)
+        Self::new(primal, tangent).unwrap()
     }
 }
 
@@ -86,58 +102,6 @@ impl<V: Value> DifferentiationDual<V> {
     pub fn into_parts(self) -> (V, MaybeZero<V>) {
         (self.primal, self.tangent)
     }
-}
-
-// TODO(eaplatanios): Review this.
-/// Validates that a dual's tangent uses the exact differential descriptor associated with its primal. Structural
-/// zeros of non-differentiable primals use their zero-space tangent descriptor.
-pub(crate) fn validate_tangent<V: Value>(
-    dual: &DifferentiationDual<V>,
-    boundary: &str,
-    index: usize,
-) -> Result<(), ProgramError>
-where
-    V::Type: DifferentiableType,
-{
-    let primal_type = dual.primal().r#type();
-    let tangent_type = match dual.tangent() {
-        MaybeZero::Zero(r#type) => r#type,
-        MaybeZero::Value(value) => {
-            let expected_type = primal_type.tangent();
-            if expected_type.is_zero_space() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} {} has live tangent type {} but primal type {} has no tangent space",
-                    boundary,
-                    index,
-                    value.r#type(),
-                    primal_type,
-                )));
-            }
-            if value.r#type().as_ref() != &expected_type {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "{} {} has tangent type {} but primal type {} requires tangent type {}",
-                    boundary,
-                    index,
-                    value.r#type(),
-                    primal_type,
-                    expected_type,
-                )));
-            }
-            return Ok(());
-        }
-    };
-    let expected_type = primal_type.tangent();
-    if tangent_type != &expected_type {
-        return Err(ProgramError::MalformedProgram(format!(
-            "{} {} has structural-zero tangent type {} but primal type {} requires tangent type {}",
-            boundary,
-            index,
-            tangent_type,
-            dual.primal().r#type(),
-            expected_type,
-        )));
-    }
-    Ok(())
 }
 
 impl<V: Typed + Display> Display for DifferentiationDual<V> {
@@ -824,9 +788,6 @@ where
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
-        for (index, dual) in input_duals.iter().enumerate() {
-            validate_tangent(dual, "differentiation operation input", index)?;
-        }
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
         // tangent is a structural zero, the operation's tangent is zero by the chain rule, and so the rule is skipped
@@ -845,10 +806,6 @@ where
             let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
             operation.jvp(&self.parent, &differentiation_driver, input_duals.as_slice())?
         };
-
-        for (index, dual) in output_duals.iter().enumerate() {
-            validate_tangent(dual, "differentiation operation output", index)?;
-        }
 
         // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
         // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
@@ -936,7 +893,7 @@ where
                             Some(tangent) => tangent.clone(),
                             None => MaybeZero::Zero(primal.r#type().tangent()),
                         };
-                        Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent))
+                        Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent)?)
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
 
@@ -1049,7 +1006,7 @@ where
                     DifferentiationDual::new(
                         PartialTracer::new(evaluation_context.clone(), PartialEvaluationValue::known_input(primal)),
                         tangent,
-                    ),
+                    )?,
                     differentiation_context.clone(),
                 ))
             })
@@ -1322,27 +1279,11 @@ pub trait ForwardModeDifferentiate: Context {
         let input_duals = primals
             .into_parameters()
             .zip(tangents.into_parameters())
-            .enumerate()
-            .map(|(index, (primal, tangent))| {
-                let primal_type = primal.r#type();
-                let tangent_type = primal_type.tangent();
-                if tangent_type.is_zero_space() && tangent.r#type().as_ref() != &tangent_type {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "JVP input {} has tangent type {} but non-differentiable primal type {} \
-                         requires zero-space tangent type {}",
-                        index,
-                        tangent.r#type(),
-                        primal_type,
-                        tangent_type,
-                    )));
-                }
-                let dual = if !tangent_type.is_zero_space() {
-                    DifferentiationDual::new(primal, tangent)
-                } else {
-                    DifferentiationDual::new_with_zero_tangent(primal)
-                };
-                validate_tangent(&dual, "JVP input", index)?;
-                Ok::<_, ProgramError>(DifferentiationTracer::new(dual, context.clone()))
+            .map(|(primal, tangent)| {
+                Ok::<_, ProgramError>(DifferentiationTracer::new(
+                    DifferentiationDual::new(primal, tangent)?,
+                    context.clone(),
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input = Input::To::<DifferentiationTracer<Self>>::from_parameters(primal_structure, input_duals)?;
@@ -1353,8 +1294,7 @@ pub trait ForwardModeDifferentiate: Context {
         let output_duals = output.into_parameters().collect::<Vec<_>>();
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        for (index, output_dual) in output_duals.into_iter().enumerate() {
-            validate_tangent(output_dual.dual(), "JVP output", index)?;
+        for output_dual in output_duals {
             let (primal, tangent) = output_dual.into_dual().into_parts();
             tangent_outputs.push(tangent.materialize(self)?);
             primal_outputs.push(primal);
@@ -1410,7 +1350,7 @@ pub trait ForwardModeDifferentiate: Context {
                 let dual = DifferentiationDual::new(
                     PartialTracer::new(evaluation_context.clone(), PartialEvaluationValue::known_input(value)),
                     tangent,
-                );
+                )?;
                 Ok::<_, ProgramError>(DifferentiationTracer::new(dual, differentiation_context.clone()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1432,9 +1372,8 @@ pub trait ForwardModeDifferentiate: Context {
         };
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        for (index, dual) in output_duals.into_iter().enumerate() {
-            validate_tangent(dual.dual(), "linearization output", index)?;
-            let (primal, tangent) = dual.into_dual().into_parts();
+        for output_dual in output_duals {
+            let (primal, tangent) = output_dual.into_dual().into_parts();
             let primal = match primal.into_value()?.value() {
                 PartialValue::Known(value) => value.clone(),
                 PartialValue::Unknown(_) => {
@@ -1624,22 +1563,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_differentiation_dual_new_canonicalizes_tangents() {
-        let differentiable = DifferentiationDual::new(Scalar::F64(2.0), Scalar::F64(3.0));
+    fn test_differentiation_dual_new_validates_and_canonicalizes_tangents() {
+        let differentiable = DifferentiationDual::new(Scalar::F64(2.0), Scalar::F64(3.0)).unwrap();
         let (primal, tangent) = differentiable.into_parts();
         assert_eq!(primal, Scalar::F64(2.0));
         assert!(matches!(tangent, MaybeZero::Value(Scalar::F64(3.0))));
 
         let differentiable_zero =
-            DifferentiationDual::new(Scalar::F64(2.0), MaybeZero::<Scalar>::Zero(DataType::Boolean));
+            DifferentiationDual::new(Scalar::F64(2.0), MaybeZero::<Scalar>::Zero(DataType::Boolean)).unwrap();
         let (primal, tangent) = differentiable_zero.into_parts();
         assert_eq!(primal, Scalar::F64(2.0));
         assert!(matches!(tangent, MaybeZero::Zero(DataType::F64)));
 
-        let non_differentiable = DifferentiationDual::new(Scalar::Token, Scalar::Zero);
+        let non_differentiable = DifferentiationDual::new(Scalar::Token, Scalar::Zero).unwrap();
         let (primal, tangent) = non_differentiable.into_parts();
         assert_eq!(primal, Scalar::Token);
         assert!(matches!(tangent, MaybeZero::Zero(DataType::Zero)));
+
+        assert!(matches!(
+            DifferentiationDual::new(Scalar::Token, Scalar::Token),
+            Err(TypeError { message })
+                if message == "tangent type token does not match type zero required by primal type token",
+        ));
     }
 
     #[test]
@@ -1842,9 +1787,8 @@ mod tests {
         assert!(matches!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
                 .jvp(|token| Ok(token), Scalar::Token, Scalar::Token),
-            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "JVP input 0 has tangent type token but non-differentiable primal type token \
-                               requires zero-space tangent type zero",
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+                if message == "tangent type token does not match type zero required by primal type token",
         ));
 
         // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
