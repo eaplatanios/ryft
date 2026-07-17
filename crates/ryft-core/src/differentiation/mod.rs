@@ -84,6 +84,8 @@ pub mod forward;
 pub mod reverse;
 pub mod types;
 
+use std::fmt::{Display, Formatter};
+
 use thiserror::Error;
 
 use crate::parameters::ParameterError;
@@ -128,11 +130,10 @@ pub enum DifferentiationError {
     /// Error returned when reverse mode differentiation is requested for a function whose output is not a single
     /// scalar. Reverse mode differentiation seeds the output cotangent with the multiplicative identity (i.e., a scalar
     /// value of `1`) and pulls it back to the inputs, which yields a gradient only when the output is a rank-0 scalar.
-    /// A non-scalar output describes a vector-valued function whose full derivative is a Jacobian. Because program
-    /// interpretation binds inputs positionally without checking their types, seeding such an output with a ones
-    /// cotangent would not fail but would instead silently compute the gradient of the sum of the outputs. So, the
-    /// gradient entry points reject it up front using this error variant. Use a Jacobian transform for non-scalar
-    /// outputs.
+    /// A non-scalar output describes a vector-valued function whose full derivative is a Jacobian. Seeding that output
+    /// with an all-ones cotangent would instead compute the gradient of the sum of its elements, which is a different
+    /// operation and not a canonical gradient of the vector-valued function. So, the gradient entry points reject it
+    /// up front using this error variant. Use a Jacobian transform for non-scalar outputs.
     #[error("gradient output must be a rank-0 scalar but got {output_type}")]
     NonScalarGradientOutput { output_type: String },
 
@@ -155,6 +156,55 @@ pub enum DifferentiationError {
         if the function is holomorphic"
     )]
     ComplexGradientOutput { output_type: String },
+
+    /// Error returned when a Jacobian or Hessian transform encounters a structured input or output parameter
+    /// with no tangent or cotangent space.
+    #[error("{transform} {role} parameter at {path} has non-differentiable type {type}")]
+    NonDifferentiableParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a non-holomorphic Jacobian or Hessian transform receives a complex parameter whose
+    /// derivative requires an explicit holomorphy promise or a real-coordinate representation that Ryft does not
+    /// yet expose.
+    #[error("{transform} {role} parameter at {path} has complex type {type}; use holomorphic {transform} instead")]
+    ComplexParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a holomorphic Jacobian or Hessian transform receives a non-complex parameter.
+    #[error("holomorphic {transform} {role} parameter at {path} must be complex but has type {type}")]
+    NonComplexParameter {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when a Jacobian or Hessian transform cannot enumerate a finite coordinate space for one of its
+    /// structured input or output parameters.
+    #[error("{transform} {role} parameter at {path} does not have a finite static coordinate space: {type}")]
+    NonFiniteCoordinateSpace {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
+
+    /// Error returned when the finite coordinate count of a Jacobian or Hessian parameter structure exceeds `usize`.
+    #[error("{transform} {role} coordinate count overflows usize at parameter {path}: {type}")]
+    CoordinateCountOverflow {
+        transform: DerivativeTransform,
+        role: DifferentiationParameterRole,
+        path: String,
+        r#type: String,
+    },
 
     #[error(transparent)]
     Program(ProgramError),
@@ -192,5 +242,101 @@ impl From<DifferentiationError> for ProgramError {
             DifferentiationError::Program(error) => error,
             error => ProgramError::custom(error),
         }
+    }
+}
+
+/// Derivative transform family that was active when an error occurred. Holomorphic entry points use the same forward-
+/// or reverse-Jacobian family as their non-holomorphic counterparts. Holomorphy changes the admissible element types,
+/// not the mathematical derivative object being materialized.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DerivativeTransform {
+    /// Forward-mode Jacobian materialization, including its holomorphic entry point.
+    JacobianForward,
+
+    /// Reverse-mode Jacobian materialization, including its holomorphic entry point.
+    JacobianReverse,
+
+    /// Hessian materialization.
+    Hessian,
+}
+
+impl Display for DerivativeTransform {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JacobianForward => write!(formatter, "forward Jacobian"),
+            Self::JacobianReverse => write!(formatter, "reverse Jacobian"),
+            Self::Hessian => write!(formatter, "hessian"),
+        }
+    }
+}
+
+/// Role of a structured parameter in a derivative transform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiationParameterRole {
+    /// Parameter belongs to the differentiated input structure.
+    Input,
+
+    /// Parameter belongs to the differentiated output structure.
+    Output,
+
+    /// Parameter describes a materialized derivative block.
+    Derivative,
+}
+
+impl Display for DifferentiationParameterRole {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => write!(formatter, "input"),
+            Self::Output => write!(formatter, "output"),
+            Self::Derivative => write!(formatter, "derivative"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_derivative_transform_display() {
+        assert_eq!(DerivativeTransform::JacobianForward.to_string(), "forward Jacobian");
+        assert_eq!(DerivativeTransform::JacobianReverse.to_string(), "reverse Jacobian");
+        assert_eq!(DerivativeTransform::Hessian.to_string(), "hessian");
+    }
+
+    #[test]
+    fn test_differentiation_parameter_role_display() {
+        assert_eq!(DifferentiationParameterRole::Input.to_string(), "input");
+        assert_eq!(DifferentiationParameterRole::Output.to_string(), "output");
+        assert_eq!(DifferentiationParameterRole::Derivative.to_string(), "derivative");
+    }
+
+    #[test]
+    fn test_differentiation_parameter_error_display() {
+        assert_eq!(
+            DifferentiationError::ComplexParameter {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
+                path: "$.value".to_string(),
+                r#type: "c64[]".to_string(),
+            }
+            .to_string(),
+            "forward Jacobian input parameter at $.value has complex type c64[]; use holomorphic forward Jacobian \
+             instead",
+        );
+        assert_eq!(
+            DifferentiationError::NonComplexParameter {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Output,
+                path: "$".to_string(),
+                r#type: "f64[]".to_string(),
+            }
+            .to_string(),
+            "holomorphic reverse Jacobian output parameter at $ must be complex but has type f64[]",
+        );
     }
 }
