@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DeviceMesh, Shape, Sharding, Size, check_sharding};
+use ryft_core::{ArrayType, DataType, DeviceMesh, Shape, Sharding, Size, Typed, check_sharding};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::host::materialize_dense_array_bytes;
@@ -94,6 +94,10 @@ impl<'o> Array<'o> {
 
         let global_shape = self.shape();
         let global_dimensions = global_shape.as_slice();
+        if self.data_type() == DataType::Zero {
+            let r#type = self.r#type().into_owned().with_sharding(target_sharding)?;
+            return Ok(Self::from_zero_space(client, r#type, target_mesh)?);
+        }
 
         // Tier 1: exact-shard fast path. Doesn't materialize anything new on host.
         if let Some(addressable_buffers) = copy_addressable_destination_shards_from_exact_source_shards(

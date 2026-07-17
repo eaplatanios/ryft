@@ -58,7 +58,7 @@ mod tests {
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
         let outputs = DotOperation::new(dimensions)
             .batch(
-                &BatchingContext::new(EagerContext::<TestArray>::new(), 2, None),
+                &BatchingContext::new(EagerContext::<TestArray>::new(), 2, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[lhs, rhs],
             )
@@ -139,7 +139,8 @@ mod tests {
             .unwrap();
 
         let while_op = WhileOperation::new();
-        let context = BatchingContext::new(EagerContext::<TestArray, TestOp>::new(), 3, None);
+        let context =
+            BatchingContext::new(EagerContext::<TestArray, TestOp>::new(), 3, None, ShardingDimension::Replicated);
 
         let initial_state = {
             let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
@@ -716,8 +717,12 @@ mod tests {
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
         let operand = TestArray::new(physical_type.clone(), input_values);
         let operand = ArrayBatch::new(physical_type, operand, Some(0)).unwrap();
-        let context =
-            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            batch_size,
+            None,
+            ShardingDimension::Replicated,
+        );
         let mut outputs = context
             .bind(
                 ArrayOperation::Condition(ConditionOperation::new()),
@@ -738,7 +743,12 @@ mod tests {
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
         let operation = ArrayOperation::Condition(condition);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            3,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let batched_input = {
             let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
@@ -768,7 +778,12 @@ mod tests {
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
         let operation = ArrayOperation::Condition(condition);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            3,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let batched_input = {
             let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
@@ -901,7 +916,12 @@ mod tests {
         let operand_batch =
             ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            4,
+            None,
+            ShardingDimension::Replicated,
+        );
         let outputs = context
             .bind(
                 operation,
@@ -941,8 +961,12 @@ mod tests {
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
         let operand = TestArray::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
-        let context =
-            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            batch_size,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let outputs = context
             .bind(
@@ -973,8 +997,12 @@ mod tests {
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
         let operand = TestArray::vector(vec![1.0, 2.0]);
         let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
-        let context =
-            BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            batch_size,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let error = context
             .bind(
@@ -1051,7 +1079,7 @@ mod tests {
 
         let outputs = SelectOperation
             .batch(
-                &BatchingContext::new(EagerContext::<TestArray>::new(), 3, None),
+                &BatchingContext::new(EagerContext::<TestArray>::new(), 3, None, ShardingDimension::Replicated),
                 &crate::EmptyRegionDriver,
                 &[pred_batch, on_true_batch, on_false_batch],
             )
@@ -1075,6 +1103,7 @@ mod tests {
                     EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
                     2,
                     None,
+                    ShardingDimension::Replicated,
                 ),
                 &crate::EmptyRegionDriver,
                 &[],
@@ -1098,6 +1127,7 @@ mod tests {
                     EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
                     2,
                     None,
+                    ShardingDimension::Replicated,
                 ),
                 &crate::EmptyRegionDriver,
                 &[],
@@ -1116,7 +1146,12 @@ mod tests {
         // `Zero`/`Fill` instruction takes when `BatchingContext::interpret_program` dispatches it through the enum's
         // `batch` with no inputs.
         let scalar = ArrayType::scalar(DataType::F64);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            2,
+            None,
+            ShardingDimension::Replicated,
+        );
 
         let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
         let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();

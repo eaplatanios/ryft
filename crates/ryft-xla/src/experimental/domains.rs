@@ -42,6 +42,7 @@ use ryft_core::types::{
     ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout,
 };
 
+use super::lowering::XlaExecutableSignature;
 use super::operations::ShardMapOperation;
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
@@ -715,6 +716,10 @@ impl<'c> XlaDomain<'c> {
             Some(_) => array_type.clone(),
             None => array_type.replicated(mesh).map_err(ArrayError::from)?,
         };
+        if array_type.data_type() == DataType::Zero {
+            return Ok(Array::from_zero_space(client, effective_type, mesh.clone())?
+                .with_compilation_cache(Arc::clone(&self.cache)));
+        }
         let addressable_ids = addressable_device_ids(client, mesh)?;
         let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
 
@@ -1036,16 +1041,22 @@ pub struct XlaLoweredProgram {
     /// Effective PJRT compilation options, including SPMD partition count.
     compilation_options: CompilationOptions,
 
-    /// Effective output types after applying output-sharding overrides.
+    /// Effective logical output types after applying output-sharding overrides.
     output_types: Arc<[ArrayType]>,
+
+    /// Effective logical input types, including captures first.
+    input_types: Arc<[ArrayType]>,
+
+    /// Logical-to-physical StableHLO/PJRT boundary mapping.
+    signature: XlaExecutableSignature,
 
     /// Donation declarations for public inputs. Captures are always non-donatable.
     donation_flags: Arc<[bool]>,
 
-    /// Number of leading executable arguments supplied by the staged capture table.
+    /// Number of leading logical inputs supplied by the staged capture table.
     capture_count: usize,
 
-    /// Effective sharding expected for every executable argument, including captures first.
+    /// Effective sharding expected for every physical executable argument, including materialized captures first.
     expected_argument_shardings: Arc<[Sharding]>,
 
     /// Concrete mesh against which the module was lowered.
@@ -1074,7 +1085,7 @@ impl XlaLoweredProgram {
         &self.stable_hlo
     }
 
-    /// Returns the effective flat output types.
+    /// Returns the effective logical flat output types, including zero-space leaves erased from the executable ABI.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types
@@ -1104,10 +1115,10 @@ impl XlaLoweredProgram {
     }
 }
 
-const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA1";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 1;
-const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 0;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 1;
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA2";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 2;
+const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 1;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 2;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1207,11 +1218,14 @@ pub struct XlaOptimizedProgram {
 }
 
 #[derive(Serialize)]
-struct XlaPersistentKeyV1<'a> {
+struct XlaPersistentKeyV2<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
+    input_types: Vec<PersistentArrayTypeV1>,
     output_types: Vec<PersistentArrayTypeV1>,
+    input_mapping: Vec<Option<u64>>,
+    output_mapping: Vec<Option<u64>>,
     donation_flags: &'a [bool],
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -1224,11 +1238,14 @@ struct XlaPersistentKeyV1<'a> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV1 {
+struct XlaPersistentExecutableMetadataV2 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
+    input_types: Vec<PersistentArrayTypeV1>,
     output_types: Vec<PersistentArrayTypeV1>,
+    input_mapping: Vec<Option<u64>>,
+    output_mapping: Vec<Option<u64>>,
     donation_flags: Vec<bool>,
     capture_count: u64,
     expected_argument_shardings: Vec<PersistentShardingV1>,
@@ -1558,6 +1575,21 @@ fn checked_usize(value: u64) -> Result<usize, XlaDomainError> {
     usize::try_from(value).map_err(|_| persistent_error(format!("value {value} does not fit in usize")))
 }
 
+/// Converts an in-memory executable signature mapping to its stable persistent representation.
+fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, XlaDomainError> {
+    mapping
+        .iter()
+        .map(|index| {
+            index
+                .map(|index| {
+                    u64::try_from(index)
+                        .map_err(|_| persistent_error(format!("physical signature index {index} does not fit in u64")))
+                })
+                .transpose()
+        })
+        .collect()
+}
+
 /// Encodes `data_type` as a stable one-byte code for persistent executables. These codes are persisted, so new data
 /// types must be appended with fresh codes and existing codes must never be renumbered.
 fn encode_data_type(data_type: DataType) -> u8 {
@@ -1653,7 +1685,9 @@ pub struct XlaCompilationKey {
 #[derive(Clone)]
 pub struct XlaCompiledProgram<'c> {
     executable: Arc<LoadedExecutable<'c>>,
+    input_types: Arc<[ArrayType]>,
     output_types: Arc<[ArrayType]>,
+    signature: XlaExecutableSignature,
     donation_flags: Arc<[bool]>,
     capture_count: usize,
     expected_argument_shardings: Arc<[Sharding]>,
@@ -1670,7 +1704,9 @@ pub struct XlaCompiledProgram<'c> {
 
 #[derive(Copy, Clone)]
 struct XlaInvocationMetadata<'a> {
+    input_types: &'a [ArrayType],
     output_types: &'a [ArrayType],
+    signature: &'a XlaExecutableSignature,
     donation_flags: &'a [bool],
     capture_count: usize,
     expected_argument_shardings: &'a [Sharding],
@@ -1680,7 +1716,9 @@ struct XlaInvocationMetadata<'a> {
 impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
     fn from(program: &'a XlaCompiledProgram<'c>) -> Self {
         Self {
+            input_types: &program.input_types,
             output_types: &program.output_types,
+            signature: &program.signature,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
@@ -1693,8 +1731,12 @@ fn validate_xla_replacement_metadata(
     current: XlaInvocationMetadata<'_>,
     replacement: XlaInvocationMetadata<'_>,
 ) -> Result<(), XlaDomainError> {
-    let incompatible_field = if current.output_types != replacement.output_types {
+    let incompatible_field = if current.input_types != replacement.input_types {
+        Some("input types")
+    } else if current.output_types != replacement.output_types {
         Some("output types")
+    } else if current.signature != replacement.signature {
+        Some("executable signature")
     } else if current.donation_flags != replacement.donation_flags {
         Some("donation flags")
     } else if current.capture_count != replacement.capture_count {
@@ -1721,7 +1763,7 @@ impl<'c> XlaCompiledProgram<'c> {
         &self.executable
     }
 
-    /// Returns the flat output types in executor-output order.
+    /// Returns the logical flat output types in user-visible order, including reconstructed zero-space leaves.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.output_types
@@ -1760,28 +1802,52 @@ impl<'c> XlaDomain<'c> {
         inputs: Vec<Array<'c>>,
     ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
         self.validate_xla_program_owner(program)?;
-        if inputs.len() != program.expected_argument_shardings.len() {
+        if inputs.len() != program.input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
                     "compiled program expects {} flat argument(s), including {} capture(s), but got {}",
-                    program.expected_argument_shardings.len(),
+                    program.input_types.len(),
                     program.capture_count,
                     inputs.len(),
                 ),
             });
         }
+        let inputs = program.signature.project_inputs(inputs.as_slice());
+        let physical_input_types = program.signature.project_inputs(&program.input_types);
+        let inputs = materialize_zero_space_carriers(self.client()?, physical_input_types.as_slice(), inputs)?;
         let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
-        let donation_flags = std::iter::repeat_n(false, program.capture_count)
+        let logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
             .chain(program.donation_flags.iter().copied())
             .collect::<Vec<_>>();
-        execute_pjrt(
-            self.client,
+        let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
+        for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types) {
+            if input_type.data_type() == DataType::Zero {
+                *donation = false;
+            }
+        }
+        let physical_output_types = program.signature.project_outputs(&program.output_types);
+        let execution = execute_pjrt(
+            self.client()?,
             &program.executable,
             &program.mesh,
             inputs,
             donation_flags.as_slice(),
-            &program.output_types,
-        )
+            physical_output_types.as_slice(),
+        )?;
+        let (physical_outputs, fence) = execution.into_parts();
+        let mut physical_outputs = physical_outputs.into_iter();
+        let mut outputs = Vec::with_capacity(program.output_types.len());
+        for (mapping, output_type) in program.signature.output_mapping().iter().zip(program.output_types.iter()) {
+            match mapping {
+                Some(_) => outputs.push(physical_outputs.next().unwrap()),
+                None => outputs.push(
+                    Array::from_zero_space(self.client()?, output_type.clone(), program.mesh.clone())?
+                        .with_execution_fence(fence.clone()),
+                ),
+            }
+        }
+        assert!(physical_outputs.next().is_none());
+        Ok(Execution::new(outputs, fence))
     }
 }
 
@@ -1893,12 +1959,13 @@ impl<'c> XlaDomain<'c> {
                 ),
             });
         }
-        let donation_flags = options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
+        let mut donation_flags =
+            options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
 
         let effective_input_types =
             capture_types.iter().cloned().chain(public_input_types.iter().cloned()).collect::<Vec<_>>();
         let output_types = apply_signature_shardings(program.output_types(), options.out_shardings.as_deref(), "out")?;
-        let expected_argument_shardings = effective_input_types
+        let logical_argument_shardings = effective_input_types
             .iter()
             .map(|array_type| {
                 array_type.sharding().cloned().unwrap_or_else(|| {
@@ -1913,22 +1980,31 @@ impl<'c> XlaDomain<'c> {
             options.mesh.devices().len(),
             options.feedback_directed_profile.as_ref(),
         );
-        let stable_hlo = crate::experimental::lowering::to_mlir_module_for_program(
+        let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program(
             program,
             &[],
             &effective_input_types,
             &output_types,
             "main",
-            Some(expected_argument_shardings.as_slice()),
+            Some(logical_argument_shardings.as_slice()),
             result_shardings.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
+        let (stable_hlo, signature) = lowered_module.into_parts();
+        for (mapping, donation) in signature.input_mapping()[capture_count..].iter().zip(donation_flags.iter_mut()) {
+            if mapping.is_none() {
+                *donation = false;
+            }
+        }
+        let expected_argument_shardings = signature.project_inputs(logical_argument_shardings.as_slice());
         let client = self.client()?;
 
         Ok(XlaLoweredProgram {
             stable_hlo: stable_hlo.into(),
             compilation_options,
+            input_types: effective_input_types.into(),
             output_types: output_types.into(),
+            signature,
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -1943,11 +2019,14 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV1 {
+        let key = XlaPersistentKeyV2 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
+            input_types: program.input_types.iter().map(PersistentArrayTypeV1::from).collect(),
             output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            input_mapping: persistent_mapping(program.signature.input_mapping())?,
+            output_mapping: persistent_mapping(program.signature.output_mapping())?,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -1977,7 +2056,9 @@ impl<'c> XlaDomain<'c> {
         let compilation_duration = compilation_start.elapsed();
         Ok(XlaCompiledProgram {
             executable: Arc::new(executable),
+            input_types: Arc::clone(&program.input_types),
             output_types: Arc::clone(&program.output_types),
+            signature: program.signature.clone(),
             donation_flags: Arc::clone(&program.donation_flags),
             capture_count: program.capture_count,
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
@@ -2030,11 +2111,14 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV1 {
+        let metadata = XlaPersistentExecutableMetadataV2 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
+            input_types: program.input_types.iter().map(PersistentArrayTypeV1::from).collect(),
             output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            input_mapping: persistent_mapping(program.signature.input_mapping())?,
+            output_mapping: persistent_mapping(program.signature.output_mapping())?,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
             expected_argument_shardings: program
@@ -2070,10 +2154,11 @@ impl<'c> XlaDomain<'c> {
 
     fn deserialize_xla_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
         let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
-        if bytes.len() < header_size
-            || &bytes[..XLA_PERSISTENT_EXECUTABLE_MAGIC.len()] != XLA_PERSISTENT_EXECUTABLE_MAGIC
-        {
+        if bytes.len() < header_size {
             return Err(persistent_error("missing persistent executable header"));
+        }
+        if &bytes[..XLA_PERSISTENT_EXECUTABLE_MAGIC.len()] != XLA_PERSISTENT_EXECUTABLE_MAGIC {
+            return Ok(None);
         }
         let metadata_size = u64::from_le_bytes(
             bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size]
@@ -2085,7 +2170,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV1 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV2 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -2109,13 +2194,21 @@ impl<'c> XlaDomain<'c> {
         if mesh.devices().iter().any(|device| !live_devices.contains(device)) {
             return Ok(None);
         }
+        let input_types = metadata.input_types.into_iter().map(ArrayType::try_from).collect::<Result<Vec<_>, _>>()?;
         let output_types = metadata.output_types.into_iter().map(ArrayType::try_from).collect::<Result<Vec<_>, _>>()?;
-        if output_types
+        let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice());
+        if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
+            || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
+        {
+            return Err(persistent_error("executable signature does not match logical input and output types"));
+        }
+        if input_types
             .iter()
+            .chain(output_types.iter())
             .filter_map(ArrayType::sharding)
             .any(|sharding| sharding.mesh() != mesh.logical_mesh())
         {
-            return Err(persistent_error("output sharding mesh does not match executable mesh"));
+            return Err(persistent_error("input or output sharding mesh does not match executable mesh"));
         }
         let expected_argument_shardings = metadata
             .expected_argument_shardings
@@ -2133,19 +2226,14 @@ impl<'c> XlaDomain<'c> {
         {
             return Err(persistent_error("device assignment does not match executable mesh"));
         }
-        if capture_count > expected_argument_shardings.len()
-            || (!metadata.donation_flags.is_empty()
-                && metadata.donation_flags.len() != expected_argument_shardings.len() - capture_count)
+        let physical_input_count = signature.input_mapping().iter().filter(|index| index.is_some()).count();
+        if capture_count > input_types.len()
+            || expected_argument_shardings.len() != physical_input_count
+            || metadata.donation_flags.len() != input_types.len() - capture_count
         {
             return Err(persistent_error("capture or donation metadata has an invalid arity"));
         }
-        // Entries persisted before donation flags were materialized at lowering time encode "no donation" as an
-        // empty vector; materialize them so execution can rely on full-length public flags.
-        let donation_flags = if metadata.donation_flags.is_empty() {
-            vec![false; expected_argument_shardings.len() - capture_count]
-        } else {
-            metadata.donation_flags
-        };
+        let donation_flags = metadata.donation_flags;
         let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
             .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
         let executable = self.client()?.deserialize_and_load_executable(
@@ -2163,7 +2251,9 @@ impl<'c> XlaDomain<'c> {
         let compilation_duration = metadata.compilation_duration_nanoseconds.map(Duration::from_nanos);
         Ok(Some(XlaCompiledProgram {
             executable: Arc::new(executable),
+            input_types: input_types.into(),
             output_types: output_types.into(),
+            signature,
             donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
@@ -2563,12 +2653,38 @@ fn reshard_inputs_if_needed<'c>(
         .collect()
 }
 
-/// Executes a compiled PJRT executable against `mesh` and reassembles per-device output
-/// buffers back into distributed [`Array`] values carrying `client` (when one is provided), so that eager execution
-/// and free transforms over the outputs can recover their execution domain. Mirrors
-/// `XlaDomain::execute_with_donation`.
+/// Materializes private false-predicate carriers for zero-space inputs that remain in the physical executable
+/// signature, currently because their declared type contains dynamic dimensions. Static zero-space inputs are erased
+/// before this point and never allocate a carrier.
+fn materialize_zero_space_carriers<'c>(
+    client: &'c Client<'c>,
+    input_types: &[ArrayType],
+    inputs: Vec<Array<'c>>,
+) -> Result<Vec<Array<'c>>, XlaDomainError> {
+    assert_eq!(input_types.len(), inputs.len());
+    input_types
+        .iter()
+        .zip(inputs)
+        .map(|(input_type, input)| {
+            if input_type.data_type() != DataType::Zero {
+                return Ok(input);
+            }
+            input.block_until_ready()?;
+            let carrier_type = input.r#type().into_owned().with_data_type(DataType::Boolean);
+            let element_count = carrier_type
+                .element_count()
+                .map_err(Error::from)?
+                .expect("runtime arrays should only have static shapes");
+            Ok(Array::from_host_buffer(client, carrier_type, input.mesh(), vec![0u8; element_count])?)
+        })
+        .collect()
+}
+
+/// Executes a compiled PJRT executable against `mesh` and reassembles per-device output buffers into distributed
+/// [`Array`] values carrying `client`, so eager execution and free transforms over the outputs can recover their
+/// execution domain. Mirrors `XlaDomain::execute_with_donation`.
 fn execute_pjrt<'c>(
-    client: Option<&'c Client<'c>>,
+    client: &'c Client<'c>,
     executable: &LoadedExecutable<'c>,
     mesh: &DeviceMesh,
     inputs: Vec<Array<'c>>,
@@ -2633,7 +2749,7 @@ mod tests {
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
-    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
 
@@ -2758,8 +2874,11 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
+        let signature = XlaExecutableSignature::new(&[], &[]);
         let current = XlaInvocationMetadata {
+            input_types: &[],
             output_types: &[],
+            signature: &signature,
             donation_flags: &[false],
             capture_count: 0,
             expected_argument_shardings: &[],
@@ -2824,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_zero_materializes_a_logical_zero_space_array() {
+    fn test_domain_zero_constructs_a_bufferless_logical_zero_space_array() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
@@ -2834,10 +2953,7 @@ mod tests {
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
         assert_eq!(array.data_type(), DataType::Zero);
-        let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
-        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
-        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
+        assert!(array.addressable_shards().next().unwrap().buffer().is_none());
     }
 
     #[test]
@@ -2963,10 +3079,24 @@ mod tests {
         let staged = stage_function(&domain, |input| input, input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
-        assert_eq!(compiled.compiled_program().output_types(), &[input_type.clone()]);
+        assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
 
-        // Boolean and zero-space identities have the same physical StableHLO signature, but their retained logical
-        // output metadata makes their compilation identities distinct.
+        let donated_staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> = stage_function(
+            &domain,
+            |input| input,
+            input_type.clone(),
+            XlaOptions { donation_flags: Some(vec![true]), ..XlaOptions::new(mesh.clone()) },
+        )
+        .unwrap();
+        let donated_lowered = domain.lower(donated_staged).unwrap();
+        assert_eq!(donated_lowered.lowered_program().donation_flags.as_ref(), &[false]);
+        assert_eq!(
+            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            domain.compilation_key(donated_lowered.lowered_program()).unwrap(),
+        );
+
+        // Boolean values retain physical `i1` arguments/results while the zero-space identity has an empty physical
+        // signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
         let boolean_staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             stage_function(&domain, |input| input, boolean_type, XlaOptions::new(mesh.clone())).unwrap();
@@ -2976,14 +3106,92 @@ mod tests {
             domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
         );
 
-        // Even deliberately non-canonical host bytes cannot affect the logical value passed through the executable.
-        let input = Array::from_host_buffer(&client, input_type, mesh, [1u8, 0u8, u8::MAX]).unwrap();
+        let input = Array::from_host_buffer(&client, input_type, mesh, []).unwrap();
         let output = ryft_core::compilation::call_function(&domain, compiled.executable_program(), input).unwrap();
         assert_eq!(output.data_type(), DataType::Zero);
-        let buffer = output.addressable_shards().next().unwrap().buffer().unwrap();
-        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
-        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
+        assert!(output.addressable_shards().next().unwrap().buffer().is_none());
+    }
+
+    #[test]
+    fn test_compiled_mixed_zero_space_signature_projects_and_reconstructs_logical_values() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let zero_type =
+            ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)])).with_sharding(sharding).unwrap();
+        let options = XlaOptions { donation_flags: Some(vec![false, true]), ..XlaOptions::new(mesh.clone()) };
+        let staged =
+            stage_function(&domain, |(value, zero)| (zero, value), (value_type.clone(), zero_type.clone()), options)
+                .unwrap();
+        let lowered = domain.lower(staged).unwrap();
+        assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
+        let compiled: ryft_core::compilation::CompiledFunction<
+            XlaDomain<'_>,
+            (ArrayType, ArrayType),
+            (ArrayType, ArrayType),
+        > = domain.compile(lowered).unwrap();
+        let value = Array::from_host_buffer(
+            &client,
+            value_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
+        )
+        .unwrap();
+        let zero = Array::from_host_buffer(&client, zero_type.clone(), mesh, []).unwrap();
+
+        let (zero_output, value_output) =
+            ryft_core::compilation::call_function(&domain, compiled.executable_program(), (value, zero)).unwrap();
+
+        assert_eq!(zero_output.r#type().as_ref(), &zero_type);
+        assert!(zero_output.addressable_shards().next().unwrap().buffer().is_none());
+        assert_eq!(value_output.r#type().as_ref(), &value_type);
+        let value_bytes = value_output
+            .addressable_shards()
+            .next()
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(value_bytes.as_slice()), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_materialize_zero_space_carriers_preserves_the_concrete_runtime_shape() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let dynamic_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Dynamic(Some(3))]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let runtime_zero_type =
+            ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)])).with_sharding(sharding).unwrap();
+        let zero = Array::from_host_buffer(&client, runtime_zero_type, mesh, []).unwrap();
+
+        let carriers = materialize_zero_space_carriers(&client, &[dynamic_zero_type], vec![zero]).unwrap();
+
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(carriers[0].data_type(), DataType::Boolean);
+        assert_eq!(carriers[0].shape().as_slice(), &[3]);
+        let carrier_bytes = carriers[0]
+            .addressable_shards()
+            .next()
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(carrier_bytes.as_slice(), &[0, 0, 0]);
     }
 
     #[test]
@@ -3055,7 +3263,9 @@ mod tests {
 
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();
+        assert_eq!(restored.input_types, compiled.compiled_program().input_types);
         assert_eq!(restored.output_types, compiled.compiled_program().output_types);
+        assert_eq!(restored.signature, compiled.compiled_program().signature);
         assert_eq!(restored.donation_flags, compiled.compiled_program().donation_flags);
         assert_eq!(restored.capture_count, compiled.compiled_program().capture_count);
         assert_eq!(restored.expected_argument_shardings, compiled.compiled_program().expected_argument_shardings);
@@ -3065,7 +3275,20 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV1 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV2 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        invalid_signature_metadata.input_mapping[0] = None;
+        let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
+        let mut invalid_signature = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+        invalid_signature.extend_from_slice(&(invalid_signature_metadata.len() as u64).to_le_bytes());
+        invalid_signature.extend_from_slice(invalid_signature_metadata.as_slice());
+        invalid_signature.extend_from_slice(&bytes[metadata_end..]);
+        assert!(matches!(
+            domain.deserialize_program(invalid_signature.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { .. }),
+        ));
+
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV2 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -3140,12 +3363,18 @@ mod tests {
             domain.deserialize_program(b"truncated"),
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
+        let mut legacy = b"RYFTXLA1".to_vec();
+        legacy.extend_from_slice(&0u64.to_le_bytes());
+        assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV1 {
+        let metadata = XlaPersistentExecutableMetadataV2 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
+            input_types: Vec::new(),
             output_types: Vec::new(),
+            input_mapping: Vec::new(),
+            output_mapping: Vec::new(),
             donation_flags: Vec::new(),
             capture_count: 0,
             expected_argument_shardings: Vec::new(),

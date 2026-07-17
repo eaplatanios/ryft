@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
+use ryft_core::Typed;
 use ryft_core::compilation::{CompilationDomain, StagedFunction, stage_function};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::types::ArrayType;
+use ryft_core::types::{ArrayType, DataType};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
@@ -67,6 +68,10 @@ pub(crate) fn reshard_with_donation<'o>(
     dst_sharding: &Sharding,
     donate: bool,
 ) -> Result<Array<'o>, ArrayError> {
+    if source.data_type() == DataType::Zero {
+        let r#type = source.r#type().into_owned().with_sharding(dst_sharding.clone())?;
+        return Ok(Array::from_zero_space(engine.client()?, r#type, dst_mesh.clone())?);
+    }
     // `Manual` axes are managed explicitly by the user (e.g. inside `shard_map`) and cannot be
     // planned by the SPMD partitioner from the top level. `Auto` and `Explicit` axes both go
     // through SPMD partitioning, so allow both.

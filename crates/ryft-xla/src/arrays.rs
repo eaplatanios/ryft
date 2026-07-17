@@ -23,10 +23,12 @@ use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
 /// its type and sharding metadata, while each physical piece of that global array is represented by an [`ArrayShard`].
 /// [`Array::shards`] is a global list: it contains one [`ShardDescriptor`] for each device that participates in the
 /// array placement, and not only for the devices that are visible to the current process. In a single-process setup,
-/// every shard is normally _addressable_ because the local [`Client`] can directly access every backing [`Buffer`].
+/// every shard is normally _addressable_ because the local [`Client`] can directly access its storage.
 /// In a multi-device or multi-node setup, the same logical array can span devices owned by other processes. Shards
-/// on the current process's devices are addressable and carry local [`Buffer`]s; shards on remote devices are
-/// non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and [`ArrayType`].
+/// on the current process's devices are addressable and ordinarily carry local [`Buffer`]s; bufferless
+/// [`DataType::Zero`] shards are also addressable because their unique value requires no storage. Shards on remote
+/// devices are non-addressable and carry only metadata such as their global [`ShardIndex`], [`DeviceId`], and
+/// [`ArrayType`].
 /// Keeping both addressable and non-addressable shards in the same [`Array`] lets local code reason about the complete
 /// global placement while only transferring, executing with, or materializing buffers that this process can access
 /// directly. This distinction is what allows array movement, execution argument assembly, and cross-host transfers to
@@ -59,9 +61,10 @@ pub struct Array<'o> {
     compilation_cache: OnceLock<Arc<CompilationContext<XlaDomain<'o>>>>,
 }
 
-// `Array` equality is *buffer identity*, not element-wise value equality: two arrays are equal if and only if they
-// have the same type and every shard references the same underlying `Buffer` (by `Arc` pointer identity), i.e., when
-// they are clones of one logical array. Arrays holding equal data in distinct buffers deliberately compare unequal —
+// `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
+// have the same type and every materialized shard references the same underlying `Buffer` (by `Arc` pointer identity),
+// while bufferless zero-space shards compare equal because their type admits exactly one value. Arrays holding equal
+// ordinary data in distinct buffers deliberately compare unequal —
 // the conservative answer that consumers such as the scan/while loop-invariance fixed points of partial evaluation
 // need when they compare known values across replay rounds to detect passthrough (mirroring `Tracer`'s
 // staging-identity `PartialEq`). Element-wise equality would require device-to-host transfers and is deliberately
@@ -70,15 +73,7 @@ impl PartialEq for Array<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.r#type == other.r#type
             && self.shards.len() == other.shards.len()
-            && self
-                .shards
-                .iter()
-                .zip(other.shards.iter())
-                .all(|(left, right)| match (left.buffer(), right.buffer()) {
-                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                    (None, None) => true,
-                    _ => false,
-                })
+            && self.shards.iter().zip(other.shards.iter()).all(|(left, right)| left.storage_eq(right))
     }
 }
 
@@ -120,7 +115,8 @@ impl<'o> Array<'o> {
     /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. Shards that do not
     /// have a local/addressable buffer are retained as non-addressable [`ArrayShard`]s. For a logical
     /// [`DataType::Zero`] array, every private predicate carrier must contain only false bits; a noncanonical buffer is
-    /// rejected so that its physical payload cannot become observable through the logical zero-space value.
+    /// rejected so that its physical payload cannot become observable through the logical zero-space value. Valid
+    /// carriers are discarded after validation and the local shards become addressable bufferless zero-space shards.
     ///
     /// # Parameters
     ///
@@ -143,7 +139,8 @@ impl<'o> Array<'o> {
 
     /// Creates an [`Array`] from backend-produced buffers whose zero-space carriers are known to be canonical. This is
     /// the trusted internal counterpart of [`Self::from_addressable_buffers`]; it avoids synchronizing device buffers
-    /// back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input boundaries.
+    /// back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input boundaries,
+    /// and discards canonical zero-space carriers after extracting their placement metadata.
     pub(crate) fn from_canonical_addressable_buffers<C: Into<Option<&'o Client<'o>>>>(
         client: C,
         r#type: ArrayType,
@@ -238,12 +235,18 @@ impl<'o> Array<'o> {
             buffers_by_device.insert(device_id, Arc::new(buffer));
         }
 
-        // Materialize the global shard list with local buffers attached to the shards addressable from this process.
+        // Materialize the global shard list with local storage attached to the shards addressable from this process.
+        // A validated zero-space carrier is discarded because its false bits carry no logical information.
+        let zero_space = r#type.data_type() == DataType::Zero;
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
                 let buffer = buffers_by_device.remove(&descriptor.device().id());
-                ArrayShard::new(descriptor, buffer)
+                if zero_space && buffer.is_some() {
+                    ArrayShard::new_zero(descriptor)
+                } else {
+                    ArrayShard::new(descriptor, buffer)
+                }
             })
             .collect::<Vec<_>>();
 
@@ -261,6 +264,52 @@ impl<'o> Array<'o> {
             Some(client) => array.with_client(client),
             None => Ok(array),
         }
+    }
+
+    /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
+    /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
+    pub(crate) fn from_zero_space(client: &'o Client<'o>, r#type: ArrayType, mesh: DeviceMesh) -> Result<Self, Error> {
+        if r#type.data_type() != DataType::Zero {
+            return Err(PjrtError::invalid_argument(format!(
+                "bufferless zero-space construction requires zero element type but got {}",
+                r#type.data_type(),
+            ))
+            .into());
+        }
+        let r#type = match r#type.sharding() {
+            Some(_) => r#type,
+            None => r#type.replicated(&mesh)?,
+        };
+        let shape = r#type.static_shape().ok_or_else(|| Error::DynamicShape { shape: r#type.shape().clone() })?;
+        let sharding = r#type.sharding().ok_or(Error::MissingSharding)?;
+        let layout = ShardLayout::new(&shape, &mesh, sharding)?;
+        let (descriptors, shard_index_by_device) = layout.into_parts();
+        let process_index = client.process_index()?;
+        let addressable_device_ids =
+            client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
+        let shards = descriptors
+            .into_iter()
+            .map(|descriptor| -> Result<_, Error> {
+                if descriptor.device().process_index() == process_index {
+                    if !addressable_device_ids.contains(&descriptor.device().id()) {
+                        return Err(Error::NonAddressableDevice { device_id: descriptor.device().id(), process_index });
+                    }
+                    Ok(ArrayShard::new_zero(descriptor))
+                } else {
+                    Ok(ArrayShard::new(descriptor, None))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        crate::telemetry::array_constructed();
+        Ok(Self {
+            r#type,
+            shards,
+            shard_index_by_device,
+            execution_fence: None,
+            client: Some(client),
+            compilation_cache: OnceLock::new(),
+        })
     }
 
     /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
@@ -293,10 +342,9 @@ impl<'o> Array<'o> {
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
         }
-        // `Zero` has one logical value, so user-provided host bytes cannot be allowed to select a predicate-carrier
-        // payload. Canonicalize the private physical representation to all-false before any shard transfer.
-        let zero_buffer = (r#type.data_type() == DataType::Zero).then(|| vec![0u8; expected_byte_count]);
-        let buffer = zero_buffer.as_deref().unwrap_or(buffer);
+        if r#type.data_type() == DataType::Zero {
+            return Ok(Self::from_zero_space(client, r#type, mesh)?);
+        }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
         let client_process_index = client.process_index()?;
@@ -437,8 +485,9 @@ impl<'o> Array<'o> {
     /// addressable shard's buffer is owned by a different PJRT client than the provided one.
     pub fn with_client(mut self, client: &'o Client<'o>) -> Result<Self, Error> {
         for shard in self.shards.iter().filter(|shard| shard.is_addressable()) {
-            let buffer = shard.buffer().unwrap();
-            if !buffer.is_owned_by(client) {
+            if let Some(buffer) = shard.buffer()
+                && !buffer.is_owned_by(client)
+            {
                 return Err(PjrtError::invalid_argument(format!(
                     "the provided client does not own the addressable shard buffer for device {}",
                     shard.device().id(),
@@ -554,7 +603,8 @@ impl<'o> Array<'o> {
         self.device_shard(device_id).filter(|shard| shard.is_addressable())
     }
 
-    /// Returns the number of bytes that this [`Array`] occupies on device memory, across all devices and processes.
+    /// Returns the number of logical payload bytes that this [`Array`] occupies across all devices and processes.
+    /// Bufferless [`DataType::Zero`] arrays occupy zero bytes.
     #[inline]
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
         self.r#type.size_in_bytes()
@@ -565,7 +615,9 @@ impl<'o> Array<'o> {
     /// data to the host.
     pub async fn ready(&self) -> Result<(), Error> {
         for shard in self.addressable_shards() {
-            shard.buffer().unwrap().ready()?.await?;
+            if let Some(buffer) = shard.buffer() {
+                buffer.ready()?.await?;
+            }
         }
         if let Some(fence) = &self.execution_fence {
             // Once all output buffers are ready the launch completion event should also be immediately consumable;
@@ -582,7 +634,9 @@ impl<'o> Array<'o> {
             fence.block_until_ready()?;
         }
         for shard in self.addressable_shards() {
-            shard.buffer().unwrap().ready()?.r#await()?;
+            if let Some(buffer) = shard.buffer() {
+                buffer.ready()?.r#await()?;
+            }
         }
         Ok(())
     }
@@ -661,26 +715,44 @@ impl<'o> Value for Array<'o> {
 }
 
 /// Shard of an [`Array`]. [`ArrayShard`]s always carry global shard metadata through [`ArrayShard::descriptor`].
-/// They also carry a PJRT [`Buffer`] when the owning device is addressable from the current process (otherwise
-/// [`ArrayShard::buffer`] is set to `None`). This lets an [`Array`] describe its full global layout while storing
-/// local buffers only for the shards that the current process can read directly, without moving data around. Note
-/// that, [`ArrayShard`]s holds their [`Buffer`]s inside [`Arc`]s so that cloning an array can share addressable
-/// PJRT [`Buffer`]s with other array instances. The last [`Arc`] dropped releases the underlying PJRT buffer via
-/// [`Buffer`]'s [`Drop`] implementation.
+/// They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the current process, a bufferless
+/// marker for the unique value of [`DataType::Zero`], or metadata only when the shard belongs to another process.
+/// This lets an [`Array`] describe its full global layout without allocating meaningless zero-space buffers. Ordinary
+/// addressable buffers remain stored inside [`Arc`]s so cloned arrays can share them.
 #[derive(Clone)]
 pub struct ArrayShard<'o> {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
     descriptor: ShardDescriptor,
 
-    /// Refer to the documentation of [`Self::buffer`] for information on this field.
-    buffer: Option<Arc<Buffer<'o>>>,
+    /// Physical storage state for this shard.
+    storage: ArrayShardStorage<'o>,
+}
+
+/// Physical storage state of one [`ArrayShard`].
+#[derive(Clone)]
+enum ArrayShardStorage<'o> {
+    /// The shard belongs to another process and has no process-local storage.
+    Remote,
+
+    /// The shard is process-local but represents the unique value of [`DataType::Zero`] without a buffer.
+    Zero,
+
+    /// The shard is process-local and backed by a PJRT buffer.
+    Buffer(Arc<Buffer<'o>>),
 }
 
 impl<'o> ArrayShard<'o> {
     /// Creates a new [`ArrayShard`].
     #[inline]
     pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'o>>>) -> Self {
-        Self { descriptor, buffer }
+        let storage = buffer.map_or(ArrayShardStorage::Remote, ArrayShardStorage::Buffer);
+        Self { descriptor, storage }
+    }
+
+    /// Creates a process-local bufferless [`DataType::Zero`] shard.
+    #[inline]
+    fn new_zero(descriptor: ShardDescriptor) -> Self {
+        Self { descriptor, storage: ArrayShardStorage::Zero }
     }
 
     /// Returns the [`ShardDescriptor`] of this [`ArrayShard`], which is defined and provided irrespective of whether
@@ -690,11 +762,14 @@ impl<'o> ArrayShard<'o> {
         &self.descriptor
     }
 
-    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is not addressable
-    /// from the current process.
+    /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
+    /// addressable bufferless [`DataType::Zero`] shard.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'o>>> {
-        self.buffer.as_ref()
+        match &self.storage {
+            ArrayShardStorage::Buffer(buffer) => Some(buffer),
+            ArrayShardStorage::Remote | ArrayShardStorage::Zero => None,
+        }
     }
 
     /// Returns this [`ArrayShard`]'s global index.
@@ -724,13 +799,27 @@ impl<'o> ArrayShard<'o> {
     /// Returns `true` if this shard is addressable from the current process.
     #[inline]
     pub fn is_addressable(&self) -> bool {
-        self.buffer.is_some()
+        !matches!(self.storage, ArrayShardStorage::Remote)
+    }
+
+    /// Compares this shard's storage identity with `other`.
+    fn storage_eq(&self, other: &Self) -> bool {
+        match (&self.storage, &other.storage) {
+            (ArrayShardStorage::Remote, ArrayShardStorage::Remote)
+            | (ArrayShardStorage::Zero, ArrayShardStorage::Zero) => true,
+            (ArrayShardStorage::Buffer(left), ArrayShardStorage::Buffer(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
     }
 
     /// Consumes this shard and returns its [`ShardDescriptor`] and addressable [`Buffer`], if any.
     #[inline]
     pub(crate) fn into_parts(self) -> (ShardDescriptor, Option<Arc<Buffer<'o>>>) {
-        (self.descriptor, self.buffer)
+        let buffer = match self.storage {
+            ArrayShardStorage::Buffer(buffer) => Some(buffer),
+            ArrayShardStorage::Remote | ArrayShardStorage::Zero => None,
+        };
+        (self.descriptor, buffer)
     }
 }
 
@@ -1011,13 +1100,17 @@ impl ShardLayout {
 
 /// Provides XLA-specific helpers for [`ArrayType`]s.
 pub(crate) trait ArrayTypeExtension {
-    /// Returns the number of bytes that dense [`Array`]s of this [`ArrayType`] require/occupy on device memory.
+    /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
+    /// [`DataType::Zero`] requires no payload bytes even though a backend may use a temporary private carrier.
     fn size_in_bytes(&self) -> Result<usize, Error>;
 }
 
 impl ArrayTypeExtension for ArrayType {
     #[inline]
     fn size_in_bytes(&self) -> Result<usize, Error> {
+        if self.data_type() == DataType::Zero {
+            return Ok(0);
+        }
         let element_count = self.element_count()?.ok_or_else(|| Error::DynamicShape { shape: self.shape().clone() })?;
         let element_size_in_bytes = self.data_type().to_pjrt().element_size_in_bytes()?;
         element_count.checked_mul(element_size_in_bytes).ok_or_else(|| Error::SizeLimitExceeded {
@@ -1142,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_array_host_transfer_canonicalizes_the_physical_carrier() {
+    fn test_zero_array_host_transfer_is_bufferless() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -1150,14 +1243,18 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
         let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
 
-        // Host bytes cannot smuggle information into the unique logical value. They are accepted only as the
-        // correctly sized physical payload and canonicalized to the all-false predicate representation.
-        let array = Array::from_host_buffer(&client, r#type, mesh, [1u8, 0u8, u8::MAX]).unwrap();
+        let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
-        let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
-        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
-        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
-        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
+        assert_eq!(array.size_in_bytes(), Ok(0));
+        let shard = array.addressable_shards().next().unwrap();
+        assert!(shard.buffer().is_none());
+        assert_eq!(array, array.clone());
+        assert_eq!(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap(), Vec::<u8>::new());
+
+        let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(0)]));
+        let zero_sized = Array::from_host_buffer(&client, zero_sized_type, array.mesh(), []).unwrap();
+        assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
+        assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
     }
 
     #[test]
@@ -1174,6 +1271,43 @@ mod tests {
         let error = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap_err();
 
         assert!(matches!(error, Error::NonCanonicalZeroBuffer { .. }));
+    }
+
+    #[test]
+    fn test_zero_array_buffer_construction_discards_a_canonical_physical_carrier() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let logical_device = Device::from_pjrt(&device).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![logical_device]).unwrap();
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
+
+        let array = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap();
+
+        assert_eq!(array.addressable_shards().count(), 1);
+        assert!(array.addressable_shards().next().unwrap().buffer().is_none());
+        assert_eq!(array.size_in_bytes(), Ok(0));
+    }
+
+    #[test]
+    fn test_zero_array_distinguishes_local_bufferless_and_remote_shards() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+
+        let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
+
+        assert_eq!(array.shards().len(), 2);
+        assert!(array.shards()[0].is_addressable());
+        assert!(array.shards()[0].buffer().is_none());
+        assert!(!array.shards()[1].is_addressable());
+        assert!(array.shards()[1].buffer().is_none());
     }
 
     #[test]
@@ -1278,7 +1412,7 @@ mod tests {
         assert_eq!(shard.shape(), StaticShape::new(vec![3, 4]));
         assert!(!shard.is_addressable());
         assert_eq!(shard.descriptor, descriptor);
-        assert!(shard.buffer.is_none());
+        assert!(shard.buffer().is_none());
     }
 
     #[test]

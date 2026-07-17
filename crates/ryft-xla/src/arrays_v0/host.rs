@@ -30,6 +30,9 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
 /// Used by [`Array::to`](crate::Array::to)'s last-resort host fallback when the fast and
 /// compiled paths can't satisfy the requested placement.
 pub(crate) fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayError> {
+    if array.data_type() == DataType::Zero {
+        return Ok(Vec::new());
+    }
     let global_shape = array.shape();
     let element_type = array.data_type();
     let total_byte_count = array.r#type().size_in_bytes()?;

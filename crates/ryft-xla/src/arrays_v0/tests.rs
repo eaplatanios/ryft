@@ -5,9 +5,10 @@ use pretty_assertions::assert_eq;
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+use ryft_core::Typed;
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::types::data_types::DataType;
-use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
+use ryft_core::types::{ArrayType, Layout, Memory, Shape, Size, StaticShape, TiledLayout};
 
 use crate::experimental::domains::XlaDomain;
 use crate::tests::{logical_mesh_2x2, values_from_bytes, values_to_bytes};
@@ -867,6 +868,33 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
         let shard_values = values_from_bytes::<f32>(shard_bytes.as_slice());
         assert_eq!(shard_values, vec![values[shard_index]]);
     }
+}
+
+#[test]
+fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
+    let plugin = load_cpu_plugin().unwrap();
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let mesh = four_device_mesh_x(&client);
+    let engine = XlaDomain::new(&client);
+    let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+    let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
+    let source_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(4)]))
+        .with_layout(layout.clone())
+        .with_memory(Memory::Host { pinned: true })
+        .with_sharding(source_sharding)
+        .unwrap();
+    let source = Array::from_host_buffer(&client, source_type, mesh.clone(), []).unwrap();
+    let target_sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+    let resharded = source
+        .to_placement(&engine, DevicePutTarget::Placement { mesh: mesh.clone(), sharding: target_sharding.clone() })
+        .unwrap();
+
+    assert_eq!(resharded.sharding(), &target_sharding);
+    assert_eq!(resharded.layout(), Some(&layout));
+    assert_eq!(resharded.r#type().memory(), Memory::Host { pinned: true });
+    assert_eq!(resharded.addressable_shards().count(), mesh.devices().len());
+    assert!(resharded.addressable_shards().all(|shard| shard.buffer().is_none()));
 }
 
 #[test]

@@ -1559,6 +1559,33 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_with_captures_erases_zero_space_capture_argument() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding.clone()).unwrap();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+        let capture = Array::from_host_buffer(&client, zero_type.clone(), mesh.clone(), []).unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile_with_captures(
+            |captures, _| captures[0].clone(),
+            vec![capture],
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
+
+        let output = engine.interpret(&compiled.executable_program(), input).unwrap();
+
+        assert_eq!(output.r#type().as_ref(), &zero_type);
+        assert!(output.addressable_shards().next().unwrap().buffer().is_none());
+        output.block_until_ready().unwrap();
+    }
+
+    #[test]
     fn test_captured_compiled_function_stages_inside_ordinary_compile() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2121,25 +2148,21 @@ mod tests {
         let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, primal_type.clone(), &engine, mesh.clone()).unwrap();
         let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
+        let zero_identity: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value, tangent_type.clone(), &engine, mesh.clone()).unwrap();
 
         let primal_input = Array::from_host_buffer(&client, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
-        let tangent_input = Array::from_host_buffer(&client, tangent_type.clone(), mesh, [1u8]).unwrap();
+        let tangent_input = Array::from_host_buffer(&client, tangent_type.clone(), mesh, []).unwrap();
         let (primal_output, tangent_output) =
             engine.interpret(&jvp.executable_program(), (primal_input, tangent_input)).unwrap();
 
         assert_eq!(primal_output.r#type().as_ref(), &primal_type);
         assert_eq!(tangent_output.r#type().as_ref(), &tangent_type);
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let tangent_bytes = tangent_output
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(tangent_bytes.as_slice(), &[0u8]);
+        assert!(tangent_output.addressable_shards().next().unwrap().buffer().is_none());
+
+        let chained_tangent = engine.interpret(&zero_identity.executable_program(), tangent_output).unwrap();
+        assert_eq!(chained_tangent.r#type().as_ref(), &tangent_type);
+        assert!(chained_tangent.addressable_shards().next().unwrap().buffer().is_none());
     }
 
     /// Driving a `jit_call` program through the capture-free forward path
