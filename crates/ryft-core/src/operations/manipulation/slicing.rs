@@ -1144,9 +1144,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
                 let outputs = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -1187,12 +1187,12 @@ where
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent().unwrap_or_else(|| input_type.into_owned()))
+                MaybeZero::Zero(input_type.cotangent())
             })
             .collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
-            let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
+            let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
             let mut operands = Vec::with_capacity(2 + start_indices.len());
             operands.push(zeros);
             operands.push(cotangent.clone());
@@ -1317,12 +1317,12 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
-                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -1390,13 +1390,13 @@ where
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent().unwrap_or_else(|| input_type.into_owned()))
+                MaybeZero::Zero(input_type.cotangent())
             })
             .collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
             let start_indices = read_known_start_indices(&inputs[2..]);
-            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()).materialize(context)?;
+            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?;
             // Input cotangent: the output cotangent with the update window overwritten by zeros.
             let mut input_operands = Vec::with_capacity(2 + start_indices.len());
             input_operands.push(cotangent.clone());

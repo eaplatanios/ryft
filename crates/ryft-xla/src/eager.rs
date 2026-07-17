@@ -233,7 +233,7 @@ mod tests {
     use ryft_core::operations::control_flow::SelectCondition;
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{Concatenate, Pad, Reshape, Slice, Transpose, UpdateSlice};
-    use ryft_core::operations::math::{Cos, Sin};
+    use ryft_core::operations::math::{Abs, Cos, Sin};
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -598,6 +598,27 @@ mod tests {
         let (value, tangent): (Array<'_>, Array<'_>) = domain.jvp(|x| Mul::mul(&x, &x), x.clone(), tangents).unwrap();
         assert_eq!(read_f32s(&value), vec![1.0, 4.0, 9.0]);
         assert_eq!(read_f32s(&tangent), vec![2.0, 4.0, 6.0]);
+    }
+
+    /// The absolute-value JVP uses its explicit origin convention after lowering the comparison and selection that
+    /// define it, rather than exposing the NaN produced by the undefined `0 / 0` formula.
+    #[test]
+    fn test_eager_abs_jvp_at_zero() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+        let primal = f32_scalar(&client, &mesh, 0.0);
+        let tangent = f32_scalar(&client, &mesh, 3.0);
+
+        let (value, tangent) = primal.execution_domain().jvp(|input| input.abs(), primal.clone(), tangent).unwrap();
+        assert_eq!(read_f32s(&value), vec![0.0]);
+        assert_eq!(read_f32s(&tangent), vec![3.0]);
+
+        let primal = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 0.0));
+        let tangent = c64_scalar(&client, &mesh, num_complex::Complex::new(1.0, 2.0));
+        let (value, tangent) = primal.execution_domain().jvp(|input| input.abs(), primal.clone(), tangent).unwrap();
+        assert_eq!(read_f32s(&value), vec![0.0]);
+        assert_eq!(read_f32s(&tangent), vec![0.0]);
     }
 
     /// Top-level reverse mode over concrete arrays: `value_and_gradient` of `f(x) = sum(x * x)` at `x = [1, 2, 3]`

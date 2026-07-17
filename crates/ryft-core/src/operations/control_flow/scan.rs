@@ -55,7 +55,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// The body computation is not part of this payload: it is a [`Region`](crate::Region) attached to the
 /// [`Instruction`](crate::Instruction) applying the operation (the single [`region_names`](Operation::region_names)
 /// slot `["body"]`), and semantic rules reach it through their driver-granted region access. Scans with owned bodies
-/// supply the body [`Program`](crate::Program) through the `regions` argument of [`Context::bind`];
+/// supply the body [`Program`](crate::Program) through the region driver passed to [`Context::bind`];
 /// [`Operation::infer_output_types`] validates the body signature over the attached [`RegionInterface`].
 ///
 /// [`WhileOperation`]: crate::operations::control_flow::WhileOperation
@@ -344,7 +344,7 @@ impl<Capture: Value> ScanOperation<Capture> {
     /// increasing order (use [`Self::with_reverse`] to flip the visit order). The body [`Program`](crate::Program)
     /// mapping
     /// `[carry..., x_slice...]` to `[carry..., y_slice...]` is supplied separately as the operation's attached
-    /// region (via the `regions` argument of [`Context::bind`]);
+    /// region (via the region driver passed to [`Context::bind`]);
     /// [`Operation::infer_output_types`] validates its signature against `carry_count` and `length`.
     ///
     /// # Parameters

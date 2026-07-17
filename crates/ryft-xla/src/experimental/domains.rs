@@ -516,6 +516,13 @@ fn eager_identity_output_type<O: Operation<ArrayType>>(operation: &O) -> Result<
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), ProgramError> {
     match array_type.data_type() {
+        DataType::Token | DataType::Zero if identity == ONE_OPERATION_NAME => Err(TypeError {
+            message: format!(
+                "xla domain cannot synthesize {identity} value for element type {}",
+                array_type.data_type()
+            ),
+        }
+        .into()),
         DataType::Token => Err(TypeError {
             message: format!(
                 "xla domain cannot synthesize {identity} value for element type {}",
@@ -746,7 +753,7 @@ impl<'c> XlaDomain<'c> {
 
         // Attach this domain's client and compile cache so that chained eager operations and transforms over the
         // materialized constant recover a context that keeps the same client and compile cache.
-        Ok(Array::from_addressable_buffers(client, effective_type, mesh.clone(), addressable_buffers)?
+        Ok(Array::from_canonical_addressable_buffers(client, effective_type, mesh.clone(), addressable_buffers)?
             .with_compilation_cache(Arc::clone(&self.cache)))
     }
 }
@@ -837,6 +844,7 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
         | DataType::F8E5M2FNUZ
         | DataType::F8E8M0FNU
         | DataType::Token
+        | DataType::Zero
         | DataType::I1
         | DataType::I2
         | DataType::I4
@@ -1587,6 +1595,7 @@ fn encode_data_type(data_type: DataType) -> u8 {
         DataType::C128 => 30,
         DataType::F6E2M3FN => 31,
         DataType::F6E3M2FN => 32,
+        DataType::Zero => 33,
     }
 }
 
@@ -1625,6 +1634,7 @@ fn decode_data_type(value: u8) -> Result<DataType, XlaDomainError> {
         30 => DataType::C128,
         31 => DataType::F6E2M3FN,
         32 => DataType::F6E3M2FN,
+        33 => DataType::Zero,
         value => return Err(persistent_error(format!("unknown data type tag {value}"))),
     })
 }
@@ -2602,7 +2612,7 @@ fn execute_pjrt<'c>(
             None => output_type.replicated(mesh).map_err(ArrayError::from)?,
         };
         outputs.push(
-            Array::from_addressable_buffers(client, resolved_type, mesh.clone(), addressable_buffers)?
+            Array::from_canonical_addressable_buffers(client, resolved_type, mesh.clone(), addressable_buffers)?
                 .with_execution_fence(fence.clone()),
         );
     }
@@ -2623,7 +2633,7 @@ mod tests {
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
 
@@ -2814,6 +2824,23 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_zero_materializes_a_logical_zero_space_array() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh);
+        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+
+        let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
+
+        assert_eq!(array.data_type(), DataType::Zero);
+        let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
+        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
+        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
+    }
+
+    #[test]
     fn test_domain_one_fills_sharded_array_with_ones() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
@@ -2922,6 +2949,41 @@ mod tests {
             cache_size_before,
             "equivalent repeat compilations should reuse the existing cache entry",
         );
+    }
+
+    #[test]
+    fn test_compiled_zero_space_identity_preserves_logical_type_and_canonical_value() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let staged = stage_function(&domain, |input| input, input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
+        assert_eq!(compiled.compiled_program().output_types(), &[input_type.clone()]);
+
+        // Boolean and zero-space identities have the same physical StableHLO signature, but their retained logical
+        // output metadata makes their compilation identities distinct.
+        let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
+        let boolean_staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> =
+            stage_function(&domain, |input| input, boolean_type, XlaOptions::new(mesh.clone())).unwrap();
+        let boolean_lowered = domain.lower(boolean_staged).unwrap();
+        assert_ne!(
+            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
+        );
+
+        // Even deliberately non-canonical host bytes cannot affect the logical value passed through the executable.
+        let input = Array::from_host_buffer(&client, input_type, mesh, [1u8, 0u8, u8::MAX]).unwrap();
+        let output = ryft_core::compilation::call_function(&domain, compiled.executable_program(), input).unwrap();
+        assert_eq!(output.data_type(), DataType::Zero);
+        let buffer = output.addressable_shards().next().unwrap().buffer().unwrap();
+        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
+        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
     }
 
     #[test]
@@ -3709,11 +3771,22 @@ mod tests {
             (DataType::C128, 30),
             (DataType::F6E2M3FN, 31),
             (DataType::F6E3M2FN, 32),
+            (DataType::Zero, 33),
         ];
         for (data_type, code) in data_types {
             assert_eq!(encode_data_type(data_type), code);
             assert_eq!(decode_data_type(code).unwrap(), data_type);
         }
-        assert!(decode_data_type(33).is_err());
+        assert!(decode_data_type(34).is_err());
+    }
+
+    #[test]
+    fn test_persistent_array_type_round_trips_zero_space_metadata() {
+        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(2), Size::Dynamic(Some(4))]))
+            .with_memory(Memory::Host { pinned: true });
+
+        let restored = ArrayType::try_from(PersistentArrayTypeV1::from(&array_type)).unwrap();
+
+        assert_eq!(restored, array_type);
     }
 }

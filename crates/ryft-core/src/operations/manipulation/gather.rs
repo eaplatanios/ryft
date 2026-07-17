@@ -900,9 +900,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
                 let dimensions = self.operation().dimensions();
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     dimensions.offset_dimensions().to_vec(),
@@ -952,8 +952,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
-                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
@@ -962,7 +962,7 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()).materialize(context)?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),
@@ -981,7 +981,7 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(outputs.into_iter().next().unwrap()),
-                    MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()),
                 ])
             }
         }

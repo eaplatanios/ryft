@@ -34,9 +34,8 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 ///
 /// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
 /// [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
-/// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Freshly
-/// authored conditions supply the two branch [`Program`]s through the `regions` argument of
-/// [`Context::bind`].
+/// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions
+/// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`].
 ///
 /// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
@@ -64,7 +63,7 @@ impl<F: Value, PredicatePayload> Debug for ConditionOperation<F, PredicatePayloa
 
 impl<F: Value> ConditionOperation<F> {
     /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The two branch
-    /// [`Program`]s are supplied separately as the operation's attached regions (via the `regions` argument of
+    /// [`Program`]s are supplied separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]); [`Operation::infer_output_types`] validates that the branch
     /// interfaces agree and that the predicate input is a scalar Boolean.
     #[inline]
@@ -83,7 +82,7 @@ impl<F: Value> Default for ConditionOperation<F> {
 impl<F: Value> ConditionOperation<F, Captured> {
     /// Creates a new [`ConditionOperation`] whose predicate is captured in the operation payload rather than supplied
     /// as an operation input. The two branch [`Program`]s are supplied separately as the operation's attached regions
-    /// (via the `regions` argument of [`Context::bind`]).
+    /// (via the region driver passed to [`Context::bind`]).
     #[inline]
     pub fn new_captured(predicate: F) -> Self {
         Self { predicate: Some(predicate), predicate_payload: PhantomData }

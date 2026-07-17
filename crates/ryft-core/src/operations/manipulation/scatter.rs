@@ -844,8 +844,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent().unwrap()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent().unwrap()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_cotangents = context.stage_operation(

@@ -514,7 +514,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::from_boundary_tangent(primal, tangent))
             .collect())
     }
 }
@@ -568,17 +568,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs
-            .iter()
-            .map(|input| {
-                let input_type = input.r#type();
-                MaybeZero::Zero(if input.is_unknown() {
-                    input_type.cotangent().unwrap()
-                } else {
-                    input_type.into_owned()
-                })
-            })
-            .collect());
+        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
     }
 
     // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
@@ -608,8 +598,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
         match cotangent {
             MaybeZero::Value(cotangent) => operands.push(cotangent.clone()),
             MaybeZero::Zero(_) => {
-                let mut zeros =
-                    context.stage_nullary_operation(ZeroOperation::new(output_type.cotangent().unwrap()))?;
+                let mut zeros = context.stage_nullary_operation(ZeroOperation::new(output_type.cotangent()))?;
                 check_count!("output", zeros, 1, ProgramError);
                 operands.push(zeros.remove(0));
             }
@@ -630,7 +619,7 @@ pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>, D: TranspositionDri
         .zip(inputs)
         .map(
             |(&linear, input)| {
-                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().into_owned()) }
+                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().cotangent()) }
             },
         )
         .collect();
@@ -657,18 +646,51 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
 mod tests {
     use std::rc::Rc;
 
-    use ryft_core::differentiation::DifferentiableType;
+    use ryft_core::contexts::StagingContext;
+    use ryft_core::differentiation::{DifferentiableType, DifferentiationError, TranspositionDriver};
     use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
     use ryft_core::programs::MaybeZero;
     use ryft_core::programs::ProgramBuilder;
-    use ryft_core::programs::regions::EmptyRegionDriver;
+    use ryft_core::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
+    use ryft_core::programs::types::Typed;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::TracingContext;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{JitCallOperation, XlaConstant, XlaOperation, transpose_primal_jit_call};
+    use super::{
+        JitCallOperation, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder, transpose_primal_jit_call,
+    };
+
+    /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
+    struct TestTranspositionDriver {
+        /// Source callee exposed to the JIT-call transpose rule.
+        source: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+
+        /// Predetermined transposed callee returned by the recursive request.
+        transposed: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>,
+    }
+
+    impl RegionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, XlaConstant, XlaOperation>>
+        where
+            XlaConstant: 'r,
+            XlaOperation: 'r,
+        {
+            std::iter::once(self.source.entry_region_ref())
+        }
+    }
+
+    impl TranspositionDriver<XlaConstant, XlaOperation> for TestTranspositionDriver {
+        fn transpose_program(
+            &self,
+            _region: RegionRef<'_, XlaConstant, XlaOperation>,
+            _input_linearity: &[bool],
+        ) -> Result<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, DifferentiationError> {
+            Ok(self.transposed.clone())
+        }
+    }
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))
@@ -680,17 +702,72 @@ mod tests {
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["x"]).unwrap())
             .unwrap();
-        let expected = tangent_type.cotangent().unwrap();
+        let expected = tangent_type.cotangent();
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
         let cotangents = transpose_primal_jit_call(
             &JitCallOperation::new(),
             &mut context,
             &EmptyRegionDriver,
             &[PartialValue::Unknown(tangent_type.clone())],
+            &[MaybeZero::Zero(tangent_type.clone())],
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+
+        let known = context.input(tangent_type.clone());
+        let cotangents = transpose_primal_jit_call(
+            &JitCallOperation::new(),
+            &mut context,
+            &EmptyRegionDriver,
+            &[PartialValue::Known(known)],
             &[MaybeZero::Zero(tangent_type)],
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+    }
+
+    #[test]
+    fn test_jit_call_mixed_output_transpose_materializes_zero_space_values() {
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
+        let source = {
+            let mut builder = XlaProgramBuilder::new();
+            let value = builder.add_input(value_type.clone());
+            let predicate = builder.add_constant(XlaConstant::new(0, predicate_type.clone()));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![value, predicate],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let transposed = {
+            let mut builder = XlaProgramBuilder::new();
+            let value_cotangent = builder.add_input(value_type.clone());
+            let _predicate_cotangent = builder.add_input(predicate_type.cotangent());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![value_cotangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let driver = TestTranspositionDriver { source, transposed };
+        let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let value_cotangent = context.input(value_type.clone());
+
+        let contributions = transpose_primal_jit_call(
+            &JitCallOperation::new(),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(value_type.clone())],
+            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(predicate_type.cotangent())],
+        )
+        .unwrap();
+
+        assert!(matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_type));
     }
 
     /// Online partial evaluation of a mixed `jit_call` against a live outer trace — the second recorded consumer of

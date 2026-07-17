@@ -164,6 +164,9 @@ impl ToPjrt for DataType {
     fn to_pjrt(&self) -> BufferType {
         match self {
             DataType::Token => BufferType::Token,
+            // PJRT has no zero-information buffer type. The predicate buffer is a private physical carrier; logical
+            // `Zero` metadata is retained by Ryft and therefore intentionally does not round-trip through `BufferType`.
+            DataType::Zero => BufferType::Predicate,
             DataType::Boolean => BufferType::Predicate,
             DataType::I1 => BufferType::I1,
             DataType::I2 => BufferType::I2,
@@ -302,6 +305,10 @@ mod tests {
             DataType::from_pjrt(BufferType::Invalid),
             Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: 'invalid'",
         ));
+        // `Zero` uses predicate as a private physical carrier, but predicate buffers are interpreted as ordinary
+        // Booleans when no retained Ryft signature supplies the logical type.
+        assert_eq!(DataType::Zero.to_pjrt(), BufferType::Predicate);
+        assert_eq!(DataType::from_pjrt(BufferType::Predicate), Ok(DataType::Boolean));
         for &(data_type, buffer_type) in &[
             (DataType::Token, BufferType::Token),
             (DataType::Boolean, BufferType::Predicate),

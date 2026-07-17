@@ -48,6 +48,9 @@ pub enum Error {
     #[error("buffer has type {actual}, but expected {expected}")]
     BufferTypeMismatch { expected: ArrayType, actual: ArrayType },
 
+    #[error("zero-space buffer on device {device_id} contains a nonzero physical carrier value")]
+    NonCanonicalZeroBuffer { device_id: DeviceId },
+
     #[error("shape rank {shape_rank} does not match shard slice rank {slice_rank}")]
     ShardSliceRankMismatch { shape_rank: usize, slice_rank: usize },
 }

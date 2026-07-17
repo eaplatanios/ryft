@@ -149,8 +149,8 @@ impl<C: Context> WhilePredicate for DifferentiationTracer<C> where C::Value: Boo
 ///
 /// The condition and body computations are not part of this payload: they are [`Region`](crate::Region)s attached to
 /// the [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
-/// order `["condition", "body"]`, and semantic rules reach them through their driver-granted region access. Freshly
-/// authored loops supply the two [`Program`](crate::Program)s through the `regions` argument of
+/// order `["condition", "body"]`, and semantic rules reach them through their driver-granted region access. Owned
+/// loops supply the two [`Program`](crate::Program)s through the `driver` argument of
 /// [`Context::bind`]. [`Operation::infer_output_types`] validates the loop contract over the
 /// attached [`RegionInterface`]s: the condition and body share the loop-carried state input signature, the condition
 /// returns exactly one Boolean predicate, the body returns the state signature, and a batched (per-item) predicate
@@ -165,9 +165,11 @@ impl<C: Context> WhilePredicate for DifferentiationTracer<C> where C::Value: Boo
 ///
 /// Differentiation through `while` follows one of three regimes:
 ///
-///   - **Eager (unrolled).** When the differentiation context's primal values are concrete, the hybrid JVP rule
-///     unrolls the loop (respecting any iteration bound), producing a straight-line — and therefore transposable —
-///     pushforward, so eager reverse mode works.
+///   - **Eager (direct dual execution).** When the differentiation context's primal values are concrete, the JVP rule
+///     evaluates each condition on the primal carries and each body once over the current dual carries (respecting any
+///     iteration bound). During linearization, partial evaluation records the executed tangent operations as a
+///     straight-line — and therefore transposable — pushforward, so eager reverse mode works without replaying primal
+///     body effects.
 ///   - **Bounded staged (stored stacks + masked scan, reverse-capable).** When primal values are tracers and the
 ///     loop carries an iteration bound `B`, the rule stages an augmented primal while that *stores* every
 ///     per-iteration pushforward residual into a preallocated `[B, …]` stack (plus a Boolean validity mask), and the
@@ -186,7 +188,7 @@ pub struct WhileOperation {
 
 impl WhileOperation {
     /// Creates a new [`WhileOperation`] with no semantic iteration bound. The condition and body [`Program`](crate::Program)s are
-    /// supplied separately as the operation's attached regions (via the `regions` argument of
+    /// supplied separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]); [`Operation::infer_output_types`] validates the loop contract over
     /// their interfaces.
     #[inline]

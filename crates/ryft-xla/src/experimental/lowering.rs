@@ -11,8 +11,8 @@ use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOpe
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConvertElementTypeOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation,
-    ScatterOperation, ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
+    BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, GatherOperation, GatherScatterMode, Reshape,
+    ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
@@ -215,14 +215,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         array_type: &ArrayType,
     ) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, LoweringError> {
         lower_tensor_type(array_type, self.context, self.location)
-    }
-
-    /// Lowers one plain traced literal value and applies its declared memory placement.
-    pub(crate) fn lower_literal_value<V: MlirLowerableValue + BooleanLike>(
-        &mut self,
-        value: &V,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-        lower_literal_value(value, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested condition operation inside this lowering context.
@@ -854,8 +846,12 @@ impl<V: MlirLowerableValue + BooleanLike, Payload: Clone> LowerableXlaOperation<
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        // A typed literal constant lowers to a StableHLO constant materialized from the captured value's elements.
-        let constant_value = lowerer.lower_literal_value(self.value())?;
+        let constant_value = self.value().lower_constant_value(
+            lowerer.captured_values.as_slice(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
         Ok(vec![constant_value])
     }
 }
@@ -1002,6 +998,12 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     if input_values.len() != 1 {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
     }
+    // The zero-space type has exactly one value. Both `zero_like` and `one_like` therefore materialize that value,
+    // even though a typed `one` operation remains invalid because the type has no numeric multiplicative identity.
+    let integer_value = match output_types {
+        [output_type] if output_type.data_type() == DataType::Zero => 0,
+        _ => integer_value,
+    };
     lower_constant_output(output_types, integer_value, block, context, location)
 }
 
@@ -6065,6 +6067,9 @@ fn lower_element_type<'c, 't>(
 ) -> Result<TypeRef<'c, 't>, LoweringError> {
     Ok(match data_type {
         DataType::Token => return Err(LoweringError::UnsupportedDataType { data_type }),
+        // StableHLO has no zero-information element type. Use an i1 tensor as an unobservable physical carrier while
+        // retaining the logical `DataType::Zero` in Ryft's lowered/compiled metadata.
+        DataType::Zero => context.signless_integer_type(1).as_ref(),
         DataType::Boolean => context.signless_integer_type(1).as_ref(),
         DataType::I1 => context.signless_integer_type(1).as_ref(),
         DataType::I2 => context.signless_integer_type(2).as_ref(),
@@ -6135,10 +6140,10 @@ where
 }
 
 /// Lowers a [`Scalar`] fill value as a splatted constant of `output_type`. Real fill values route through
-/// [`lower_f64_constant_splat`] after an exact widening cast to `f64`, while complex fill values compose two real
+/// [`lower_f64_constant_splat`] after an exact widening conversion to `f64`, while complex fill values compose two real
 /// part splats through `stablehlo.complex` (MLIR has no complex scalar attribute to splat) and broadcast the
 /// composed scalar when the output is not rank zero. A complex fill value with a real output data type surfaces the
-/// cast's promotion error.
+/// conversion's promotion error.
 fn lower_scalar_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     value: Scalar,
     output_type: &ArrayType,
@@ -6152,13 +6157,19 @@ where
     L: Copy + Location<'c, 't>,
 {
     let data_type = output_type.data_type();
+    if data_type == DataType::Zero {
+        if value != Scalar::Zero {
+            return Err(LoweringError::UnsupportedDataType { data_type });
+        }
+        return lower_f64_constant_splat(0.0, output_type, output_tensor_type, block, context, location);
+    }
     if matches!(data_type, DataType::C64 | DataType::C128) {
         let (real, imaginary) = match value {
             Scalar::C64(value) => (value.re as f64, value.im as f64),
             Scalar::C128(value) => (value.re, value.im),
             value => {
-                let Scalar::F64(real) = value.cast(DataType::F64)? else {
-                    unreachable!("a cast to f64 yields an f64 scalar")
+                let Scalar::F64(real) = value.promote_element_type(DataType::F64)? else {
+                    unreachable!("promotion to f64 yields an f64 scalar")
                 };
                 (real, 0.0)
             }
@@ -6179,7 +6190,9 @@ where
         let broadcast = block.append_operation(stable_hlo::broadcast(complex, output_tensor_type, &[], location)?)?;
         return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
     }
-    let Scalar::F64(value) = value.cast(DataType::F64)? else { unreachable!("a cast to f64 yields an f64 scalar") };
+    let Scalar::F64(value) = value.promote_element_type(DataType::F64)? else {
+        unreachable!("promotion to f64 yields an f64 scalar")
+    };
     lower_f64_constant_splat(value, output_type, output_tensor_type, block, context, location)
 }
 
@@ -6190,6 +6203,10 @@ fn lower_f64_scalar_elements_attribute<'c, 't>(
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
     match data_type {
+        DataType::Zero if factor == 0.0 => context
+            .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(false))
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::Zero => Err(LoweringError::UnsupportedDataType { data_type }),
         DataType::Boolean => context
             .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(factor != 0.0))
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
@@ -6252,6 +6269,10 @@ fn lower_constant_elements_attribute<'c, 't>(
     let float_value = integer_value as f64;
 
     match data_type {
+        DataType::Zero if integer_value == 0 => context
+            .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(false))
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::Zero => Err(LoweringError::UnsupportedDataType { data_type }),
         DataType::Boolean => context
             .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(integer_value != 0))
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
@@ -6407,7 +6428,9 @@ mod tests {
     use ryft_core::EagerContext;
     use ryft_core::contexts::Context;
     use ryft_core::operations::compare::CompareOperation;
-    use ryft_core::operations::constants::{ConstantOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
+    use ryft_core::operations::constants::{
+        ConstantOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroOperation,
+    };
     use ryft_core::operations::control_flow::SelectOperation;
     use ryft_core::operations::logical::{AndOperation, OrOperation, XorOperation};
     use ryft_core::operations::manipulation::{
@@ -6525,6 +6548,88 @@ mod tests {
             "{stablehlo}",
         );
         assert!(stablehlo.contains("stablehlo.add %arg1, %arg0 : tensor<4xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_operation_form_capture_as_a_hidden_argument() {
+        let array_type = test_vector_type(4);
+        let mut builder = XlaProgramBuilder::new();
+        let output = builder
+            .add_instruction(
+                XlaOperation::Constant(ConstantOperation::new(XlaConstant::new(0, array_type.clone()))),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let input_types: [ArrayType; 0] = [];
+        let output_types = vec![array_type.clone()];
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            std::slice::from_ref(&array_type),
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32>"), "{stablehlo}");
+        assert!(stablehlo.contains("return %arg0 : tensor<4xf32>"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.constant"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_forwards_operation_form_capture_into_nested_regions() {
+        let array_type = test_vector_type(4);
+        let branch = || {
+            let mut builder = XlaProgramBuilder::new();
+            let output = builder
+                .add_instruction(
+                    XlaOperation::Constant(ConstantOperation::new(XlaConstant::new(0, array_type.clone()))),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let true_region = builder.import_program(branch());
+        let false_region = builder.import_program(branch());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let output = builder
+            .add_instruction(
+                XlaOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = vec![array_type.clone()];
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            std::slice::from_ref(&array_type),
+            &[ArrayType::scalar(DataType::Boolean)],
+            &output_types,
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            stablehlo.contains("func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i1>) -> tensor<4xf32>",),
+            "{stablehlo}",
+        );
+        assert_eq!(stablehlo.matches("stablehlo.return %arg0 : tensor<4xf32>").count(), 2, "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.constant"), "{stablehlo}");
     }
 
     #[test]
@@ -8509,6 +8614,39 @@ mod tests {
                 assert!(stablehlo.contains(&format!("_xla_buffer_placement = \"{placement}\"")), "{stablehlo}");
             }
         }
+    }
+
+    #[test]
+    fn test_zero_space_type_and_constant_lower_to_a_false_i1_carrier() {
+        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new()).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("func.func @main() -> tensor<3xi1>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant dense<false> : tensor<i1>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.broadcast_in_dim"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_zero_space_one_like_lowers_to_the_unique_zero_value() {
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(OneLikeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("func.func @main(%arg0: tensor<3xi1>) -> tensor<3xi1>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant dense<false> : tensor<i1>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.broadcast_in_dim"), "{stablehlo}");
     }
 
     #[test]

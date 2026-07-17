@@ -202,11 +202,11 @@ where
         let primal = inputs[0].primal().convert_element_type(self.data_type)?;
         let primal_type = primal.r#type();
         let output_tangent_type = primal_type.tangent();
-        let tangent = match (inputs[0].tangent(), output_tangent_type) {
-            (_, None) => MaybeZero::Zero(primal_type.tangent_slot()),
-            (MaybeZero::Zero(_), Some(tangent_type)) => MaybeZero::Zero(tangent_type),
-            (MaybeZero::Value(tangent), Some(tangent_type)) => {
-                MaybeZero::Value(tangent.convert_element_type(tangent_type.element_type())?)
+        let tangent = match inputs[0].tangent() {
+            _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
+            MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
+            MaybeZero::Value(tangent) => {
+                MaybeZero::Value(tangent.convert_element_type(output_tangent_type.element_type())?)
             }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -228,10 +228,13 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        let input_cotangent_type =
-            inputs[0].r#type().cotangent().ok_or_else(|| ProgramError::UnsupportedOperation {
+        let input_cotangent_type = inputs[0].r#type().cotangent();
+        if input_cotangent_type.is_zero_space() {
+            return Err(ProgramError::UnsupportedOperation {
                 message: format!("'{CONVERT_ELEMENT_TYPE_OPERATION_NAME}' input 0 has no cotangent space"),
-            })?;
+            }
+            .into());
+        }
         Ok(vec![match &outputs[0] {
             MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
             MaybeZero::Value(cotangent) => {

@@ -118,7 +118,9 @@ impl<'o> Array<'o> {
     /// `mesh`, an [`Error::NonAddressableDevice`] for buffers whose device belongs to a different process than the
     /// corresponding mesh device, and an [`Error::BufferTypeMismatch`] for buffers whose data type or static shape
     /// does not match the shard type derived from `r#type`, `mesh`, and the effective sharding. Shards that do not
-    /// have a local/addressable buffer are retained as non-addressable [`ArrayShard`]s.
+    /// have a local/addressable buffer are retained as non-addressable [`ArrayShard`]s. For a logical
+    /// [`DataType::Zero`] array, every private predicate carrier must contain only false bits; a noncanonical buffer is
+    /// rejected so that its physical payload cannot become observable through the logical zero-space value.
     ///
     /// # Parameters
     ///
@@ -135,6 +137,29 @@ impl<'o> Array<'o> {
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
+    ) -> Result<Self, Error> {
+        Self::from_addressable_buffers_internal(client, r#type, mesh, buffers, true)
+    }
+
+    /// Creates an [`Array`] from backend-produced buffers whose zero-space carriers are known to be canonical. This is
+    /// the trusted internal counterpart of [`Self::from_addressable_buffers`]; it avoids synchronizing device buffers
+    /// back to the host solely to revalidate an invariant already enforced by Ryft's lowering and input boundaries.
+    pub(crate) fn from_canonical_addressable_buffers<C: Into<Option<&'o Client<'o>>>>(
+        client: C,
+        r#type: ArrayType,
+        mesh: DeviceMesh,
+        buffers: Vec<Buffer<'o>>,
+    ) -> Result<Self, Error> {
+        Self::from_addressable_buffers_internal(client, r#type, mesh, buffers, false)
+    }
+
+    /// Implements addressable-buffer construction with optional validation of private zero-space carrier payloads.
+    fn from_addressable_buffers_internal<C: Into<Option<&'o Client<'o>>>>(
+        client: C,
+        r#type: ArrayType,
+        mesh: DeviceMesh,
+        buffers: Vec<Buffer<'o>>,
+        validate_zero_carriers: bool,
     ) -> Result<Self, Error> {
         // Normalize the provided `r#type` before deriving shard placement. A single buffer with no sharding metadata
         // is treated as an unsharded replicated array over the caller-provided mesh.
@@ -174,8 +199,16 @@ impl<'o> Array<'o> {
                 });
             }
 
-            // Validate the concrete buffer type against the shard type that the layout assigns to this device.
-            let data_type = DataType::from_pjrt(buffer.element_type()?)?;
+            // Validate the concrete buffer type against the physical representation of the logical shard type.
+            // `DataType::Zero` deliberately uses a predicate carrier, so converting the buffer type back to a
+            // `DataType` would incorrectly relabel a logical zero-space array as Boolean.
+            let buffer_type = buffer.element_type()?;
+            let expected_buffer_type = r#type.data_type().to_pjrt();
+            let data_type = if buffer_type == expected_buffer_type {
+                r#type.data_type()
+            } else {
+                DataType::from_pjrt(buffer_type)?
+            };
             let shape = StaticShape::new(
                 buffer
                     .dimensions()?
@@ -194,6 +227,12 @@ impl<'o> Array<'o> {
             let expected_array_type = ArrayType::new(r#type.data_type(), descriptor.shape().into());
             if array_type != expected_array_type {
                 return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: array_type });
+            }
+            if validate_zero_carriers
+                && r#type.data_type() == DataType::Zero
+                && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
+            {
+                return Err(Error::NonCanonicalZeroBuffer { device_id });
             }
 
             buffers_by_device.insert(device_id, Arc::new(buffer));
@@ -254,6 +293,10 @@ impl<'o> Array<'o> {
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
         }
+        // `Zero` has one logical value, so user-provided host bytes cannot be allowed to select a predicate-carrier
+        // payload. Canonicalize the private physical representation to all-false before any shard transfer.
+        let zero_buffer = (r#type.data_type() == DataType::Zero).then(|| vec![0u8; expected_byte_count]);
+        let buffer = zero_buffer.as_deref().unwrap_or(buffer);
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
         let client_process_index = client.process_index()?;
@@ -379,7 +422,7 @@ impl<'o> Array<'o> {
         // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly; it
         // also attaches the client that transferred the local shard buffers so that it can be recovered later via
         // `Self::client`.
-        Ok(Self::from_addressable_buffers(client, r#type, mesh, addressable_buffers)?)
+        Ok(Self::from_canonical_addressable_buffers(client, r#type, mesh, addressable_buffers)?)
     }
 
     /// Attaches the provided PJRT [`Client`] to this [`Array`] so that it can be recovered later via [`Self::client`],
@@ -1096,6 +1139,41 @@ mod tests {
             .r#await()
             .unwrap();
         assert_eq!(values_from_bytes::<f32>(shard_bytes.as_slice()), vec![0.0, 1.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_zero_array_host_transfer_canonicalizes_the_physical_carrier() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+
+        // Host bytes cannot smuggle information into the unique logical value. They are accepted only as the
+        // correctly sized physical payload and canonicalized to the all-false predicate representation.
+        let array = Array::from_host_buffer(&client, r#type, mesh, [1u8, 0u8, u8::MAX]).unwrap();
+        assert_eq!(array.data_type(), DataType::Zero);
+        let buffer = array.addressable_shards().next().unwrap().buffer().unwrap();
+        assert_eq!(buffer.element_type().unwrap(), BufferType::Predicate);
+        let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(bytes.as_slice(), &[0u8, 0u8, 0u8]);
+    }
+
+    #[test]
+    fn test_zero_array_buffer_construction_rejects_a_noncanonical_physical_carrier() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let logical_device = Device::from_pjrt(&device).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![logical_device]).unwrap();
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
+
+        let error = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap_err();
+
+        assert!(matches!(error, Error::NonCanonicalZeroBuffer { .. }));
     }
 
     #[test]

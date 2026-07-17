@@ -17,7 +17,7 @@ use ryft_core::compilation::{
     jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_core::contexts::Context;
-use ryft_core::differentiation::DifferentiationError;
+use ryft_core::differentiation::{DifferentiableType, DifferentiationError};
 use ryft_core::operations::constants::Constant;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, Value};
@@ -526,7 +526,9 @@ where
         let function = self;
         let staged = function.function.staged();
         let input_signature = staged.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
-        let primals_and_tangents = (input_signature.clone(), input_signature);
+        let tangent_signature =
+            input_signature.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
+        let primals_and_tangents = (input_signature, tangent_signature);
         let mesh = function.mesh().clone();
         let captures = function.source_program().captures().to_vec();
         compile_with_flat_captures(
@@ -884,9 +886,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::differentiation::DifferentiableType;
     use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::math::{Atan2, Cos, Mul, Sin};
     use ryft_core::programs::regions::CalleeRegionDriver;
+    use ryft_core::programs::types::Typed;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::{
         DenseDifferentiate, ForwardModeDifferentiate, Hessian, Jacobian, ReverseModeDifferentiate,
@@ -2102,6 +2106,40 @@ mod tests {
                 "jvp tangent at (primal={primal}, tangent={tangent}): expected ~{expected_tangent}, got {tangent_observed}",
             );
         }
+    }
+
+    #[test]
+    fn test_jvp_method_executes_zero_space_boundaries() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+        let tangent_type = primal_type.tangent();
+        let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value, primal_type.clone(), &engine, mesh.clone()).unwrap();
+        let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();
+
+        let primal_input = Array::from_host_buffer(&client, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
+        let tangent_input = Array::from_host_buffer(&client, tangent_type.clone(), mesh, [1u8]).unwrap();
+        let (primal_output, tangent_output) =
+            engine.interpret(&jvp.executable_program(), (primal_input, tangent_input)).unwrap();
+
+        assert_eq!(primal_output.r#type().as_ref(), &primal_type);
+        assert_eq!(tangent_output.r#type().as_ref(), &tangent_type);
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let tangent_bytes = tangent_output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(tangent_bytes.as_slice(), &[0u8]);
     }
 
     /// Driving a `jit_call` program through the capture-free forward path
