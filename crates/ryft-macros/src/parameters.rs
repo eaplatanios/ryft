@@ -19,6 +19,7 @@ const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_MACRO_PARAMETER_LIFETIME: Symbol = Symbol::new("'__p");
 const DEFAULT_MACRO_PARAMETER_TYPE: Symbol = Symbol::new("__P");
+const DEFAULT_MACRO_ITERATOR_TYPE: Symbol = Symbol::new("__I");
 const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Parameter");
 
 const FIELD_ATTRIBUTE_ERROR: &str = "\
@@ -46,6 +47,11 @@ pub(crate) struct CodeGenerator {
     /// arguments). This should not conflict with any identifiers that already appear in the scope in which the
     /// corresponding code will be generated. It defaults to [`DEFAULT_MACRO_PARAMETER_TYPE`].
     macro_parameter_type: syn::Ident,
+
+    /// [`syn::Ident`] that represents the macro-internal iterator type parameter used by generated reconstruction
+    /// methods. This should not conflict with any identifiers that already appear in the scope in which the
+    /// corresponding code will be generated. It defaults to [`DEFAULT_MACRO_ITERATOR_TYPE`].
+    macro_iterator_type: syn::Ident,
 
     /// [`syn::Ident`] that represents the parameter type in the container on which our macros operate. This must match
     /// one of the generic type parameters of that container. This [`syn::Ident`] is always inferred from the
@@ -126,9 +132,9 @@ impl CodeGenerator {
     ///         fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> { ... }
     ///         fn into_parameters(self) -> Self::ParameterIntoIterator<P> { ... }
     ///
-    ///         fn from_parameters_with_remainder<I: Iterator<Item = P>>(
+    ///         fn from_parameters_with_remainder<__I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
-    ///             parameters: &mut I,
+    ///             parameters: &mut __I,
     ///         ) -> Result<Self, ryft::ParameterError> {
     ///             let expected_count = structure.parameter_count();
     ///             Ok(...)
@@ -171,6 +177,7 @@ impl CodeGenerator {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -599,9 +606,8 @@ impl CodeGenerator {
         self.generics = generics;
     }
 
-    /// Checks whether there are any name conflicts in the provided [`syn::DeriveInput`]. Specifically, this function
-    /// will check for whether the reserved [`MACRO_PARAMETER_LIFETIME`] and [`MACRO_PARAMETER_TYPE`] identifiers appear
-    /// anywhere in the provided [`syn::DeriveInput`] and will report corresponding errors if they do.
+    /// Checks whether any macro-reserved identifiers appear in the generic parameters of the provided
+    /// [`syn::DeriveInput`] and reports corresponding errors if they do.
     fn check_for_name_conflicts(&mut self, input: &syn::DeriveInput) {
         input.generics.params.iter().for_each(|parameter| match parameter {
             syn::GenericParam::Lifetime(parameter) if parameter.lifetime == self.macro_parameter_lifetime => {
@@ -620,6 +626,18 @@ impl CodeGenerator {
                 self.add_error(
                     parameter,
                     format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                );
+            }
+            syn::GenericParam::Type(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
+                );
+            }
+            syn::GenericParam::Const(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
                 );
             }
             _ => {}
@@ -1549,9 +1567,9 @@ impl CodeGenerator {
     /// as well):
     ///
     /// ```ignore
-    /// fn from_parameters_with_remainder<I: Iterator<Item = P>>(
+    /// fn from_parameters_with_remainder<__I: Iterator<Item = P>>(
     ///     structure: Self::To<ryft::Placeholder>,
-    ///     parameters: &mut I,
+    ///     parameters: &mut __I,
     /// ) -> Result<Self, ryft::ParameterError> {
     ///     let expected_count = structure.parameter_count();
     ///     Ok(...)
@@ -1641,11 +1659,12 @@ impl CodeGenerator {
 
         let ryft = &self.ryft_crate;
         let parameter_type = &self.parameter_type;
+        let macro_iterator_type = &self.macro_iterator_type;
         let self_to_as_parameterized = quote!(<Self::ParameterStructure as #ryft::Parameterized<#ryft::Placeholder>>);
         quote! {
-            fn from_parameters_with_remainder<I: Iterator<Item = #parameter_type>>(
+            fn from_parameters_with_remainder<#macro_iterator_type: Iterator<Item = #parameter_type>>(
                 structure: Self::To<#ryft::Placeholder>,
-                parameters: &mut I,
+                parameters: &mut #macro_iterator_type,
             ) -> Result<Self, #ryft::ParameterError> {
                 let expected_count = #self_to_as_parameterized::parameter_count(&structure);
                 Ok(#body)
@@ -1871,6 +1890,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -1890,6 +1910,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -1928,6 +1949,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2001,6 +2023,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2135,6 +2158,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2187,14 +2211,15 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
             errors: Vec::new(),
         };
         let input = syn::parse2(quote! {
-            struct Container<'__p, __P: Parameter, P: Parameter> {
-                marker: std::marker::PhantomData<(&'__p (), __P, P)>,
+            struct Container<'__p, __P: Parameter, __I, P: Parameter> {
+                marker: std::marker::PhantomData<(&'__p (), __P, __I, P)>,
             }
         })
         .expect("failed to parse derive input");
@@ -2203,6 +2228,7 @@ mod tests {
         assert!(errors.contains("reserved"));
         assert!(errors.contains("'__p"));
         assert!(errors.contains("__P"));
+        assert!(errors.contains("__I"));
     }
 
     #[test]
@@ -2211,6 +2237,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2316,6 +2343,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2351,6 +2379,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2387,6 +2416,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2464,6 +2494,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2483,8 +2514,8 @@ mod tests {
         assert_eq!(
             generated,
             indoc! {"
-                fn from_parameters_with_remainder < I : Iterator < Item = P >> \
-                    (structure : Self :: To < ryft :: Placeholder > , parameters : & mut I ,) \
+                fn from_parameters_with_remainder < __I : Iterator < Item = P >> \
+                    (structure : Self :: To < ryft :: Placeholder > , parameters : & mut __I ,) \
                     -> Result < Self , ryft :: ParameterError > { \
                     let expected_count = < \
                         Self :: ParameterStructure as ryft :: Parameterized < ryft :: Placeholder >\
@@ -2522,6 +2553,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::parse2::<syn::DeriveInput>(quote!(
                 struct Dummy<P, U, V>

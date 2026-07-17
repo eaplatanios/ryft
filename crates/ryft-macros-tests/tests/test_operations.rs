@@ -195,6 +195,11 @@ trait Operation<T: Type>: Clone {
         Vec::new()
     }
 
+    fn is_zero(&self, output_index: usize) -> bool {
+        let _ = output_index;
+        false
+    }
+
     fn effects(&self) -> Effects {
         Effects::Pure
     }
@@ -711,6 +716,10 @@ impl Operation<DataType> for PrintOperation {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    fn is_zero(&self, output_index: usize) -> bool {
+        output_index == 3
+    }
+
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         write!(formatter, "{:indentation$}rendered print", "")
     }
@@ -948,6 +957,9 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(print.effects(), Effects::Ordered);
     assert_eq!(print.region_names(), &["body"]);
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
+    assert!(!add.is_zero(0));
+    assert!(print.is_zero(3));
+    assert!(!print.is_zero(4));
     assert_eq!(print.to_string(), "rendered print");
 }
 
