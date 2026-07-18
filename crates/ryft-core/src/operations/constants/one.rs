@@ -1,20 +1,19 @@
 use std::fmt::Display;
 
-use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-};
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
-use crate::partial::{PartialEvaluationContext, PartialTracer, PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
+};
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -92,33 +91,8 @@ impl<T: Type, C: Context<Type = T, Operation: From<OneOperation<T>>>> PartiallyE
 }
 
 impl_non_differentiable_operation!(OneOperation<C::Type>);
-
-impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for OneOperation<T> {
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(Vec::new())
-    }
-}
-
-/// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is replicated by the
-/// same argument.
-impl<C: Context<Type = ArrayType> + One<C::Value>> BatchableOperation<C> for OneOperation<ArrayType> {
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        context: &BatchingContext<C>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
-        Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
-    }
-}
+impl_nullary_transposable_operation!(OneOperation<T>);
+impl_nullary_batchable_operation!(@replicated OneOperation<ArrayType>);
 
 /// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
 /// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its

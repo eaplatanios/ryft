@@ -1,20 +1,19 @@
 use std::fmt::Display;
 
-use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-};
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
-use crate::partial::{PartialEvaluationContext, PartialTracer, PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
+};
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -111,34 +110,8 @@ impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for IotaOpe
 }
 
 impl_non_differentiable_operation!(IotaOperation<C::Type>);
-
-impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for IotaOperation<T> {
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(Vec::new())
-    }
-}
-
-/// See [`ZeroOperation`]'s impl above for the reasoning — [`IotaOperation`] is also replicated because it has no data
-/// inputs; a raw iota of a fixed type is the same value for every batch item. (The per-item batch index produced by
-/// `axis_index` is materialized directly against the mapped axis instead of relying on this replicated rule.)
-impl<C: Context<Type = ArrayType> + Iota<C::Value>> BatchableOperation<C> for IotaOperation<ArrayType> {
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        context: &BatchingContext<C>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
-        Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
-    }
-}
+impl_nullary_transposable_operation!(IotaOperation<T>);
+impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
 
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for

@@ -1,20 +1,19 @@
 use std::fmt::Display;
 
-use crate::batching::{
-    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-};
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
-use crate::partial::{PartialEvaluationContext, PartialTracer, PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
+};
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -97,38 +96,8 @@ impl<T: Type, C: Context<Type = T, Operation: From<ZeroOperation<T>>>> Partially
 }
 
 impl_non_differentiable_operation!(ZeroOperation<C::Type>);
-
-impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for ZeroOperation<T> {
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(Vec::new())
-    }
-}
-
-/// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
-/// constant is the right value for every batch item, so the rule interprets the operation once
-/// under the parent context — constructing the constant eagerly under an eager parent and
-/// staging a nullary operation under a staging parent — and wraps each output as a replicated
-/// [`ArrayBatch`] (`batch_axis = None`). Downstream elementwise consumers that need the constant
-/// materialized at the batched physical shape will broadcast it through the internal elementwise
-/// batching rule.
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> BatchableOperation<C> for ZeroOperation<ArrayType> {
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        context: &BatchingContext<C>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
-        Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
-    }
-}
+impl_nullary_transposable_operation!(ZeroOperation<T>);
+impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 
 /// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`] is
 /// the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its

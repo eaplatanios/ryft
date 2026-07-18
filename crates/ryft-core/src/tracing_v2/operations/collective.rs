@@ -9,7 +9,7 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
 use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::constants::{FillOperation, IotaOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -519,20 +519,7 @@ where
 }
 
 impl_non_differentiable_operation!(AxisIndexOperation);
-
-/// Transpose rule for [`AxisIndexOperation`]: it is a nullary constant, so it contributes no operand cotangents.
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for AxisIndexOperation {
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(Vec::new())
-    }
-}
+impl_nullary_transposable_operation!(AxisIndexOperation);
 
 /// Batching rule for [`AxisIndexOperation`], mirroring the collective rule above and, like it, deciding purely
 /// from the active context's [`axis_name`](crate::batching::BatchingContext::axis_name). When this level's axis

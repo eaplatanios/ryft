@@ -4,20 +4,17 @@ use std::ops::{Add, Mul};
 use crate::backends::scalars::Scalar;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, One, Zero};
 use crate::operations::control_flow::Select;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Size};
 
 // TODO(eaplatanios): Review this.
@@ -227,6 +224,8 @@ where
     }
 }
 
+// Keep the dedicated operation intact when batching into a staging parent so that backends can lower the packed basis
+// directly. The generic replicated-nullary rule interprets its operation and would expand this primitive instead.
 impl<C> BatchableOperation<C> for CoordinateBasisOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
@@ -249,22 +248,7 @@ where
 }
 
 impl_non_differentiable_operation!(CoordinateBasisOperation<ArrayType>);
-
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O>
-    for CoordinateBasisOperation<ArrayType>
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 0, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(Vec::new())
-    }
-}
+impl_nullary_transposable_operation!(CoordinateBasisOperation<ArrayType>);
 
 /// Partial evaluation preserves the operation as an input-independent residual instruction.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CoordinateBasisOperation<ArrayType> where

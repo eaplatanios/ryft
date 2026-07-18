@@ -452,6 +452,118 @@ macro_rules! impl_non_transposable_operation {
     };
 }
 
+// TODO(eaplatanios): Review this macro.
+/// Implements the [`TransposableOperation`](crate::TransposableOperation) rule for a regionless nullary operation.
+/// The generated rule validates that the operation application has no inputs, infers and validates its output count,
+/// and returns no operand cotangents. The optional leading generic list declares operation-specific type parameters;
+/// the macro supplies the standard `T`, `V`, and `O` transposition parameters and derives behavioral bounds from
+/// [`Operation<T>`](crate::Operation). An optional `where` clause can provide bounds required to make the operation
+/// type itself well-formed.
+///
+/// # Parameters
+///
+///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
+///   - `$operation`: Regionless nullary operation type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
+#[macro_export]
+macro_rules! impl_nullary_transposable_operation {
+    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_nullary_transposable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+    };
+    (<$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_nullary_transposable_operation!(@impl [$($generic),+] ($operation) {});
+    };
+    ($operation:ty where $($bounds:tt)+) => {
+        $crate::impl_nullary_transposable_operation!(@impl [] ($operation) { $($bounds)+ });
+    };
+    ($operation:ty $(,)?) => {
+        $crate::impl_nullary_transposable_operation!(@impl [] ($operation) {});
+    };
+    (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T> $(, $generic)*>
+            $crate::TransposableOperation<V, O> for $operation
+        where
+            $operation: $crate::Operation<T>,
+            $($bounds)*
+        {
+            #[inline]
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 0, ProgramError);
+                let output_count = $crate::Operation::<T>::infer_output_types(self, &[], &[])?.len();
+                $crate::check_count!("output", outputs, output_count, ProgramError);
+                Ok(Vec::new())
+            }
+        }
+    };
+}
+
+// TODO(eaplatanios): Review this macro.
+/// Implements the [`BatchableOperation`](crate::BatchableOperation) rule for a regionless nullary operation according
+/// to the selected batching policy. The `@replicated` policy interprets the operation once through the parent
+/// [`Context`](crate::Context) and marks every output as replicated because the operation is invariant across the
+/// mapped axis. Nullary operations whose result depends on that axis, such as
+/// [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead. The optional leading
+/// generic list declares operation-specific type parameters; behavioral bounds are derived from
+/// [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can provide bounds required
+/// to make the operation type itself well-formed.
+///
+/// # Parameters
+///
+///   - `@replicated`: Selects batching that evaluates the operation once and marks every output as replicated.
+///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
+///   - `$operation`: Regionless nullary operation type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
+#[macro_export]
+macro_rules! impl_nullary_batchable_operation {
+    (@replicated <$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) { $($bounds)+ });
+    };
+    (@replicated <$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) {});
+    };
+    (@replicated $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_nullary_batchable_operation!(@impl_replicated [] ($operation) { $($bounds)+ });
+    };
+    (@replicated $operation:ty $(,)?) => {
+        $crate::impl_nullary_batchable_operation!(@impl_replicated [] ($operation) {});
+    };
+    (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*> $crate::BatchableOperation<C> for $operation
+        where
+            $operation: $crate::InterpretableOperation<C>,
+            $($bounds)*
+        {
+            #[inline]
+            fn batch<D: $crate::BatchingDriver<C>>(
+                &self,
+                context: &$crate::BatchingContext<C>,
+                _driver: &D,
+                inputs: &[$crate::ArrayBatch<C::Value>],
+            ) -> Result<Vec<$crate::ArrayBatch<C::Value>>, $crate::BatchingError> {
+                $crate::check_count!("input", inputs, 0, ProgramError);
+                Ok($crate::InterpretableOperation::interpret(
+                    self,
+                    context.parent(),
+                    &$crate::EmptyRegionDriver,
+                    &[],
+                )?
+                .into_iter()
+                .map($crate::ArrayBatch::replicated)
+                .collect())
+            }
+        }
+    };
+}
+
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
 /// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
@@ -815,5 +927,5 @@ macro_rules! check_gradient {
 pub use crate::{
     check_builders, check_count, check_gradient, check_sharding, check_types, define_elementwise_capability,
     define_elementwise_operation, define_tracer_operator, impl_non_differentiable_operation,
-    impl_non_transposable_operation,
+    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
 };
