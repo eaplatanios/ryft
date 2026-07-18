@@ -1,27 +1,23 @@
 use std::fmt::Display;
-use std::ops::{Div, Mul, Neg};
+use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
 use crate::contexts::{Context, Domain};
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_non_transposable_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`AbsOperation`].
@@ -30,7 +26,9 @@ pub const ABS_OPERATION_NAME: &str = "abs";
 /// Infers the result [`DataType`] of an absolute-value operation for one input element type.
 fn infer_abs_output_data_type(input_type: DataType) -> Result<DataType, TypeError> {
     match input_type {
-        DataType::I8
+        DataType::I2
+        | DataType::I4
+        | DataType::I8
         | DataType::I16
         | DataType::I32
         | DataType::I64
@@ -59,9 +57,11 @@ fn infer_abs_output_data_type(input_type: DataType) -> Result<DataType, TypeErro
 
 /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|` on
 /// complex operands with a real result) while preserving all other type metadata. Inputs that still represent partial
-/// sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial-sum semantics.
-/// Unsigned-integer, Boolean, token, and structural-zero inputs are rejected because absolute value is not defined for
-/// them by this operation family.
+/// sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial-sum
+/// semantics. Matching the operand constraints of [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs),
+/// signed-integer (including the sub-byte `si2` and `si4` types, with the minimum value wrapping to itself),
+/// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, structural-zero, and
+/// single-bit `si1` inputs (whose only negative value `-1` has no representable absolute value) are rejected.
 #[derive(Clone, Debug, Default)]
 pub struct AbsOperation;
 
@@ -101,12 +101,7 @@ impl Operation<ArrayType> for AbsOperation {
         input_types: &[ArrayType],
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        super::validate_no_unreduced_inputs(input_types, ABS_OPERATION_NAME)?;
-        Ok(vec![ArrayType {
-            data_type: infer_abs_output_data_type(input_types[0].data_type())?,
-            ..input_types[0].clone()
-        }])
+        ElementwiseOperation::infer_output_types(self, input_types)
     }
 }
 
@@ -118,7 +113,14 @@ impl ElementwiseOperation for AbsOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
+        // The absolute value maps complex element types to their real part data type while preserving all other
+        // metadata, so the generic broadcasting default does not apply.
+        check_count!("input", input_types, 1, TypeError);
+        super::validate_no_unreduced_inputs(input_types, ABS_OPERATION_NAME)?;
+        Ok(vec![ArrayType {
+            data_type: infer_abs_output_data_type(input_types[0].data_type())?,
+            ..input_types[0].clone()
+        }])
     }
 }
 
@@ -153,10 +155,10 @@ where
         + SelectCondition
         + ZeroLike
         + OneLike
-        + Neg<Output = C::Value>
-        + Mul<Output = C::Value>
-        + Div<Output = C::Value>
-        + ElementwiseDifferentiableValue<C::Type>,
+        + StandardNeg<Output = C::Value>
+        + StandardMul<Output = C::Value>
+        + StandardDiv<Output = C::Value>
+        + ElementwiseDerivativeAlignment<C::Type>,
     AbsOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -174,17 +176,17 @@ where
         let input = &inputs[0];
         let primal = input.primal().abs()?;
         let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'abs' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
         let tangent = match input.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(target),
+            MaybeZero::Value(_) if target.is_zero_space() => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("'abs' output type {} has no tangent space", primal.r#type()),
+                }
+                .into());
+            }
             MaybeZero::Value(tangent) => {
                 if input.primal().r#type().is_complex() {
-                    let denominator = primal.normalize_elementwise_tangent(&target)?;
+                    let denominator = primal.align_tangent(&target)?;
                     let zero = denominator.zero_like();
                     let one = denominator.one_like();
                     let denominator_is_zero =
@@ -197,13 +199,11 @@ where
                         (conjugate.real()? / denominator.clone()).complex(&(conjugate.imaginary()? / denominator))?;
                     let input_target = input.primal().r#type().tangent();
                     MaybeZero::Value(
-                        (tangent.normalize_elementwise_tangent(&input_target)? * coefficient)
-                            .real()?
-                            .normalize_elementwise_tangent(&target)?,
+                        (tangent.align_tangent(&input_target)? * coefficient).real()?.align_tangent(&target)?,
                     )
                 } else {
-                    let input = input.primal().normalize_elementwise_tangent(&target)?;
-                    let tangent = tangent.normalize_elementwise_tangent(&target)?;
+                    let input = input.primal().align_tangent(&target)?;
+                    let tangent = tangent.align_tangent(&target)?;
                     let zero = input.zero_like();
                     let nonnegative =
                         input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
@@ -215,30 +215,10 @@ where
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AbsOperation
-where
-    AbsOperation: Operation<V::Type>,
-{
-    #[inline]
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The absolute value is nonlinear in its operand and so it cannot be transposed. The reason we still implement
-        // `TransposableOperation` and return a `ProgramError::UnsupportedOperation` is because we need the whole
-        // operation family of a `Context` to implement `TransposableOperation`. Ryft used to have a separate linear
-        // operation family type but that resulted in overly complicated backend and operation implementations for very
-        // little benefit in practice, and so we ended up unifying them.
-        Err(ProgramError::UnsupportedOperation { message: format!("operation `{}` is not transposable", self.name()) }
-            .into())
-    }
-}
+impl_non_transposable_operation!(AbsOperation);
 
 /// Value-level elementwise absolute-value capability. [`Abs`] fills the same role for [`AbsOperation`] that
-/// [`Neg`](crate::Neg) fills for [`NegOperation`](crate::NegOperation).
+/// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait Abs: Sized {
     /// Computes the elementwise absolute value of this value (i.e., the magnitude for complex values, with a real
     /// result), returning a [`ProgramError`] if something goes wrong (e.g., when the value's data type carries no
@@ -287,18 +267,6 @@ mod tests {
             Ok(vec![DataType::F32]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::I32], &[]),
-            Ok(vec![DataType::I32]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
-            Ok(vec![DataType::F32]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C128], &[]),
-            Ok(vec![DataType::F64]),
-        );
-        assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
@@ -345,38 +313,6 @@ mod tests {
             <AbsOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
             Ok(vec![input]),
         );
-
-        // Complex array element types map to their real part data type while the shape is preserved.
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]))],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
-        );
-
-        for input_type in [
-            DataType::Token,
-            DataType::Zero,
-            DataType::Boolean,
-            DataType::I1,
-            DataType::I2,
-            DataType::I4,
-            DataType::U32,
-        ] {
-            let expected = TypeError {
-                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-            };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&operation, &[input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(input_type)], &[]),
-                Err(expected),
-            );
-        }
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -435,6 +371,52 @@ mod tests {
 
     #[test]
     fn test_abs_type_inference() {
+        // Signed-integer inputs, including the sub-byte `si2` and `si4` types, pass through unchanged.
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I32], &[]),
+            Ok(vec![DataType::I32]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I2], &[]),
+            Ok(vec![DataType::I2]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I4], &[]),
+            Ok(vec![DataType::I4]),
+        );
+
+        // Complex element types map to their real part data type, preserving the shape for arrays.
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::C64], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::C128], &[]),
+            Ok(vec![DataType::F64]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(
+                &AbsOperation,
+                &[ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]))],
+                &[],
+            ),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
+        );
+
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::I1, DataType::U32] {
+            let expected = TypeError {
+                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
+            };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&AbsOperation, &[input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(&AbsOperation, &[ArrayType::scalar(input_type)], &[]),
+                Err(expected),
+            );
+        }
+
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
@@ -451,6 +433,11 @@ mod tests {
     }
 
     #[test]
+    fn test_abs_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(AbsOperation, &[-2.0], 2.0);
+    }
+
+    #[test]
     fn test_abs_batching() {
         crate::operations::math::tests::assert_unary_batching(AbsOperation, &[0.5, -2.0], &[0.5, 2.0]);
     }
@@ -462,7 +449,7 @@ mod tests {
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.0f64)).unwrap(), 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(-0.7f64)).unwrap(), -1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(
-            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Scalar::from(0.0f64),).unwrap(),
+            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Scalar::from(0.0f64)).unwrap(),
             0.0,
             epsilon = 1e-9,
         );

@@ -67,7 +67,7 @@ impl Display for CustomJvpOperation {
 
 /// Validates the custom-JVP contract over the two attached region interfaces (`["primal", "jvp"]` region order) and
 /// returns the primal interface: the JVP interface's inputs must be the primal inputs followed by values using their
-/// tangent boundary descriptors, and its outputs must be the primal outputs followed by correspondingly typed tangent
+/// tangent boundary types, and its outputs must be the primal outputs followed by correspondingly typed tangent
 /// values.
 fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
@@ -175,27 +175,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
     }
 }
 
-/// Transpose rule for [`CustomJvpOperation`]: the call is a higher-order primal boundary rather than a linear map,
-/// so a tangent program never contains it on a linear operand (linearization replays the user-supplied JVP program
-/// instead) and the rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<W, OLinear> TransposableOperation<W, OLinear> for CustomJvpOperation
-where
-    W: Value<Type: DifferentiableType>,
-    OLinear: Operation<W::Type>,
-{
-    fn transpose<D: TranspositionDriver<W, OLinear>>(
-        &self,
-        _context: &mut TracingContext<W, OLinear>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "operation `custom_jvp` has no partition-aware transpose rule".to_string(),
-        }
-        .into())
-    }
-}
+crate::impl_non_transposable_operation!(CustomJvpOperation);
 
 /// Binds a re-wrapped custom-derivative call into the batching context's parent.
 ///
@@ -534,28 +514,7 @@ where
     }
 }
 
-/// Transpose rule for [`CustomVjpOperation`]: the call is a higher-order primal boundary rather than a linear map,
-/// so a tangent program never contains it on a linear operand (linearization stages the opaque
-/// [`CustomVjpTangentOperation`] carrier instead, which owns the executable transpose) and the rule reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<W, OLinear> TransposableOperation<W, OLinear> for CustomVjpOperation
-where
-    W: Value<Type: DifferentiableType>,
-    OLinear: Operation<W::Type>,
-{
-    fn transpose<D: TranspositionDriver<W, OLinear>>(
-        &self,
-        _context: &mut TracingContext<W, OLinear>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "operation `custom_vjp` has no partition-aware transpose rule".to_string(),
-        }
-        .into())
-    }
-}
+crate::impl_non_transposable_operation!(CustomVjpOperation);
 
 /// Opaque primal-enum carrier staged by [`CustomVjpOperation`]'s capture-free forward-mode rule.
 ///
@@ -568,8 +527,8 @@ where
 /// interpretation: `custom_vjp` functions are reverse-mode-only. Transposition (see [`transpose_primal_custom_vjp`])
 /// reads the residual operands from the pullback and replays the user's backward program on them and the incoming
 /// output cotangents, producing the input cotangents — so reverse mode uses exactly the user-supplied gradient.
-/// The carrier stores its input and output tangent descriptors because they can differ from both the primal types and
-/// the backward region's cotangent descriptors.
+/// The carrier stores its input and output tangent types because they can differ from both the primal types and
+/// the backward region's cotangent types.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CustomVjpTangentOperation<T: Type> {
     /// Number of residual operands, used to split the backward program's inputs into the residual prefix and the
@@ -684,7 +643,7 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
             Ok(backward_interface.output_types().to_vec())
         } else {
             // The un-transposed (tangent-map) carrier maps `[input_tangents..., residuals...]` to the output tangents.
-            // Those descriptors are stored explicitly because they need not match the backward program's cotangent
+            // Those types are stored explicitly because they need not match the backward program's cotangent
             // boundary.
             let expected: Vec<T> = self.input_tangent_types.iter().chain(residual_types.iter()).cloned().collect();
             check_types!("custom_vjp tangent", &expected, input_types);
@@ -1350,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_derivative_inference_uses_differential_descriptors() {
+    fn test_custom_derivative_inference_uses_differential_types() {
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
         let residual_type = test_type(&[]);
@@ -1521,7 +1480,7 @@ mod tests {
         assert_ne!(tangent_type, cotangent_type);
 
         // A canonical `zero` backward output is already typed in the primal input's cotangent space. Recovering its
-        // structural zero must retain that descriptor instead of dualizing its sharding a second time.
+        // structural zero must retain that type instead of dualizing its sharding a second time.
         let mut backward_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         backward_builder.add_input(cotangent_type.clone());
         let zero = backward_builder

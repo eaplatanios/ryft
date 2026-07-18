@@ -1,18 +1,12 @@
 use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 
 use crate::contexts::Context;
-use crate::define_elementwise_capability;
+use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, unary_elementwise_jvp};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
 };
-use crate::macros::{check_count, define_elementwise_operation};
-use crate::partial::PartialValue;
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
 use crate::programs::operations::Operation;
-use crate::programs::types::Typed;
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 use super::Sin;
 
@@ -20,7 +14,7 @@ use super::Sin;
 pub const COS_OPERATION_NAME: &str = "cos";
 
 define_elementwise_operation!(
-    @unary_base
+    @unary
     /// [`Operation`] that computes the elementwise cosine of a floating-point or complex value while
     /// preserving its array metadata. Array operands that still carry partial sums are rejected.
     CosOperation, COS_OPERATION_NAME,
@@ -36,7 +30,7 @@ where
         + Cos
         + StandardNeg<Output = C::Value>
         + StandardMul<Output = C::Value>
-        + ElementwiseDifferentiableValue<C::Type>,
+        + ElementwiseDerivativeAlignment<C::Type>,
     CosOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -45,43 +39,17 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().cos()?;
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'cos' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(target),
-            MaybeZero::Value(tangent) => {
-                let coefficient = input.primal().normalize_elementwise_tangent(&target)?.sin()?;
-                MaybeZero::Value(-(coefficient * tangent.normalize_elementwise_tangent(&target)?))
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        // d(cos(x)) = -sin(x) · dx.
+        unary_elementwise_jvp(
+            self,
+            inputs,
+            |input| input.cos(),
+            |operands| Ok(-(operands.input_primal()?.sin()? * operands.input_tangent()?)),
+        )
     }
 }
 
-/// Reports that a primal cosine is nonlinear and therefore cannot occur on a linear operand in a valid tangent program.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for CosOperation
-where
-    CosOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation { message: format!("operation `{}` is not transposable", self.name()) }
-            .into())
-    }
-}
+impl_non_transposable_operation!(CosOperation);
 
 define_elementwise_capability!(
     @unary
@@ -101,15 +69,14 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
-    use crate::programs::types::Typed;
+    use crate::programs::types::{TypeError, Typed};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::{TestArray, check_gradient};
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
@@ -253,6 +220,13 @@ mod tests {
             Ok(Scalar::from(-input.sin())),
         );
 
+        // Second-order differentiation recovers d²(cos(x))/dx² = -cos(x).
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(|x| x.cos().unwrap(), x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            -0.7f64.cos(),
+            epsilon = 1e-9,
+        );
+
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![4.0]);
         let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
@@ -260,6 +234,29 @@ mod tests {
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.values()[0], -3.0 * 4.0f64.sin(), epsilon = 1e-9);
 
+        // The plain staged tangent program computes the coefficient directly on the input.
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(CosOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = cos %0
+                    %3:f64[] = sin %0
+                    %4:f64[] = mul %3 %1
+                    %5:f64[] = neg %4
+                in (%2, %5)
+            "}
+            .trim_end(),
+        );
+
+        // The widened staged tangent program computes the coefficient in the widened differential representation.
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(CosOperation, Vec::new(), vec![input]).unwrap()[0];
@@ -281,6 +278,11 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_cos_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(CosOperation, &[0.5], 0.5f64.cos());
     }
 
     #[test]

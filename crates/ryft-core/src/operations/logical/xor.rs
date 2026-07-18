@@ -1,9 +1,8 @@
-use crate::macros::{define_elementwise_operation, define_tracer_operator};
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &str = "xor";
 
-// TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that computes the elementwise exclusive disjunction (i.e., `left ^ right`) of
@@ -11,12 +10,17 @@ define_elementwise_operation!(
     /// Boolean) and bitwise exclusive disjunction: the two semantics coincide on Boolean element types, and
     /// StableHLO's [`xor`](https://openxla.org/stablehlo/spec#xor) operation likewise serves both.
     XorOperation, XOR_OPERATION_NAME,
+    Xor, xor,
+);
+
+define_elementwise_capability!(
+    @binary
     /// Value-level elementwise exclusive-disjunction capability. [`Xor`] is the fallible Ryft counterpart to
     /// [`std::ops::BitXor`] that [`XorOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support exclusive disjunction), instead of panicking. Value types additionally provide [`std::ops::BitXor`]
     /// as ergonomic (albeit panicking) sugar layered on top of this capability.
-    Xor, xor,
+    Xor, xor, XorOperation,
 );
 
 define_tracer_operator!(@binary std::ops::BitXor, bitxor, XorOperation, "`xor` operation failed");

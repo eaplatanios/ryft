@@ -20,7 +20,7 @@ use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{TypeError, Typed};
 use crate::types::{ArrayType, DataType};
 
-use super::broadcasting::ElementwiseDifferentiableValue;
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
 ///
@@ -175,7 +175,7 @@ where
     V::Type: DifferentiableType,
     Self: Operation<V::Type>,
     O: From<ZeroOperation<V::Type>> + From<LinearSelectOperation<F>>,
-    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -201,12 +201,8 @@ where
                 let on_true_type = inputs[0].r#type().cotangent();
                 let on_false_type = inputs[1].r#type().cotangent();
                 Ok(vec![
-                    MaybeZero::Value(
-                        on_true.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_true_type)?,
-                    ),
-                    MaybeZero::Value(
-                        on_false.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_false_type)?,
-                    ),
+                    MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
+                    MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
                 ])
             }
         }
@@ -231,7 +227,7 @@ where
     V::Type: DifferentiableType,
     SelectOperation: Operation<V::Type>,
     O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -271,12 +267,8 @@ where
                 let on_false_type = inputs[2].r#type().cotangent();
                 Ok(vec![
                     MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                    MaybeZero::Value(
-                        on_true.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_true_type)?,
-                    ),
-                    MaybeZero::Value(
-                        on_false.into_iter().next().unwrap().unbroadcast_elementwise_cotangent(&on_false_type)?,
-                    ),
+                    MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
+                    MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
                 ])
             }
         }
@@ -291,7 +283,7 @@ impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for SelectOperation
 where
     C::Type: DifferentiableType,
     C::Operation: From<SelectOperation>,
-    C::Value: ElementwiseDifferentiableValue<C::Type>,
+    C::Value: ElementwiseDerivativeAlignment<C::Type>,
     SelectOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -327,7 +319,7 @@ where
             )?;
             check_count!("output", tangents, 1, ProgramError);
             let output_tangent_type = primal.r#type().tangent();
-            MaybeZero::Value(tangents.remove(0).normalize_elementwise_tangent(&output_tangent_type)?)
+            MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type)?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }

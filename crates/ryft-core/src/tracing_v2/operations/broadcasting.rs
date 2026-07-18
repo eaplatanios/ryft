@@ -1,12 +1,11 @@
 use crate::batching::BatchAxis;
 use crate::contexts::Context;
+use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
 use crate::macros::check_count;
-use crate::operations::manipulation::ConvertElementType;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
-use crate::operations::sharding::Reshard;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
@@ -17,173 +16,6 @@ use crate::batching::{BatchingContext, BatchingDriver};
 use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
 use crate::programs::types::{TypeError, Typed};
 use crate::types::{ArrayType, Size};
-
-/// Value whose elementwise derivative contributions can be mapped between an operand descriptor and the common
-/// descriptor inferred for an implicitly broadcasting arithmetic result.
-pub(crate) trait ElementwiseDifferentiableValue<T: DifferentiableType>: Value<Type = T> {
-    /// Converts and broadcasts this live tangent to `target`.
-    fn normalize_elementwise_tangent(&self, target: &T) -> Result<Self, DifferentiationError>;
-
-    /// Applies the adjoint of the implicit conversion and broadcast from `target` to this value's descriptor.
-    fn unbroadcast_elementwise_cotangent(&self, target: &T) -> Result<Self, DifferentiationError>;
-}
-
-impl<V: Value<Type = crate::types::DataType> + ConvertElementType>
-    ElementwiseDifferentiableValue<crate::types::DataType> for V
-{
-    fn normalize_elementwise_tangent(&self, target: &crate::types::DataType) -> Result<Self, DifferentiationError> {
-        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
-    }
-
-    fn unbroadcast_elementwise_cotangent(&self, target: &crate::types::DataType) -> Result<Self, DifferentiationError> {
-        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
-    }
-}
-
-impl<V> ElementwiseDifferentiableValue<ArrayType> for V
-where
-    V: Value<Type = ArrayType>
-        + Broadcast
-        + ConvertElementType
-        + crate::operations::manipulation::Reshape
-        + crate::operations::manipulation::Transpose
-        + Reshard
-        + crate::tracing_v2::operations::reduce::Reduce,
-{
-    fn normalize_elementwise_tangent(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
-        normalize_elementwise_tangent(self, target)
-    }
-
-    fn unbroadcast_elementwise_cotangent(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
-        let rank = self.r#type().rank();
-        let offset = rank.checked_sub(target.rank()).ok_or_else(|| TypeError {
-            message: format!("cannot unbroadcast cotangent type {} to input cotangent type {target}", self.r#type()),
-        })?;
-        let output_axes = (0..target.rank()).map(|axis| axis + offset).collect::<Vec<_>>();
-        unbroadcast_elementwise_cotangent(self, target, output_axes.as_slice())
-    }
-}
-
-/// Converts and broadcasts one live tangent contribution to the exact descriptor of its primal output.
-pub(crate) fn normalize_elementwise_tangent<V>(value: &V, target: &ArrayType) -> Result<V, DifferentiationError>
-where
-    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshard,
-{
-    let mut value = if value.r#type().data_type() == target.data_type() {
-        value.clone()
-    } else {
-        value.convert_element_type(target.data_type())?
-    };
-    if value.r#type().as_ref() == target {
-        return Ok(value);
-    }
-    let requires_reshard = value.r#type().sharding() != target.sharding();
-    let rank = value.r#type().rank();
-    if rank > target.rank() {
-        return Err(TypeError {
-            message: format!("cannot normalize tangent type {} to output type {target}", value.r#type()),
-        }
-        .into());
-    }
-    let offset = target.rank() - rank;
-    let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
-    value = value.broadcast(target.clone(), output_axes.as_slice())?;
-    // `BroadcastOperation` carries the requested output descriptor, but changing an explicit/manual sharding is a
-    // semantic redistribution rather than a metadata-only broadcast. Stage that transition explicitly so backend
-    // lowering cannot silently relabel the tangent when the primal result is placed differently from this operand.
-    if requires_reshard && let Some(sharding) = target.sharding() {
-        value = value.reshard(sharding);
-    }
-    Ok(value)
-}
-
-/// Applies the adjoint of an implicit elementwise broadcast and promotion, returning a contribution with the exact
-/// cotangent descriptor of the corresponding primal input.
-pub(crate) fn unbroadcast_elementwise_cotangent<V>(
-    value: &V,
-    target: &ArrayType,
-    output_axes: &[usize],
-) -> Result<V, DifferentiationError>
-where
-    V: Value<Type = ArrayType>
-        + Broadcast
-        + ConvertElementType
-        + crate::operations::manipulation::Reshape
-        + crate::operations::manipulation::Transpose
-        + Reshard
-        + crate::tracing_v2::operations::reduce::Reduce,
-{
-    use crate::tracing_v2::operations::reduce::ReductionKind;
-
-    let value_type = value.r#type();
-    if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
-        return Err(TypeError {
-            message: format!(
-                "cannot unbroadcast cotangent type {value_type} to input cotangent type {target} using output axes \
-                 {output_axes:?}",
-            ),
-        }
-        .into());
-    }
-    let mut kept_axes = Vec::with_capacity(target.rank());
-    for target_axis in 0..target.rank() {
-        let value_axis = output_axes[target_axis];
-        let target_dimension = target.dimension(target_axis as isize);
-        let value_dimension = value_type.dimension(value_axis as isize);
-        if target_dimension != value_dimension {
-            if target_dimension != Size::Static(1) {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot unbroadcast cotangent axis {value_axis} of size {value_dimension} to input axis \
-                         {target_axis} of size {target_dimension}",
-                    ),
-                }
-                .into());
-            }
-        } else {
-            kept_axes.push((target_axis, value_axis));
-        }
-    }
-    let reduce_axes = (0..value_type.rank())
-        .filter(|axis| kept_axes.iter().all(|(_, value_axis)| value_axis != axis))
-        .collect::<Vec<_>>();
-    let mut contribution =
-        if reduce_axes.is_empty() { value.clone() } else { value.reduce(reduce_axes.as_slice(), ReductionKind::Sum) };
-    let mut kept_axes_by_value = kept_axes.clone();
-    kept_axes_by_value.sort_by_key(|(_, value_axis)| *value_axis);
-    let permutation = kept_axes
-        .iter()
-        .map(|kept| kept_axes_by_value.iter().position(|candidate| candidate == kept).unwrap())
-        .collect::<Vec<_>>();
-    if permutation.iter().enumerate().any(|(axis, position)| axis != *position) {
-        contribution = crate::operations::manipulation::Transpose::transpose(&contribution, permutation)?;
-    }
-    if contribution.r#type().shape() != target.shape() {
-        contribution = contribution.reshape(target.shape().clone())?;
-    }
-    if contribution.r#type().data_type() != target.data_type() {
-        contribution = contribution.convert_element_type(target.data_type())?;
-    }
-    if contribution.r#type().sharding() != target.sharding()
-        && let Some(sharding) = target.sharding()
-    {
-        contribution = contribution.reshard(sharding);
-    }
-    if contribution.r#type().as_ref() != target {
-        let output_axes = (0..target.rank()).collect::<Vec<_>>();
-        contribution = contribution.broadcast(target.clone(), output_axes.as_slice())?;
-    }
-    if contribution.r#type().as_ref() != target {
-        return Err(TypeError {
-            message: format!(
-                "unbroadcasted cotangent type {} does not match required input cotangent type {target}",
-                contribution.r#type(),
-            ),
-        }
-        .into());
-    }
-    Ok(contribution)
-}
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
@@ -222,11 +54,7 @@ where
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
         };
-        Ok(vec![MaybeZero::Value(unbroadcast_elementwise_cotangent(
-            cotangent,
-            &input_cotangent_type,
-            self.output_axes(),
-        )?)])
+        Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent_along(&input_cotangent_type, self.output_axes())?)])
     }
 }
 

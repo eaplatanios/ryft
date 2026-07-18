@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::ops::Neg as StandardNeg;
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -104,7 +105,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for NegOperation where C::Oper
 impl<C: Context> DifferentiableOperation<C> for NegOperation
 where
     C::Type: DifferentiableType,
-    C::Value: std::ops::Neg<Output = C::Value>,
+    C::Value: StandardNeg<Output = C::Value>,
     NegOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -162,13 +163,14 @@ define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operatio
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -221,6 +223,15 @@ mod tests {
             ),
             Ok(vec![TestArray::scalar(-2.0)]),
         );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(Complex::new(1.0f64, -2.0))],
+            ),
+            Ok(vec![Scalar::from(Complex::new(-1.0f64, 2.0))]),
+        );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
         let mesh = LogicalMesh::new(vec![
@@ -260,18 +271,6 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::F8E8M0FNU] {
-            let expected =
-                TypeError { message: format!("'{NEG_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&operation, &[input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(input_type)], &[]),
-                Err(expected),
-            );
-        }
         assert_eq!(
             InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
@@ -299,6 +298,49 @@ mod tests {
     }
 
     #[test]
+    fn test_neg_type_inference() {
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::F8E8M0FNU] {
+            let expected =
+                TypeError { message: format!("'{NEG_OPERATION_NAME}' does not support input data type {input_type}") };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&NegOperation, &[input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(&NegOperation, &[ArrayType::scalar(input_type)], &[]),
+                Err(expected),
+            );
+        }
+
+        // Negation is linear, so partial-sum and reduced markers pass through unchanged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&NegOperation, std::slice::from_ref(&unreduced), &[]),
+            Ok(vec![unreduced]),
+        );
+        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&NegOperation, std::slice::from_ref(&reduced), &[]),
+            Ok(vec![reduced]),
+        );
+    }
+
+    #[test]
     fn test_neg_batching() {
         crate::operations::math::tests::assert_unary_batching(NegOperation, &[1.0, -2.0], &[-1.0, 2.0]);
     }
@@ -315,24 +357,36 @@ mod tests {
             Ok(Scalar::from(Complex::new(-1.0, 0.0))),
         );
 
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
+        // Second-order differentiation recovers d²(-x)/dx² = 0.
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(|x| -x, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            0.0,
+            epsilon = 1e-9,
+        );
+
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = neg %0
-                    %3:f64 = neg %1
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = neg %0
+                    %3:f64[] = neg %1
                 in (%2, %3)
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_neg_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(NegOperation, &[2.0], -2.0);
     }
 
     #[test]
@@ -342,6 +396,16 @@ mod tests {
         let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        // The pullback negates the output cotangent.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = neg %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
         assert_eq!(pullback.interpret(vec![TestArray::scalar(3.0)]), Ok(vec![TestArray::scalar(-3.0)]));
     }
 }

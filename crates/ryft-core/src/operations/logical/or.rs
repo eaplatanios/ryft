@@ -1,9 +1,8 @@
-use crate::macros::{define_elementwise_operation, define_tracer_operator};
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`OrOperation`].
 pub const OR_OPERATION_NAME: &str = "or";
 
-// TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that computes the elementwise disjunction (i.e., `left | right`) of two
@@ -11,12 +10,17 @@ define_elementwise_operation!(
     /// Boolean) and bitwise disjunction: the two semantics coincide on Boolean element types, and StableHLO's
     /// [`or`](https://openxla.org/stablehlo/spec#or) operation likewise serves both.
     OrOperation, OR_OPERATION_NAME,
+    Or, or,
+);
+
+define_elementwise_capability!(
+    @binary
     /// Value-level elementwise disjunction capability. [`Or`] is the fallible Ryft counterpart to
     /// [`std::ops::BitOr`] that [`OrOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support disjunction), instead of panicking. Value types additionally provide [`std::ops::BitOr`] as
     /// ergonomic (albeit panicking) sugar layered on top of this capability.
-    Or, or,
+    Or, or, OrOperation,
 );
 
 define_tracer_operator!(@binary std::ops::BitOr, bitor, OrOperation, "`or` operation failed");

@@ -1,24 +1,23 @@
 use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
 use crate::contexts::Context;
-use crate::define_elementwise_capability;
+use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation, TranspositionDriver,
 };
-use crate::macros::{check_count, define_elementwise_operation, define_tracer_operator};
+use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &str = "div";
 
 define_elementwise_operation!(
-    @binary_base
+    @binary
     /// [`Operation`] that divides two numeric values elementwise, promoting their element types and
     /// broadcasting their shapes. Array operands that still carry partial sums are rejected, and their reduced-axis
     /// markers must agree.
@@ -35,7 +34,7 @@ where
         + StandardAdd<Output = C::Value>
         + StandardMul<Output = C::Value>
         + StandardDiv<Output = C::Value>
-        + ElementwiseDifferentiableValue<C::Type>,
+        + ElementwiseDerivativeAlignment<C::Type>,
     DivOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -44,42 +43,18 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let left = &inputs[0];
-        let right = &inputs[1];
-        let primal = left.primal().clone() / right.primal().clone();
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'div' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let left_term = left
-            .tangent()
-            .as_value()
-            .map(|tangent| -> Result<_, DifferentiationError> {
-                let right_primal = right.primal().normalize_elementwise_tangent(&target)?;
-                Ok(tangent.normalize_elementwise_tangent(&target)? / right_primal)
-            })
-            .transpose()?;
-        let right_term = right
-            .tangent()
-            .as_value()
-            .map(|tangent| -> Result<_, DifferentiationError> {
-                let left_primal = left.primal().normalize_elementwise_tangent(&target)?;
-                let right_primal = right.primal().normalize_elementwise_tangent(&target)?;
-                let denominator = right_primal.clone() * right_primal;
-                let coefficient = -(left_primal / denominator);
-                Ok(coefficient * tangent.normalize_elementwise_tangent(&target)?)
-            })
-            .transpose()?;
-        let tangent = left_term
-            .into_iter()
-            .chain(right_term)
-            .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        // d(x / y) = dx / y - (x / y²) · dy.
+        binary_elementwise_jvp(
+            self,
+            inputs,
+            |left, right| Ok(left.clone() / right.clone()),
+            |operands, tangent| Ok(tangent / operands.right_primal()?),
+            |operands, tangent| {
+                let right = operands.right_primal()?;
+                let coefficient = -(operands.left_primal()? / (right.clone() * right));
+                Ok(coefficient * tangent)
+            },
+        )
     }
 }
 
@@ -87,7 +62,7 @@ where
 impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation<V, O> for DivOperation
 where
     V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     DivOperation: Operation<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -101,32 +76,31 @@ where
         check_count!("output", outputs, 1, ProgramError);
         if !inputs[0].is_unknown() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "`div` with no linear numerator cannot be transposed".to_string(),
+                message: "'div' with no linear numerator cannot be transposed".to_string(),
             }
             .into());
         }
         if inputs[1].is_unknown() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "`div` with a linear denominator is nonlinear and cannot be transposed".to_string(),
+                message: "'div' with a linear denominator is nonlinear and cannot be transposed".to_string(),
             }
             .into());
         }
         let numerator_type = inputs[0].r#type().cotangent();
-        if numerator_type.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'div' numerator has no cotangent space".to_string(),
-            }
-            .into());
-        }
         let numerator_contribution = match &outputs[0] {
             MaybeZero::Zero(_) => MaybeZero::Zero(numerator_type),
             MaybeZero::Value(output_cotangent) => {
-                let denominator = inputs[1].as_known().expect("the known denominator carries its pullback value");
-                let denominator = denominator.normalize_elementwise_tangent(output_cotangent.r#type().as_ref())?;
+                if numerator_type.is_zero_space() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "'div' numerator has no cotangent space".to_string(),
+                    }
+                    .into());
+                }
+                // The `is_unknown` check above guarantees the denominator is a known operand.
+                let denominator = inputs[1].as_known().unwrap();
+                let denominator = denominator.align_tangent(output_cotangent.r#type().as_ref())?;
                 MaybeZero::Value(
-                    output_cotangent
-                        .binary(&denominator, DivOperation)
-                        .unbroadcast_elementwise_cotangent(&numerator_type)?,
+                    output_cotangent.binary(&denominator, DivOperation).unalign_cotangent(&numerator_type)?,
                 )
             }
         };
@@ -156,7 +130,7 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
@@ -202,6 +176,19 @@ mod tests {
                 &[TestArray::scalar(7.0), TestArray::scalar(2.0)],
             ),
             Ok(vec![TestArray::scalar(3.5)]),
+        );
+        assert_abs_diff_eq!(
+            match InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+            ) {
+                Ok(outputs) => outputs[0].clone(),
+                Err(error) => panic!("expected a complex quotient but got {error}"),
+            },
+            Scalar::from(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
+            epsilon = 1e-12,
         );
 
         // Array type inference broadcasts shapes and promotes data types.
@@ -284,40 +271,6 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }),
-        );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
-            let expected =
-                TypeError { message: format!("'{DIV_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&operation, &[input_type, input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(
-                    &operation,
-                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
-                    &[],
-                ),
-                Err(expected),
-            );
-        }
-        let error = <DivOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-            ],
-            &[],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }
-        );
-
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, DivOperation>::new();
         let left = builder.add_input(DataType::F64);
@@ -339,6 +292,38 @@ mod tests {
 
     #[test]
     fn test_div_type_inference() {
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&DivOperation, &[DataType::F8E3M4, DataType::F32], &[]),
+            Err(TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
+            let expected =
+                TypeError { message: format!("'{DIV_OPERATION_NAME}' does not support input data type {input_type}") };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&DivOperation, &[input_type, input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(
+                    &DivOperation,
+                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
+                    &[],
+                ),
+                Err(expected),
+            );
+        }
+        assert_eq!(
+            <DivOperation as Operation<ArrayType>>::infer_output_types(
+                &DivOperation,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                ],
+                &[],
+            ),
+            Err(TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let plain = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
         let unreduced = plain
@@ -368,7 +353,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(&DivOperation, &[plain, unreduced.clone()], &[]),
             expected,
         );
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&DivOperation, &[unreduced, reduced], &[]), expected,);
+        assert_eq!(Operation::<ArrayType>::infer_output_types(&DivOperation, &[unreduced, reduced], &[]), expected);
         crate::operations::math::tests::assert_rejects_mismatched_reduced(DivOperation, DIV_OPERATION_NAME);
     }
 
@@ -412,8 +397,19 @@ mod tests {
         }
         check_gradient!(normalized_ratio, 0.7, 1e-6, 1e-6);
         let input = Complex::new(0.7f64, -0.3);
-        let gradient = gradient_holomorphic(normalized_ratio, Scalar::from(input)).unwrap();
-        assert_abs_diff_eq!(gradient, Scalar::from(Complex::new(1.0, 0.0) / (input + 1.0).powu(2)), epsilon = 1e-12);
+        let holomorphic_gradient = gradient_holomorphic(normalized_ratio, Scalar::from(input)).unwrap();
+        assert_abs_diff_eq!(
+            holomorphic_gradient,
+            Scalar::from(Complex::new(1.0, 0.0) / (input + 1.0).powu(2)),
+            epsilon = 1e-12,
+        );
+
+        // Second-order differentiation recovers d²(x / (x + 1))/dx² = -2 / (x + 1)³.
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(normalized_ratio, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            -2.0 / (1.7f64 * 1.7 * 1.7),
+            epsilon = 1e-9,
+        );
 
         let left = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let right = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
@@ -450,6 +446,11 @@ mod tests {
     }
 
     #[test]
+    fn test_div_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(DivOperation, &[7.0, 2.0], 3.5);
+    }
+
+    #[test]
     fn test_div_transposition() {
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -459,6 +460,16 @@ mod tests {
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        // The pullback divides the output cotangent by the residual denominator.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = div %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![TestArray::scalar(2.0), TestArray::scalar(3.0)]),
             Ok(vec![TestArray::scalar(2.0 / 3.0)]),
@@ -473,6 +484,17 @@ mod tests {
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        // The pullback divides the output cotangent elementwise and sum-reduces it back to the scalar numerator.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = div %0 %1
+                    %3:f64[] = reduce_sum [axes=[0]] %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![
                 TestArray::new(vector_type.clone(), vec![2.0, 4.0, 10.0]),

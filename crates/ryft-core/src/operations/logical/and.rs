@@ -1,9 +1,8 @@
-use crate::macros::{define_elementwise_operation, define_tracer_operator};
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`AndOperation`].
 pub const AND_OPERATION_NAME: &str = "and";
 
-// TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
     @binary
     /// [`Operation`](crate::Operation) that computes the elementwise conjunction (i.e., `left & right`) of two
@@ -11,12 +10,17 @@ define_elementwise_operation!(
     /// Boolean) and bitwise conjunction: the two semantics coincide on Boolean element types, and StableHLO's
     /// [`and`](https://openxla.org/stablehlo/spec#and) operation likewise serves both.
     AndOperation, AND_OPERATION_NAME,
+    And, and,
+);
+
+define_elementwise_capability!(
+    @binary
     /// Value-level elementwise conjunction capability. [`And`] is the fallible Ryft counterpart to
     /// [`std::ops::BitAnd`] that [`AndOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support conjunction), instead of panicking. Value types additionally provide [`std::ops::BitAnd`] as
     /// ergonomic (albeit panicking) sugar layered on top of this capability.
-    And, and,
+    And, and, AndOperation,
 );
 
 define_tracer_operator!(@binary std::ops::BitAnd, bitand, AndOperation, "`and` operation failed");

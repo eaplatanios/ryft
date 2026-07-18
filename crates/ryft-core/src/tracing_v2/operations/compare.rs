@@ -1,60 +1,8 @@
-use crate::contexts::Context;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
-};
 use crate::operations::compare::CompareOperation;
-use crate::partial::PartialValue;
-use crate::programs::operations::Operation;
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
 
-/// Forward-mode rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain, so the primal
-/// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for CompareOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<CompareOperation>,
-    CompareOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+crate::impl_non_differentiable_operation!(CompareOperation);
 
-/// Transpose rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain and are not linear
-/// maps, so a tangent program never contains a primal `compare` on a linear operand (its forward pairs the replayed
-/// primal with a zero tangent) and the rule reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for CompareOperation
-where
-    CompareOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        }
-        .into())
-    }
-}
+crate::impl_non_transposable_operation!(CompareOperation);
 
 #[cfg(test)]
 mod tests {

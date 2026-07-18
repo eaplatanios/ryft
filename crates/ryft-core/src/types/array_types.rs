@@ -773,7 +773,15 @@ impl Type for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Move this to a top-level `arrays` module, parallel to `ryft_core::backends::scalars`.
+// `ArrayType` describes itself. This fixed point (rather than a dummy unit-like type) is deliberate and load-bearing
+// for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the same
+// type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<ArrayType>` type inference,
+// lowering bounds such as `MlirLowerableValue: Value<Type = ArrayType>` in `ryft-xla`, and tracing and staging code
+// pinned on `V: Value<Type = ArrayType>`) accepts it anywhere a concrete array value would slot in. A dummy `Type`
+// would place the carrier in a fresh operation universe with no operations or inference rules and an opaque unit type
+// would additionally discard the shape, element-type, and sharding payload that `r#type()` feeds to type inference
+// during a metadata trace. This is the standard abstract-interpretation move (e.g., JAX's `eval_shape` traces with
+// `ShapeDtypeStruct` standing in for arrays, and an abstract value's abstract value is itself).
 impl Typed for ArrayType {
     type Type = ArrayType;
 
@@ -783,12 +791,11 @@ impl Typed for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Move this to a top-level `arrays` module, parallel to `ryft_core::backends::scalars`.
 // Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
 // because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
 // self-describing: its type is itself. This is not a type-theoretic universe claim (i.e., `ArrayType : ArrayType`).
 // It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program storage, lowering, and
-// transformation.
+// transformation. Refer to the comment above the `Typed` implementation for `ArrayType` for more information.
 impl Value for ArrayType {
     type DispatchDomain = EagerContext<Self>;
     type ExecutionDomain = EagerContext<Self>;

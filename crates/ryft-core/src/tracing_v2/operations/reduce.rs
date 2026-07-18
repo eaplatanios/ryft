@@ -27,7 +27,7 @@ use crate::interpretation::InterpretationDriver;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::types::{ArrayType, DataType, Shape, StaticShape};
 
-use super::broadcasting::ElementwiseDifferentiableValue;
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -565,7 +565,7 @@ where
         + Broadcast
         + Compare<Output = C::Value>
         + Div<Output = C::Value>
-        + ElementwiseDifferentiableValue<ArrayType>
+        + ElementwiseDerivativeAlignment<ArrayType>
         + Mul<Output = C::Value>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -603,7 +603,7 @@ where
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(input_tangent) => {
-                        let numeric_mask = mask.normalize_elementwise_tangent(input_tangent.r#type().as_ref())?;
+                        let numeric_mask = mask.align_tangent(input_tangent.r#type().as_ref())?;
                         let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
                         let masked_tangent = numeric_mask * input_tangent.clone();
                         MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)

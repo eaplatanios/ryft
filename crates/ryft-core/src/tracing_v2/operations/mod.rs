@@ -64,9 +64,6 @@ pub mod sharding;
 /// Static and dynamic slicing differentiation and batching rules.
 pub mod slicing;
 
-/// Gradient-severing `stop_gradient` differentiation rule.
-pub mod stop_gradient;
-
 /// N-dimensional axis-permutation differentiation and batching rules.
 pub mod transpose;
 

@@ -1,24 +1,23 @@
 use std::ops::Add as StandardAdd;
 
 use crate::contexts::Context;
-use crate::define_elementwise_capability;
+use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation, TranspositionDriver,
 };
-use crate::macros::{check_count, define_elementwise_operation, define_tracer_operator};
+use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
 use crate::programs::types::Typed;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 /// Canonical operation name for [`AddOperation`].
 pub const ADD_OPERATION_NAME: &str = "add";
 
 define_elementwise_operation!(
-    @binary_base
+    @binary
     /// [`Operation`] that adds two numeric values elementwise, promoting their element types and
     /// broadcasting their shapes. Array operands that carry partial sums must both be unreduced over exactly the same
     /// mesh axes; mixing an unreduced operand with an already reduced operand would duplicate the reduced contribution
@@ -26,38 +25,13 @@ define_elementwise_operation!(
     AddOperation, ADD_OPERATION_NAME,
     Add, add,
     validate = super::validate_numeric_input_types,
-    validate_array = validate_add_reduction_state,
+    validate_array = super::validate_linear_reduction_state,
 );
-
-/// Validates the reduction-state rule for elementwise addition.
-///
-/// # Parameters
-///
-///   - `input_types`: The two array operand types.
-///   - `operation_name`: Canonical operation name used to identify invalid signatures in the returned error.
-fn validate_add_reduction_state(
-    input_types: &[crate::ArrayType],
-    operation_name: &str,
-) -> Result<(), crate::TypeError> {
-    let left = input_types[0].unreduced_axes();
-    let right = input_types[1].unreduced_axes();
-    if left.is_empty() != right.is_empty() || (!left.is_empty() && left != right) {
-        return Err(crate::TypeError {
-            message: format!("'{operation_name}' operands must be unreduced over the same axes"),
-        });
-    }
-    if input_types[0].reduced_axes() != input_types[1].reduced_axes() {
-        return Err(crate::TypeError {
-            message: format!("'{operation_name}' operands must be reduced over the same axes"),
-        });
-    }
-    Ok(())
-}
 
 impl<C: Context> DifferentiableOperation<C> for AddOperation
 where
     C::Type: DifferentiableType,
-    C::Value: StandardAdd<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
+    C::Value: StandardAdd<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
     AddOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -66,38 +40,26 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let primal = inputs[0].primal().clone() + inputs[1].primal().clone();
-        let left = inputs[0].tangent().as_value().cloned();
-        let right = inputs[1].tangent().as_value().cloned();
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'add' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let tangent = match (left, right) {
-            (Some(left), Some(right)) => MaybeZero::Value(
-                left.normalize_elementwise_tangent(&target)? + right.normalize_elementwise_tangent(&target)?,
-            ),
-            (Some(tangent), None) | (None, Some(tangent)) => {
-                MaybeZero::Value(tangent.normalize_elementwise_tangent(&target)?)
-            }
-            (None, None) => MaybeZero::Zero(target),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        // d(x + y) = dx + dy.
+        binary_elementwise_jvp(
+            self,
+            inputs,
+            |left, right| Ok(left.clone() + right.clone()),
+            |_, tangent| Ok(tangent),
+            |_, tangent| Ok(tangent),
+        )
     }
 }
 
-/// Transposes addition by unbroadcasting its output cotangent to each operand's exact cotangent type.
+/// Transposes addition by unbroadcasting its output cotangent to each operand's exact cotangent type. A
+/// structural-zero output cotangent propagates as structural zeros — including to operands without a cotangent space
+/// (e.g., integer operands), which only reject *live* cotangents.
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
     V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     AddOperation: Operation<V::Type>,
 {
-    #[inline]
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
@@ -108,19 +70,7 @@ where
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => inputs
-                .iter()
-                .map(|input| {
-                    let target = input.r#type().cotangent();
-                    if target.is_zero_space() {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "'add' input has no cotangent space".to_string(),
-                        });
-                    }
-                    Ok(MaybeZero::Zero(target))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(Into::into),
+            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect()),
             MaybeZero::Value(cotangent) => inputs
                 .iter()
                 .map(|input| {
@@ -131,7 +81,7 @@ where
                         }
                         .into());
                     }
-                    Ok(MaybeZero::Value(cotangent.unbroadcast_elementwise_cotangent(&target)?))
+                    Ok(MaybeZero::Value(cotangent.unalign_cotangent(&target)?))
                 })
                 .collect(),
         }
@@ -153,13 +103,14 @@ define_tracer_operator!(@binary std::ops::Add, add, AddOperation, "`add` operati
 mod tests {
     use std::collections::BTreeSet;
 
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -203,6 +154,15 @@ mod tests {
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
             ),
             Ok(vec![TestArray::scalar(5.5)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+            ),
+            Ok(vec![Scalar::from(Complex::new(1.5f64, 1.0))]),
         );
 
         // Array type inference broadcasts shapes and promotes data types.
@@ -285,40 +245,6 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }),
-        );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
-            let expected =
-                TypeError { message: format!("'{ADD_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&operation, &[input_type, input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(
-                    &operation,
-                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
-                    &[],
-                ),
-                Err(expected),
-            );
-        }
-        let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-            ],
-            &[],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }
-        );
-
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, AddOperation>::new();
         let left = builder.add_input(DataType::F64);
@@ -340,6 +266,38 @@ mod tests {
 
     #[test]
     fn test_add_type_inference() {
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&AddOperation, &[DataType::F8E3M4, DataType::F32], &[]),
+            Err(TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
+            let expected =
+                TypeError { message: format!("'{ADD_OPERATION_NAME}' does not support input data type {input_type}") };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&AddOperation, &[input_type, input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(
+                    &AddOperation,
+                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
+                    &[],
+                ),
+                Err(expected),
+            );
+        }
+        assert_eq!(
+            <AddOperation as Operation<ArrayType>>::infer_output_types(
+                &AddOperation,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                ],
+                &[],
+            ),
+            Err(TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let plain = || {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
@@ -390,6 +348,14 @@ mod tests {
         let input = Complex::new(0.7f64, -0.3);
         assert_eq!(gradient_holomorphic(double, Scalar::from(input)), Ok(Scalar::from(Complex::new(2.0, 0.0))));
 
+        // Second-order differentiation recovers d²(x + x)/dx² = 0.
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(double, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            0.0,
+            epsilon = 1e-9,
+        );
+
+        // The `DataType`-typed staged tangent program adds the operand tangents.
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
@@ -409,6 +375,32 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // The array-typed staged tangent program has the same shape.
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(AddOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[] = add %0 %1
+                    %5:f64[] = add %2 %3
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_add_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(AddOperation, &[2.0, 3.5], 5.5);
     }
 
     #[test]
@@ -421,6 +413,15 @@ mod tests {
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        // The pullback fans the output cotangent out to both operands.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0, %0)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![TestArray::scalar(3.0)]),
             Ok(vec![TestArray::scalar(3.0), TestArray::scalar(3.0)]),
@@ -435,9 +436,19 @@ mod tests {
             .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        // The pullback sum-reduces the broadcast operand's cotangent back to its scalar type.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[] = reduce_sum [axes=[0]] %0
+                in (%1, %0)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![TestArray::new(vector_type.clone(), vec![2.0, 3.0, 4.0])]),
-            Ok(vec![TestArray::scalar(9.0), TestArray::new(vector_type, vec![2.0, 3.0, 4.0]),]),
+            Ok(vec![TestArray::scalar(9.0), TestArray::new(vector_type, vec![2.0, 3.0, 4.0])]),
         );
     }
 }

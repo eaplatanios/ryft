@@ -1,9 +1,8 @@
-use crate::macros::{define_elementwise_operation, define_tracer_operator};
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &str = "not";
 
-// TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise negation (i.e., `!input`) of one value while
@@ -11,12 +10,17 @@ define_elementwise_operation!(
     /// two semantics coincide on Boolean element types, and StableHLO's
     /// [`not`](https://openxla.org/stablehlo/spec#not) operation likewise serves both.
     NotOperation, NOT_OPERATION_NAME,
+    Not, not,
+);
+
+define_elementwise_capability!(
+    @unary
     /// Value-level elementwise negation capability. [`Not`] is the fallible Ryft counterpart to [`std::ops::Not`]
     /// that [`NotOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
     /// goes wrong (e.g., when a value's data type does not support negation), instead of panicking. Value types
     /// additionally provide [`std::ops::Not`] as ergonomic (albeit panicking) sugar layered on top of this
     /// capability.
-    Not, not,
+    Not, not, NotOperation,
 );
 
 define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");

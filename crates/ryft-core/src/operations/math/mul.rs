@@ -4,6 +4,7 @@ use std::ops::{Add as StandardAdd, Mul as StandardMul};
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
+use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation, TranspositionDriver,
@@ -15,10 +16,8 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`MulOperation`].
@@ -185,7 +184,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for MulOperation where C::Oper
 impl<C: Context> DifferentiableOperation<C> for MulOperation
 where
     C::Type: DifferentiableType,
-    C::Value: StandardAdd<Output = C::Value> + StandardMul<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
+    C::Value: StandardAdd<Output = C::Value> + StandardMul<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
     MulOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -194,53 +193,24 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let left = &inputs[0];
-        let right = &inputs[1];
-        let primal = left.primal().clone() * right.primal().clone();
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'mul' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let left_term = left
-            .tangent()
-            .as_value()
-            .map(|tangent| {
-                Ok::<_, DifferentiationError>(
-                    right.primal().normalize_elementwise_tangent(&target)?
-                        * tangent.normalize_elementwise_tangent(&target)?,
-                )
-            })
-            .transpose()?;
-        let right_term = right
-            .tangent()
-            .as_value()
-            .map(|tangent| {
-                Ok::<_, DifferentiationError>(
-                    left.primal().normalize_elementwise_tangent(&target)?
-                        * tangent.normalize_elementwise_tangent(&target)?,
-                )
-            })
-            .transpose()?;
-        let tangent = left_term
-            .into_iter()
-            .chain(right_term)
-            .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        // d(x · y) = y · dx + x · dy.
+        binary_elementwise_jvp(
+            self,
+            inputs,
+            |left, right| Ok(left.clone() * right.clone()),
+            |operands, tangent| Ok(operands.right_primal()? * tangent),
+            |operands, tangent| Ok(operands.left_primal()? * tangent),
+        )
     }
 }
 
 /// Transposes multiplication when exactly one operand is linear and the other is a known runtime value.
 /// Multiplication by that known value is self-adjoint under Ryft's bilinear cotangent pairing. The contribution is
-/// unbroadcast to the linear operand's exact cotangent descriptor, while the known operand receives a structural zero.
+/// unbroadcast to the linear operand's exact cotangent type, while the known operand receives a structural zero.
 impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation<V, O> for MulOperation
 where
     V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDifferentiableValue<V::Type>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     MulOperation: Operation<V::Type>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -257,34 +227,33 @@ where
             (false, true) => (1, 0),
             (true, true) => {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: "bilinear `mul` with two linear operands cannot be transposed".to_string(),
+                    message: "bilinear 'mul' with two linear operands cannot be transposed".to_string(),
                 }
                 .into());
             }
             (false, false) => {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: "`mul` with no linear operand cannot be transposed".to_string(),
+                    message: "'mul' with no linear operand cannot be transposed".to_string(),
                 }
                 .into());
             }
         };
         let target = inputs[linear_index].r#type().cotangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'mul' linear input has no cotangent space".to_string(),
-            }
-            .into());
-        }
         let contribution = match &outputs[0] {
             MaybeZero::Zero(_) => MaybeZero::Zero(target),
             MaybeZero::Value(output_cotangent) => {
-                let known_value =
-                    inputs[known_index].as_known().expect("the selected known operand carries its pullback value");
+                if target.is_zero_space() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "'mul' linear input has no cotangent space".to_string(),
+                    }
+                    .into());
+                }
+                // The `is_unknown` match above guarantees the selected operand is a known operand.
+                let known_value = inputs[known_index].as_known().unwrap();
                 let output_type = output_cotangent.r#type();
-                let contribution = known_value
-                    .normalize_elementwise_tangent(output_type.as_ref())?
-                    .binary(output_cotangent, MulOperation);
-                MaybeZero::Value(contribution.unbroadcast_elementwise_cotangent(&target)?)
+                let contribution =
+                    known_value.align_tangent(output_type.as_ref())?.binary(output_cotangent, MulOperation);
+                MaybeZero::Value(contribution.unalign_cotangent(&target)?)
             }
         };
         let mut contributions =
@@ -323,7 +292,7 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -364,6 +333,15 @@ mod tests {
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
             ),
             Ok(vec![TestArray::scalar(7.0)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
+            ),
+            Ok(vec![Scalar::from(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
         );
 
         // Array type inference broadcasts shapes and promotes data types.
@@ -446,40 +424,6 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
-        );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
-            let expected =
-                TypeError { message: format!("'{MUL_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&operation, &[input_type, input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(
-                    &operation,
-                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
-                    &[],
-                ),
-                Err(expected),
-            );
-        }
-        let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-            ],
-            &[],
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") },
-        );
-
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, MulOperation>::new();
         let left = builder.add_input(DataType::F64);
@@ -501,6 +445,38 @@ mod tests {
 
     #[test]
     fn test_mul_type_inference() {
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&MulOperation, &[DataType::F8E3M4, DataType::F32], &[]),
+            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
+            let expected =
+                TypeError { message: format!("'{MUL_OPERATION_NAME}' does not support input data type {input_type}") };
+            assert_eq!(
+                Operation::<DataType>::infer_output_types(&MulOperation, &[input_type, input_type], &[]),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Operation::<ArrayType>::infer_output_types(
+                    &MulOperation,
+                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
+                    &[],
+                ),
+                Err(expected),
+            );
+        }
+        assert_eq!(
+            <MulOperation as Operation<ArrayType>>::infer_output_types(
+                &MulOperation,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                ],
+                &[],
+            ),
+            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        );
+
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -612,6 +588,13 @@ mod tests {
         let input = Complex::new(0.7f64, -0.3);
         assert_eq!(gradient_holomorphic(square, Scalar::from(input)), Ok(Scalar::from(input * 2.0)));
 
+        // Second-order differentiation recovers d²(x²)/dx² = 2.
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(square, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            2.0,
+            epsilon = 1e-9,
+        );
+
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -636,6 +619,11 @@ mod tests {
     }
 
     #[test]
+    fn test_mul_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(MulOperation, &[2.0, 3.5], 7.0);
+    }
+
+    #[test]
     fn test_mul_transposition() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
@@ -647,6 +635,16 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1);
+        // The pullback multiplies the output cotangent by the residual known operand.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![TestArray::scalar(1.0), TestArray::scalar(4.0)]),
             Ok(vec![TestArray::scalar(4.0)]),
@@ -661,6 +659,17 @@ mod tests {
             .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        // The pullback multiplies elementwise and sum-reduces back to the scalar linear operand.
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[3] .
+                let %2:f64[3] = mul %1 %0
+                    %3:f64[] = reduce_sum [axes=[0]] %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             pullback.interpret(vec![
                 TestArray::new(vector_type.clone(), vec![2.0, 3.0, 4.0]),

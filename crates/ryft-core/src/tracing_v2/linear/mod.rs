@@ -28,7 +28,7 @@ pub use jacobian::{
 ///
 /// Unlike the lower-level JVP and VJP transforms, these methods enumerate every finite input or output coordinate and
 /// return structured derivative blocks. Availability is determined by [`DenseDifferentiableType`], so the result data
-/// model remains generic over [`Type`](crate::programs::types::Type) while execution is exposed only for descriptor
+/// model remains generic over [`Type`](crate::Type) while execution is exposed only for type
 /// families with an efficient packed replay representation.
 ///
 /// Ordinary forward mode requires real differentiated inputs but permits complex outputs. Ordinary reverse mode

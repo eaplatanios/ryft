@@ -112,24 +112,20 @@ macro_rules! check_builders {
 }
 
 // TODO(eaplatanios): Review this macro.
-/// Defines the structural implementations shared by elementwise operations. The generated base includes the unit
-/// operation struct, its [`Display`](std::fmt::Display), [`Operation`](crate::Operation),
+/// Defines the structural implementations shared by elementwise operations. The generated base
+/// includes the unit operation struct, its [`Display`](std::fmt::Display), [`Operation`](crate::Operation),
 /// [`ElementwiseOperation`](crate::ElementwiseOperation), [`InterpretableOperation`](crate::InterpretableOperation),
-/// and [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations. The combined
-/// `@unary` and `@binary` forms also generate the paired value-level capability trait; the `@unary_base` and
-/// `@binary_base` forms leave that trait to [`crate::define_elementwise_capability!`] so an operation module can place
-/// its differentiation and transposition implementations before the capability API.
+/// and [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations.
 ///
 /// # Parameters
 ///
-///   - `@unary` / `@binary`: Generates both the base operation and its capability trait for the selected arity.
-///   - `@unary_base` / `@binary_base`: Generates only the base operation for the selected arity.
+///   - `@unary` / `@binary`: Selects the operation arity.
 ///   - `$(#[$operation_documentation])*`: Documentation attributes attached to the generated operation struct.
 ///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
-///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
-///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
-///   - `$method`: Identifier of the generated capability trait method (e.g., `sin`).
+///   - `$capability`: Identifier of the value-level capability trait bound by the generated
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
+///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
 ///   - `validate = $validator`: Optional hook that validates scalar [`DataType`](crate::DataType) inputs before type
 ///     inference and array element types before array broadcasting.
 ///   - `validate_array = $array_validator`: Optional hook that validates complete
@@ -139,50 +135,6 @@ macro_rules! check_builders {
 macro_rules! define_elementwise_operation {
     (
         @unary
-        $(#[$operation_documentation:meta])*
-        $operation:ident, $name:ident,
-        $(#[$capability_documentation:meta])*
-        $capability:ident, $method:ident
-        $(, validate = $validator:path)?
-        $(, validate_array = $array_validator:path)? $(,)?
-    ) => {
-        $crate::define_elementwise_operation!(
-            @unary_base
-            $(#[$operation_documentation])*
-            $operation, $name, $capability, $method
-            $(, validate = $validator)?
-            $(, validate_array = $array_validator)?,
-        );
-        $crate::define_elementwise_capability!(
-            @unary
-            $(#[$capability_documentation])*
-            $capability, $method, $operation,
-        );
-    };
-    (
-        @binary
-        $(#[$operation_documentation:meta])*
-        $operation:ident, $name:ident,
-        $(#[$capability_documentation:meta])*
-        $capability:ident, $method:ident
-        $(, validate = $validator:path)?
-        $(, validate_array = $array_validator:path)? $(,)?
-    ) => {
-        $crate::define_elementwise_operation!(
-            @binary_base
-            $(#[$operation_documentation])*
-            $operation, $name, $capability, $method
-            $(, validate = $validator)?
-            $(, validate_array = $array_validator)?,
-        );
-        $crate::define_elementwise_capability!(
-            @binary
-            $(#[$capability_documentation])*
-            $capability, $method, $operation,
-        );
-    };
-    (
-        @unary_base
         $(#[$operation_documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
@@ -264,10 +216,9 @@ macro_rules! define_elementwise_operation {
             C::Operation: ::std::convert::From<$operation>
         {
         }
-
     };
     (
-        @binary_base
+        @binary
         $(#[$operation_documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
@@ -353,7 +304,6 @@ macro_rules! define_elementwise_operation {
             C::Operation: ::std::convert::From<$operation>
         {
         }
-
     };
 }
 
@@ -424,6 +374,86 @@ macro_rules! define_elementwise_capability {
                     &[self.clone(), right.clone()],
                 )?
                 .remove(0))
+            }
+        }
+    };
+}
+
+// TODO(eaplatanios): Review this macro.
+/// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs
+/// carry no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier: the primal operation is
+/// replayed on the input primals and each output is paired with a structural zero tangent, which stays symbolic and
+/// stages nothing. Because such a rule stages no live tangent, the operation can never appear on a linear operand in
+/// a valid tangent program, so it typically pairs with
+/// [`impl_non_transposable_operation!`](crate::impl_non_transposable_operation).
+///
+/// # Parameters
+///
+///   - `$operation`: The operation type for which the implementation is generated.
+#[macro_export]
+macro_rules! impl_non_differentiable_operation {
+    ($operation:ty $(,)?) => {
+        impl<C: $crate::Context> $crate::DifferentiableOperation<C> for $operation
+        where
+            C::Type: $crate::DifferentiableType,
+            C::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<C::Type>,
+        {
+            fn jvp<D: $crate::DifferentiationDriver<C>>(
+                &self,
+                context: &C,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<C::Value>],
+            ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
+                // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+                // with a structural zero tangent, which stays symbolic and stages nothing.
+                let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+                Ok($crate::Context::bind(context, self.clone(), ::std::vec::Vec::new(), &primal_inputs)?
+                    .into_iter()
+                    .map($crate::DifferentiationDual::new_with_zero_tangent)
+                    .collect())
+            }
+        }
+    };
+}
+
+// TODO(eaplatanios): Review this macro.
+/// Implements the erroring [`TransposableOperation`](crate::TransposableOperation) rule for an operation that is not
+/// a linear map on any operand. A valid tangent program never contains such an operation on a linear operand (its
+/// forward-mode rule pairs replayed primals with tangents computed by other operations), so the generated rule
+/// reports an [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error. The reason non-transposable
+/// operations still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is
+/// driven through whole operation families: Ryft used to have a separate linear operation family type, but that
+/// resulted in overly complicated backend and operation implementations for very little benefit in practice, and so
+/// the two families were unified.
+///
+/// # Parameters
+///
+///   - `$operation`: The operation type for which the implementation is generated.
+#[macro_export]
+macro_rules! impl_non_transposable_operation {
+    ($operation:ty $(,)?) => {
+        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T>> $crate::TransposableOperation<V, O>
+            for $operation
+        where
+            $operation: $crate::Operation<T>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                // A fully qualified call is required here because operations typically implement `Operation` for both
+                // the `DataType` and the `ArrayType` type universes.
+                Err($crate::ProgramError::UnsupportedOperation {
+                    message: format!("operation `{}` is not transposable", $crate::Operation::<T>::name(self)),
+                }
+                .into())
             }
         }
     };
@@ -569,5 +599,7 @@ macro_rules! define_tracer_operator {
 }
 
 pub use crate::{
-    check_builders, check_count, check_sharding, check_types, define_elementwise_operation, define_tracer_operator,
+    check_builders, check_count, check_sharding, check_types, define_elementwise_capability,
+    define_elementwise_operation, define_tracer_operator, impl_non_differentiable_operation,
+    impl_non_transposable_operation,
 };

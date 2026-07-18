@@ -1,24 +1,18 @@
 use std::ops::Div as StandardDiv;
 
 use crate::contexts::Context;
-use crate::define_elementwise_capability;
+use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, unary_elementwise_jvp};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
 };
-use crate::macros::{check_count, define_elementwise_operation};
-use crate::partial::PartialValue;
+use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
 use crate::programs::operations::Operation;
-use crate::programs::types::Typed;
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::broadcasting::ElementwiseDifferentiableValue;
 
 /// Canonical operation name for [`LogOperation`].
 pub const LOG_OPERATION_NAME: &str = "log";
 
 define_elementwise_operation!(
-    @unary_base
+    @unary
     /// [`Operation`] that computes the elementwise natural logarithm of one value (i.e.,
     /// `x ↦ ln(x)`, the principal branch `ln(z)` on complex operands) while preserving its array metadata. Only
     /// floating-point and complex operands are supported, and operands that still carry partial sums are rejected.
@@ -31,7 +25,7 @@ define_elementwise_operation!(
 impl<C: Context> DifferentiableOperation<C> for LogOperation
 where
     C::Type: DifferentiableType,
-    C::Value: Log + StandardDiv<Output = C::Value> + ElementwiseDifferentiableValue<C::Type>,
+    C::Value: Log + StandardDiv<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
     LogOperation: Operation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -40,43 +34,17 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().log()?;
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'log' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(target),
-            MaybeZero::Value(tangent) => MaybeZero::Value(
-                tangent.normalize_elementwise_tangent(&target)?
-                    / input.primal().normalize_elementwise_tangent(&target)?,
-            ),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        // d(ln(x)) = dx / x.
+        unary_elementwise_jvp(
+            self,
+            inputs,
+            |input| input.log(),
+            |operands| Ok(operands.input_tangent()? / operands.input_primal()?),
+        )
     }
 }
 
-/// Reports that a primal logarithm is nonlinear and cannot occur on a linear operand in a valid tangent program.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for LogOperation
-where
-    LogOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation { message: format!("operation `{}` is not transposable", self.name()) }
-            .into())
-    }
-}
+impl_non_transposable_operation!(LogOperation);
 
 define_elementwise_capability!(
     @unary
@@ -88,13 +56,14 @@ define_elementwise_capability!(
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
+    use half::{bf16, f16};
     use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -110,7 +79,22 @@ mod tests {
 
     #[test]
     fn test_log() {
+        assert_eq!(Scalar::from(0.5f32).log().unwrap(), 0.5f32.ln());
+        assert_eq!(Scalar::from(0.5f64).log().unwrap(), 0.5f64.ln());
+        assert_eq!(Scalar::from(bf16::from_f32(0.5)).log().unwrap(), bf16::from_f32(0.5f32.ln()));
+        assert_eq!(Scalar::from(f16::from_f32(0.5)).log().unwrap(), f16::from_f32(0.5f32.ln()));
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(Scalar::from(input).log().unwrap(), Scalar::from(input.ln()), epsilon = 1e-12);
+        // The principal branch maps the negative real axis to `ln|x| + iπ`.
+        assert_abs_diff_eq!(
+            Scalar::from(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
+            Scalar::from(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
+            epsilon = 1e-12,
+        );
+
         let operation = LogOperation;
+
+        // Operation identity and concrete interpretation.
         assert_eq!(Operation::<DataType>::name(&operation), LOG_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "LogOperation");
         assert_eq!(format!("{operation}"), LOG_OPERATION_NAME);
@@ -225,6 +209,13 @@ mod tests {
             Ok(Scalar::from(ComplexNumber::new(1.0, 0.0) / input)),
         );
 
+        // Second-order differentiation recovers d²(ln(x))/dx² = -1/x².
+        assert_abs_diff_eq!(
+            gradient(|x| gradient(|x| x.log().unwrap(), x).unwrap(), Scalar::from(0.7f64)).unwrap(),
+            -1.0 / (0.7f64 * 0.7f64),
+            epsilon = 1e-9,
+        );
+
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
@@ -232,6 +223,28 @@ mod tests {
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.values()[0], 1.5, epsilon = 1e-9);
 
+        // The plain staged tangent program divides the tangent directly by the input.
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = log %0
+                    %3:f64[] = div %1 %0
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+
+        // The widened staged tangent program divides by the input converted to the widened differential
+        // representation.
         let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
@@ -251,6 +264,11 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_log_partial_evaluation() {
+        crate::operations::math::tests::assert_partial_evaluation(LogOperation, &[0.7], 0.7f64.ln());
     }
 
     #[test]

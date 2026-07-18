@@ -237,7 +237,7 @@ where
             })?);
         } else {
             // A differentiable carry's cotangent boundary carries its cotangent dual; a non-differentiable carry uses
-            // the first-class zero-space descriptor returned by `cotangent`.
+            // the first-class zero-space type returned by `cotangent`.
             let output_type = &body_output_types[carry_index];
             let cotangent_type = output_type.cotangent();
             let zero = builder.add_instruction(ZeroOperation::new(cotangent_type), Vec::new(), Vec::new())?;

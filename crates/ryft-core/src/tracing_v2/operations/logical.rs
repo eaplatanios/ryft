@@ -1,150 +1,21 @@
-use crate::contexts::Context;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
-};
+use crate::macros::{impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use crate::partial::PartialValue;
-use crate::programs::operations::Operation;
-use crate::programs::types::Type;
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
 
-/// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not
-/// linear maps, so a tangent program never contains them on a linear operand (their forwards pair the replayed
-/// primal with a zero tangent) and each rule reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-macro_rules! logical_unsupported_transpose {
-    ($operation:ty) => {
-        impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for $operation
-        where
-            $operation: Operation<T>,
-        {
-            fn transpose<D: TranspositionDriver<V, O>>(
-                &self,
-                _context: &mut TracingContext<V, O>,
-                _driver: &D,
-                _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-                _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-            ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-                Err(ProgramError::UnsupportedOperation {
-                    // A fully qualified call is required here because logical operations implement `Operation` for
-                    // both the `DataType` and the `ArrayType` type universes.
-                    message: format!(
-                        "operation `{}` has no partition-aware transpose rule",
-                        Operation::<T>::name(self),
-                    ),
-                }
-                .into())
-            }
-        }
-    };
-}
+impl_non_differentiable_operation!(NotOperation);
 
-logical_unsupported_transpose!(NotOperation);
-logical_unsupported_transpose!(AndOperation);
-logical_unsupported_transpose!(OrOperation);
-logical_unsupported_transpose!(XorOperation);
+impl_non_transposable_operation!(NotOperation);
 
-/// Forward-mode rule for [`NotOperation`]: a Boolean output has no tangent, so the primal operation is replayed
-/// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for NotOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<NotOperation>,
-    NotOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_differentiable_operation!(AndOperation);
 
-/// Forward-mode rule for [`AndOperation`]: a Boolean output has no tangent, so the primal operation is replayed
-/// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for AndOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<AndOperation>,
-    AndOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_transposable_operation!(AndOperation);
 
-/// Forward-mode rule for [`OrOperation`]: a Boolean output has no tangent, so the primal operation is replayed on
-/// the input primals and paired with a canonical typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for OrOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<OrOperation>,
-    OrOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_differentiable_operation!(OrOperation);
 
-/// Forward-mode rule for [`XorOperation`]: a Boolean output has no tangent, so the primal operation is replayed
-/// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for XorOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<XorOperation>,
-    XorOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_transposable_operation!(OrOperation);
+
+impl_non_differentiable_operation!(XorOperation);
+
+impl_non_transposable_operation!(XorOperation);
 
 #[cfg(test)]
 mod tests {
