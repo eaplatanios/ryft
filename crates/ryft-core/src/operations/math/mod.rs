@@ -47,20 +47,21 @@ pub(crate) mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    /// Checks the shared elementwise batching rule for a unary operation over a mapped vector of scalar batch items.
-    pub(crate) fn assert_unary_batching<O>(operation: O, input: &[f64], expected: &[f64])
-    where
-        O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>>,
-    {
-        let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(input.len())]));
-        let input =
-            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, input.to_vec()), BatchAxis::new(0))
-                .unwrap();
+    /// Asserts that applying the provided operation on the provided batch of inputs results in the expected outputs.
+    pub fn assert_unary_batching<O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>>>(
+        operation: O,
+        input: &[f64],
+        expected: &[f64],
+    ) {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(input.len())]));
+        let input = Array::from_f64s(r#type.clone(), input.to_vec());
+        let input_batch = ArrayBatch::new(r#type.clone(), input, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), expected.len());
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        for (actual, expected) in outputs[0].value().to_f64s().iter().zip(expected) {
+        let output_batch = operation.batch(&context, &EmptyRegionDriver, &[input_batch]).unwrap();
+        assert_eq!(output_batch.len(), 1);
+        assert_eq!(output_batch[0].batch_axis(), BatchAxis::new(0));
+        let output = output_batch[0].value().to_f64s();
+        for (actual, expected) in output.iter().zip(expected) {
             assert_abs_diff_eq!(actual, expected, epsilon = 1e-9);
         }
     }

@@ -559,13 +559,12 @@ macro_rules! impl_non_transposable_operation {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Implements the [`TransposableOperation`](crate::TransposableOperation) rule for a regionless nullary operation.
-/// The generated rule validates that the operation application has no inputs, infers and validates its output count,
-/// and returns no operand cotangents. The optional leading generic list declares operation-specific type parameters;
-/// the macro supplies the standard `T`, `V`, and `O` transposition parameters and derives behavioral bounds from
-/// [`Operation<T>`](crate::Operation). An optional `where` clause can provide bounds required to make the operation
-/// type itself well-formed.
+/// Implements the [`TransposableOperation`](crate::TransposableOperation) trait for a [`Region`](crate::Region)-less
+/// nullary [`Operation`](crate::Operation). The generated implementation validates that the operation application has
+/// no inputs, infers and validates its output count, and returns no operand cotangents. The optional leading generic
+/// list declares operation-specific type parameters; the macro supplies the standard `T`, `V`, and `O` transposition
+/// parameters and derives behavioral bounds from [`Operation<T>`](crate::Operation). An optional `where` clause can
+/// provide bounds required to make the operation type itself well-formed.
 ///
 /// # Parameters
 ///
@@ -613,15 +612,14 @@ macro_rules! impl_nullary_transposable_operation {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Implements the [`BatchableOperation`](crate::BatchableOperation) rule for a regionless nullary operation according
-/// to the selected batching policy. The `@replicated` policy interprets the operation once through the parent
-/// [`Context`](crate::Context) and marks every output as replicated because the operation is invariant across the
-/// mapped axis. Nullary operations whose result depends on that axis, such as
-/// [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead. The optional leading
-/// generic list declares operation-specific type parameters; behavioral bounds are derived from
-/// [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can provide bounds required
-/// to make the operation type itself well-formed.
+/// Implements the [`BatchableOperation`](crate::BatchableOperation) trait for a [`Region`](crate::Region)-less
+/// nullary [`Operation`](crate::Operation) according to the selected batching policy. The `@replicated` policy
+/// interprets the operation once through the parent [`Context`](crate::Context) and marks every output as replicated
+/// because the operation is invariant across the mapped axis. Nullary operations whose result depends on that axis,
+/// such as [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead. The optional
+/// leading generic list declares operation-specific type parameters. Behavioral bounds are derived from
+/// [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can provide
+/// bounds required to make the operation type itself well-formed.
 ///
 /// # Parameters
 ///
@@ -1039,8 +1037,35 @@ pub use crate::{
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use crate::programs::ProgramError;
     use crate::programs::types::TypeError;
+    use crate::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
     use crate::types::{ArrayType, DataType};
+
+    #[test]
+    fn test_check_count() {
+        let check_input = |values: &[usize]| -> Result<(), ProgramError> {
+            check_count!("input", values, 1, ProgramError);
+            Ok(())
+        };
+        let check_output = |values: &[usize]| -> Result<(), ProgramError> {
+            check_count!("output", values, 2, ProgramError);
+            Ok(())
+        };
+        let check_operand = |values: &[usize], expected: usize| -> Result<(), TypeError> {
+            check_count!("operand", values, expected, TypeError);
+            Ok(())
+        };
+        assert_eq!(check_input(&[0]), Ok(()));
+        assert_eq!(check_input(&[]), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }));
+        assert_eq!(check_output(&[0, 1]), Ok(()));
+        assert_eq!(check_output(&[0]), Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }));
+        assert_eq!(check_operand(&[0], 1), Ok(()));
+        assert_eq!(check_operand(&[], 1), Err(TypeError { message: "expected 1 operand but got 0".to_string() }),);
+        assert_eq!(check_operand(&[0], 2), Err(TypeError { message: "expected 2 operands but got 1".to_string() }),);
+    }
 
     #[test]
     fn test_check_types_same() {
@@ -1059,7 +1084,57 @@ mod tests {
     }
 
     #[test]
-    fn test_check_types_binary_selector_arity() {
+    fn test_check_types_data_types() {
+        let check_numeric = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@numeric, "test", types);
+            Ok(())
+        };
+        let check_floating_or_complex = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@floating_or_complex, "test", types);
+            Ok(())
+        };
+        assert_eq!(check_numeric(&[DataType::I32, DataType::F64, DataType::C128]), Ok(()));
+        for r#type in [DataType::Boolean, DataType::Token, DataType::Zero] {
+            assert_eq!(
+                check_numeric(&[DataType::F32, r#type]),
+                Err(TypeError { message: format!("'test' does not support input data type {type}", type = r#type) }),
+            );
+        }
+        assert_eq!(check_floating_or_complex(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
+        assert_eq!(
+            check_floating_or_complex(&[DataType::I64]),
+            Err(TypeError { message: "'test' does not support input data type i64".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_check_types_array_types() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let plain = ArrayType::scalar(DataType::F32);
+        let unreduced_x = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh.clone(), vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced_y = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh.clone(), vec![]).unwrap().with_unreduced_axes(["y"]).unwrap())
+            .unwrap();
+        let reduced_x = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh.clone(), vec![]).unwrap().with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_y = plain
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_reduced_axes(["y"]).unwrap())
+            .unwrap();
+        let check_no_unreduced = |types: &[ArrayType]| -> Result<(), TypeError> {
+            check_types!(@no_unreduced, "test", types);
+            Ok(())
+        };
         let check_unreduced_axes = |types: &[ArrayType]| -> Result<(), TypeError> {
             check_types!(@same_unreduced_axes, "test", types);
             Ok(())
@@ -1068,9 +1143,61 @@ mod tests {
             check_types!(@same_reduced_axes, "test", types);
             Ok(())
         };
-        let expected = Err(TypeError { message: "expected 2 inputs but got 1".to_string() });
-        let input = ArrayType::scalar(DataType::F32);
-        assert_eq!(check_unreduced_axes(std::slice::from_ref(&input)), expected);
-        assert_eq!(check_reduced_axes(std::slice::from_ref(&input)), expected);
+        assert_eq!(check_no_unreduced(std::slice::from_ref(&plain)), Ok(()));
+        assert_eq!(
+            check_no_unreduced(std::slice::from_ref(&unreduced_x)),
+            Err(TypeError { message: "'test' does not support unreduced operands".to_string() }),
+        );
+        assert_eq!(check_unreduced_axes(&[unreduced_x.clone(), unreduced_x.clone()]), Ok(()));
+        assert_eq!(
+            check_unreduced_axes(&[unreduced_x, unreduced_y]),
+            Err(TypeError { message: "'test' operands must be unreduced over the same axes".to_string() }),
+        );
+        assert_eq!(
+            check_unreduced_axes(std::slice::from_ref(&plain)),
+            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+        );
+        assert_eq!(check_reduced_axes(&[reduced_x.clone(), reduced_x.clone()]), Ok(()));
+        assert_eq!(
+            check_reduced_axes(&[reduced_x, reduced_y]),
+            Err(TypeError { message: "'test' operands must be reduced over the same axes".to_string() }),
+        );
+        assert_eq!(
+            check_reduced_axes(std::slice::from_ref(&plain)),
+            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_check_sharding() {
+        let expected_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let actual_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(expected_mesh.clone(), vec![Device::new(0, 0)]).unwrap();
+        let matching = Sharding::new(expected_mesh.clone(), vec![]).unwrap();
+        let mismatching = Sharding::new(actual_mesh.clone(), vec![]).unwrap();
+        let check = |sharding: &Sharding| -> Result<(), ShardingError> {
+            check_sharding!(&device_mesh, sharding);
+            Ok(())
+        };
+        assert_eq!(check(&matching), Ok(()));
+        assert_eq!(
+            check(&mismatching),
+            Err(ShardingError::MeshMismatch { expected: expected_mesh, actual: actual_mesh }),
+        );
+    }
+
+    #[test]
+    fn test_check_builders() {
+        let reference = Rc::new(0);
+        let same = Rc::clone(&reference);
+        let different = Rc::new(0);
+        assert_eq!(check_builders!(&reference, &same), Ok(()));
+        assert_eq!(check_builders!(&reference, &different), Err(ProgramError::MismatchedProgramBuilders));
+        assert_eq!(check_builders!(&reference, [std::iter::empty::<&Rc<i32>>()]), Ok(()));
+        assert_eq!(check_builders!(&reference, [[&same, &reference].into_iter()]), Ok(()));
+        assert_eq!(
+            check_builders!(&reference, [[&same, &different].into_iter()]),
+            Err(ProgramError::MismatchedProgramBuilders),
+        );
     }
 }
