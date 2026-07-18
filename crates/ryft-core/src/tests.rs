@@ -49,6 +49,7 @@ macro_rules! check_gradient {
             $function, $input, $step, $tolerance
         )
     };
+
     (@array, $function:expr, $input:expr, $step:expr, $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
@@ -59,44 +60,51 @@ macro_rules! check_gradient {
             $function, $input, $step, $tolerance
         )
     };
-    // Internal rule shared by both selectors: `$value` and `$operation` pick the eager context whose linearization
-    // tracer pins the traced instantiation of `$function`, and `@$assert` names the internal rule below that checks
-    // the resulting gradient against the concrete-side finite-difference estimate.
+
+    // Internal rule shared by both scalar and array branches of this macro. `$value` and `$operation` pick the eager
+    // context whose linearization tracer pins the traced instantiation of `$function`, and `@$assert` names the
+    // internal rule below that checks the resulting gradient against the concrete-side finite-difference estimate.
     (
         @check($value:ty, $operation:ty, @$assert:ident $(,)?)
         $function:expr, $input:expr, $step:expr, $tolerance:expr
     ) => {{
-        // Closure parameter types infer from an expected type, so each instantiation of `$function` flows through
-        // an identity function pinning the signature that instantiation is used at.
+        // Closure parameter types infer from an expected type, so each instantiation of `$function` flows
+        // through an identity function pinning the signature that instantiation is used at.
         type EagerCheckContext = $crate::contexts::EagerContext<$value, $operation>;
-        fn pin_traced<F>(function: F) -> F
-        where
+
+        fn pin_traced<
             F: Fn(
                 $crate::differentiation::LinearizationTracer<EagerCheckContext>,
             ) -> $crate::differentiation::LinearizationTracer<EagerCheckContext>,
-        {
+        >(function: F) -> F {
             function
         }
+
         fn pin_eager<F: Fn($value) -> $value>(function: F) -> F {
             function
         }
+
         let input: $value = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::gradient(pin_traced($function), input.clone()).unwrap();
+
         $crate::check_gradient!(@$assert(gradient, pin_eager($function), input, step, tolerance))
     }};
-    // Internal rule behind `@scalar`: checks a reverse-mode `$gradient` of the ℝ → ℝ or ℂ → ℝ function `$evaluate`
-    // at `$input` against the central finite-difference estimate of its derivative.
+
+    // Internal rule behind the `@scalar` branch of this macro. It checks a reverse-mode `$gradient` of the ℝ → ℝ or
+    // ℂ → ℝ function `$evaluate` at `$input` against the central finite-difference estimate of its derivative.
     (@assert_scalar($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
         let gradient = $gradient;
         let evaluate = $evaluate;
-        let input: $crate::backends::scalars::Scalar = $input;
-        let step: f64 = $step;
-        let tolerance: f64 = $tolerance;
+        let input = $input;
+        let step = $step;
+        let tolerance = $tolerance;
+
         let central_difference = |plus: $crate::backends::scalars::Scalar, minus: $crate::backends::scalars::Scalar| {
             (evaluate(plus) - evaluate(minus)) / $crate::backends::scalars::Scalar::from(2.0 * step)
         };
+
         match input {
             $crate::backends::scalars::Scalar::F64(input) => {
                 let estimate = central_difference(
@@ -106,8 +114,8 @@ macro_rules! check_gradient {
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             $crate::backends::scalars::Scalar::C128(_) => {
-                // The two central differences estimate the real partials that assemble the conjugate steepest-ascent
-                // gradient `complex(∂f/∂re, -∂f/∂im)`.
+                // The two central differences estimate the real partials that assemble the conjugate
+                // steepest-ascent gradient `complex(∂f/∂re, -∂f/∂im)`.
                 let (real_step, imaginary_step) = $crate::check_gradient!(@complex_perturbation_steps(step));
                 let real_estimate = central_difference(input + real_step, input - real_step);
                 let imaginary_estimate = central_difference(input + imaginary_step, input - imaginary_step);
@@ -121,7 +129,7 @@ macro_rules! check_gradient {
             ),
         }
     }};
- 
+
     // Internal rule behind the `@array` branch of this macro. It checks a reverse-mode `$gradient` of the ℝⁿ → ℝ or
     // ℂⁿ → ℝ function `$evaluate` at `$input` (an array of any shape whose output is a rank-0 real `f64` array) against
     // the central finite-difference estimates of its partials, perturbing one input element at a time with all others
@@ -129,13 +137,15 @@ macro_rules! check_gradient {
     (@assert_array($gradient:expr, $evaluate:expr, $input:expr, $step:expr, $tolerance:expr $(,)?)) => {{
         let gradient = $gradient;
         let evaluate = $evaluate;
-        let input: $crate::backends::arrays::Array = $input;
-        let step: f64 = $step;
-        let tolerance: f64 = $tolerance;
+        let input = $input;
+        let step = $step;
+        let tolerance = $tolerance;
+
         // The function output is a rank-0 real array, so the central difference reads its single `f64` element.
         let central_difference = |plus: $crate::backends::arrays::Array, minus: $crate::backends::arrays::Array| {
             (evaluate(plus).to_f64s()[0] - evaluate(minus).to_f64s()[0]) / (2.0 * step)
         };
+
         let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
         let element_count = input.values().len();
         match input_type.data_type() {
@@ -181,7 +191,7 @@ macro_rules! check_gradient {
             other => panic!("finite-difference gradient checking requires an f64 or c128 input but got {other}"),
         }
     }};
-    
+
     // Internal rule shared by the complex arms of both assertion rules of this macro. It builds the complex-valued
     // real- and imaginary-axis perturbation steps so that the central differences remain in the complex tangent space.
     (@complex_perturbation_steps($step:expr)) => {{
