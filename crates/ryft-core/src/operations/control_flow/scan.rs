@@ -312,9 +312,9 @@ pub(crate) fn scalar_scan_output_types(
             ),
         });
     }
-    check_types!("scan body carry", body_input_types, body_output_types);
+    check_types!(@same, "scan body carry", [body_input_types, body_output_types]);
     check_count!("input", input_types, carry_count, TypeError);
-    check_types!("scan input", body_input_types, input_types);
+    check_types!(@same, "scan input", [body_input_types, input_types]);
     Ok(body_output_types.to_vec())
 }
 
@@ -374,7 +374,10 @@ impl ScanTypeSemantics for ArrayType {
                 ),
             });
         }
-        check_types!("scan body carry", &body_input_types[..carry_count], &body_output_types[..carry_count]);
+        check_types!(@same, "scan body carry", [
+            &body_input_types[..carry_count],
+            &body_output_types[..carry_count],
+        ]);
         for (index, input_type) in body_input_types.iter().enumerate() {
             check_static_scan_type("input", index, input_type)?;
         }

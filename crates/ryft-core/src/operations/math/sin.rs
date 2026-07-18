@@ -21,8 +21,8 @@ define_elementwise_operation!(
     /// preserving its array metadata. Array operands that still carry partial sums are rejected.
     SinOperation, SIN_OPERATION_NAME,
     Sin, sin,
-    validate_data_types = super::validate_floating_or_complex_input_types,
-    validate_array_types = super::validate_no_unreduced_inputs,
+    check_data_types = [@floating_or_complex],
+    check_array_types = [@no_unreduced],
 );
 
 impl<C: Context> DifferentiableOperation<C> for SinOperation

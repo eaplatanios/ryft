@@ -103,8 +103,14 @@ fn validated_branch_interfaces<'i, T: Type>(
     }
     let true_interface = &region_interfaces[0];
     let false_interface = &region_interfaces[1];
-    check_types!("condition branch input", true_interface.input_types(), false_interface.input_types());
-    check_types!("condition branch output", true_interface.output_types(), false_interface.output_types());
+    check_types!(@same, "condition branch input", [
+        true_interface.input_types(),
+        false_interface.input_types(),
+    ]);
+    check_types!(@same, "condition branch output", [
+        true_interface.output_types(),
+        false_interface.output_types(),
+    ]);
     Ok((true_interface, false_interface))
 }
 
@@ -129,7 +135,7 @@ where
                 message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
             });
         }
-        check_types!("condition input", true_interface.input_types(), &input_types[1..]);
+        check_types!(@same, "condition input", [true_interface.input_types(), &input_types[1..]]);
         Ok(true_interface.output_types().to_vec())
     }
 

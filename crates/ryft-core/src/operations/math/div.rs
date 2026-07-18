@@ -27,8 +27,8 @@ define_elementwise_operation!(
     /// markers must agree.
     DivOperation, DIV_OPERATION_NAME,
     Div, div,
-    validate_data_types = super::validate_numeric_input_types,
-    validate_array_types = super::validate_binary_reduction_state,
+    check_data_types = [@numeric],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation

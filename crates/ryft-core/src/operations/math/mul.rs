@@ -10,7 +10,7 @@ use crate::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, define_tracer_operator};
+use crate::macros::{check_count, check_types, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -53,7 +53,7 @@ impl Operation<DataType> for MulOperation {
         _region_interfaces: &[RegionInterface<DataType>],
     ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        super::validate_numeric_input_types(input_types, MUL_OPERATION_NAME)?;
+        check_types!(@numeric, MUL_OPERATION_NAME, input_types);
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
             message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
         })
@@ -88,10 +88,10 @@ impl ElementwiseOperation for MulOperation {
         // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
         // and the recomputed state is reattached afterward.
         check_count!("input", input_types, 2, TypeError);
-        super::validate_numeric_input_types(
-            &[input_types[0].data_type(), input_types[1].data_type()],
-            MUL_OPERATION_NAME,
-        )?;
+        check_types!(@numeric, MUL_OPERATION_NAME, [
+            input_types[0].data_type(),
+            input_types[1].data_type(),
+        ]);
         let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
         let output = self.broadcast_output_type(&stripped)?;
         let left_unreduced = input_types[0].unreduced_axes();

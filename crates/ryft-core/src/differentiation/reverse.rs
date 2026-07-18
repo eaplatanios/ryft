@@ -1742,8 +1742,8 @@ mod tests {
                 Self::RegionIdentity => {
                     check_count!("region", region_interfaces, 1, TypeError);
                     check_count!("input", input_types, 1, TypeError);
-                    check_types!("region identity input", input_types, region_interfaces[0].input_types());
-                    check_types!("region identity output", input_types, region_interfaces[0].output_types());
+                    check_types!(@same, "region identity input", [input_types, region_interfaces[0].input_types()]);
+                    check_types!(@same, "region identity output", [input_types, region_interfaces[0].output_types()]);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::Add => {

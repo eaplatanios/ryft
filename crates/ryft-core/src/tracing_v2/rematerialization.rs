@@ -146,7 +146,7 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
     let tangent_interface = &region_interfaces[3];
     let input_types = primal_interface.input_types();
     let output_types = primal_interface.output_types();
-    check_types!("rematerialize forward input", input_types, forward_interface.input_types());
+    check_types!(@same, "rematerialize forward input", [input_types, forward_interface.input_types()]);
     let forward_output_types = forward_interface.output_types();
     if forward_output_types.len() < output_types.len() {
         return Err(TypeError {
@@ -157,14 +157,23 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
             ),
         });
     }
-    check_types!("rematerialize forward output", output_types, &forward_output_types[..output_types.len()]);
+    check_types!(@same, "rematerialize forward output", [
+        output_types,
+        &forward_output_types[..output_types.len()],
+    ]);
     let residual_types = &forward_output_types[output_types.len()..];
     let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
-    check_types!("rematerialize backward input", &expected_backward_input_types, backward_interface.input_types());
-    check_types!("rematerialize backward output", input_types, backward_interface.output_types());
+    check_types!(@same, "rematerialize backward input", [
+        &expected_backward_input_types,
+        backward_interface.input_types(),
+    ]);
+    check_types!(@same, "rematerialize backward output", [input_types, backward_interface.output_types()]);
     let expected_tangent_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
-    check_types!("rematerialize tangent input", &expected_tangent_input_types, tangent_interface.input_types());
-    check_types!("rematerialize tangent output", output_types, tangent_interface.output_types());
+    check_types!(@same, "rematerialize tangent input", [
+        &expected_tangent_input_types,
+        tangent_interface.input_types(),
+    ]);
+    check_types!(@same, "rematerialize tangent output", [output_types, tangent_interface.output_types()]);
     Ok(primal_interface)
 }
 
@@ -180,7 +189,7 @@ impl<T: Type> Operation<T> for RematerializeOperation {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         let primal_interface = validated_rematerialize_interfaces(region_interfaces)?;
-        check_types!("rematerialize input", primal_interface.input_types(), input_types);
+        check_types!(@same, "rematerialize input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
     }
 

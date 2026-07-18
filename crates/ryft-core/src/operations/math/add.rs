@@ -28,8 +28,8 @@ define_elementwise_operation!(
     /// when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
     AddOperation, ADD_OPERATION_NAME,
     Add, add,
-    validate_data_types = super::validate_numeric_input_types,
-    validate_array_types = super::validate_linear_reduction_state,
+    check_data_types = [@numeric],
+    check_array_types = [@same_unreduced_axes, @same_reduced_axes],
 );
 
 impl<C: Context> DifferentiableOperation<C> for AddOperation

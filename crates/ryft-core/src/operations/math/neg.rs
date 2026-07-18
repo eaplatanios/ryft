@@ -7,7 +7,7 @@ use crate::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, define_tracer_operator};
+use crate::macros::{check_count, check_types, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
@@ -26,7 +26,7 @@ pub const NEG_OPERATION_NAME: &str = "neg";
 
 /// Infers the output data type for numeric negation.
 fn infer_neg_output_data_type(input_type: DataType) -> Result<DataType, TypeError> {
-    super::validate_numeric_input_types(std::slice::from_ref(&input_type), NEG_OPERATION_NAME)?;
+    check_types!(@numeric, NEG_OPERATION_NAME, std::slice::from_ref(&input_type));
     if input_type == DataType::F8E8M0FNU {
         return Err(TypeError { message: "'neg' does not support input data type f8e8m0fnu".to_string() });
     }

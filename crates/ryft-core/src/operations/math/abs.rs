@@ -7,7 +7,7 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
@@ -120,7 +120,7 @@ impl ElementwiseOperation for AbsOperation {
         // The absolute value maps complex element types to their real part data type while preserving all other
         // metadata, so the generic broadcasting default does not apply.
         check_count!("input", input_types, 1, TypeError);
-        super::validate_no_unreduced_inputs(input_types, ABS_OPERATION_NAME)?;
+        check_types!(@no_unreduced, ABS_OPERATION_NAME, input_types);
         Ok(vec![ArrayType {
             data_type: infer_abs_output_data_type(input_types[0].data_type())?,
             ..input_types[0].clone()

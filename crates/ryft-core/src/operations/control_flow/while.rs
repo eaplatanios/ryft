@@ -238,7 +238,7 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     let condition_interface = &region_interfaces[0];
     let body_interface = &region_interfaces[1];
     let state_types = body_interface.input_types();
-    check_types!("while condition/body input", state_types, condition_interface.input_types());
+    check_types!(@same, "while condition/body input", [state_types, condition_interface.input_types()]);
     let condition_output_types = condition_interface.output_types();
     if condition_output_types.len() != 1 {
         return Err(TypeError {
@@ -249,7 +249,7 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
         });
     }
     T::validate_while_condition_output(&condition_output_types[0], state_types)?;
-    check_types!("while body output", state_types, body_interface.output_types());
+    check_types!(@same, "while body output", [state_types, body_interface.output_types()]);
     if T::is_batched_predicate(&condition_output_types[0])
         && (!condition_interface.effects().is_pure() || !body_interface.effects().is_pure())
     {
@@ -276,7 +276,7 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
         let (_, body_interface) = validated_while_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
         check_count!("input", input_types, state_types.len(), TypeError);
-        check_types!("while input", state_types, input_types);
+        check_types!(@same, "while input", [state_types, input_types]);
         Ok(state_types.to_vec())
     }
 
@@ -2565,7 +2565,7 @@ mod tests {
             match self {
                 Self::Sub => {
                     check_count!("input", input_types, 2, TypeError);
-                    check_types!(self.name(), &input_types[..1], &input_types[1..]);
+                    check_types!(@same, self.name(), [&input_types[..1], &input_types[1..]]);
                     Ok(vec![input_types[0].clone()])
                 }
                 Self::IsPositive => {

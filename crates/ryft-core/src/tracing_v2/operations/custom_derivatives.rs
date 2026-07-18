@@ -83,10 +83,10 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     let output_types = primal_interface.output_types();
     let input_tangent_types = input_types.iter().map(|r#type| r#type.tangent());
     let expected_jvp_input_types: Vec<T> = input_types.iter().cloned().chain(input_tangent_types).collect();
-    check_types!("custom_jvp rule input", &expected_jvp_input_types, jvp_interface.input_types());
+    check_types!(@same, "custom_jvp rule input", [&expected_jvp_input_types, jvp_interface.input_types()]);
     let output_tangent_types = output_types.iter().map(|r#type| r#type.tangent());
     let expected_jvp_output_types: Vec<T> = output_types.iter().cloned().chain(output_tangent_types).collect();
-    check_types!("custom_jvp rule output", &expected_jvp_output_types, jvp_interface.output_types());
+    check_types!(@same, "custom_jvp rule output", [&expected_jvp_output_types, jvp_interface.output_types()]);
     Ok(primal_interface)
 }
 
@@ -102,7 +102,7 @@ impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         let primal_interface = validated_custom_jvp_interfaces(region_interfaces)?;
-        check_types!("custom_jvp input", primal_interface.input_types(), input_types);
+        check_types!(@same, "custom_jvp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
     }
 
@@ -337,7 +337,7 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     let backward_interface = &region_interfaces[2];
     let input_types = primal_interface.input_types();
     let output_types = primal_interface.output_types();
-    check_types!("custom_vjp forward input", input_types, forward_interface.input_types());
+    check_types!(@same, "custom_vjp forward input", [input_types, forward_interface.input_types()]);
     let forward_output_types = forward_interface.output_types();
     if forward_output_types.len() < output_types.len() {
         return Err(TypeError {
@@ -348,13 +348,22 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
             ),
         });
     }
-    check_types!("custom_vjp forward output", output_types, &forward_output_types[..output_types.len()]);
+    check_types!(@same, "custom_vjp forward output", [
+        output_types,
+        &forward_output_types[..output_types.len()],
+    ]);
     let residual_types = &forward_output_types[output_types.len()..];
     let output_cotangent_types = output_types.iter().map(|r#type| r#type.cotangent());
     let expected_backward_input_types: Vec<T> = residual_types.iter().cloned().chain(output_cotangent_types).collect();
-    check_types!("custom_vjp backward input", &expected_backward_input_types, backward_interface.input_types());
+    check_types!(@same, "custom_vjp backward input", [
+        &expected_backward_input_types,
+        backward_interface.input_types(),
+    ]);
     let expected_backward_output_types = input_types.iter().map(|r#type| r#type.cotangent()).collect::<Vec<_>>();
-    check_types!("custom_vjp backward output", &expected_backward_output_types, backward_interface.output_types());
+    check_types!(@same, "custom_vjp backward output", [
+        &expected_backward_output_types,
+        backward_interface.output_types(),
+    ]);
     Ok(primal_interface)
 }
 
@@ -370,7 +379,7 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         let primal_interface = validated_custom_vjp_interfaces(region_interfaces)?;
-        check_types!("custom_vjp input", primal_interface.input_types(), input_types);
+        check_types!(@same, "custom_vjp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
     }
 
@@ -639,14 +648,14 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
             // The transposed (pullback) carrier maps `[output_cotangents..., residuals...]` to the input cotangents
             // carried by the backward program's outputs.
             let expected: Vec<T> = cotangent_types.iter().chain(residual_types.iter()).cloned().collect();
-            check_types!("custom_vjp backward", &expected, input_types);
+            check_types!(@same, "custom_vjp backward", [&expected, input_types]);
             Ok(backward_interface.output_types().to_vec())
         } else {
             // The un-transposed (tangent-map) carrier maps `[input_tangents..., residuals...]` to the output tangents.
             // Those types are stored explicitly because they need not match the backward program's cotangent
             // boundary.
             let expected: Vec<T> = self.input_tangent_types.iter().chain(residual_types.iter()).cloned().collect();
-            check_types!("custom_vjp tangent", &expected, input_types);
+            check_types!(@same, "custom_vjp tangent", [&expected, input_types]);
             Ok(self.output_tangent_types.clone())
         }
     }

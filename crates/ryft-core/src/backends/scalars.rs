@@ -19,6 +19,7 @@ use num_complex::Complex;
 use ryft_macros::{Operation, Parameter};
 
 use crate::contexts::EagerContext;
+use crate::macros::check_types;
 use crate::operations::BooleanLike;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
@@ -35,7 +36,7 @@ use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOper
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Exp,
     ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub,
-    SubOperation, validate_floating_or_complex_input_types, validate_numeric_input_types,
+    SubOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -832,7 +833,7 @@ fn promote_scalar_arithmetic_operands(
     operation_name: &str,
 ) -> Result<(Scalar, Scalar), ProgramError> {
     let input_types = [left.r#type().into_owned(), right.r#type().into_owned()];
-    validate_numeric_input_types(&input_types, operation_name)?;
+    check_types!(@numeric, operation_name, input_types);
     let target = DataType::promoted(&input_types).map_err(|error| TypeError { message: error.to_string() })?;
     Ok((left.convert_element_type(target)?, right.convert_element_type(target)?))
 }
@@ -1121,7 +1122,7 @@ impl Atan2 for Scalar {
     /// complex operands are promoted to a common data type; any other combination returns a [`TypeError`]. Complex
     /// results use the principal value `-i · log((x + i · self) / sqrt(x² + self²))`.
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        validate_floating_or_complex_input_types(&[self.r#type().into_owned(), x.r#type().into_owned()], "atan2")?;
+        check_types!(@floating_or_complex, "atan2", [self.r#type().into_owned(), x.r#type().into_owned()]);
         let (y, x) = promote_scalar_arithmetic_operands(self, x, "atan2")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (y.low_precision_float_parts(), x.low_precision_float_parts())
