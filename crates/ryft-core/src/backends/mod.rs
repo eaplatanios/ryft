@@ -2,6 +2,8 @@
 //! evaluation, batching, differentiation, and transposition machinery without depending on an optimized backend such
 //! as the XLA backend.
 
+pub mod arrays;
 pub mod scalars;
 
+pub use arrays::{Array, ArrayOperation, ArrayTracingContext};
 pub use scalars::{Scalar, ScalarOperation, ScalarTracingContext};

@@ -70,12 +70,10 @@ macro_rules! check_gradient {
     ) => {{
         // Closure parameter types infer from an expected type, so each instantiation of `$function` flows
         // through an identity function pinning the signature that instantiation is used at.
-        type EagerCheckContext = $crate::contexts::EagerContext<$value, $operation>;
-
         fn pin_traced<
             F: Fn(
-                $crate::differentiation::LinearizationTracer<EagerCheckContext>,
-            ) -> $crate::differentiation::LinearizationTracer<EagerCheckContext>,
+                $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
+            ) -> $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
         >(function: F) -> F {
             function
         }
