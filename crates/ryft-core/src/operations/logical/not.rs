@@ -1,4 +1,9 @@
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_non_differentiable_operation, impl_non_transposable_operation,
+};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &str = "not";
@@ -12,6 +17,9 @@ define_elementwise_operation!(
     NotOperation, NOT_OPERATION_NAME,
     Not, not,
 );
+
+impl_non_differentiable_operation!(NotOperation);
+impl_non_transposable_operation!(NotOperation);
 
 define_elementwise_capability!(
     @unary
@@ -30,6 +38,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
@@ -38,7 +47,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -51,12 +59,12 @@ mod tests {
         assert_eq!(Operation::<ArrayType>::name(&operation), NOT_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "NotOperation");
         assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
-        let input = TestArray::vector(vec![1.0, 0.0, 1.0]);
-        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input]).unwrap();
-        assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
+        let input = Array::vector(vec![true, false, true]);
+        let outputs = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input]).unwrap();
+        assert_eq!(outputs[0].values(), &[false, true, false]);
 
         // The `!` operator implementation matches the interpretation.
-        assert_eq!((!TestArray::vector(vec![1.0, 0.0, 1.0])).values(), &[0.0, 1.0, 0.0]);
+        assert_eq!((!Array::vector(vec![true, false, true])).values(), &[false, true, false]);
 
         // Array type inference preserves the Boolean input type.
         let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
@@ -71,9 +79,9 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -81,10 +89,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<TestArray, NotOperation>::new();
+        let mut builder = ProgramBuilder::<Array, NotOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

@@ -167,12 +167,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -181,10 +181,10 @@ mod tests {
     fn test_iota() {
         // A rank-2 iota along dimension 1 increases across columns and repeats down rows.
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let context = EagerContext::<TestArray, IotaOperation<ArrayType>>::new();
-        assert_eq!(context.iota(&r#type, 1), Ok(TestArray::new(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0])),);
+        let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
+        assert_eq!(context.iota(&r#type, 1), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0])),);
         // Along dimension 0 the index increases down rows and repeats across columns.
-        assert_eq!(context.iota(&r#type, 0), Ok(TestArray::new(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
+        assert_eq!(context.iota(&r#type, 0), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
 
         // An out-of-bounds dimension surfaces an error rather than mis-indexing.
         assert!(matches!(context.iota(&r#type, 2), Err(ProgramError::Type(_))));
@@ -200,9 +200,9 @@ mod tests {
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
 
-        let mut builder = ProgramBuilder::<TestArray, IotaOperation<ArrayType>>::new();
+        let mut builder = ProgramBuilder::<Array, IotaOperation<ArrayType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

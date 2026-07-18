@@ -1,4 +1,9 @@
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_non_differentiable_operation, impl_non_transposable_operation,
+};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`AndOperation`].
 pub const AND_OPERATION_NAME: &str = "and";
@@ -12,6 +17,9 @@ define_elementwise_operation!(
     AndOperation, AND_OPERATION_NAME,
     And, and,
 );
+
+impl_non_differentiable_operation!(AndOperation);
+impl_non_transposable_operation!(AndOperation);
 
 define_elementwise_capability!(
     @binary
@@ -30,18 +38,33 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
+    use crate::differentiation::DifferentiationTracer;
+    use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::interpretation::InterpretableOperation;
+    use crate::operations::compare::{Compare, ComparisonDirection};
+    use crate::operations::constants::{OneLike, ZeroLike};
+    use crate::operations::control_flow::Select;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
+
+    /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over JVP duals of the eager [`Array`] context.
+    fn masked_select(
+        x: DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+    ) -> Result<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
+        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
+        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan)?;
+        let mask = positive & above_one;
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
+    }
 
     #[test]
     fn test_and() {
@@ -51,16 +74,16 @@ mod tests {
         assert_eq!(Operation::<ArrayType>::name(&operation), AND_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "AndOperation");
         assert_eq!(format!("{operation}"), AND_OPERATION_NAME);
-        let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
-        let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs]).unwrap();
-        assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        let outputs = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[left, right]).unwrap();
+        assert_eq!(outputs[0].values(), &[true, false, false, false]);
 
         // The `&` operator implementation matches the interpretation, including scalar broadcasting.
-        let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
-        let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        assert_eq!((lhs & rhs).values(), &[1.0, 0.0, 0.0, 0.0]);
-        assert_eq!((TestArray::vector(vec![1.0, 0.0]) & TestArray::scalar(1.0)).values(), &[1.0, 0.0]);
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!((left & right).values(), &[true, false, false, false]);
+        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).values(), &[true, false]);
 
         // Array type inference broadcasts the Boolean input types.
         let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
@@ -79,22 +102,22 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[]
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<TestArray, AndOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AndOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![program_output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![program_output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -105,5 +128,22 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_and_differentiation() {
+        // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
+        // predicates hold (x > 1) and 3 otherwise.
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(masked_select, Array::scalar(2.0), Array::scalar(1.0))
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![4.0]);
+        assert_eq!(tangent.to_f64s(), vec![2.0]);
+
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(masked_select, Array::scalar(0.5), Array::scalar(1.0))
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![1.5]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
     }
 }

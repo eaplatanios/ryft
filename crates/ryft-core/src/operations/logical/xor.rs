@@ -1,4 +1,9 @@
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_non_differentiable_operation, impl_non_transposable_operation,
+};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &str = "xor";
@@ -12,6 +17,9 @@ define_elementwise_operation!(
     XorOperation, XOR_OPERATION_NAME,
     Xor, xor,
 );
+
+impl_non_differentiable_operation!(XorOperation);
+impl_non_transposable_operation!(XorOperation);
 
 define_elementwise_capability!(
     @binary
@@ -30,6 +38,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
@@ -38,7 +47,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -51,16 +59,16 @@ mod tests {
         assert_eq!(Operation::<ArrayType>::name(&operation), XOR_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "XorOperation");
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
-        let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
-        let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs]).unwrap();
-        assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        let outputs = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[left, right]).unwrap();
+        assert_eq!(outputs[0].values(), &[false, true, true, false]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.
-        let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
-        let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        assert_eq!((lhs ^ rhs).values(), &[0.0, 1.0, 1.0, 0.0]);
-        assert_eq!((TestArray::vector(vec![1.0, 0.0]) ^ TestArray::scalar(1.0)).values(), &[0.0, 1.0]);
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!((left ^ right).values(), &[false, true, true, false]);
+        assert_eq!((Array::vector(vec![true, false]) ^ Array::scalar(true)).values(), &[false, true]);
 
         // Array type inference broadcasts the Boolean input types.
         let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
@@ -79,22 +87,22 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[]
+                &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<TestArray, XorOperation>::new();
+        let mut builder = ProgramBuilder::<Array, XorOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![program_output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![program_output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),

@@ -161,6 +161,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
@@ -170,7 +171,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -178,8 +178,8 @@ mod tests {
     #[test]
     fn test_fill() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let context = EagerContext::<TestArray, FillOperation<ArrayType, Scalar>>::new();
-        assert_eq!(context.fill(&r#type, Scalar::from(3.5)), Ok(TestArray::new(r#type.clone(), vec![3.5, 3.5])));
+        let context = EagerContext::<Array, FillOperation<ArrayType, Scalar>>::new();
+        assert_eq!(context.fill(&r#type, Scalar::from(3.5)), Ok(Array::from_f64s(r#type.clone(), vec![3.5, 3.5])));
 
         // Filling a dynamically sized type cannot materialize element data and surfaces an error.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
@@ -198,31 +198,31 @@ mod tests {
         assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[]
             ),
-            Ok(vec![TestArray::new(r#type.clone(), vec![3.5, 3.5])]),
+            Ok(vec![Array::from_f64s(r#type.clone(), vec![3.5, 3.5])]),
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()], &[]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::new(r#type.clone(), vec![0.0, 0.0])],
+                &[Array::from_f64s(r#type.clone(), vec![0.0, 0.0])],
             ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
-        let mut builder = ProgramBuilder::<TestArray, FillOperation<ArrayType, Scalar>>::new();
+        let mut builder = ProgramBuilder::<Array, FillOperation<ArrayType, Scalar>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
