@@ -1,9 +1,6 @@
 /// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
 pub mod collective;
 
-/// Higher-order condition and while-loop operations.
-pub mod control_flow;
-
 /// Higher-order custom-derivative operations (`custom_jvp` / `custom_vjp`).
 pub mod custom_derivatives;
 

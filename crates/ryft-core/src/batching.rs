@@ -81,8 +81,8 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
-use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::{BooleanLike, ElementwiseOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
@@ -697,6 +697,26 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     #[inline]
     fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
+    }
+}
+
+impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
+    fn as_boolean(&self) -> Self {
+        // Returns an `ArrayBatch` that wraps the Boolean reinterpretation of the carried value (via the value's own
+        // `BooleanLike::as_boolean`) under the same batch axis. The `.unwrap()` here is safe because `as_boolean`
+        // preserves structural metadata, so the batch axis that was valid for this batch remains in bounds for the
+        // reinterpreted value.
+        let value = self.value().as_boolean();
+        Self::new(value.r#type().into_owned(), value, self.batch_axis()).unwrap()
+    }
+
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        if let Some(axis) = self.batch_axis().axis() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a value batched along axis {axis}"),
+            });
+        }
+        self.value().boolean()
     }
 }
 
