@@ -1,16 +1,22 @@
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
+use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, InterpretableBatchableOperation};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::{Sharding, ShardingError};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape};
 
 // TODO(eaplatanios): Review this module.
@@ -150,6 +156,92 @@ impl<C: Domain<Type = ArrayType, Value: Transpose>> InterpretableOperation<C> fo
 impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> PartiallyEvaluatableOperation<C>
     for TransposeOperation
 {
+}
+
+/// Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the same
+/// transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
+/// rule is consulted, so the operand tangent reaching here is always live.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransposeOperation
+where
+    C::Operation: From<TransposeOperation>,
+    C::Value: Transpose,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().transpose(self.permutation())?;
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(self.permutation())?),
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
+where
+    O: Operation<ArrayType> + From<TransposeOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let inverse = self.permutation().inverse();
+        match &outputs[0] {
+            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.transpose(inverse)?)]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+        }
+    }
+}
+
+/// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.
+///
+/// The returned permutation has length `permutation.len() + 1`, places the batch axis at the
+/// same output position as it appears in the input (so the output's batch axis stays at the
+/// input's `batch_axis`), and shifts every other axis index `i` to `i + 1` when `i >= batch_axis`.
+pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> {
+    let mut lifted = Vec::with_capacity(permutation.len() + 1);
+    for output_axis in 0..=permutation.len() {
+        if output_axis == batch_axis {
+            lifted.push(batch_axis);
+        } else {
+            let original_output_axis = if output_axis < batch_axis { output_axis } else { output_axis - 1 };
+            let input_axis = permutation[original_output_axis];
+            lifted.push(if input_axis >= batch_axis { input_axis + 1 } else { input_axis });
+        }
+    }
+    lifted
+}
+
+impl<C: Context<Type = ArrayType>> crate::batching::BatchableOperation<C> for TransposeOperation
+where
+    TransposeOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[crate::batching::ArrayBatch<C::Value>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        // Validates that a mapped batch axis has a static size before lifting.
+        crate::batching::ArrayBatch::common_batch_size(inputs)?;
+        let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
+            Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
+            None => (self.permutation().to_vec(), None),
+        };
+        let lifted_op = TransposeOperation::new(lifted_permutation);
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
+    }
 }
 
 /// Represents the ability to transpose the axes of an array. [`Transpose`] fills the same role for
@@ -299,7 +391,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -451,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_test_array() {
+    fn test_transpose_array() {
         // Rank-2 swap of a row-major 2x3 payload.
         let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
         assert_eq!(
@@ -557,5 +650,29 @@ mod tests {
 
         // An out-of-bounds axis is a clean error rather than an out-of-bounds panic.
         assert!(matrix.swap_axes(2, 0).is_err());
+    }
+
+    #[test]
+    fn test_transpose_batching_lifts_permutation() {
+        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-item rank-2 matrices,
+        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
+        // tensor, leaving the batch axis (originally axis 0) in place.
+        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
+        let x = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
+            x_data,
+        );
+
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
+            .unwrap();
+
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)])),
+        );
+        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
+        assert_eq!(output.to_f64s()[0], 0.0);
+        assert_eq!(output.to_f64s()[1 * 3], 1.0);
     }
 }

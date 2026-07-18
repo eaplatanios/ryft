@@ -9,7 +9,7 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
 use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_non_differentiable_operation};
 use crate::operations::constants::{FillOperation, IotaOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -518,30 +518,7 @@ where
     }
 }
 
-/// Forward-mode rule for [`AxisIndexOperation`]: the mesh index is an integer constant with no tangent, so the primal
-/// is replayed and paired with a typed zero tangent.
-impl<C: Context> DifferentiableOperation<C> for AxisIndexOperation
-where
-    C::Type: crate::differentiation::DifferentiableType,
-    C::Operation: From<AxisIndexOperation>,
-    AxisIndexOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_differentiable_operation!(AxisIndexOperation);
 
 /// Transpose rule for [`AxisIndexOperation`]: it is a nullary constant, so it contributes no operand cotangents.
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for AxisIndexOperation {

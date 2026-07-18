@@ -2,20 +2,24 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_builders, check_count};
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::macros::{check_builders, check_count, impl_non_differentiable_operation};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::{Captured, Input};
-use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::tracing::Tracer;
+use crate::programs::{MaybeZero, ProgramError};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
 /// Canonical operation name for [`ConstantOperation`].
@@ -121,6 +125,44 @@ impl<
 impl<V: Clone + Typed, Payload: Clone, C: Context<Type = V::Type, Operation: From<ConstantOperation<V, Payload>>>>
     PartiallyEvaluatableOperation<C> for ConstantOperation<V, Payload>
 {
+}
+
+impl_non_differentiable_operation!(ConstantOperation<C::Constant>);
+
+impl<T, V, O, F, Mode> TransposableOperation<V, O> for ConstantOperation<F, Mode>
+where
+    T: Type,
+    V: Value<Type = T>,
+    O: Operation<T>,
+    F: Clone + Display + Typed<Type = T>,
+    Mode: Clone,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _driver: &D,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(Vec::new())
+    }
+}
+
+impl<Stored, C> BatchableOperation<C> for ConstantOperation<Stored>
+where
+    Stored: Clone + Display + Typed<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Constant<C::Value, Stored>,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(&context.parent().clone(), &crate::EmptyRegionDriver, &[])?;
+        Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
+    }
 }
 
 /// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented

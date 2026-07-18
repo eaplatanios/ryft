@@ -40,7 +40,6 @@ pub use operations::collective::{
 pub use operations::control_flow::transpose_primal_condition;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
 pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};
-pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::transpose_primal_scan;
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,

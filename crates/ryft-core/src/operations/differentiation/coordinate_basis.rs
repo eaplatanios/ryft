@@ -4,12 +4,9 @@ use std::ops::{Add, Mul};
 use crate::backends::scalars::Scalar;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_non_differentiable_operation};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, One, Zero};
 use crate::operations::control_flow::Select;
@@ -251,24 +248,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CoordinateBasisOperation<ArrayType>
-where
-    C::Operation: From<CoordinateBasisOperation<ArrayType>>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 0, ProgramError);
-        Ok(context
-            .bind(self.clone(), Vec::new(), &[])?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
+impl_non_differentiable_operation!(CoordinateBasisOperation<ArrayType>);
 
 impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O>
     for CoordinateBasisOperation<ArrayType>

@@ -1,11 +1,20 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
+};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose, UpdateSlice};
+use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -19,7 +28,7 @@ use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Shape, Size};
 
 use super::scatter::{LinearScatterAddOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
-use super::slicing::is_integer;
+use super::slicing::{batch_by_item_expansion, is_integer};
 
 // TODO(eaplatanios): Review this module.
 
@@ -712,6 +721,57 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for GatherOp
 {
 }
 
+/// Forward-mode rule for [`GatherOperation`]: `gather` is linear in the data operand, and the index operand is a
+/// non-differentiated primal operand edge, so the tangent gathers the operand tangent at the same primal indices. A
+/// zero operand tangent yields a typed zero output tangent.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for GatherOperation
+where
+    C::Operation: From<GatherOperation>,
+    C::Value: Gather,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let indices = inputs[1].primal();
+        let primal = inputs[0].primal().gather(indices, self)?;
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Batching rule for [`GatherOperation`]. A gather mixes window reads, collapsed axes, and index-driven offsets whose
+/// axis bookkeeping does not compose cleanly with an extra mapped axis, so any batched operand, indices, or both is
+/// handled by per-item expansion (`batch_by_item_expansion`): each batch item gathers independently and the results
+/// restack along a fresh leading batch axis. This stages `O(axis_size)` gathers but is correct for every
+/// dimension-number configuration; dimension-number lifting (one lifted gather, no expansion) is a performance
+/// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
+impl<C> BatchableOperation<C> for GatherOperation
+where
+    C: Context<Type = ArrayType> + Zero<C::Value>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    GatherOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+        };
+        batch_by_item_expansion(context, GATHER_OPERATION_NAME, self, inputs, axis_size)
+    }
+}
+
 /// Returns whether `dimension` is sharded over at least one explicit mesh axis of `mesh` (the explicit-axis gate used
 /// by the dot/reduce/slice sharding rules). Shared with [`super::scatter`].
 pub(crate) fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &ShardingDimension) -> bool {
@@ -996,9 +1056,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation};
+    use crate::contexts::{Context, EagerContext};
+    use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::DataType;
 
     use super::*;
@@ -1181,5 +1248,92 @@ mod tests {
         assert_eq!(*operand_cotangents[0].r#type(), operand_type);
         // The scatter-add adjoint writes the cotangent rows back into rows 0 and 2 of a zero operand.
         assert_eq!(operand_cotangents[0].to_f64s(), vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]);
+    }
+
+    /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
+    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
+    where
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
+    {
+        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
+        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
+    }
+
+    #[test]
+    fn test_gather_value_and_grad_scatters_at_captured_indices() {
+        // f(x) = sum(gather(x, [[0], [2]])) takes rows 0 and 2 of a 3x2 matrix; the integer indices are constants of
+        // the trace, so the gather/scatter-add transpose duality pulls the all-ones cotangent back into a zero operand
+        // at exactly those rows.
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |x| {
+                    let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
+                    let operation =
+                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+                    x.gather(&indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
+                },
+                Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 10.0, epsilon = 1e-9);
+        assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_gather_jacfwd_selects_operand_coordinates() {
+        // Forward mode through `f(x) = gather(x, [[0], [2]])` selects the operand coordinate feeding each output, so the
+        // Jacobian is the row-selection indicator from the captured-index linear gather.
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(
+                |x| {
+                    let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
+                    let operation =
+                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+                    Ok(x.gather(&indices, &operation).unwrap())
+                },
+                Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+            )
+            .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2, 2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3, 2]);
+        assert_eq!(
+            block.value().values(),
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
+            ],
+        );
+    }
+
+    #[test]
+    fn test_gather_batching_expands_an_empty_batch() {
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)]));
+        let operand =
+            ArrayBatch::new(operand_type.clone(), Array::from_f64s(operand_type, Vec::new()), Some(0)).unwrap();
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(0), Size::Static(1), Size::Static(1)]));
+        let indices =
+            ArrayBatch::new(indices_type.clone(), Array::from_f64s(indices_type, Vec::new()), Some(0)).unwrap();
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
+
+        let outputs = operation
+            .batch(
+                &crate::BatchingContext::new(EagerContext::<Array>::new(), 0),
+                &crate::EmptyRegionDriver,
+                &[operand, indices],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            *outputs[0].value().r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(1)])),
+        );
+        assert!(outputs[0].value().values().is_empty());
     }
 }
