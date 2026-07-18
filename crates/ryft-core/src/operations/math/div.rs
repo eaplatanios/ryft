@@ -23,8 +23,8 @@ define_elementwise_operation!(
     /// markers must agree.
     DivOperation, DIV_OPERATION_NAME,
     Div, div,
-    validate = super::validate_numeric_input_types,
-    validate_array = super::validate_binary_reduction_state,
+    validate_data_types = super::validate_numeric_input_types,
+    validate_array_types = super::validate_binary_reduction_state,
 );
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation

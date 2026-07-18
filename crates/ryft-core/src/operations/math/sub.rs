@@ -26,8 +26,8 @@ define_elementwise_operation!(
     /// contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
     SubOperation, SUB_OPERATION_NAME,
     Sub, sub,
-    validate = super::validate_numeric_input_types,
-    validate_array = super::validate_linear_reduction_state,
+    validate_data_types = super::validate_numeric_input_types,
+    validate_array_types = super::validate_linear_reduction_state,
 );
 
 impl<C: Context> DifferentiableOperation<C> for SubOperation

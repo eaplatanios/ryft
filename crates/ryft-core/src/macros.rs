@@ -111,7 +111,6 @@ macro_rules! check_builders {
     }};
 }
 
-// TODO(eaplatanios): Review this macro.
 /// Defines the structural implementations shared by elementwise operations. The generated base
 /// includes the unit operation struct, its [`Display`](std::fmt::Display), [`Operation`](crate::Operation),
 /// [`ElementwiseOperation`](crate::ElementwiseOperation), [`InterpretableOperation`](crate::InterpretableOperation),
@@ -120,28 +119,28 @@ macro_rules! check_builders {
 /// # Parameters
 ///
 ///   - `@unary` / `@binary`: Selects the operation arity.
-///   - `$(#[$operation_documentation])*`: Documentation attributes attached to the generated operation struct.
+///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
 ///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
 ///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
-///   - `validate = $validator`: Optional hook that validates scalar [`DataType`](crate::DataType) inputs before type
-///     inference and array element types before array broadcasting.
-///   - `validate_array = $array_validator`: Optional hook that validates complete
-///     [`ArrayType`](crate::ArrayType) inputs before array broadcasting, for rules that depend on metadata beyond the
-///     element type.
+///   - `validate_data_types = $data_type_validator`: Optional hook that validates scalar [`DataType`](crate::DataType)
+///     inputs before type inference and array element [`DataType`](crate::DataType)s before array broadcasting.
+///   - `validate_array_types = $array_type_validator`: Optional hook that validates [`ArrayType`](crate::ArrayType)
+///     inputs before array broadcasting, for rules that depend on metadata beyond the element
+///     [`DataType`](crate::DataType).
 #[macro_export]
 macro_rules! define_elementwise_operation {
     (
         @unary
-        $(#[$operation_documentation:meta])*
+        $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
-        $(, validate = $validator:path)?
-        $(, validate_array = $array_validator:path)? $(,)?
+        $(, validate_data_types = $data_type_validator:path)?
+        $(, validate_array_types = $array_type_validator:path)? $(,)?
     ) => {
-        $(#[$operation_documentation])*
+        $(#[$documentation])*
         #[derive(Clone, Debug, Default)]
         pub struct $operation;
 
@@ -165,7 +164,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
-                $($validator(input_types, $name)?;)?
+                $($data_type_validator(input_types, $name)?;)?
                 Ok(vec![input_types[0]])
             }
         }
@@ -183,8 +182,8 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
-                $($validator(&[input_types[0].data_type()], $name)?;)?
-                $($array_validator(input_types, $name)?;)?
+                $($data_type_validator(&[input_types[0].data_type()], $name)?;)?
+                $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -219,13 +218,13 @@ macro_rules! define_elementwise_operation {
     };
     (
         @binary
-        $(#[$operation_documentation:meta])*
+        $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
-        $(, validate = $validator:path)?
-        $(, validate_array = $array_validator:path)? $(,)?
+        $(, validate_data_types = $data_type_validator:path)?
+        $(, validate_array_types = $array_type_validator:path)? $(,)?
     ) => {
-        $(#[$operation_documentation])*
+        $(#[$documentation])*
         #[derive(Clone, Debug, Default)]
         pub struct $operation;
 
@@ -249,7 +248,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
-                $($validator(input_types, $name)?;)?
+                $($data_type_validator(input_types, $name)?;)?
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
                     .map_err(|_| $crate::TypeError {
@@ -271,8 +270,8 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
-                $($validator(&[input_types[0].data_type(), input_types[1].data_type()], $name)?;)?
-                $($array_validator(input_types, $name)?;)?
+                $($data_type_validator(&[input_types[0].data_type(), input_types[1].data_type()], $name)?;)?
+                $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -307,30 +306,25 @@ macro_rules! define_elementwise_operation {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Defines the value-level capability trait paired with an elementwise operation and its dispatch-domain blanket
-/// implementation. This macro is separate from [`define_elementwise_operation!`] so operation modules can place
-/// differentiation and transposition implementations before the capability API while retaining shared boilerplate.
+/// Defines a value-level capability trait paired with an elementwise operation and its dispatch-domain implementation.
 ///
 /// # Parameters
 ///
 ///   - `@unary` / `@binary`: Selects whether the capability consumes only `self` or also a right-hand-side value.
-///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
-///   - `$capability`: Identifier of the generated value-level capability trait.
-///   - `$method`: Identifier of the generated capability method.
-///   - `$operation`: Unit-struct operation bound through the value's dispatch domain.
+///   - `$(#[$documentation])*`: Documentation attributes attached to the generated capability trait.
+///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
+///   - `$method`: Identifier of the generated capability method (e.g., `sin`).
+///   - `$operation`: Unit-struct operation bound through the value's dispatch domain (e.g., `SinOperation`).
 #[macro_export]
 macro_rules! define_elementwise_capability {
     (
         @unary
-        $(#[$capability_documentation:meta])*
+        $(#[$documentation:meta])*
         $capability:ident, $method:ident, $operation:ident $(,)?
     ) => {
-        $(#[$capability_documentation])*
+        $(#[$documentation])*
         pub trait $capability: Sized {
-            /// Computes this operation elementwise for this value, returning a [`ProgramError`](crate::ProgramError)
-            /// if something goes wrong (e.g., when this operation does not support the value's
-            /// [`DataType`](crate::DataType)).
+            #[doc = concat!("Computes [`", stringify!($operation), "`] elementwise for this value.")]
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
@@ -351,14 +345,12 @@ macro_rules! define_elementwise_capability {
     };
     (
         @binary
-        $(#[$capability_documentation:meta])*
+        $(#[$documentation:meta])*
         $capability:ident, $method:ident, $operation:ident $(,)?
     ) => {
-        $(#[$capability_documentation])*
+        $(#[$documentation])*
         pub trait $capability: Sized {
-            /// Computes this operation elementwise for this value and `right`, returning a
-            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
-            /// support the values' [`DataType`](crate::DataType)s).
+            #[doc = concat!("Computes [`", stringify!($operation), "`] elementwise for this value and `right`.")]
             fn $method(&self, right: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
@@ -379,13 +371,11 @@ macro_rules! define_elementwise_capability {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs
-/// carry no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier: the primal operation is
-/// replayed on the input primals and each output is paired with a structural zero tangent, which stays symbolic and
-/// stages nothing. Because such a rule stages no live tangent, the operation can never appear on a linear operand in
-/// a valid tangent program, so it typically pairs with
-/// [`impl_non_transposable_operation!`](crate::impl_non_transposable_operation).
+/// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs carry
+/// no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier. The primal operation is replayed
+/// on the input primals, and each output is paired with a structural zero tangent, which stays symbolic and stages
+/// nothing. Because such a rule stages no live tangent, the operation can never appear on a linear operand in a valid
+/// tangent program, and so it is typically paired with [`impl_non_transposable_operation!`].
 ///
 /// # Parameters
 ///
@@ -399,33 +389,37 @@ macro_rules! impl_non_differentiable_operation {
             C::Operation: ::std::convert::From<$operation>,
             $operation: $crate::Operation<C::Type>,
         {
+            #[inline]
             fn jvp<D: $crate::DifferentiationDriver<C>>(
                 &self,
                 context: &C,
                 _driver: &D,
                 inputs: &[$crate::DifferentiationDual<C::Value>],
             ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
-                // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-                // with a structural zero tangent, which stays symbolic and stages nothing.
-                let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-                Ok($crate::Context::bind(context, self.clone(), ::std::vec::Vec::new(), &primal_inputs)?
-                    .into_iter()
-                    .map($crate::DifferentiationDual::new_with_zero_tangent)
-                    .collect())
+                // The outputs carry no tangent. We replay the primal operation on the input primals and pair each
+                // output with a structural zero tangent, which stays symbolic and stages nothing.
+                Ok($crate::Context::bind(
+                    context,
+                    self.clone(),
+                    ::std::vec::Vec::new(),
+                    &inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map($crate::DifferentiationDual::new_with_zero_tangent)
+                .collect())
             }
         }
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Implements the erroring [`TransposableOperation`](crate::TransposableOperation) rule for an operation that is not
-/// a linear map on any operand. A valid tangent program never contains such an operation on a linear operand (its
-/// forward-mode rule pairs replayed primals with tangents computed by other operations), so the generated rule
-/// reports an [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error. The reason non-transposable
-/// operations still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is
-/// driven through whole operation families: Ryft used to have a separate linear operation family type, but that
-/// resulted in overly complicated backend and operation implementations for very little benefit in practice, and so
-/// the two families were unified.
+/// Implements the erroring [`TransposableOperation`](crate::TransposableOperation) rule for an operation that is not a
+/// linear map on any input/operand. A valid tangent program never contains such an operation on a linear operand (its
+/// forward-mode rule pairs replayed primals with tangents computed by other operations), so the generated rule reports
+/// an [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error. The reason non-transposable operations
+/// still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is driven
+/// through whole operation families. Ryft used to have a separate linear operation family type, but that resulted
+/// in overly complicated backend and operation implementations for very little benefit in practice, and so the two
+/// families were unified.
 ///
 /// # Parameters
 ///
@@ -438,6 +432,7 @@ macro_rules! impl_non_transposable_operation {
         where
             $operation: $crate::Operation<T>,
         {
+            #[inline]
             fn transpose<D: $crate::TranspositionDriver<V, O>>(
                 &self,
                 _context: &mut $crate::TracingContext<V, O>,
@@ -448,8 +443,6 @@ macro_rules! impl_non_transposable_operation {
                 Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
                 $crate::DifferentiationError,
             > {
-                // A fully qualified call is required here because operations typically implement `Operation` for both
-                // the `DataType` and the `ArrayType` type universes.
                 Err($crate::ProgramError::UnsupportedOperation {
                     message: format!("operation `{}` is not transposable", $crate::Operation::<T>::name(self)),
                 }

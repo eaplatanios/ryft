@@ -22,8 +22,8 @@ define_elementwise_operation!(
     /// operands that still carry partial sums are rejected, with their reduced-axis markers required to agree.
     Atan2Operation, ATAN2_OPERATION_NAME,
     Atan2, atan2,
-    validate = super::validate_floating_or_complex_input_types,
-    validate_array = super::validate_binary_reduction_state,
+    validate_data_types = super::validate_floating_or_complex_input_types,
+    validate_array_types = super::validate_binary_reduction_state,
 );
 
 impl<C: Context> DifferentiableOperation<C> for Atan2Operation

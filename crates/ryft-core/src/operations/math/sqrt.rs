@@ -18,8 +18,8 @@ define_elementwise_operation!(
     /// complex operands are supported, and operands that still carry partial sums are rejected.
     SqrtOperation, SQRT_OPERATION_NAME,
     Sqrt, sqrt,
-    validate = super::validate_floating_or_complex_input_types,
-    validate_array = super::validate_no_unreduced_inputs,
+    validate_data_types = super::validate_floating_or_complex_input_types,
+    validate_array_types = super::validate_no_unreduced_inputs,
 );
 
 impl<C: Context> DifferentiableOperation<C> for SqrtOperation
