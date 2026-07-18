@@ -215,13 +215,13 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::differentiation::DifferentiationTracer;
+    use crate::differentiation::forward::{DifferentiationTracer, ForwardModeDifferentiate};
+    use crate::macros::check_operation;
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -345,6 +345,31 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_batching() {
+        check_operation!(
+            @batching @exact,
+            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(0.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_compare_differentiation() {
         // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
         // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
@@ -359,5 +384,15 @@ mod tests {
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![-6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_compare_partial_evaluation() {
+        check_operation!(
+            @partial_evaluation @fold_and_residualize,
+            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
+            inputs = [Scalar::from(1.0), Scalar::from(0.0)],
+            expected = Scalar::from(true),
+        );
     }
 }

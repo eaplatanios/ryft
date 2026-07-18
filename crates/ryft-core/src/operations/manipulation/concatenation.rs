@@ -456,6 +456,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::macros::check_operation;
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -744,59 +745,38 @@ mod tests {
 
     #[test]
     fn test_concatenate_batching_lifts_batch_axis() {
-        // Two batched operands keep their batch axis at 0 and concatenate along the shifted axis 1: batch item 0 joins
-        // [0, 1] with [4, 5] and batch item 1 joins [2, 3] with [6, 7].
-        let first = {
-            let value = Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let second = {
-            let value = Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = ConcatenateOperation::new(0)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[first, second],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(4)]);
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
-
-        // A replicated operand is broadcast to gain the batch axis so each batch item concatenates the same copy.
-        let batched = {
-            let value = Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let uniform = ArrayBatch::replicated(Array::vector(vec![8.0, 9.0]));
-        let outputs = ConcatenateOperation::new(0)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[batched, uniform],
-            )
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
-
-        // Replicated operands pass through the unlifted rule.
-        let left = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
-        let right = ArrayBatch::replicated(Array::vector(vec![3.0]));
-        let outputs = ConcatenateOperation::new(0)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[left, right],
-            )
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 3.0]);
+        check_operation!(
+            @batching @exact,
+            operation = ConcatenateOperation::new(0),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0])),
+                    ],
+                    outputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 4, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@replicated, Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 4, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@replicated, Array::vector(vec![3.0])),
+                    ],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                },
+            ],
+        );
     }
 
     #[test]

@@ -792,6 +792,541 @@ macro_rules! define_tracer_operator {
     };
 }
 
+// TODO(eaplatanios): Review this macro.
+/// Checks a concrete [`Operation`](crate::Operation) contract through Ryft's reference transform machinery. This macro
+/// is intended for operation unit tests in Ryft and downstream crates. Its selectors describe the semantic test case,
+/// while its input and output lists encode [`Operation`](crate::Operation) arity directly:
+///
+///   - `@batching @exact` / `@batching @approx(epsilon = ...)`: Applies an operation to one or more batching cases.
+///     Each input and expected output is written as `(@mapped(axis = ...), value)` or `(@replicated, value)`.
+///     The default form uses the eager [`Array`](crate::Array) reference context, an
+///     [`EmptyRegionDriver`](crate::EmptyRegionDriver), and replicated mapped-axis sharding. The extended
+///     form accepts `context`, `driver`, and `axis_sharding` expressions. Exact comparison checks complete
+///     [`ArrayBatch`](crate::ArrayBatch) equality. Approximate comparison still checks output types and
+///     batch axes exactly and applies the epsilon only to `f64` payload values.
+///   - `@partial_evaluation`: Builds a one-instruction program for each case and checks its partial-evaluation output
+///     classification, residual instruction count, and replayed values. `@partial_evaluation @fold_and_residualize`
+///     is the concise form for a single-output operation using the default partial-evaluation rule. That form checks
+///     the all-known case, every individual unknown-input position, and the all-unknown case. Explicit cases use
+///     `(@known, value)` or `(@unknown(type = ..., replay = ...))`. Outputs use `(@known, value)` or `(@residual,
+///     value)`. The default form uses the eager [`Scalar`](crate::Scalar) reference backend. The extended
+///     `backend = (Value, Operation)` form supports downstream value and operation families.
+///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
+///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands
+///     must carry the same reduced-axis markers.
+///   - `@reject @transposition`: Builds a one-instruction array program and checks that transposition
+///     reaches the operation's unsupported-transposition error. The input type list encodes arity.
+///
+/// [`Region`](crate::Region)-ful operations may use the extended batching form with their
+/// [`Instruction`](crate::Instruction)-scoped driver, but tests whose main subject is nested-region
+/// transformation should generally keep that setup explicit.
+///
+/// # Example
+/// 
+/// This is an example for how to use this macro to check the elementwise [`AddOperation`](crate::AddOperation):
+///
+/// ```rust
+/// # use ryft_core::{Array, AddOperation, check_operation};
+/// check_operation!(
+///     @batching @exact,
+///     operation = AddOperation,
+///     axis_size = 2,
+///     cases = [
+///         {
+///             inputs = [
+///                 (@mapped(axis = 0), Array::vector(vec![1.0, 2.0])),
+///                 (@replicated, Array::scalar(3.0)),
+///             ],
+///             outputs = [
+///                 (@mapped(axis = 0), Array::vector(vec![4.0, 5.0])),
+///             ],
+///         },
+///     ],
+/// );
+/// ```
+///
+/// # Parameters
+///
+///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
+///   - `axis_size = $axis_size`: Size of the mapped batching axis. It remains explicit because no mapped input exists
+///     from which to infer it in an all-replicated case.
+///   - `cases = $cases`: Batching or partial-evaluation cases. Every case declares its inputs and expected outputs.
+///     Partial-evaluation cases additionally declare the expected residual instruction count.
+///   - `context = $context`: Optional parent [`Context`](crate::Context) for the extended batching form.
+///   - `driver = $driver`: Optional [`BatchingDriver`](crate::BatchingDriver) for the extended batching form.
+///   - `axis_sharding = $axis_sharding`: Optional [`ShardingDimension`](crate::ShardingDimension) assigned to the
+///     mapped axis by the extended batching form.
+///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct
+///     partial-evaluation or transposition programs for downstream operation families.
+///   - `input_types = $input_types`: Input types used by rejection checks, in operation input order.
+#[macro_export]
+macro_rules! check_operation {
+    (
+        @batching @exact,
+        operation = $operation:expr,
+        axis_size = $axis_size:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @batching_run (@exact),
+            context = $crate::contexts::EagerContext::<
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+            >::new(),
+            driver = &$crate::programs::regions::EmptyRegionDriver,
+            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
+            operation = $operation,
+            axis_size = $axis_size,
+            cases = $cases,
+        )
+    };
+
+    (
+        @batching @approx(epsilon = $epsilon:expr),
+        operation = $operation:expr,
+        axis_size = $axis_size:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @batching_run (@approx($epsilon)),
+            context = $crate::contexts::EagerContext::<
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+            >::new(),
+            driver = &$crate::programs::regions::EmptyRegionDriver,
+            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
+            operation = $operation,
+            axis_size = $axis_size,
+            cases = $cases,
+        )
+    };
+
+    (
+        @batching @exact,
+        context = $context:expr,
+        driver = $driver:expr,
+        axis_sharding = $axis_sharding:expr,
+        operation = $operation:expr,
+        axis_size = $axis_size:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @batching_run (@exact),
+            context = $context,
+            driver = $driver,
+            axis_sharding = $axis_sharding,
+            operation = $operation,
+            axis_size = $axis_size,
+            cases = $cases,
+        )
+    };
+
+    (
+        @batching @approx(epsilon = $epsilon:expr),
+        context = $context:expr,
+        driver = $driver:expr,
+        axis_sharding = $axis_sharding:expr,
+        operation = $operation:expr,
+        axis_size = $axis_size:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @batching_run (@approx($epsilon)),
+            context = $context,
+            driver = $driver,
+            axis_sharding = $axis_sharding,
+            operation = $operation,
+            axis_size = $axis_size,
+            cases = $cases,
+        )
+    };
+
+    (
+        @batching_run $comparison:tt,
+        context = $context:expr,
+        driver = $driver:expr,
+        axis_sharding = $axis_sharding:expr,
+        operation = $operation:expr,
+        axis_size = $axis_size:expr,
+        cases = [
+            $(
+                {
+                    inputs = [$($input:tt),* $(,)?],
+                    outputs = [$($output:tt),* $(,)?] $(,)?
+                }
+            ),* $(,)?
+        ] $(,)?
+    ) => {{
+        let operation = $operation;
+        let driver = $driver;
+        let axis_size = $axis_size;
+        let axis_sharding = $axis_sharding;
+        let context = $crate::batching::BatchingContext::new($context, axis_size)
+            .with_axis_sharding(axis_sharding);
+        $(
+            let inputs = vec![$($crate::check_operation!(@batch_value $input)),*];
+            let expected_outputs = vec![$($crate::check_operation!(@batch_value $output)),*];
+            let actual_outputs = $crate::batching::BatchableOperation::batch(
+                &operation,
+                &context,
+                driver,
+                inputs.as_slice(),
+            )
+            .unwrap();
+            $crate::check_operation!(@compare_batches $comparison, actual_outputs, expected_outputs);
+        )*
+    }};
+
+    (@batch_value (@mapped(axis = $axis:expr), $value:expr)) => {{
+        let value = $value;
+        let r#type = $crate::programs::types::Typed::r#type(&value).into_owned();
+        $crate::batching::ArrayBatch::new(r#type, value, $crate::batching::BatchAxis::new($axis)).unwrap()
+    }};
+
+    (@batch_value (@replicated, $value:expr)) => {
+        $crate::batching::ArrayBatch::replicated($value)
+    };
+
+    (@compare_batches (@exact), $actual:expr, $expected:expr) => {{
+        assert_eq!($actual, $expected);
+    }};
+
+    (@compare_batches (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {{
+        let actual = $actual;
+        let expected = $expected;
+        let epsilon: f64 = $epsilon;
+        assert_eq!(actual.len(), expected.len());
+        for (output_index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                $crate::programs::types::Typed::r#type(actual),
+                $crate::programs::types::Typed::r#type(expected),
+                "batching output {output_index} has the wrong type",
+            );
+            assert_eq!(
+                actual.batch_axis(),
+                expected.batch_axis(),
+                "batching output {output_index} has the wrong batch axis",
+            );
+            let actual_values = actual.value().to_f64s();
+            let expected_values = expected.value().to_f64s();
+            assert_eq!(actual_values.len(), expected_values.len());
+            for (value_index, (actual, expected)) in
+                actual_values.iter().zip(expected_values.iter()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= epsilon,
+                    "batching output {output_index} value {value_index} differs: {actual} vs {expected}",
+                );
+            }
+        }
+    }};
+
+    (
+        @partial_evaluation @fold_and_residualize,
+        operation = $operation:expr,
+        inputs = [$($input:expr),+ $(,)?],
+        expected = $expected:expr $(,)?
+    ) => {{
+        let operation = $operation;
+        let inputs: Vec<$crate::backends::scalars::Scalar> =
+            vec![$(::core::convert::Into::into($input)),+];
+        let expected: $crate::backends::scalars::Scalar = ::core::convert::Into::into($expected);
+        let mut builder = $crate::programs::builders::ProgramBuilder::<
+            $crate::backends::scalars::Scalar,
+            $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
+        >::new();
+        let input_ids = inputs
+            .iter()
+            .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
+            .collect::<Vec<_>>();
+        let operation: $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar> =
+            ::core::convert::Into::into(operation);
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+        assert_eq!(output_ids.len(), 1);
+        let program = builder
+            .build::<
+                Vec<$crate::backends::scalars::Scalar>,
+                Vec<$crate::backends::scalars::Scalar>,
+            >(
+                output_ids,
+                vec![$crate::parameters::Placeholder; inputs.len()],
+                vec![$crate::parameters::Placeholder],
+            )
+            .unwrap();
+        let context = $crate::contexts::EagerContext::<
+            $crate::backends::scalars::Scalar,
+            $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
+        >::new();
+
+        let known = inputs
+            .iter()
+            .cloned()
+            .map($crate::partial::PartialValue::Known)
+            .collect::<Vec<_>>();
+        let evaluation = program.partially_evaluate(known.as_slice()).unwrap();
+        assert!(evaluation.program().instructions().is_empty());
+        assert_eq!(evaluation.outputs().len(), 1);
+        assert!(evaluation.outputs()[0].is_known());
+        assert_eq!(evaluation.interpret(&context, &[]).unwrap(), vec![expected.clone()]);
+
+        for unknown_index in 0..inputs.len() {
+            let mut knowledge = known.clone();
+            knowledge[unknown_index] = $crate::partial::PartialValue::Unknown(
+                $crate::programs::types::Typed::r#type(&inputs[unknown_index]).into_owned(),
+            );
+            let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+            assert_eq!(evaluation.program().instructions().len(), 1);
+            assert_eq!(evaluation.outputs().len(), 1);
+            assert!(evaluation.outputs()[0].is_unknown());
+            assert_eq!(
+                evaluation.interpret(&context, &[inputs[unknown_index].clone()]).unwrap(),
+                vec![expected.clone()],
+            );
+        }
+
+        if inputs.len() > 1 {
+            let unknown = inputs
+                .iter()
+                .map(|input| {
+                    $crate::partial::PartialValue::Unknown(
+                        $crate::programs::types::Typed::r#type(input).into_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let evaluation = program.partially_evaluate(unknown.as_slice()).unwrap();
+            assert_eq!(evaluation.program().instructions().len(), 1);
+            assert_eq!(evaluation.outputs().len(), 1);
+            assert!(evaluation.outputs()[0].is_unknown());
+            assert_eq!(evaluation.interpret(&context, inputs.as_slice()).unwrap(), vec![expected]);
+        }
+    }};
+
+    (
+        @partial_evaluation,
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @partial_evaluation,
+            backend = (
+                $crate::backends::scalars::Scalar,
+                $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>
+            ),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @partial_evaluation,
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        cases = [
+            $(
+                {
+                    inputs = [$($input:tt),* $(,)?],
+                    outputs = [$($output:tt),* $(,)?],
+                    residual_instructions = $instruction_count:expr $(,)?
+                }
+            ),* $(,)?
+        ] $(,)?
+    ) => {{
+        let operation = $operation;
+        $(
+        {
+            let inputs: Vec<($crate::partial::PartialValue<$value>, Option<$value>)> =
+                vec![$($crate::check_operation!(@partial_input $value, $input)),*];
+            let expected_outputs: Vec<(bool, $value)> =
+                vec![$($crate::check_operation!(@partial_output $output)),*];
+            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
+            let input_ids = inputs
+                .iter()
+                .map(|(input, _)| {
+                    builder.add_input($crate::programs::types::Typed::r#type(input).into_owned())
+                })
+                .collect::<Vec<_>>();
+            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            let output_count = output_ids.len();
+            let program = builder
+                .build::<Vec<$value>, Vec<$value>>(
+                    output_ids,
+                    vec![$crate::parameters::Placeholder; inputs.len()],
+                    vec![$crate::parameters::Placeholder; output_count],
+                )
+                .unwrap();
+            let knowledge = inputs.iter().map(|(input, _)| input.clone()).collect::<Vec<_>>();
+            let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+            assert_eq!(evaluation.program().instructions().len(), $instruction_count);
+            assert_eq!(evaluation.outputs().len(), expected_outputs.len());
+            for (actual, (expected_known, _)) in evaluation.outputs().iter().zip(expected_outputs.iter()) {
+                assert_eq!(actual.is_known(), *expected_known);
+            }
+            let unknown_inputs = inputs
+                .into_iter()
+                .filter_map(|(_, replay)| replay)
+                .collect::<Vec<_>>();
+            let actual_outputs = evaluation
+                .interpret(
+                    &$crate::contexts::EagerContext::<$value, $operation_family>::new(),
+                    unknown_inputs.as_slice(),
+                )
+                .unwrap();
+            let expected_outputs = expected_outputs
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
+            assert_eq!(actual_outputs, expected_outputs);
+        }
+        )*
+    }};
+
+    (@partial_input $value:ty, (@known, $input:expr)) => {{
+        let input: $value = ::core::convert::Into::into($input);
+        ($crate::partial::PartialValue::Known(input), Option::<$value>::None)
+    }};
+
+    (@partial_input $value:ty, (@unknown(type = $r#type:expr, replay = $input:expr))) => {{
+        let input: $value = ::core::convert::Into::into($input);
+        ($crate::partial::PartialValue::Unknown($r#type), Some(input))
+    }};
+
+    (@partial_output (@known, $output:expr)) => {
+        (true, ::core::convert::Into::into($output))
+    };
+
+    (@partial_output (@residual, $output:expr)) => {
+        (false, ::core::convert::Into::into($output))
+    };
+
+    (
+        @reject @unreduced,
+        operation = $operation:expr,
+        input_types = [$($input_type:expr),+ $(,)?] $(,)?
+    ) => {{
+        let operation = $operation;
+        let descriptor = $crate::programs::operations::Operation::<$crate::types::ArrayType>::name(&operation);
+        let mesh = $crate::sharding::LogicalMesh::new(vec![
+            $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_types = vec![$($input_type),+]
+            .into_iter()
+            .map(|input_type| {
+                let dimensions = vec![$crate::sharding::ShardingDimension::Replicated; input_type.rank()];
+                let sharding = $crate::sharding::Sharding::new(mesh.clone(), dimensions)
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap();
+                input_type.with_sharding(sharding).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            $crate::programs::operations::Operation::infer_output_types(&operation, input_types.as_slice(), &[]),
+            Err($crate::programs::types::TypeError {
+                message: format!("'{descriptor}' does not support unreduced operands"),
+            }),
+        );
+    }};
+
+    (
+        @reject @mismatched_reduced,
+        operation = $operation:expr,
+        input_types = [$left_type:expr, $right_type:expr $(,)?] $(,)?
+    ) => {{
+        let operation = $operation;
+        let descriptor = $crate::programs::operations::Operation::<$crate::types::ArrayType>::name(&operation);
+        let mesh = $crate::sharding::LogicalMesh::new(vec![
+            $crate::sharding::MeshAxis::new("x", 2, $crate::sharding::MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let plain = |input_type: $crate::types::ArrayType| {
+            let dimensions = vec![$crate::sharding::ShardingDimension::Replicated; input_type.rank()];
+            input_type
+                .with_sharding($crate::sharding::Sharding::new(mesh.clone(), dimensions).unwrap())
+                .unwrap()
+        };
+        let left = plain($left_type);
+        let right = plain($right_type);
+        let reduced_left = left
+            .clone()
+            .with_sharding(left.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_right = right
+            .clone()
+            .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let expected = Err($crate::programs::types::TypeError {
+            message: format!("'{descriptor}' operands must be reduced over the same axes"),
+        });
+        assert_eq!(
+            $crate::programs::operations::Operation::infer_output_types(
+                &operation,
+                &[reduced_left, right.clone()],
+                &[],
+            ),
+            expected.clone(),
+        );
+        assert_eq!(
+            $crate::programs::operations::Operation::infer_output_types(
+                &operation,
+                &[left, reduced_right],
+                &[],
+            ),
+            expected,
+        );
+    }};
+
+    (
+        @reject @transposition,
+        operation = $operation:expr,
+        input_types = $input_types:tt $(,)?
+    ) => {
+        $crate::check_operation!(
+            @reject @transposition,
+            backend = (
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+            ),
+            operation = $operation,
+            input_types = $input_types,
+        )
+    };
+
+    (
+        @reject @transposition,
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        input_types = [$($input_type:expr),+ $(,)?] $(,)?
+    ) => {{
+        let operation: $operation_family = ::core::convert::Into::into($operation);
+        let descriptor = $crate::programs::operations::Operation::name(&operation);
+        let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
+        let input_types = vec![$($input_type),+];
+        let input_count = input_types.len();
+        let input_ids = input_types
+            .into_iter()
+            .map(|input_type| builder.add_input(input_type))
+            .collect::<Vec<_>>();
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+        let output_count = output_ids.len();
+        let program = builder
+            .build::<Vec<$value>, Vec<$value>>(
+                output_ids,
+                vec![$crate::parameters::Placeholder; input_count],
+                vec![$crate::parameters::Placeholder; output_count],
+            )
+            .unwrap();
+        let input_indices = (0..input_count).collect::<Vec<_>>();
+        assert!(matches!(
+            program.transpose_with_respect_to(input_indices.as_slice()),
+            Err($crate::differentiation::DifferentiationError::Program(
+                $crate::programs::ProgramError::UnsupportedOperation { message },
+            )) if message == format!("operation `{descriptor}` is not transposable"),
+        ));
+    }};
+}
+
 /// Asserts that the reverse-mode gradient of a function at an input matches a central finite-difference estimate of its
 /// derivative within an absolute tolerance. This is the standard oracle for testing operation gradient rules without
 /// hand-deriving the expected derivative and without trusting the machinery under test (i.e., the gradient side runs
@@ -1014,9 +1549,10 @@ macro_rules! check_gradient {
 }
 
 pub use crate::{
-    check_builders, check_count, check_gradient, check_sharding, check_types, define_elementwise_capability,
-    define_elementwise_operation, define_tracer_operator, impl_non_differentiable_operation,
-    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
+    check_builders, check_count, check_gradient, check_operation, check_sharding, check_types,
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
 };
 
 #[cfg(test)]
@@ -1035,11 +1571,13 @@ mod tests {
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
         DifferentiationTracer, TransposableOperation,
     };
-    use crate::interpretation::InterpretableOperation;
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::ElementwiseOperation;
     use crate::operations::constants::ZeroOperation;
     use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
-    use crate::operations::math::{Abs, Add, AddOperation, Neg, NegOperation, Reduce, ReductionKind};
+    use crate::operations::math::{
+        Abs, Add, AddOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, SubOperation,
+    };
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
     };
@@ -1520,6 +2058,227 @@ mod tests {
         assert_eq!(
             check_builders!(&reference, [[&same, &different].into_iter()]),
             Err(ProgramError::MismatchedProgramBuilders),
+        );
+    }
+
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_check_operation_batching() {
+        #[derive(Clone)]
+        struct TestPairOperation;
+
+        impl Operation<ArrayType> for TestPairOperation {
+            fn name(&self) -> &'static str {
+                "test_pair"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[crate::RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone(), input_types[0].clone()])
+            }
+        }
+
+        impl ElementwiseOperation for TestPairOperation {
+            fn input_count(&self) -> usize {
+                1
+            }
+
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                Operation::infer_output_types(self, input_types, &[])
+            }
+        }
+
+        impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TestPairOperation {
+            fn interpret<D: InterpretationDriver<C>>(
+                &self,
+                _context: &C,
+                _driver: &D,
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, ProgramError> {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone(), inputs[0].clone()])
+            }
+        }
+
+        check_operation!(
+            @batching @exact,
+            operation = ZeroOperation::new(ArrayType::scalar(DataType::F64)),
+            axis_size = 2,
+            cases = [{
+                inputs = [],
+                outputs = [(@replicated, Array::scalar(0.0))],
+            }],
+        );
+
+        check_operation!(
+            @batching @exact,
+            context = EagerContext::<Array>::new(),
+            driver = &EmptyRegionDriver,
+            axis_sharding = crate::ShardingDimension::Replicated,
+            operation = TestPairOperation,
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                    outputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                },
+            ],
+        );
+
+        check_operation!(
+            @batching @approx(epsilon = 1e-9),
+            operation = SubOperation,
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![-2.0, -5.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![2.0, 5.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@mapped(axis = 0), Array::vector(vec![4.0, 1.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![-3.0, -3.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(1.0)),
+                    ],
+                    outputs = [
+                        (@replicated, Array::scalar(2.0)),
+                    ],
+                },
+            ],
+        );
+
+        check_operation!(
+            @batching @approx(epsilon = 1e-9),
+            operation = SinOperation,
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![0.5f64.sin(), (-1.0f64).sin()])),
+                    ],
+                },
+            ],
+        );
+    }
+
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_check_operation_partial_evaluation() {
+        check_operation!(
+            @partial_evaluation @fold_and_residualize,
+            operation = NegOperation,
+            inputs = [Scalar::from(2.0)],
+            expected = Scalar::from(-2.0),
+        );
+
+        check_operation!(
+            @partial_evaluation,
+            operation = AddOperation,
+            cases = [
+                {
+                    inputs = [
+                        (@known, Scalar::from(2.0)),
+                        (@known, Scalar::from(3.5)),
+                    ],
+                    outputs = [
+                        (@known, Scalar::from(5.5)),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = DataType::F64, replay = Scalar::from(2.0))),
+                        (@known, Scalar::from(3.5)),
+                    ],
+                    outputs = [
+                        (@residual, Scalar::from(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, Scalar::from(2.0)),
+                        (@unknown(type = DataType::F64, replay = Scalar::from(3.5))),
+                    ],
+                    outputs = [
+                        (@residual, Scalar::from(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = DataType::F64, replay = Scalar::from(2.0))),
+                        (@unknown(type = DataType::F64, replay = Scalar::from(3.5))),
+                    ],
+                    outputs = [
+                        (@residual, Scalar::from(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_check_operation_rejections() {
+        check_operation!(
+            @reject @unreduced,
+            operation = SinOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+        check_operation!(
+            @reject @mismatched_reduced,
+            operation = AddOperation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+        check_operation!(
+            @reject @transposition,
+            operation = SinOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
 

@@ -39,10 +39,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::DifferentiationTracer;
     use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
@@ -131,6 +133,31 @@ mod tests {
     }
 
     #[test]
+    fn test_and_batching() {
+        check_operation!(
+            @batching @exact,
+            operation = AndOperation,
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![true, false])),
+                        (@replicated, Array::scalar(true)),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(false)),
+                        (@mapped(axis = 0), Array::vector(vec![true, false])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, false]))],
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_and_differentiation() {
         // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
         // predicates hold (x > 1) and 3 otherwise.
@@ -145,5 +172,15 @@ mod tests {
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![1.5]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
+    }
+
+    #[test]
+    fn test_and_partial_evaluation() {
+        check_operation!(
+            @partial_evaluation @fold_and_residualize,
+            operation = AndOperation,
+            inputs = [Scalar::from(true), Scalar::from(false)],
+            expected = Scalar::from(false),
+        );
     }
 }

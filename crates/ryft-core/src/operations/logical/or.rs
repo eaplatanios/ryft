@@ -39,8 +39,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_operation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -112,6 +114,32 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_or_batching() {
+        check_operation!(
+            @batching @exact,
+            operation = OrOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![true, false])),
+                    (@replicated, Array::scalar(false)),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_or_partial_evaluation() {
+        check_operation!(
+            @partial_evaluation @fold_and_residualize,
+            operation = OrOperation,
+            inputs = [Scalar::from(true), Scalar::from(false)],
+            expected = Scalar::from(true),
         );
     }
 }

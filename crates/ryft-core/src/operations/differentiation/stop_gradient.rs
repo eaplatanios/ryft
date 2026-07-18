@@ -138,6 +138,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::macros::check_operation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
@@ -290,7 +291,15 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_batching() {
-        crate::operations::math::tests::assert_unary_batching(StopGradientOperation, &[1.0, -2.0], &[1.0, -2.0]);
+        check_operation!(
+            @batching @approx(epsilon = 1e-9),
+            operation = StopGradientOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+            }],
+        );
 
         // Gradient stopping composes with batching: `x * stop_gradient(x)` batches like `x * x`.
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
@@ -344,15 +353,20 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(StopGradientOperation, &[2.0], 2.0);
+        check_operation!(
+            @partial_evaluation @fold_and_residualize,
+            operation = StopGradientOperation,
+            inputs = [2.0],
+            expected = 2.0,
+        );
     }
 
     #[test]
     fn test_stop_gradient_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(
-            StopGradientOperation,
-            STOP_GRADIENT_OPERATION_NAME,
-            1,
+        check_operation!(
+            @reject @transposition,
+            operation = StopGradientOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
 }

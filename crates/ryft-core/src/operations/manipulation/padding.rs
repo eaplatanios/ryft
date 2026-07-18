@@ -498,6 +498,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::macros::check_operation;
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -724,65 +725,47 @@ mod tests {
 
     #[test]
     fn test_pad_batching_lifts_batch_axis_with_zero_paddings() {
-        // A batched input keeps its batch axis by padding it with zero amounts: each batch item pads independently.
-        let input = {
-            let value = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let padding_value = ArrayBatch::replicated(Array::scalar(0.0));
-        let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
-        let outputs = operation
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input.clone(), padding_value],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]);
-
-        // Replicated operands pass through the unlifted rule.
-        let uniform = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
-        let outputs = operation
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[uniform, ArrayBatch::replicated(Array::scalar(0.0))],
-            )
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0]);
-
-        // Batch-varying padding values expand per item: item 0 pads with 8 and item 1 pads with 9.
-        let batch_varying = {
-            let value = Array::vector(vec![8.0, 9.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = operation
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input, batch_varying.clone()],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
-
-        // A replicated input is broadcast to gain the batch axis when only the padding value is batched.
-        let uniform_input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
-        let outputs = operation
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[uniform_input, batch_varying],
-            )
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
+        check_operation!(
+            @batching @exact,
+            operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 3, vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0]))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 3, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 3, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]))],
+                },
+            ],
+        );
     }
 
     #[test]
