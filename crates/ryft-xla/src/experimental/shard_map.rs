@@ -3574,8 +3574,8 @@ mod tests {
 
     #[test]
     fn test_collective_inside_condition_inside_shard_map_lowers_to_all_reduce() {
-        use ryft_core::operations::control_flow::ConditionOperation;
         use ryft_core::operations::collectives::{CollectiveKind, CollectiveOperation};
+        use ryft_core::operations::control_flow::ConditionOperation;
         use ryft_core::operations::math::{Reduce, ReductionKind};
         use ryft_core::{Compare, ComparisonDirection};
 

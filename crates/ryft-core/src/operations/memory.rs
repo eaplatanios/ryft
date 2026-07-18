@@ -1,5 +1,5 @@
 //! Contains the memory-placement operation: [`TransferToMemoryOperation`], which moves a value into a destination
-//! [`Memory`] space, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
+//! [`Memory`](crate::types::Memory) space, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
 //! and transposition rules. This is the analogue of placing a value with
 //! [JAX's `jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) and a
 //! memory-kind-bearing sharding. Like the sharding-control operations (see
@@ -391,6 +391,4 @@ mod tests {
         assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);
     }
-
-
 }

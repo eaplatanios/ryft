@@ -119,7 +119,7 @@ impl ElementwiseOperation for SelectOperation {
 /// Interpretation selects through the value-level [`Select`] capability, with the condition operand's
 /// [`SelectCondition`] view providing the condition representation of the active value semantics: eager scalar values
 /// decode the in-band Boolean into a plain [`bool`], eager array values pass themselves as the Boolean mask, and
-/// context-carrying values (e.g., staged [`Tracer`](crate::Tracer)s) select by binding a [`SelectOperation`] through
+/// context-carrying values (e.g., staged [`Tracer`]s) select by binding a [`SelectOperation`] through
 /// their own context.
 impl<C: Domain> InterpretableOperation<C> for SelectOperation
 where
@@ -266,7 +266,7 @@ where
 /// `on_false` need not share a shape and the branches need not share a data type (see [`SelectOperation`]). The
 /// condition and branch value types may differ: for scalar values the condition is a plain [`bool`], while array
 /// value types pair with a Boolean-typed condition array. Value types that participate in closed staged operation
-/// sets (e.g., [`Tracer`](crate::Tracer)) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
+/// sets (e.g., [`Tracer`]) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
 ///
 /// # Example
 ///
@@ -308,7 +308,7 @@ pub trait Select: Sized {
 /// condition is the value itself, while for scalar domains it is the decoded in-band Boolean.
 ///
 /// The condition of a [`SelectOperation`] crosses the primal/tangent boundary differently per domain: array and
-/// staged [`Tracer`](crate::Tracer) values implement [`Select`] with `Condition = Self`, whereas eager scalar values
+/// staged [`Tracer`] values implement [`Select`] with `Condition = Self`, whereas eager scalar values
 /// implement it with `Condition = bool` by decoding an in-band Boolean via
 /// [`BooleanLike::boolean`](crate::operations::BooleanLike::boolean). This trait gives the interpretation rule of
 /// [`SelectOperation`] a single hook to obtain the right [`Select`] condition from a value without committing to one

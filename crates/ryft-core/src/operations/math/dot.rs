@@ -1,25 +1,22 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
-use crate::batching::{BatchAxis, BatchingError, InterpretableBatchableOperation};
+use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::manipulation::{ConvertElementType, Transpose};
+use crate::operations::manipulation::{Broadcast, ConvertElementType, Transpose};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-
-use crate::batching::{BatchingContext, BatchingDriver};
-use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::interpretation::InterpretationDriver;
-use crate::programs::types::{TypeError, Typed};
 use crate::types::{ArrayType, Shape, Size, StaticShape};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -122,73 +119,6 @@ impl Display for DotDimensionNumbers {
         )
     }
 }
-
-/// Value-level generalized dot capability.
-///
-/// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It
-/// performs the contraction described by `dimensions`, supporting standard matrix
-/// multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor
-/// contractions.
-pub trait Dot<Rhs = Self>: Sized {
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
-    fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
-
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
-    /// for the result. The requested sharding overrides the inferred output sharding and is validated by the staged
-    /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). The
-    /// default implementation ignores the requested sharding and delegates to [`Self::dot`], which is correct for
-    /// concrete (single-device) values, for which a sharding only describes distribution metadata; staging
-    /// implementations override this method to attach the requested sharding to the staged operation.
-    fn dot_with_output_sharding(
-        &self,
-        rhs: &Rhs,
-        dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
-    ) -> Self {
-        let _ = output_sharding;
-        self.dot(rhs, dimensions)
-    }
-}
-
-/// Any context-carrying value takes a dot product by binding a [`DotOperation`] through its own context. The
-/// `From<DotOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> Dot for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<DotOperation>,
-{
-    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.dispatch_domain()
-            .bind(DotOperation::new(dimensions.clone()), Vec::new(), &[self.clone(), rhs.clone()])
-            .expect("`dot` operation failed")
-            .remove(0)
-    }
-
-    fn dot_with_output_sharding(
-        &self,
-        rhs: &Self,
-        dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
-    ) -> Self {
-        self.dispatch_domain()
-            .bind(
-                DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
-                Vec::new(),
-                &[self.clone(), rhs.clone()],
-            )
-            .expect("`dot` operation failed")
-            .remove(0)
-    }
-}
-
-/// Generalized N-C dot and transpose capability.
-///
-/// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
-/// [`DotOperation`] and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation) primitives.
-pub trait DotOps: Dot + Transpose {}
-
-impl<T: Dot + Transpose> DotOps for T {}
 
 /// Returns whether `dimension` is sharded over at least one [`MeshAxisType::Explicit`] mesh axis of `mesh`.
 ///
@@ -614,8 +544,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: crate::operations::manipulation::Broadcast>>
-    crate::batching::BatchableOperation<C> for DotOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast>> crate::batching::BatchableOperation<C> for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
@@ -923,6 +852,73 @@ pub fn adjoint_dimensions_for_right_dot(
         rhs_contracting_dimensions: factor_result,
     }
 }
+
+/// Value-level generalized dot capability.
+///
+/// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It
+/// performs the contraction described by `dimensions`, supporting standard matrix
+/// multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor
+/// contractions.
+pub trait Dot<Rhs = Self>: Sized {
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
+    fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
+
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
+    /// for the result. The requested sharding overrides the inferred output sharding and is validated by the staged
+    /// operation's type inference (refer to the documentation of [`DotOperation::with_output_sharding`]). The
+    /// default implementation ignores the requested sharding and delegates to [`Self::dot`], which is correct for
+    /// concrete (single-device) values, for which a sharding only describes distribution metadata; staging
+    /// implementations override this method to attach the requested sharding to the staged operation.
+    fn dot_with_output_sharding(
+        &self,
+        rhs: &Rhs,
+        dimensions: &DotDimensionNumbers,
+        output_sharding: &Sharding,
+    ) -> Self {
+        let _ = output_sharding;
+        self.dot(rhs, dimensions)
+    }
+}
+
+/// Any context-carrying value takes a dot product by binding a [`DotOperation`] through its own context. The
+/// `From<DotOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Dot for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<DotOperation>,
+{
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
+        self.dispatch_domain()
+            .bind(DotOperation::new(dimensions.clone()), Vec::new(), &[self.clone(), rhs.clone()])
+            .expect("`dot` operation failed")
+            .remove(0)
+    }
+
+    fn dot_with_output_sharding(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        output_sharding: &Sharding,
+    ) -> Self {
+        self.dispatch_domain()
+            .bind(
+                DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
+                Vec::new(),
+                &[self.clone(), rhs.clone()],
+            )
+            .expect("`dot` operation failed")
+            .remove(0)
+    }
+}
+
+/// Combined generalized dot product and transposition capability.
+///
+/// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
+/// [`DotOperation`] and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation) primitives.
+pub trait DotOps: Dot + Transpose {}
+
+impl<T: Dot + Transpose> DotOps for T {}
 
 /// Generalized N-dimensional dot-product helper.
 ///
@@ -1486,6 +1482,19 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_operation_output_sharding_builder_and_render() {
+        let mesh = test_mesh();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
+        let operation = DotOperation::matmul().with_output_sharding(sharding.clone());
+        assert_eq!(operation.output_sharding(), Some(&sharding));
+        assert_eq!(DotOperation::matmul().output_sharding(), None);
+        // The output sharding is rendered only when present.
+        assert!(!DotOperation::matmul().to_string().contains("output_sharding="));
+        assert!(operation.to_string().contains(&format!("output_sharding={sharding}")));
+    }
+
+    #[test]
     fn test_dot_batching_stages_the_lifted_output_sharding() {
         use std::rc::Rc;
 
@@ -1611,19 +1620,6 @@ mod tests {
         for (actual, expected) in output.to_f64s().iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
         }
-    }
-
-    #[test]
-    fn test_dot_operation_output_sharding_builder_and_render() {
-        let mesh = test_mesh();
-        let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
-        let operation = DotOperation::matmul().with_output_sharding(sharding.clone());
-        assert_eq!(operation.output_sharding(), Some(&sharding));
-        assert_eq!(DotOperation::matmul().output_sharding(), None);
-        // The output sharding is rendered only when present.
-        assert!(!DotOperation::matmul().to_string().contains("output_sharding="));
-        assert!(operation.to_string().contains(&format!("output_sharding={sharding}")));
     }
 
     #[test]

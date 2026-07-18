@@ -2169,9 +2169,9 @@ mod tests {
     #[test]
     fn test_condition_outputs_expose_all_possible_branch_producers() {
         use crate::operations::control_flow::ConditionOperation;
+        use crate::operations::math::DotOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
-        use crate::operations::math::DotOperation;
 
         let vector_type = vector_type(2);
         let branch = |tag_output| {

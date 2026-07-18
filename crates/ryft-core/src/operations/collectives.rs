@@ -19,7 +19,7 @@ use crate::backends::scalars::Scalar;
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -284,9 +284,7 @@ where
 
 /// Returns the static batch size for a `PMean` over the mapped batch axis of `input`, erroring when
 /// the batch size is dynamic (a mean cannot be scaled by `1 / N` without a static `N`).
-fn pmean_batch_size<V: Value<Type = ArrayType>>(
-    input: &ArrayBatch<V>,
-) -> Result<usize, BatchingError> {
+fn pmean_batch_size<V: Value<Type = ArrayType>>(input: &ArrayBatch<V>) -> Result<usize, BatchingError> {
     input.batch_size()?.ok_or_else(|| BatchingError::UnsupportedOperation {
         message: "pmean requires a static batch size; the staged batch axis is dynamic".to_string(),
     })
@@ -398,7 +396,7 @@ where
 /// The staged operation references an enclosing named-axis binder by name and the name is validated against the active
 /// [`NamedAxes`] environment at staging time: an unbound name fails fast rather than silently acting as identity. A
 /// name bound by an enclosing `batch` level is collapsed at trace time by
-/// [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) (which reduces the mapped batch axis),
+/// [`BatchableOperation::batch`] (which reduces the mapped batch axis),
 /// while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged body program and lowers
 /// to a cross-device `all_reduce` over that mesh axis.
 pub trait Collective: Sized {
@@ -560,8 +558,7 @@ where
             // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
             let size = context.axis_size();
-            let physical_type =
-                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
+            let physical_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
             let mut index_vector =
                 context.parent().bind(IotaOperation::new(physical_type.clone(), 0), Vec::new(), &[])?;
             check_count!("output", index_vector, 1, ProgramError);
@@ -627,6 +624,30 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values(), &[4.0]);
+    }
+
+    #[test]
+    fn test_collective_pmean_divides_by_batch_size() {
+        // Per-item scalar input of shape [3] mapped at axis 0. PMean returns the mean of the three batch items as a
+        // replicated scalar, exercising the `1 / N` factor that distinguishes it from PSum. The batching frame binds
+        // the axis name `"data"` to show the rule matches on the collective's own axis name rather than a fixture
+        // default.
+        let input = {
+            let value = Array::vector(vec![2.0, 4.0, 6.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+            .with_axis_name("data".to_string());
+        let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
+            .batch(&context, &crate::EmptyRegionDriver, &[input])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        let values = outputs[0].value().to_f64s();
+        assert_eq!(values.len(), 1);
+        let delta = (values[0] - 4.0).abs();
+        assert!(delta < 1e-9, "expected pmean = 4.0, got {}", values[0]);
     }
 
     #[test]
