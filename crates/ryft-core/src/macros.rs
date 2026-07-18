@@ -27,28 +27,120 @@ macro_rules! check_count {
     }};
 }
 
-/// Checks that two flat type signatures are identical and, if not, returns a [`TypeError`](crate::TypeError)
-/// whose message names the mismatching descriptor.
+/// Checks types against a structural or semantic type contract. All forms use an `@` selector and return
+/// [`TypeError`](crate::TypeError)s as appropriate, converted into the enclosing function's error type,
+/// when the selected contract is not satisfied. The available selectors are:
+///
+///   - `@same`: Requires the provided expected and actual flat type signatures to be identical.
+///   - `@numeric`: Accepts only numeric [`DataType`](crate::DataType)s.
+///   - `@floating_or_complex`: Accepts only floating-point and complex [`DataType`](crate::DataType)s.
+///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
+///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets.
+///   - `@same_reduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching reduced-axis sets.
 ///
 /// # Parameters
 ///
-///   - `descriptor`: Expression evaluating to a string that names the validated signature in the error message.
-///   - `$left`: Expression evaluating to a slice of [`Type`](crate::Type)s.
-///   - `$right`: Expression evaluating to a slice of [`Type`](crate::Type)s.
+///   - `$selector`: Selector identifying the structural or semantic contract to validate.
+///   - `$descriptor`: Expression evaluating to a string that identifies the checked operation or signature in errors.
+///   - `$types`: Expression evaluating to the data or array types checked by `$selector`.
+///   - `$signatures`: Bracketed pair containing the expected and actual flat type signatures checked by `@same`.
 #[macro_export]
 macro_rules! check_types {
-    ($descriptor:expr, $left:expr, $right:expr $(,)?) => {{
-        let left = &$left[..];
-        let right = &$right[..];
-        if left != right {
+    (@same, $descriptor:expr, [$expected:expr, $actual:expr $(,)?] $(,)?) => {{
+        let expected = &$expected[..];
+        let actual = &$actual[..];
+        if expected != actual {
             return Err($crate::TypeError {
                 message: format!(
                     "{} type signature mismatch: expected [{}] but got [{}]",
                     $descriptor,
-                    left.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                    right.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    expected.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    actual.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 ),
             });
+        }
+    }};
+
+    (@numeric, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if let Some(input_type) = types.iter().find(|input_type| {
+            matches!(input_type, $crate::DataType::Token | $crate::DataType::Zero | $crate::DataType::Boolean)
+        }) {
+            return Err($crate::TypeError {
+                message: format!("'{descriptor}' does not support input data type {input_type}"),
+            }
+            .into());
+        }
+    }};
+
+    (@floating_or_complex, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if let Some(input_type) = types.iter().find(|input_type| {
+            !matches!(
+                input_type,
+                $crate::DataType::F4E2M1FN
+                    | $crate::DataType::F6E2M3FN
+                    | $crate::DataType::F6E3M2FN
+                    | $crate::DataType::F8E3M4
+                    | $crate::DataType::F8E4M3
+                    | $crate::DataType::F8E4M3FN
+                    | $crate::DataType::F8E4M3FNUZ
+                    | $crate::DataType::F8E4M3B11FNUZ
+                    | $crate::DataType::F8E5M2
+                    | $crate::DataType::F8E5M2FNUZ
+                    | $crate::DataType::F8E8M0FNU
+                    | $crate::DataType::BF16
+                    | $crate::DataType::F16
+                    | $crate::DataType::F32
+                    | $crate::DataType::F64
+                    | $crate::DataType::C64
+                    | $crate::DataType::C128
+            )
+        }) {
+            return Err($crate::TypeError {
+                message: format!("'{descriptor}' does not support input data type {input_type}"),
+            }
+            .into());
+        }
+    }};
+
+    (@no_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if types.iter().any(|r#type| !r#type.unreduced_axes().is_empty()) {
+            return Err(
+                $crate::TypeError { message: format!("'{descriptor}' does not support unreduced operands") }.into()
+            );
+        }
+    }};
+
+    (@same_unreduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if types.len() != 2 {
+            return Err($crate::TypeError { message: format!("expected 2 inputs but got {}", types.len()) }.into());
+        }
+        if types[0].unreduced_axes() != types[1].unreduced_axes() {
+            return Err($crate::TypeError {
+                message: format!("'{descriptor}' operands must be unreduced over the same axes"),
+            }
+            .into());
+        }
+    }};
+
+    (@same_reduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if types.len() != 2 {
+            return Err($crate::TypeError { message: format!("expected 2 inputs but got {}", types.len()) }.into());
+        }
+        if types[0].reduced_axes() != types[1].reduced_axes() {
+            return Err($crate::TypeError {
+                message: format!("'{descriptor}' operands must be reduced over the same axes"),
+            }
+            .into());
         }
     }};
 }
@@ -125,11 +217,16 @@ macro_rules! check_builders {
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
 ///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
+///   - `check_data_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types)
+///     selectors applied to scalar input types and array element types before type inference.
+///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types) selectors
+///     applied to array input types before array broadcasting.
 ///   - `validate_data_types = $data_type_validator`: Optional hook that validates scalar [`DataType`](crate::DataType)
-///     inputs before type inference and array element [`DataType`](crate::DataType)s before array broadcasting.
+///     inputs before type inference and array element [`DataType`](crate::DataType)s before array broadcasting when a
+///     reusable [`check_types!`](crate::check_types) selector does not express the required contract.
 ///   - `validate_array_types = $array_type_validator`: Optional hook that validates [`ArrayType`](crate::ArrayType)
-///     inputs before array broadcasting, for rules that depend on metadata beyond the element
-///     [`DataType`](crate::DataType).
+///     inputs before array broadcasting when a reusable [`check_types!`](crate::check_types) selector does not express
+///     the required contract.
 #[macro_export]
 macro_rules! define_elementwise_operation {
     (
@@ -137,6 +234,8 @@ macro_rules! define_elementwise_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
+        $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
+        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])?
         $(, validate_data_types = $data_type_validator:path)?
         $(, validate_array_types = $array_type_validator:path)? $(,)?
     ) => {
@@ -164,6 +263,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
                 $($data_type_validator(input_types, $name)?;)?
                 Ok(vec![input_types[0]])
             }
@@ -182,7 +282,9 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type()]);)*)?
                 $($data_type_validator(&[input_types[0].data_type()], $name)?;)?
+                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
@@ -221,6 +323,8 @@ macro_rules! define_elementwise_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
+        $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
+        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])?
         $(, validate_data_types = $data_type_validator:path)?
         $(, validate_array_types = $array_type_validator:path)? $(,)?
     ) => {
@@ -248,6 +352,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
                 $($data_type_validator(input_types, $name)?;)?
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
@@ -270,7 +375,9 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type(), input_types[1].data_type()]);)*)?
                 $($data_type_validator(&[input_types[0].data_type(), input_types[1].data_type()], $name)?;)?
+                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
@@ -929,3 +1036,41 @@ pub use crate::{
     define_elementwise_operation, define_tracer_operator, impl_non_differentiable_operation,
     impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
 };
+
+#[cfg(test)]
+mod tests {
+    use crate::programs::types::TypeError;
+    use crate::types::{ArrayType, DataType};
+
+    #[test]
+    fn test_check_types_same() {
+        let check = |expected: &[DataType], actual: Vec<DataType>| -> Result<(), TypeError> {
+            check_types!(@same, "test", [expected, actual]);
+            Ok(())
+        };
+        let expected = [DataType::F32, DataType::F64];
+        assert_eq!(check(&expected, expected.to_vec()), Ok(()));
+        assert_eq!(
+            check(&expected, vec![DataType::F32, DataType::I64]),
+            Err(TypeError {
+                message: "test type signature mismatch: expected [f32, f64] but got [f32, i64]".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_check_types_binary_selector_arity() {
+        let check_unreduced_axes = |types: &[ArrayType]| -> Result<(), TypeError> {
+            check_types!(@same_unreduced_axes, "test", types);
+            Ok(())
+        };
+        let check_reduced_axes = |types: &[ArrayType]| -> Result<(), TypeError> {
+            check_types!(@same_reduced_axes, "test", types);
+            Ok(())
+        };
+        let expected = Err(TypeError { message: "expected 2 inputs but got 1".to_string() });
+        let input = ArrayType::scalar(DataType::F32);
+        assert_eq!(check_unreduced_axes(std::slice::from_ref(&input)), expected);
+        assert_eq!(check_reduced_axes(std::slice::from_ref(&input)), expected);
+    }
+}
