@@ -46,8 +46,8 @@
 //! # Core Data Model
 //!
 //! [`Value`] is the common contract for leaf values that can inhabit programs or flow through Ryft contexts. Every
-//! value has one associated type descriptor through [`Typed`], plus separate dispatch and execution domains used by
-//! capabilities and transforms.
+//! value has one associated type through [`Typed`], plus separate dispatch and execution domains used by capabilities
+//! and transforms.
 //!
 //! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the containing
 //! [`Region`]'s atom table. An [`Instruction`] owns one [`Operation`], lists the input and output atom IDs of that

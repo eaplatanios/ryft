@@ -14,16 +14,16 @@ pub struct TypeError {
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
 /// Ryft needs to reason about values without inspecting the values themselves. Examples include scalar data types such
-/// as [`DataType`](crate::types::DataType), array-like types that combine an element
-/// [`DataType`](crate::types::DataType) with shape information, and richer type descriptors for traced values.
+/// as [`DataType`](crate::DataType), array-like types that combine an element [`DataType`](crate::DataType) with shape
+/// information, and richer types for traced values.
 ///
-/// Note that [`Type`] requires [`Clone`] so that descriptors can be duplicated into staged [`Program`](crate::Program)s
+/// Note that [`Type`] requires [`Clone`] so that types can be duplicated into staged [`Program`](crate::Program)s
 /// returned via [`Cow`] using the [`Typed`] trait, and stored in tracing data structures. It requires [`Debug`] and
-/// [`Display`] so diagnostics and rendered programs can show type descriptors consistently without forcing every call
-/// site to repeat those bounds. It also requires [`PartialEq`] because type equality is fundamental to type inference
-/// and validation, and so generic code bounded on [`Type`] can compare type descriptors without repeating that bound.
-/// Finally, it requires [`Parameter`] so that type descriptors can be used as leaves in
-/// [`Parameterized`](crate::Parameterized) data structures.
+/// [`Display`] so diagnostics and rendered programs can show types consistently without forcing every call site to
+/// repeat those bounds. It also requires [`PartialEq`] because type equality is fundamental to type inference and
+/// validation, and so generic code bounded on [`Type`] can compare types without repeating that bound. Finally, it
+/// requires [`Parameter`] so that types can be used as leaves in [`Parameterized`](crate::Parameterized) data
+/// structures.
 pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
@@ -76,13 +76,13 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     fn is_complex(&self) -> bool;
 }
 
-/// Associates a runtime value with the abstract [`Type`] descriptor that Ryft should use to reason about it. [`Typed`]
-/// is the value-level counterpart to [`Type`]. While [`Type`] models relationships between abstract type descriptors,
-/// [`Typed`] lets a concrete value produce the descriptor that should represent it during tracing, staging, type
-/// checking, and other forms of abstract reasoning.
+/// Associates a runtime value with the abstract [`Type`] that Ryft should use to reason about it. [`Typed`] is the
+/// value-level counterpart to [`Type`]. While [`Type`] models relationships between abstract types, [`Typed`] lets a
+/// concrete value produce the type that should represent it during tracing, staging, type checking, and other forms of
+/// abstract reasoning.
 pub trait Typed {
-    /// [`Type`] descriptor family this value is typed against (e.g., [`DataType`](crate::types::DataType) for scalars,
-    /// [`ArrayType`](crate::types::ArrayType) for arrays, etc.).
+    /// [`Type`] family this value is typed against (e.g., [`DataType`](crate::DataType) for scalars,
+    /// [`ArrayType`](crate::ArrayType) for arrays, etc.).
     type Type: Type;
 
     /// Returns the [`Type`] description of this value. The returned [`Type`] should capture the structural information

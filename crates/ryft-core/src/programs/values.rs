@@ -39,8 +39,8 @@ impl ValueId {
 
 /// Represents leaf values that can participate in traced [`Program`](crate::Program)s. [`Value`] is implemented by
 /// every type that can appear as a leaf in a staged [`Program`](crate::Program): both concrete data types such as
-/// `f32`, `f64`, and backend arrays, and tracing wrappers such as [`Tracer`](crate::Tracer). It inherits its type
-/// descriptor from [`Typed`], so generic code recovers the descriptor as `V::Type` and pinning sites write
+/// `f32`, `f64`, and backend arrays, and tracing wrappers such as [`Tracer`](crate::Tracer). It inherits its associated
+/// [`Type`](crate::Type) from [`Typed`], so generic code recovers the type as `V::Type` and pinning sites write
 /// `V: Value<Type = ArrayType>`. It additionally requires [`Debug`] and [`Display`] so that diagnostics, constants,
 /// and [`Operation`](crate::Operation) metadata can render their carried values directly.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {

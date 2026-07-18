@@ -786,9 +786,9 @@ impl Typed for ArrayType {
 // TODO(eaplatanios): Move this to a top-level `arrays` module, parallel to `ryft_core::backends::scalars`.
 // Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
 // because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
-// self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
-// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program
-// storage, lowering, and transformation.
+// self-describing: its type is itself. This is not a type-theoretic universe claim (i.e., `ArrayType : ArrayType`).
+// It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program storage, lowering, and
+// transformation.
 impl Value for ArrayType {
     type DispatchDomain = EagerContext<Self>;
     type ExecutionDomain = EagerContext<Self>;
