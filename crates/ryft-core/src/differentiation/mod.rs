@@ -73,13 +73,14 @@
 //!
 //! # Extending differentiation
 //!
-//! Implement [`DifferentiableType`] for type descriptors that possess tangent and cotangent spaces. Implement
+//! Implement [`DifferentiableType`] for types that possess tangent and cotangent spaces. Implement
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
 //! context and preserve symbolic zeros where possible. Implement [`TransposableOperation`] for linear primitives that
 //! may occur in a pushforward. Higher-order [`Operation`](crate::Operation) logic belongs with the operation whose
 //! instruction attaches to the nested [`Region`](crate::Region). Wrapper operation enums should provide family dispatch
 //! and forward to those payload rules.
 
+pub mod elementwise;
 pub mod forward;
 pub mod reverse;
 pub mod types;
@@ -92,6 +93,10 @@ use crate::parameters::ParameterError;
 use crate::programs::ProgramError;
 use crate::programs::types::TypeError;
 
+pub use elementwise::{
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
+    UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,
+};
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
     ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, linearize,
