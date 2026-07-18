@@ -565,9 +565,9 @@ impl<
         }
 
         // Seed the reverse pass with one cotangent input for each primal output, typed with that output's cotangent
-        // descriptor. A differentiable output carries its cotangent dual (e.g., swapping unreduced and reduced sharding
+        // type. A differentiable output carries its cotangent dual (e.g., swapping unreduced and reduced sharding
         // axes for arrays). A non-differentiable output, such as a Boolean, integer, or token, uses the first-class
-        // zero-space descriptor. The adjoint table is indexed by atoms from the original program, and each slot stores
+        // zero-space type. The adjoint table is indexed by atoms from the original program, and each slot stores
         // the staged pullback atom that currently represents the accumulated cotangent for that primal atom.
         let mut adjoints = vec![None; self.atoms().len()];
         for output in self.output_ids().iter().copied() {
@@ -625,11 +625,11 @@ impl<
 
             // Materialize the instruction's output cotangents in operation-result order. Missing adjoint slots become
             // structural zeros so transpose rules can distinguish unused outputs without staging zero operations.
-            // Structural zeros carry the output's cotangent descriptor: a differentiable output's cotangent dual or
-            // the first-class zero-space descriptor for a non-differentiable output. Accumulated adjoints are always
-            // live: rules communicate zero-ness symbolically through `MaybeZero` (opaque program splices such as the
-            // custom-VJP backward replay recover it at their own boundary), and so no staged canonical zero ever needs
-            // to be recognized here.
+            // Structural zeros carry the output's cotangent type: a differentiable output's cotangent dual or the
+            // first-class zero-space type for a non-differentiable output. Accumulated adjoints are always live: rules
+            // communicate zero-ness symbolically through `MaybeZero` (opaque program splices such as the custom-VJP
+            // backward replay recover it at their own boundary), and so no staged canonical zero ever needs to be
+            // recognized here.
             instruction_output_cotangents.clear();
             for output in instruction.outputs().iter().copied() {
                 let cotangent = adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
@@ -711,8 +711,8 @@ impl<
         // The pullback outputs are the accumulated cotangents of the selected inputs, emitted directly in
         // `input_indices` order. Known inputs receive no cotangent output. Disconnected selected inputs are emitted
         // as input-free `ZeroOperation` instructions, which the value type's `Zero` implementation evaluates at
-        // interpretation time, typed with the input's cotangent descriptor: a differentiable input's cotangent dual,
-        // or the first-class zero-space descriptor for a non-differentiable selected input.
+        // interpretation time, typed with the input's cotangent type: a differentiable input's cotangent dual,
+        // or the first-class zero-space type for a non-differentiable selected input.
         let outputs = input_indices
             .iter()
             .map(|&index| {
@@ -2660,9 +2660,9 @@ mod tests {
         assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
 
-        // Auxiliary cotangent seeds use each auxiliary leaf's cotangent descriptor. This matters both for
-        // non-differentiable leaves, whose descriptor is the first-class zero space, and for differentiable storage
-        // representations such as E8M0, whose cotangent descriptor is widened to F32 and can represent zero.
+        // Auxiliary cotangent seeds use each auxiliary leaf's cotangent type. This matters both for non-differentiable
+        // leaves, whose cotangent type is the first-class zero space, and for differentiable storage representations
+        // such as E8M0, whose cotangent type is widened to F32 and can represent zero.
         let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), Scalar) = value_and_gradient_with_aux(
             |x| {
                 let integer = x.context().constant(Scalar::from(7i32))?;

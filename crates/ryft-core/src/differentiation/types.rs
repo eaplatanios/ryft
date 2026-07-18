@@ -8,7 +8,7 @@ use crate::types::{ArrayType, DataType};
 pub trait DifferentiableType: Type {
     /// Returns `true` if this [`Type`] represents the trivial differential space whose only possible value is zero
     /// (e.g., [`DataType::Zero`]). Generic transform code uses this property to distinguish a first-class zero-space
-    /// descriptor from a type that can carry live, potentially nonzero differential values.
+    /// type from a type that can carry live, potentially nonzero differential values.
     fn is_zero_space(&self) -> bool;
 
     /// Returns the [`Type`] that forward-mode tangents of values of this [`Type`] carry. The returned type is used
@@ -17,8 +17,8 @@ pub trait DifferentiableType: Type {
     /// differentiable types use themselves, but specialized storage representations may use a wider differential
     /// representation. For example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] because its unsigned power-of-two
     /// representation cannot represent zero or negative linear contributions. Non-differentiable types return a
-    /// first-class zero-space descriptor, such as [`DataType::Zero`], preserving leaf-for-leaf transform boundaries
-    /// without assigning an ordinary Boolean or numeric carrier type.
+    /// first-class zero-space type, such as [`DataType::Zero`], preserving leaf-for-leaf transform boundaries without
+    /// assigning an ordinary Boolean or numeric carrier type.
     fn tangent(&self) -> Self;
 
     /// Returns the [`Type`] that reverse-mode cotangents of values of this [`Type`] carry. The returned type is the
@@ -28,7 +28,7 @@ pub trait DifferentiableType: Type {
     /// format cannot represent zero or negative values, while [`ArrayType`] also swaps the unreduced and reduced axes
     /// of its [`Sharding`]. Refer to [`Sharding::cotangent`] for more information. This mapping is not required to be
     /// an _involution_ (i.e., a specialized primal representation may map to a general-purpose cotangent representation
-    /// that is itself a fixed point). Non-differentiable types return a first-class zero-space descriptor. Reverse mode
+    /// that is itself a fixed point). Non-differentiable types return a first-class zero-space type. Reverse mode
     /// accumulates no live adjoint for values of those types, while fixed-structure boundaries retain the corresponding
     /// zero-space leaf.
     fn cotangent(&self) -> Self;

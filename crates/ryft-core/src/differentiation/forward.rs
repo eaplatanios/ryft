@@ -32,9 +32,9 @@ use crate::tracing::{Tracer, TracingContext};
 /// input to the dual `(y, ẏ) = (f(x), (∂f/∂x)(x) · ẋ)` at the output. This is the data that the per-operation
 /// [`jvp`](DifferentiableOperation::jvp) rules consume and produce.
 ///
-/// The tangent need not have the same descriptor as the primal. Its descriptor is determined by
-/// [`DifferentiableType::tangent`]; for example, an array stored using an unsigned low-precision floating-point
-/// representation may carry an `F32` tangent.
+/// The tangent need not have the same type as the primal. Its type is determined by [`DifferentiableType::tangent`].
+/// For example, an array stored using an unsigned low-precision floating-point representation may carry an `F32`
+/// tangent.
 #[derive(Clone, Debug)]
 pub struct DifferentiationDual<V: Typed> {
     /// Primal value of this dual.
@@ -845,7 +845,7 @@ where
 
             // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
             // input tangent (i.e., constants and dead inputs) are derived lazily as structural zeros typed with the
-            // atom's tangent boundary descriptor.
+            // atom's tangent boundary type.
             let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; self.atoms().len()];
             let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; self.atoms().len()];
 
@@ -867,7 +867,7 @@ where
             }
 
             // Constants are lifted into the builder as primal constants. Their tangents are derived lazily as
-            // structural zeros typed with the atom's tangent boundary descriptor. The call is disambiguated to
+            // structural zeros typed with the atom's tangent boundary type. The call is disambiguated to
             // the staging method because the `Constant` capability trait also provides a `constant` method.
             for (atom_index, atom) in self.atoms().iter().enumerate() {
                 if let Atom::Constant(value) = atom {
@@ -888,7 +888,7 @@ where
                             .clone()
                             .ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
                         // Atoms not connected to an input tangent (i.e., constants and dead inputs)
-                        // take a structural zero typed with the atom's tangent boundary descriptor.
+                        // take a structural zero typed with the atom's tangent boundary type.
                         let tangent = match &tangents[input_atom.index()] {
                             Some(tangent) => tangent.clone(),
                             None => MaybeZero::Zero(primal.r#type().tangent()),
@@ -943,7 +943,7 @@ where
                 .copied()
                 .map(|output_atom| {
                     // Atoms not connected to an input tangent (i.e., constants and dead inputs)
-                    // take a structural zero typed with the atom's tangent boundary descriptor.
+                    // take a structural zero typed with the atom's tangent boundary type.
                     let tangent = match &tangents[output_atom.index()] {
                         Some(tangent) => tangent.clone(),
                         None => MaybeZero::Zero(
@@ -1165,7 +1165,7 @@ where
     /// `[x_1, …, x_n]` and outputs `[y_1, …, y_m]` (so that `y = f(x)`), the returned program has:
     ///
     ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]`, which correspond to the `n` primal inputs followed by one fresh tangent
-    ///     input `ẋ_i` per primal input `x_i`, using the descriptor returned by [`DifferentiableType::tangent`]. A
+    ///     input `ẋ_i` per primal input `x_i`, using the type returned by [`DifferentiableType::tangent`]. A
     ///     non-differentiable input uses a zero-space value that preserves positional arity, but the transform treats
     ///     that slot as a structural zero and does not read its value; and
     ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]`, which correspond to the `m` primal outputs `y_j = f_j(x)` followed by
@@ -1227,9 +1227,9 @@ where
 /// [`DifferentiableOperation`] rules), so whether a particular transform is available on a particular context is
 /// decided per method at the call site, in exactly the same way as [`Batch::batch`](crate::Batch::batch). Tangents are
 /// ordinary values of the same universe as the primals (i.e., [`Domain::Value`]) flowing through the same context. The
-/// descriptor-level tangent structure, such as the cotangent types, live on [`DifferentiableType`] instead. Operations
-/// that involve predicates such as `condition`, `while`, and `select` impose their own
-/// [`BooleanLike`](crate::BooleanLike) bounds through their operation-family implementations.
+/// type-level tangent structure, such as the cotangent types, live on [`DifferentiableType`] instead. Operations that
+/// involve predicates such as `condition`, `while`, and `select` impose their own [`BooleanLike`](crate::BooleanLike)
+/// bounds through their operation-family implementations.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's [`Value`](Domain::Value) (i.e.,
 /// concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are detected lazily, like
@@ -1856,7 +1856,7 @@ mod tests {
         assert_abs_diff_eq!(tangent, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
         // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
-        // is `Scalar::Zero`, and output structural zeros materialize with the same descriptor.
+        // is `Scalar::Zero`, and output structural zeros materialize with the same type.
         let (value, tangent): ((Scalar, Scalar), (Scalar, Scalar)) =
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
                 .jvp(
