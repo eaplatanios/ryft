@@ -112,12 +112,15 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -125,7 +128,6 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -326,26 +328,47 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(&AddOperation, &[plain(), unreduced()], &[]),
             Err(TypeError { message: "'add' operands must be unreduced over the same axes".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_mismatched_reduced(AddOperation, ADD_OPERATION_NAME);
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = AddOperation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_add_batching() {
-        crate::operations::math::tests::assert_binary_batching(AddOperation, &[1.0, -2.0], 3.0, &[4.0, 1.0]);
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = AddOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    (@replicated, Array::scalar(3.0)),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![4.0, 1.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_add_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context
-            .jvp(
-                |(left, right)| Ok(left + right),
-                (Scalar::from(2.0), Scalar::from(5.0)),
-                (Scalar::from(3.0), Scalar::from(-1.0)),
-            )
-            .unwrap();
-        assert_eq!(primal, 7.0);
-        assert_eq!(tangent, 2.0);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = AddOperation,
+            cases = [{
+                primals = [Array::scalar(2.0), Array::scalar(5.0)],
+                tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
+                primal_outputs = [Array::scalar(7.0)],
+                tangent_outputs = [Array::scalar(2.0)],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = add %0 %1
+                        %5:f64[] = add %2 %3
+                    in (%4, %5)
+                "},
+            }],
+        );
         fn double<V: Clone + std::ops::Add<Output = V>>(input: V) -> V {
             input.clone() + input
         }
@@ -359,98 +382,49 @@ mod tests {
             0.0,
             epsilon = 1e-9,
         );
-
-        // The `DataType`-typed staged tangent program adds the operand tangents.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64, %2:f64, %3:f64 .
-                let %4:f64 = add %0 %1
-                    %5:f64 = add %2 %3
-                in (%4, %5)
-            "}
-            .trim_end(),
-        );
-
-        // The array-typed staged tangent program has the same shape.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[] = add %0 %1
-                    %5:f64[] = add %2 %3
-                in (%4, %5)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_add_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(AddOperation, &[2.0, 3.5], 5.5);
+        check_operation_partial_evaluation!(operation = AddOperation, inputs = [2.0, 3.5], expected = 5.5,);
     }
 
     #[test]
     fn test_add_transposition() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
-        // The pullback fans the output cotangent out to both operands.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                in (%0, %0)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(pullback.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(3.0), Array::scalar(3.0)]),);
-
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(vector_type.clone());
-        let output = builder.add_instruction(AddOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
-        // The pullback sum-reduces the broadcast operand's cotangent back to its scalar type.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = reduce_sum [axes=[0]] %0
-                in (%1, %0)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            pullback.interpret(vec![Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0])]),
-            Ok(vec![Array::scalar(9.0), Array::from_f64s(vector_type, vec![2.0, 3.0, 4.0])]),
+        check_operation_transposition!(
+            @exact,
+            operation = AddOperation,
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::scalar(3.0)],
+                    input_cotangents = [Array::scalar(3.0), Array::scalar(3.0)],
+                    pullback = indoc! {"
+                        lambda %0:f64[] .
+                        in (%0, %0)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@linear(type = vector_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0])],
+                    input_cotangents = [
+                        Array::scalar(9.0),
+                        Array::from_f64s(vector_type, vec![2.0, 3.0, 4.0]),
+                    ],
+                    pullback = indoc! {"
+                        lambda %0:f64[3] .
+                        let %1:f64[] = reduce_sum [axes=[0]] %0
+                        in (%1, %0)
+                    "},
+                },
+            ],
         );
     }
 }

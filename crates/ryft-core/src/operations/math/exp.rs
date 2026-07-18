@@ -67,11 +67,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -194,24 +197,44 @@ mod tests {
             Operation::<DataType>::infer_output_types(&ExpOperation, &[DataType::I32], &[]),
             Err(TypeError { message: "'exp' does not support input data type i32".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_unreduced(ExpOperation, EXP_OPERATION_NAME, 1);
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = ExpOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_exp_batching() {
-        crate::operations::math::tests::assert_unary_batching(
-            ExpOperation,
-            &[0.5, -1.0],
-            &[0.5f64.exp(), (-1.0f64).exp()],
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = ExpOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.exp(), (-1.0f64).exp()]))],
+            }],
         );
     }
 
     #[test]
     fn test_exp_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context.jvp(|input| input.exp(), Scalar::from(0.7), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(primal, 0.7f64.exp(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0 * 0.7f64.exp(), epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ExpOperation,
+            cases = [{
+                primals = [Array::scalar(0.7)],
+                tangents = [Array::scalar(3.0)],
+                primal_outputs = [Array::scalar(0.7f64.exp())],
+                tangent_outputs = [Array::scalar(3.0 * 0.7f64.exp())],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = exp %0
+                        %3:f64[] = mul %2 %1
+                    in (%2, %3)
+                "},
+            }],
+        );
         check_gradient!(@scalar, |input| input.exp(), at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
@@ -241,26 +264,6 @@ mod tests {
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.values()[0], 3.0 * 2.0f64.exp(), epsilon = 1e-6);
 
-        // The plain staged tangent program reuses the primal `exp` as the coefficient instead of staging a duplicate.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(ExpOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = exp %0
-                    %3:f64[] = mul %2 %1
-                in (%2, %3)
-            "}
-            .trim_end(),
-        );
-
         // The widened staged tangent program recomputes the coefficient in the widened differential representation
         // instead of converting the narrower primal output.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -287,11 +290,15 @@ mod tests {
 
     #[test]
     fn test_exp_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(ExpOperation, &[0.7], 0.7f64.exp());
+        check_operation_partial_evaluation!(operation = ExpOperation, inputs = [0.7], expected = 0.7f64.exp(),);
     }
 
     #[test]
     fn test_exp_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(ExpOperation, EXP_OPERATION_NAME, 1);
+        check_operation_transposition!(
+            @rejected,
+            operation = ExpOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 }

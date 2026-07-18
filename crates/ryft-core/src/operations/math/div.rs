@@ -132,12 +132,15 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
     use crate::parameters::Placeholder;
@@ -359,26 +362,53 @@ mod tests {
             expected,
         );
         assert_eq!(Operation::<ArrayType>::infer_output_types(&DivOperation, &[unreduced, reduced], &[]), expected);
-        crate::operations::math::tests::assert_rejects_mismatched_reduced(DivOperation, DIV_OPERATION_NAME);
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = DivOperation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_div_batching() {
-        crate::operations::math::tests::assert_binary_batching(DivOperation, &[3.0, -6.0], 3.0, &[1.0, -2.0]);
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = DivOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![3.0, -6.0])),
+                    (@replicated, Array::scalar(3.0)),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_div_differentiation() {
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent): (Scalar, Scalar) = context
-            .jvp(
-                |(left, right)| Ok(left / right),
-                (Scalar::from(6.0), Scalar::from(2.0)),
-                (Scalar::from(3.0), Scalar::from(4.0)),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(primal, 3.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, -4.5, epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = DivOperation,
+            cases = [{
+                primals = [Array::scalar(6.0), Array::scalar(2.0)],
+                tangents = [Array::scalar(3.0), Array::scalar(4.0)],
+                primal_outputs = [Array::scalar(3.0)],
+                tangent_outputs = [Array::scalar(-4.5)],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = div %0 %1
+                        %5:f64[] = div %2 %1
+                        %6:f64[] = mul %1 %1
+                        %7:f64[] = div %0 %6
+                        %8:f64[] = neg %7
+                        %9:f64[] = mul %8 %3
+                        %10:f64[] = add %5 %9
+                    in (%4, %10)
+                "},
+            }],
+        );
         let smallest_positive = f64::from_bits(1);
         let outputs = DivOperation
             .jvp(
@@ -423,89 +453,49 @@ mod tests {
             .unwrap();
         assert_eq!(primal, Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Scalar::from(-0.5f32));
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
-        let denominator = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[] = div %0 %1
-                    %5:f64[] = div %2 %1
-                    %6:f64[] = mul %1 %1
-                    %7:f64[] = div %0 %6
-                    %8:f64[] = neg %7
-                    %9:f64[] = mul %8 %3
-                    %10:f64[] = add %5 %9
-                in (%4, %10)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_div_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(DivOperation, &[7.0, 2.0], 3.5);
+        check_operation_partial_evaluation!(operation = DivOperation, inputs = [7.0, 2.0], expected = 3.5,);
     }
 
     #[test]
     fn test_div_transposition() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
-        let denominator = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
-        // The pullback divides the output cotangent by the residual denominator.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = div %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            pullback.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]),
-            Ok(vec![Array::scalar(2.0 / 3.0)]),
-        );
-
+        let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
-        let denominator = builder.add_input(vector_type.clone());
-        let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
-        // The pullback divides the output cotangent elementwise and sum-reduces it back to the scalar numerator.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3] = div %0 %1
-                    %3:f64[] = reduce_sum [axes=[0]] %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            pullback.interpret(vec![
-                Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 10.0]),
-                Array::from_f64s(vector_type, vec![2.0, 4.0, 5.0]),
-            ]),
-            Ok(vec![Array::scalar(4.0)]),
+        check_operation_transposition!(
+            @approx(epsilon = 1e-12),
+            operation = DivOperation,
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = scalar_type.clone())),
+                        (@known, Array::scalar(3.0)),
+                    ],
+                    output_cotangents = [Array::scalar(2.0)],
+                    input_cotangents = [Array::scalar(2.0 / 3.0)],
+                    pullback = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = div %0 %1
+                        in (%2)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@linear(type = scalar_type)),
+                        (@known, Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 5.0])),
+                    ],
+                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 10.0])],
+                    input_cotangents = [Array::scalar(4.0)],
+                    pullback = indoc! {"
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = div %0 %1
+                            %3:f64[] = reduce_sum [axes=[0]] %2
+                        in (%3)
+                    "},
+                },
+            ],
         );
     }
 }

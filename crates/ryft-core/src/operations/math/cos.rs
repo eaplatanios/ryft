@@ -70,11 +70,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -198,24 +201,46 @@ mod tests {
             Operation::<DataType>::infer_output_types(&CosOperation, &[DataType::I32], &[]),
             Err(TypeError { message: "'cos' does not support input data type i32".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_unreduced(CosOperation, COS_OPERATION_NAME, 1);
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = CosOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_cos_batching() {
-        crate::operations::math::tests::assert_unary_batching(
-            CosOperation,
-            &[0.5, -1.0],
-            &[0.5f64.cos(), (-1.0f64).cos()],
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = CosOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.cos(), (-1.0f64).cos()]))],
+            }],
         );
     }
 
     #[test]
     fn test_cos_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context.jvp(|input| input.cos(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(primal, 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, -3.0 * 2.0f64.sin(), epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = CosOperation,
+            cases = [{
+                primals = [Array::scalar(2.0)],
+                tangents = [Array::scalar(3.0)],
+                primal_outputs = [Array::scalar(2.0f64.cos())],
+                tangent_outputs = [Array::scalar(-3.0 * 2.0f64.sin())],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = cos %0
+                        %3:f64[] = sin %0
+                        %4:f64[] = mul %3 %1
+                        %5:f64[] = neg %4
+                    in (%2, %5)
+                "},
+            }],
+        );
         check_gradient!(@scalar, |input| input.cos(), at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
@@ -237,28 +262,6 @@ mod tests {
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.values()[0], -3.0 * 4.0f64.sin(), epsilon = 1e-6);
-
-        // The plain staged tangent program computes the coefficient directly on the input.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = cos %0
-                    %3:f64[] = sin %0
-                    %4:f64[] = mul %3 %1
-                    %5:f64[] = neg %4
-                in (%2, %5)
-            "}
-            .trim_end(),
-        );
 
         // The widened staged tangent program computes the coefficient in the widened differential representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -286,11 +289,15 @@ mod tests {
 
     #[test]
     fn test_cos_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(CosOperation, &[0.5], 0.5f64.cos());
+        check_operation_partial_evaluation!(operation = CosOperation, inputs = [0.5], expected = 0.5f64.cos(),);
     }
 
     #[test]
     fn test_cos_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(CosOperation, COS_OPERATION_NAME, 1);
+        check_operation_transposition!(
+            @rejected,
+            operation = CosOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 }

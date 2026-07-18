@@ -748,9 +748,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -991,61 +991,50 @@ mod tests {
 
     #[test]
     fn test_reduce_operation_batches_replicated_input_as_pass_through() {
-        let input = ArrayBatch::replicated(Array::matrix(2, 3, vec![1.0; 6]));
-        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values(), &[3.0, 3.0]);
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@replicated, Array::matrix(2, 3, vec![1.0; 6]))],
+                outputs = [(@replicated, Array::vector(vec![3.0, 3.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_reduce_operation_batches_along_non_batch_axis() {
         // Physical input is [3 batch items, 2 rows, 3 cols] mapped at axis 0. Per-item reduce over
         // axis 1 (the "cols" axis from the per-item view; physically axis 2 after batching).
-        let values: Vec<f64> = (0..18).map(|index| index as f64).collect();
-        let physical_type = array_type(&[3, 2, 3], DataType::F64);
-        let input = {
-            let value = Array::from_f64s(physical_type, values);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 3),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().shape(), &Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        assert_eq!(outputs[0].value().values(), &[3.0, 12.0, 21.0, 30.0, 39.0, 48.0]);
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
+            axis_size = 3,
+            cases = [{
+                inputs = [(@mapped(
+                    axis = 0
+                ), Array::from_f64s(
+                    array_type(&[3, 2, 3], DataType::F64),
+                    (0..18).map(|index| index as f64).collect(),
+                ))],
+                outputs = [(@mapped(
+                    axis = 0
+                ), Array::matrix(3, 2, vec![3.0, 12.0, 21.0, 30.0, 39.0, 48.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_reduce_operation_batches_a_per_item_axis_at_the_physical_batch_position() {
-        let input = {
-            let value = Array::matrix(3, 2, vec![1.0; 6]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = ReduceOperation::new(vec![0], ReductionKind::Sum)
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 3),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().shape(), &Shape::new(vec![Size::Static(3)]));
-        assert_eq!(outputs[0].value().values(), &[2.0, 2.0, 2.0]);
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![0], ReductionKind::Sum),
+            axis_size = 3,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::matrix(3, 2, vec![1.0; 6]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 2.0, 2.0]))],
+            }],
+        );
     }
 
     #[test]

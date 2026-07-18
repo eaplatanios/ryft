@@ -2070,6 +2070,7 @@ mod tests {
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::LinearizationTracer;
+    use crate::macros::{check_operation_batching, check_operation_transposition};
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -2845,29 +2846,19 @@ mod tests {
         let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]);
         let sizes = vec![1, 2];
 
-        // Build `dynamic_slice(operand, start_row, start_col)` over the test enum, treat only the operand as linear,
-        // and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<Array, crate::backends::arrays::ArrayOperation<Array>>::new();
-        let operand_input = builder.add_input(operand_type.clone());
-        let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
-        let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
-        let output = builder
-            .add_instruction(
-                DynamicSliceOperation::new(sizes.clone()),
-                Vec::new(),
-                vec![operand_input, row_input, col_input],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<(Array, Array, Array), Array>(vec![output], (Placeholder, Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 1, "the known start indices must receive no cotangent output");
-        let operand_cotangents = pullback.interpret(vec![cotangent, index(1.0), index(1.0)]).unwrap();
-        assert_eq!(operand_cotangents.len(), 1);
-        assert_eq!(*operand_cotangents[0].r#type(), operand_type);
-        // The dynamic-slice adjoint writes the cotangent block back at start (1, 1) of a [2, 3] zero operand.
-        assert_eq!(operand_cotangents[0].to_f64s(), vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0]);
+        check_operation_transposition!(
+            @exact,
+            operation = DynamicSliceOperation::new(sizes),
+            cases = [{
+                inputs = [
+                    (@linear(type = operand_type)),
+                    (@known, index(1.0)),
+                    (@known, index(1.0)),
+                ],
+                output_cotangents = [cotangent],
+                input_cotangents = [Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0])],
+            }],
+        );
     }
 
     #[test]
@@ -2878,37 +2869,23 @@ mod tests {
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        // Build `dynamic_update_slice(input, update, start_row, start_col)` over the test enum, treat the input and
-        // update as linear, and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<Array, crate::backends::arrays::ArrayOperation<Array>>::new();
-        let input_input = builder.add_input(input_type.clone());
-        let update_input = builder.add_input(update_type.clone());
-        let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
-        let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
-        let output = builder
-            .add_instruction(
-                DynamicUpdateSliceOperation,
-                Vec::new(),
-                vec![input_input, update_input, row_input, col_input],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<(Array, Array, Array, Array), Array>(
-                vec![output],
-                (Placeholder, Placeholder, Placeholder, Placeholder),
-                Placeholder,
-            )
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 2, "the known start indices must receive no cotangent output");
-        let cotangents = pullback.interpret(vec![cotangent, index(0.0), index(1.0)]).unwrap();
-        assert_eq!(cotangents.len(), 2);
-        assert_eq!(*cotangents[0].r#type(), input_type);
-        assert_eq!(*cotangents[1].r#type(), update_type);
-        // Input cotangent: the cotangent with the update window (start (0, 1), shape [1, 2]) zeroed.
-        assert_eq!(cotangents[0].to_f64s(), vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]);
-        // Update cotangent: the cotangent block at the update window.
-        assert_eq!(cotangents[1].to_f64s(), vec![2.0, 3.0]);
+        check_operation_transposition!(
+            @exact,
+            operation = DynamicUpdateSliceOperation,
+            cases = [{
+                inputs = [
+                    (@linear(type = input_type)),
+                    (@linear(type = update_type)),
+                    (@known, index(0.0)),
+                    (@known, index(1.0)),
+                ],
+                output_cotangents = [cotangent],
+                input_cotangents = [
+                    Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]),
+                    Array::matrix(1, 2, vec![2.0, 3.0]),
+                ],
+            }],
+        );
     }
 
     /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
@@ -3040,40 +3017,35 @@ mod tests {
 
     #[test]
     fn test_slice_batching_lifts_batch_axis() {
-        // A batched operand keeps its batch axis by slicing it fully.
-        let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[input])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 5.0, 6.0]);
+        check_operation_batching!(
+            @exact,
+            operation = SliceOperation::new(vec![1], vec![3]),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [(@mapped(
+                        axis = 0
+                    ), Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))],
+                    outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
+                },
+                {
+                    inputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]))],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0]))],
+                },
+            ],
+        );
 
-        // Replicated operands pass through the unlifted rule.
-        let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
-        let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[uniform])
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0]);
-
-        // Strided slices keep their strides and gain a unit stride at the batch axis: each batch item keeps the
-        // elements at positions 0 and 2.
-        let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
-        let outputs = strided
-            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[input])
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 2.0, 4.0, 6.0]);
+        check_operation_batching!(
+            @exact,
+            operation = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(
+                    axis = 0
+                ), Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 2.0, 4.0, 6.0]))],
+            }],
+        );
     }
 
     #[test]

@@ -124,12 +124,15 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient, value_and_gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
     use crate::parameters::Placeholder;
@@ -305,23 +308,65 @@ mod tests {
             Operation::<DataType>::infer_output_types(&Atan2Operation, &[DataType::I32, DataType::F32], &[]),
             Err(TypeError { message: "'atan2' does not support input data type i32".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_unreduced(Atan2Operation, ATAN2_OPERATION_NAME, 2);
-        crate::operations::math::tests::assert_rejects_mismatched_reduced(Atan2Operation, ATAN2_OPERATION_NAME);
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = Atan2Operation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = Atan2Operation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_atan2_batching() {
-        crate::operations::math::tests::assert_binary_batching(
-            Atan2Operation,
-            &[0.5, -1.0],
-            2.0,
-            &[0.5f64.atan2(2.0), (-1.0f64).atan2(2.0)],
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = Atan2Operation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
+                    (@replicated, Array::scalar(2.0)),
+                ],
+                outputs = [(@mapped(
+                    axis = 0
+                ), Array::vector(vec![0.5f64.atan2(2.0), (-1.0f64).atan2(2.0)]))],
+            }],
         );
     }
 
     #[test]
     fn test_atan2_differentiation() {
         let (y, x) = (0.7f64, -0.3f64);
+        let (y_tangent, x_tangent) = (0.4f64, -0.2f64);
+        let tangent = (x * y_tangent - y * x_tangent) / (x * x + y * y);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = Atan2Operation,
+            cases = [{
+                primals = [Array::scalar(y), Array::scalar(x)],
+                tangents = [Array::scalar(y_tangent), Array::scalar(x_tangent)],
+                primal_outputs = [Array::scalar(y.atan2(x))],
+                tangent_outputs = [Array::scalar(tangent)],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = atan2 %0 %1
+                        %5:f64[] = mul %1 %1
+                        %6:f64[] = mul %0 %0
+                        %7:f64[] = add %5 %6
+                        %8:f64[] = div %1 %7
+                        %9:f64[] = mul %8 %2
+                        %10:f64[] = div %0 %7
+                        %11:f64[] = neg %10
+                        %12:f64[] = mul %11 %3
+                        %13:f64[] = add %9 %12
+                    in (%4, %13)
+                "},
+            }],
+        );
         let (value, (y_gradient, x_gradient)) =
             value_and_gradient(|(y, x)| y.atan2(&x).unwrap(), (Scalar::from(y), Scalar::from(x))).unwrap();
         assert_abs_diff_eq!(value, y.atan2(x), epsilon = 1e-9);
@@ -365,43 +410,23 @@ mod tests {
         assert!(matches!(primal, Scalar::F8E8M0FNU(_)));
         let Scalar::F32(tangent) = tangent else { panic!("expected an f32 tangent") };
         assert_abs_diff_eq!(tangent, 0.1f32, epsilon = 1e-6);
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let y = builder.add_input(ArrayType::scalar(DataType::F64));
-        let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(Atan2Operation, Vec::new(), vec![y, x]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[] = atan2 %0 %1
-                    %5:f64[] = mul %1 %1
-                    %6:f64[] = mul %0 %0
-                    %7:f64[] = add %5 %6
-                    %8:f64[] = div %1 %7
-                    %9:f64[] = mul %8 %2
-                    %10:f64[] = div %0 %7
-                    %11:f64[] = neg %10
-                    %12:f64[] = mul %11 %3
-                    %13:f64[] = add %9 %12
-                in (%4, %13)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_atan2_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(Atan2Operation, &[0.5, -0.25], 0.5f64.atan2(-0.25));
+        check_operation_partial_evaluation!(
+            operation = Atan2Operation,
+            inputs = [0.5, -0.25],
+            expected = 0.5f64.atan2(-0.25),
+        );
     }
 
     #[test]
     fn test_atan2_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(Atan2Operation, ATAN2_OPERATION_NAME, 2);
+        check_operation_transposition!(
+            @rejected,
+            operation = Atan2Operation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
     }
 }

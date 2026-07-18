@@ -248,7 +248,10 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition,
+    };
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -440,16 +443,51 @@ mod tests {
 
     #[test]
     fn test_abs_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(AbsOperation, &[-2.0], 2.0);
+        check_operation_partial_evaluation!(operation = AbsOperation, inputs = [-2.0], expected = 2.0,);
     }
 
     #[test]
     fn test_abs_batching() {
-        crate::operations::math::tests::assert_unary_batching(AbsOperation, &[0.5, -2.0], &[0.5, 2.0]);
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = AbsOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_abs_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = AbsOperation,
+            cases = [
+                {
+                    primals = [Array::scalar(0.7)],
+                    tangents = [Array::scalar(3.0)],
+                    primal_outputs = [Array::scalar(0.7)],
+                    tangent_outputs = [Array::scalar(3.0)],
+                    jvp = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = abs %0
+                            %3:f64[] = zero_like %0
+                            %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
+                            %5:f64[] = neg %1
+                            %6:f64[] = select %4 %1 %5
+                        in (%2, %6)
+                    "},
+                },
+                {
+                    primals = [Array::scalar(-2.5)],
+                    tangents = [Array::scalar(2.0)],
+                    primal_outputs = [Array::scalar(2.5)],
+                    tangent_outputs = [Array::scalar(-2.0)],
+                },
+            ],
+        );
         // The real rule uses +1 at and above zero and -1 below zero.
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.7f64)).unwrap(), 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.0f64)).unwrap(), 1.0, epsilon = 1e-9);
@@ -518,32 +556,14 @@ mod tests {
         let (_, tangent) = context.jvp(|input| input.abs(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_eq!(tangent.to_f64s(), vec![3.0]);
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(AbsOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = abs %0
-                    %3:f64[] = zero_like %0
-                    %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
-                    %5:f64[] = neg %1
-                    %6:f64[] = select %4 %1 %5
-                in (%2, %6)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_abs_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(AbsOperation, ABS_OPERATION_NAME, 1);
+        check_operation_transposition!(
+            @rejected,
+            operation = AbsOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 }

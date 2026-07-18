@@ -42,7 +42,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     fn test_not_batching() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = NotOperation,
             axis_size = 2,
             cases = [
@@ -127,8 +127,7 @@ mod tests {
 
     #[test]
     fn test_not_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
+        check_operation_partial_evaluation!(
             operation = NotOperation,
             inputs = [Scalar::from(true)],
             expected = Scalar::from(false),

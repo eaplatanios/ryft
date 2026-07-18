@@ -498,7 +498,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::check_operation;
+    use crate::macros::check_operation_batching;
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -725,8 +725,8 @@ mod tests {
 
     #[test]
     fn test_pad_batching_lifts_batch_axis_with_zero_paddings() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
             axis_size = 2,
             cases = [

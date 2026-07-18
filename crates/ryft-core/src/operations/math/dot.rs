@@ -1054,6 +1054,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
+    use crate::macros::check_operation_transposition;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -1624,54 +1625,34 @@ mod tests {
 
     #[test]
     fn test_dot_partitioned_transpose_computes_operand_adjoints() {
-        use crate::backends::arrays::{Array, ArrayOperation};
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
         let matmul = DotDimensionNumbers::matmul();
         let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
         let cotangent = Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]);
-        let left_type = left.r#type().into_owned();
-        let right_type = right.r#type().into_owned();
-
-        // Known LEFT operand (linear RHS): the partition-aware transpose stages the adjoint of `t -> dot(left, t)`,
-        // whose RHS cotangent is `dot(left^T, cotangent)`. Build `dot(left, right)` over the test enum, treat only the
-        // RHS as linear, and interpret the pullback on `[cotangent, left]`.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left_input = builder.add_input(left_type.clone());
-        let right_input = builder.add_input(right_type.clone());
-        let product = builder
-            .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
-            .unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 1, "the known left input must receive no cotangent output");
-        let right_cotangents = pullback.interpret(vec![cotangent.clone(), left.clone()]).unwrap();
-        assert_eq!(right_cotangents.len(), 1);
-        assert_eq!(*right_cotangents[0].r#type(), right_type);
-        // `left^T @ cotangent` with `left^T = [[1,4],[2,5],[3,6]]` and `cotangent = [[1,-2],[0.5,3]]`.
-        assert_eq!(right_cotangents[0].to_f64s(), vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0]);
-
-        // Known RIGHT operand (linear LHS): the partition-aware transpose stages the adjoint of `t -> dot(t, right)`,
-        // whose LHS cotangent is `dot(cotangent, right^T)`.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left_input = builder.add_input(left_type.clone());
-        let right_input = builder.add_input(right_type.clone());
-        let product = builder
-            .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
-            .unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 1, "the known right input must receive no cotangent output");
-        let left_cotangents = pullback.interpret(vec![cotangent, right]).unwrap();
-        assert_eq!(left_cotangents.len(), 1);
-        assert_eq!(*left_cotangents[0].r#type(), left_type);
-        // `cotangent @ right^T` with `cotangent = [[1,-2],[0.5,3]]` and `right^T = [[7,9,11],[8,10,12]]`.
-        assert_eq!(left_cotangents[0].to_f64s(), vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]);
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::new(matmul),
+            cases = [
+                {
+                    inputs = [
+                        (@known, left),
+                        (@linear(type = right.r#type().into_owned())),
+                    ],
+                    output_cotangents = [cotangent.clone()],
+                    input_cotangents = [Array::matrix(3, 2, vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0])],
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(
+                            DataType::F64,
+                            Shape::new(vec![Size::Static(2), Size::Static(3)]),
+                        ))),
+                        (@known, right),
+                    ],
+                    output_cotangents = [cotangent],
+                    input_cotangents = [Array::matrix(2, 3, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5])],
+                },
+            ],
+        );
     }
 }

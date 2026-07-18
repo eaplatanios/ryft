@@ -70,11 +70,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -197,24 +200,45 @@ mod tests {
             Operation::<DataType>::infer_output_types(&SqrtOperation, &[DataType::I32], &[]),
             Err(TypeError { message: "'sqrt' does not support input data type i32".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_unreduced(SqrtOperation, SQRT_OPERATION_NAME, 1);
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SqrtOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_sqrt_batching() {
-        crate::operations::math::tests::assert_unary_batching(
-            SqrtOperation,
-            &[0.5, 2.0],
-            &[0.5f64.sqrt(), 2.0f64.sqrt()],
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = SqrtOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.sqrt(), 2.0f64.sqrt()]))],
+            }],
         );
     }
 
     #[test]
     fn test_sqrt_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context.jvp(|input| input.sqrt(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(primal, 2.0f64.sqrt(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = SqrtOperation,
+            cases = [{
+                primals = [Array::scalar(2.0)],
+                tangents = [Array::scalar(3.0)],
+                primal_outputs = [Array::scalar(2.0f64.sqrt())],
+                tangent_outputs = [Array::scalar(3.0 / (2.0 * 2.0f64.sqrt()))],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = sqrt %0
+                        %3:f64[] = add %2 %2
+                        %4:f64[] = div %1 %3
+                    in (%2, %4)
+                "},
+            }],
+        );
         check_gradient!(@scalar, |input| input.sqrt(), at = 2.0, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
@@ -236,28 +260,6 @@ mod tests {
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.values()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-6);
-
-        // The plain staged tangent program reuses the primal `sqrt` as the denominator instead of staging a
-        // duplicate.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SqrtOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = sqrt %0
-                    %3:f64[] = add %2 %2
-                    %4:f64[] = div %1 %3
-                in (%2, %4)
-            "}
-            .trim_end(),
-        );
 
         // The widened staged tangent program recomputes the denominator in the widened differential representation
         // instead of converting the narrower primal output.
@@ -286,11 +288,15 @@ mod tests {
 
     #[test]
     fn test_sqrt_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(SqrtOperation, &[4.0], 2.0);
+        check_operation_partial_evaluation!(operation = SqrtOperation, inputs = [4.0], expected = 2.0,);
     }
 
     #[test]
     fn test_sqrt_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(SqrtOperation, SQRT_OPERATION_NAME, 1);
+        check_operation_transposition!(
+            @rejected,
+            operation = SqrtOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 }

@@ -295,10 +295,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition,
+    };
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -572,21 +575,40 @@ mod tests {
 
     #[test]
     fn test_mul_batching() {
-        crate::operations::math::tests::assert_binary_batching(MulOperation, &[1.0, -2.0], 3.0, &[3.0, -6.0]);
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = MulOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    (@replicated, Array::scalar(3.0)),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -6.0]))],
+            }],
+        );
     }
 
     #[test]
     fn test_mul_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context
-            .jvp(
-                |(left, right)| Ok(left * right),
-                (Scalar::from(2.0), Scalar::from(5.0)),
-                (Scalar::from(3.0), Scalar::from(-1.0)),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(primal, 10.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 13.0, epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = MulOperation,
+            cases = [{
+                primals = [Array::scalar(2.0), Array::scalar(5.0)],
+                tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
+                primal_outputs = [Array::scalar(10.0)],
+                tangent_outputs = [Array::scalar(13.0)],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %0 %1
+                        %5:f64[] = mul %1 %2
+                        %6:f64[] = mul %0 %3
+                        %7:f64[] = add %5 %6
+                    in (%4, %7)
+                "},
+            }],
+        );
         fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
             input.clone() * input
         }
@@ -608,28 +630,6 @@ mod tests {
             gradient(|x| gradient(square, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
             2.0,
             epsilon = 1e-9,
-        );
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(MulOperation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[] = mul %0 %1
-                    %5:f64[] = mul %1 %2
-                    %6:f64[] = mul %0 %3
-                    %7:f64[] = add %5 %6
-                in (%4, %7)
-            "}
-            .trim_end(),
         );
 
         // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
@@ -659,59 +659,45 @@ mod tests {
 
     #[test]
     fn test_mul_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(MulOperation, &[2.0, 3.5], 7.0);
+        check_operation_partial_evaluation!(operation = MulOperation, inputs = [2.0, 3.5], expected = 7.0,);
     }
 
     #[test]
     fn test_mul_transposition() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let residual = builder.add_input(scalar_type.clone());
-        let tangent = builder.add_input(scalar_type);
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 1);
-        // The pullback multiplies the output cotangent by the residual known operand.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                in (%2)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(pullback.interpret(vec![Array::scalar(1.0), Array::scalar(4.0)]), Ok(vec![Array::scalar(4.0)]),);
-
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let residual = builder.add_input(vector_type.clone());
-        let tangent = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
-        // The pullback multiplies elementwise and sum-reduces back to the scalar linear operand.
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[3], %1:f64[3] .
-                let %2:f64[3] = mul %1 %0
-                    %3:f64[] = reduce_sum [axes=[0]] %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            pullback.interpret(vec![
-                Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0]),
-                Array::from_f64s(vector_type, vec![1.0, 2.0, 3.0]),
-            ]),
-            Ok(vec![Array::scalar(20.0)]),
+        check_operation_transposition!(
+            @exact,
+            operation = MulOperation,
+            cases = [
+                {
+                    inputs = [
+                        (@known, Array::scalar(4.0)),
+                        (@linear(type = scalar_type.clone())),
+                    ],
+                    output_cotangents = [Array::scalar(1.0)],
+                    input_cotangents = [Array::scalar(4.0)],
+                    pullback = indoc! {"
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    "},
+                },
+                {
+                    inputs = [
+                        (@known, Array::from_f64s(vector_type.clone(), vec![1.0, 2.0, 3.0])),
+                        (@linear(type = scalar_type)),
+                    ],
+                    output_cotangents = [Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0])],
+                    input_cotangents = [Array::scalar(20.0)],
+                    pullback = indoc! {"
+                        lambda %0:f64[3], %1:f64[3] .
+                        let %2:f64[3] = mul %1 %0
+                            %3:f64[] = reduce_sum [axes=[0]] %2
+                        in (%3)
+                    "},
+                },
+            ],
         );
     }
 }

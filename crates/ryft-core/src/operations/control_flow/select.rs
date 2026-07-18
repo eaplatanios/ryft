@@ -368,13 +368,15 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::macros::check_operation_transposition;
     use crate::operations::BooleanLike;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::math::Add;
     use crate::parameters::Placeholder;
+    use crate::programs::ProgramBuilder;
+    use crate::programs::ProgramError;
     use crate::programs::types::Typed;
-    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use crate::types::{Shape, Size};
 
@@ -784,30 +786,19 @@ mod tests {
         // The branches are linear operands, so only their type enters the transpose; their values are unused.
         let on_true = Array::vector(vec![10.0, 20.0]);
         let cotangent = Array::vector(vec![5.0, 7.0]);
-        let condition_type = condition.r#type().into_owned();
         let branch_type = on_true.r#type().into_owned();
-
-        // Build `select(condition, on_true, on_false)`, treat only the branches as linear, and interpret the
-        // pullback on `[cotangent, condition]`.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let condition_input = builder.add_input(condition_type.clone());
-        let on_true_input = builder.add_input(branch_type.clone());
-        let on_false_input = builder.add_input(branch_type.clone());
-        let output = builder
-            .add_instruction(SelectOperation, Vec::new(), vec![condition_input, on_true_input, on_false_input])
-            .unwrap()[0];
-        let program = builder
-            .build::<(Array, Array, Array), Array>(vec![output], (Placeholder, Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 2, "the known condition input must receive no cotangent output");
-        let branch_cotangents = pullback.interpret(vec![cotangent, condition]).unwrap();
-
-        // The select adjoint routes the cotangent into each selected branch: under condition `[true, false]` the
-        // `on_true` cotangent keeps the cotangent at the true batch items and zeroes the rest (`[5, 0]`), and the
-        // `on_false` cotangent does the opposite (`[0, 7]`).
-        assert_eq!(branch_cotangents.len(), 2);
-        assert_eq!(branch_cotangents[0].to_f64s(), vec![5.0, 0.0]);
-        assert_eq!(branch_cotangents[1].to_f64s(), vec![0.0, 7.0]);
+        check_operation_transposition!(
+            @exact,
+            operation = SelectOperation,
+            cases = [{
+                inputs = [
+                    (@known, condition),
+                    (@linear(type = branch_type.clone())),
+                    (@linear(type = branch_type)),
+                ],
+                output_cotangents = [cotangent],
+                input_cotangents = [Array::vector(vec![5.0, 0.0]), Array::vector(vec![0.0, 7.0])],
+            }],
+        );
     }
 }

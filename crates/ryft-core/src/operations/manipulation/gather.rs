@@ -1060,11 +1060,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::macros::{check_operation_batching, check_operation_transposition};
     use crate::operations::math::{Reduce, ReductionKind};
-    use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::linear::DenseDifferentiate;
     use crate::types::DataType;
@@ -1217,11 +1216,6 @@ mod tests {
 
     #[test]
     fn test_gather_partitioned_transpose_computes_scatter_add_adjoint() {
-        use crate::backends::arrays::Array;
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-        use crate::programs::types::Typed;
-
         // Take rows 0 and 2 of a [3, 2] operand: the operand is linear and the [2, 1] index array is the known
         // operand. The gathered output and its cotangent have shape [2, 2].
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
@@ -1229,26 +1223,19 @@ mod tests {
         let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]);
         let cotangent = Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]);
-        let operand_type = operand.r#type().into_owned();
-        let indices_type = indices.r#type().into_owned();
-
-        // Build `gather(operand, indices)` over the test enum, treat only the operand as linear, and interpret the
-        // pullback on `[cotangent, indices]`.
-        let mut builder = ProgramBuilder::<Array, TestGatherOperation<Array>>::new();
-        let operand_input = builder.add_input(operand_type.clone());
-        let indices_input = builder.add_input(indices_type.clone());
-        let output =
-            builder.add_instruction(operation.clone(), Vec::new(), vec![operand_input, indices_input]).unwrap()[0];
-        let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
-        assert_eq!(pullback.output_ids().len(), 1, "the known index input must receive no cotangent output");
-        let operand_cotangents = pullback.interpret(vec![cotangent, indices]).unwrap();
-        assert_eq!(operand_cotangents.len(), 1);
-        assert_eq!(*operand_cotangents[0].r#type(), operand_type);
-        // The scatter-add adjoint writes the cotangent rows back into rows 0 and 2 of a zero operand.
-        assert_eq!(operand_cotangents[0].to_f64s(), vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]);
+        check_operation_transposition!(
+            @exact,
+            backend = (Array, TestGatherOperation<Array>),
+            operation = operation,
+            cases = [{
+                inputs = [
+                    (@linear(type = operand.r#type().into_owned())),
+                    (@known, indices),
+                ],
+                output_cotangents = [cotangent],
+                input_cotangents = [Array::matrix(3, 2, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0])],
+            }],
+        );
     }
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -1313,28 +1300,20 @@ mod tests {
     #[test]
     fn test_gather_batching_expands_an_empty_batch() {
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)]));
-        let operand =
-            ArrayBatch::new(operand_type.clone(), Array::from_f64s(operand_type, Vec::new()), Some(0)).unwrap();
         let indices_type =
             ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(0), Size::Static(1), Size::Static(1)]));
-        let indices =
-            ArrayBatch::new(indices_type.clone(), Array::from_f64s(indices_type, Vec::new()), Some(0)).unwrap();
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]);
-
-        let outputs = operation
-            .batch(
-                &crate::BatchingContext::new(EagerContext::<Array>::new(), 0),
-                &crate::EmptyRegionDriver,
-                &[operand, indices],
-            )
-            .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            *outputs[0].value().r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(1)])),
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(1)]));
+        check_operation_batching!(
+            @exact,
+            operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]),
+            axis_size = 0,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::from_f64s(operand_type, Vec::new())),
+                    (@mapped(axis = 0), Array::from_f64s(indices_type, Vec::new())),
+                ],
+                outputs = [(@mapped(axis = 0), Array::from_f64s(output_type, Vec::new()))],
+            }],
         );
-        assert!(outputs[0].value().values().is_empty());
     }
 }

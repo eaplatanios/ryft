@@ -44,7 +44,7 @@ mod tests {
     use crate::differentiation::DifferentiationTracer;
     use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
@@ -134,8 +134,8 @@ mod tests {
 
     #[test]
     fn test_and_batching() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = AndOperation,
             axis_size = 2,
             cases = [
@@ -176,8 +176,7 @@ mod tests {
 
     #[test]
     fn test_and_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
+        check_operation_partial_evaluation!(
             operation = AndOperation,
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(false),

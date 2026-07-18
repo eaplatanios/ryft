@@ -216,7 +216,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{DifferentiationTracer, ForwardModeDifferentiate};
-    use crate::macros::check_operation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
@@ -346,8 +346,8 @@ mod tests {
 
     #[test]
     fn test_compare_batching() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
             axis_size = 2,
             cases = [
@@ -388,8 +388,7 @@ mod tests {
 
     #[test]
     fn test_compare_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
+        check_operation_partial_evaluation!(
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
             inputs = [Scalar::from(1.0), Scalar::from(0.0)],
             expected = Scalar::from(true),

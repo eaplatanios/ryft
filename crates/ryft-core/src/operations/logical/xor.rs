@@ -42,7 +42,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -119,8 +119,8 @@ mod tests {
 
     #[test]
     fn test_xor_batching() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = XorOperation,
             axis_size = 2,
             cases = [{
@@ -135,8 +135,7 @@ mod tests {
 
     #[test]
     fn test_xor_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
+        check_operation_partial_evaluation!(
             operation = XorOperation,
             inputs = [Scalar::from(true), Scalar::from(false)],
             expected = Scalar::from(true),

@@ -64,11 +64,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_gradient;
+    use crate::macros::{
+        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -191,20 +194,44 @@ mod tests {
             Operation::<DataType>::infer_output_types(&LogOperation, &[DataType::I32], &[]),
             Err(TypeError { message: "'log' does not support input data type i32".to_string() }),
         );
-        crate::operations::math::tests::assert_rejects_unreduced(LogOperation, LOG_OPERATION_NAME, 1);
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = LogOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
     fn test_log_batching() {
-        crate::operations::math::tests::assert_unary_batching(LogOperation, &[0.5, 2.0], &[0.5f64.ln(), 2.0f64.ln()]);
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = LogOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, 2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5f64.ln(), 2.0f64.ln()]))],
+            }],
+        );
     }
 
     #[test]
     fn test_log_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context.jvp(|input| input.log(), Scalar::from(0.7), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(primal, 0.7f64.ln(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 3.0 / 0.7, epsilon = 1e-9);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = LogOperation,
+            cases = [{
+                primals = [Array::scalar(0.7)],
+                tangents = [Array::scalar(3.0)],
+                primal_outputs = [Array::scalar(0.7f64.ln())],
+                tangent_outputs = [Array::scalar(3.0 / 0.7)],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = log %0
+                        %3:f64[] = div %1 %0
+                    in (%2, %3)
+                "},
+            }],
+        );
         check_gradient!(@scalar, |input| input.log(), at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
@@ -225,26 +252,6 @@ mod tests {
         let (_, tangent) = context.jvp(|input| input.log(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.values()[0], 1.5, epsilon = 1e-9);
-
-        // The plain staged tangent program divides the tangent directly by the input.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .jvp()
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = log %0
-                    %3:f64[] = div %1 %0
-                in (%2, %3)
-            "}
-            .trim_end(),
-        );
 
         // The widened staged tangent program divides by the input converted to the widened differential
         // representation.
@@ -271,11 +278,15 @@ mod tests {
 
     #[test]
     fn test_log_partial_evaluation() {
-        crate::operations::math::tests::assert_partial_evaluation(LogOperation, &[0.7], 0.7f64.ln());
+        check_operation_partial_evaluation!(operation = LogOperation, inputs = [0.7], expected = 0.7f64.ln(),);
     }
 
     #[test]
     fn test_log_transposition() {
-        crate::operations::math::tests::assert_rejects_nonlinear_transposition(LogOperation, LOG_OPERATION_NAME, 1);
+        check_operation_transposition!(
+            @rejected,
+            operation = LogOperation,
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 }

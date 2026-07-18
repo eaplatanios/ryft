@@ -456,7 +456,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::check_operation;
+    use crate::macros::check_operation_batching;
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -745,8 +745,8 @@ mod tests {
 
     #[test]
     fn test_concatenate_batching_lifts_batch_axis() {
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = ConcatenateOperation::new(0),
             axis_size = 2,
             cases = [

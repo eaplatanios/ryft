@@ -138,7 +138,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::check_operation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_transposition};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
@@ -291,8 +291,8 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_batching() {
-        check_operation!(
-            @batching @approx(epsilon = 1e-9),
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
             operation = StopGradientOperation,
             axis_size = 2,
             cases = [{
@@ -353,18 +353,13 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
-            operation = StopGradientOperation,
-            inputs = [2.0],
-            expected = 2.0,
-        );
+        check_operation_partial_evaluation!(operation = StopGradientOperation, inputs = [2.0], expected = 2.0,);
     }
 
     #[test]
     fn test_stop_gradient_transposition() {
-        check_operation!(
-            @reject @transposition,
+        check_operation_transposition!(
+            @rejected,
             operation = StopGradientOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
