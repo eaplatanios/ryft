@@ -341,14 +341,14 @@ impl Operation<ArrayType> for GatherOperation {
 /// ```rust
 /// # use ryft_core::operations::manipulation::{Gather, GatherDimensionNumbers, GatherOperation};
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{ArrayType, DataType};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Take rows 0 and 2 of a 3x2 matrix: each query is a scalar row index, so the indices have shape [2, 1]
 /// // (two queries, one index component each) and the gathered window is a full row (slice sizes [1, 2]).
 /// let operand = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
-/// let indices = Array::new(
+/// let indices = Array::from_f64s(
 ///     ArrayType::new(DataType::I32, ryft_core::types::Shape::new(vec![
 ///         ryft_core::types::Size::Static(2),
 ///         ryft_core::types::Size::Static(1),
@@ -359,7 +359,7 @@ impl Operation<ArrayType> for GatherOperation {
 /// let operation = GatherOperation::new(dimensions, vec![1, 2]);
 /// let rows = operand.gather(&indices, &operation)?;
 /// // `rows` has shape [2, 2] holding rows 0 and 2: [[0, 1], [4, 5]].
-/// assert_eq!(rows.values, vec![0.0, 1.0, 4.0, 5.0]);
+/// assert_eq!(rows.to_f64s(), vec![0.0, 1.0, 4.0, 5.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -1096,16 +1096,16 @@ mod tests {
 
     #[test]
     fn test_gather_eager_modes() {
-        use crate::tests::TestArray;
+        use crate::backends::arrays::Array;
 
         // Gather scalars from [10, 20, 30, 40] at positions 1 and 5; position 5 is out of bounds (last valid is 3).
         let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let indices = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 5.0]);
+        let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 5.0]);
         let run = |mode| {
-            TestArray::vector(vec![10.0, 20.0, 30.0, 40.0])
+            Array::vector(vec![10.0, 20.0, 30.0, 40.0])
                 .gather(&indices, &GatherOperation::new(dimensions.clone(), vec![1]).with_mode(mode))
                 .unwrap()
-                .values
+                .to_f64s()
         };
         // Clip and promise-in-bounds clamp the out-of-bounds index to the last valid start.
         assert_eq!(run(GatherScatterMode::Clip), vec![20.0, 40.0]);
@@ -1149,30 +1149,30 @@ mod tests {
 
     #[test]
     fn test_gather_partitioned_transpose_computes_scatter_add_adjoint() {
+        use crate::backends::arrays::Array;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::programs::types::Typed;
-        use crate::tests::TestArray;
 
         // Take rows 0 and 2 of a [3, 2] operand: the operand is linear and the [2, 1] index array is the known
         // operand. The gathered output and its cotangent have shape [2, 2].
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
         let operation = GatherOperation::new(dimensions, vec![1, 2]);
-        let operand = TestArray::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let indices = TestArray::new(indices_type(vec![2, 1]), vec![0.0, 2.0]);
-        let cotangent = TestArray::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]);
+        let operand = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]);
+        let cotangent = Array::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]);
         let operand_type = operand.r#type().into_owned();
         let indices_type = indices.r#type().into_owned();
 
         // Build `gather(operand, indices)` over the test enum, treat only the operand as linear, and interpret the
         // pullback on `[cotangent, indices]`.
-        let mut builder = ProgramBuilder::<TestArray, TestGatherOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, TestGatherOperation<Array>>::new();
         let operand_input = builder.add_input(operand_type.clone());
         let indices_input = builder.add_input(indices_type.clone());
         let output =
             builder.add_instruction(operation.clone(), Vec::new(), vec![operand_input, indices_input]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1, "the known index input must receive no cotangent output");
@@ -1180,6 +1180,6 @@ mod tests {
         assert_eq!(operand_cotangents.len(), 1);
         assert_eq!(*operand_cotangents[0].r#type(), operand_type);
         // The scatter-add adjoint writes the cotangent rows back into rows 0 and 2 of a zero operand.
-        assert_eq!(operand_cotangents[0].values, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]);
+        assert_eq!(operand_cotangents[0].to_f64s(), vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]);
     }
 }

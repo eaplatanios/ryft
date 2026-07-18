@@ -236,7 +236,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SliceOpe
 /// ```rust
 /// # use ryft_core::operations::manipulation::Slice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Slice the middle 1x2 block out of a 2x3 matrix. This is equivalent to
@@ -244,12 +244,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SliceOpe
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let y = x.slice(&[1, 1], &[2, 3], &[1, 1])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
-/// assert_eq!(y.values, vec![5.0, 6.0]);
+/// assert_eq!(y.to_f64s(), vec![5.0, 6.0]);
 ///
 /// // A non-unit stride keeps every other element, like `x[0:6:2]` in NumPy.
 /// let x = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 /// let y = x.slice(&[1], &[6], &[2])?;
-/// assert_eq!(y.values, vec![1.0, 3.0, 5.0]);
+/// assert_eq!(y.to_f64s(), vec![1.0, 3.0, 5.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -526,14 +526,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for UpdateSl
 /// ```rust
 /// # use ryft_core::operations::manipulation::UpdateSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
 /// let y = x.update_slice(&update, &[0, 1])?;
-/// assert_eq!(y.values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+/// assert_eq!(y.to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -738,18 +738,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 /// ```rust
 /// # use ryft_core::operations::manipulation::DynamicSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{ArrayType, DataType};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix. This is equivalent to
 /// // `jax.lax.dynamic_slice(x, (i, j), slice_sizes=(1, 2))` in JAX.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-/// let i = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
-/// let j = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
+/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
+/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
 /// let y = x.dynamic_slice(&[i, j], &[1, 2])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
-/// assert_eq!(y.values, vec![5.0, 6.0]);
+/// assert_eq!(y.to_f64s(), vec![5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -910,7 +910,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicU
 /// ```rust
 /// # use ryft_core::operations::manipulation::DynamicUpdateSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{ArrayType, DataType};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
@@ -918,10 +918,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicU
 /// // `jax.lax.dynamic_update_slice(x, update, (i, j))` in JAX.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
-/// let i = Array::new(ArrayType::scalar(DataType::I32), vec![0.0]);
-/// let j = Array::new(ArrayType::scalar(DataType::I32), vec![1.0]);
+/// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![0.0]);
+/// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
 /// let y = x.dynamic_update_slice(&update, &[i, j])?;
-/// assert_eq!(y.values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+/// assert_eq!(y.to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -1423,19 +1423,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::tests::TestArray;
 
     use super::*;
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
-    fn index(value: f64) -> TestArray {
-        TestArray::new(ArrayType::scalar(DataType::I32), vec![value])
+    fn index(value: f64) -> Array {
+        Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value])
     }
 
     #[test]
@@ -1456,20 +1456,18 @@ mod tests {
         assert_eq!(input_type.slice(&[1, 1], &[2, 3], &[1, 1]), Ok(output_type.clone()));
 
         // Interpretation copies the selected block out of the row-major payload.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![5.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![5.0, 6.0]);
 
         // Empty slices produce empty payloads and rank-0 slices pass through.
-        let empty = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-            .slice(&[1, 1], &[1, 3], &[1, 1])
-            .unwrap();
-        assert_eq!(empty.values, Vec::<f64>::new());
-        let scalar = TestArray::scalar(42.0).slice(&[], &[], &[]).unwrap();
-        assert_eq!(scalar.values, vec![42.0]);
+        let empty = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).slice(&[1, 1], &[1, 3], &[1, 1]).unwrap();
+        assert_eq!(empty.to_f64s(), Vec::<f64>::new());
+        let scalar = Array::scalar(42.0).slice(&[], &[], &[]).unwrap();
+        assert_eq!(scalar.to_f64s(), vec![42.0]);
 
         // Strided operations carry their strides through the builder, accessors, rendering, and inference: the
         // output dimension per axis is `ceil((limit - start) / stride)`.
@@ -1483,18 +1481,18 @@ mod tests {
         );
 
         // Strided interpretation keeps the elements at `start + i * stride`.
-        let vector = TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let vector = Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         let strided_output = strided
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&vector))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&vector))
             .unwrap();
-        assert_eq!(strided_output[0].values, vec![1.0, 3.0, 5.0]);
+        assert_eq!(strided_output[0].to_f64s(), vec![1.0, 3.0, 5.0]);
 
         // A stride larger than the sliced extent keeps a single element, and `start == limit` keeps none.
-        let single = TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[1], &[4], &[5]).unwrap();
-        assert_eq!(single.values, vec![1.0]);
-        let strided_empty = TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[2], &[2], &[2]).unwrap();
+        let single = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[1], &[4], &[5]).unwrap();
+        assert_eq!(single.to_f64s(), vec![1.0]);
+        let strided_empty = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[2], &[2], &[2]).unwrap();
         assert_eq!(*strided_empty.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)])));
-        assert_eq!(strided_empty.values, Vec::<f64>::new());
+        assert_eq!(strided_empty.to_f64s(), Vec::<f64>::new());
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -1553,9 +1551,9 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -1563,10 +1561,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured indices.
-        let mut builder = ProgramBuilder::<TestArray, SliceOperation>::new();
+        let mut builder = ProgramBuilder::<Array, SliceOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1606,17 +1604,15 @@ mod tests {
         assert_eq!((&input_type).update_slice(&update_type, &[0, 1]), Ok(input_type.clone()));
 
         // Interpretation overwrites the selected block of the row-major payload.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
-        let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input, update])
-            .unwrap();
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]);
+        let output = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input, update]).unwrap();
         assert_eq!(*output[0].r#type(), input_type);
-        assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
         // Rank-0 updates replace the input entirely.
-        let scalar = TestArray::scalar(1.0).update_slice(&TestArray::scalar(7.0), &[]).unwrap();
-        assert_eq!(scalar.values, vec![7.0]);
+        let scalar = Array::scalar(1.0).update_slice(&Array::scalar(7.0), &[]).unwrap();
+        assert_eq!(scalar.to_f64s(), vec![7.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -1681,9 +1677,9 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -1691,13 +1687,13 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured indices.
-        let mut builder = ProgramBuilder::<TestArray, UpdateSliceOperation>::new();
+        let mut builder = ProgramBuilder::<Array, UpdateSliceOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_update = builder.add_input(update_type);
         let program_output =
             builder.add_instruction(operation, Vec::new(), vec![program_input, program_update]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1733,19 +1729,19 @@ mod tests {
         );
 
         // Interpretation extracts the block at the in-band start indices.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input.clone(), index(1.0), index(1.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(1.0), index(1.0)])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![5.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![5.0, 6.0]);
 
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`.
         let clamped = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input.clone(), index(5.0), index(-2.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone(), index(5.0), index(-2.0)])
             .unwrap();
-        assert_eq!(clamped[0].values, vec![4.0, 5.0]);
+        assert_eq!(clamped[0].to_f64s(), vec![4.0, 5.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -1828,9 +1824,9 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -1838,7 +1834,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured sizes.
-        let mut builder = ProgramBuilder::<TestArray, DynamicSliceOperation>::new();
+        let mut builder = ProgramBuilder::<Array, DynamicSliceOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_index_0 = builder.add_input(index_type.clone());
         let program_index_1 = builder.add_input(index_type);
@@ -1846,11 +1842,7 @@ mod tests {
             .add_instruction(operation, Vec::new(), vec![program_input, program_index_0, program_index_1])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(
-                vec![program_output],
-                vec![Placeholder, Placeholder, Placeholder],
-                Placeholder,
-            )
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1888,28 +1880,28 @@ mod tests {
         );
 
         // Interpretation overwrites the block at the in-band start indices.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let update = TestArray::matrix(1, 2, vec![8.0, 9.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]);
         let output = operation
             .interpret(
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[input.clone(), update.clone(), index(0.0), index(1.0)],
             )
             .unwrap();
         assert_eq!(*output[0].r#type(), input_type);
-        assert_eq!(output[0].values, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
 
         // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
         // `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`.
         let clamped = operation
             .interpret(
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[input.clone(), update.clone(), index(5.0), index(-3.0)],
             )
             .unwrap();
-        assert_eq!(clamped[0].values, vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
+        assert_eq!(clamped[0].to_f64s(), vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -2008,9 +2000,9 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -2018,7 +2010,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<TestArray, DynamicUpdateSliceOperation>::new();
+        let mut builder = ProgramBuilder::<Array, DynamicUpdateSliceOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_update = builder.add_input(update_type);
         let program_index_0 = builder.add_input(index_type.clone());
@@ -2031,7 +2023,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(
+            .build::<Vec<Array>, Array>(
                 vec![program_output],
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
                 Placeholder,
@@ -2054,23 +2046,23 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = TestArray::new(input_type.clone(), values.clone())
+        let output = Array::from_f64s(input_type.clone(), values.clone())
             .slice(&[0, 1, 2], &[2, 3, 4], &[1, 1, 1])
             .unwrap();
         assert_eq!(
             *output.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
         );
-        assert_eq!(output.values, vec![6.0, 7.0, 10.0, 11.0, 18.0, 19.0, 22.0, 23.0]);
+        assert_eq!(output.to_f64s(), vec![6.0, 7.0, 10.0, 11.0, 18.0, 19.0, 22.0, 23.0]);
 
         // The matching update-slice writes the block back into place.
-        let update = TestArray::new(
+        let update = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
         );
-        let updated = TestArray::new(input_type, values).update_slice(&update, &[0, 1, 2]).unwrap();
+        let updated = Array::from_f64s(input_type, values).update_slice(&update, &[0, 1, 2]).unwrap();
         assert_eq!(
-            updated.values,
+            updated.to_f64s(),
             vec![
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, -6.0, -7.0, 8.0, 9.0, -10.0, -11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
                 -18.0, -19.0, 20.0, 21.0, -22.0, -23.0,
@@ -2079,7 +2071,7 @@ mod tests {
 
         // Strided slicing walks the row-major odometer with per-axis steps: rows with stride 2 and columns with
         // stride 3 keep elements at indices (0, 0), (0, 3), (1, 0), and (1, 3) of a 2x3x4 input's last two axes.
-        let strided = TestArray::new(
+        let strided = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
             (0..24).map(|value| value as f64).collect(),
         )
@@ -2089,18 +2081,18 @@ mod tests {
             *strided.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2), Size::Static(2)])),
         );
-        assert_eq!(strided.values, vec![0.0, 3.0, 8.0, 11.0]);
+        assert_eq!(strided.to_f64s(), vec![0.0, 3.0, 8.0, 11.0]);
 
         // The dynamic kernels validate their index operand shapes eagerly.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
-            input.dynamic_slice(&[index(0.0), TestArray::vector(vec![1.0, 2.0])], &[1, 2]),
+            input.dynamic_slice(&[index(0.0), Array::vector(vec![1.0, 2.0])], &[1, 2]),
             Err(ProgramError::Type(TypeError {
                 message: "'dynamic_slice' start index 1 must be a scalar integer but has type f64[2]".to_string(),
             })),
         );
         assert_eq!(
-            input.dynamic_update_slice(&TestArray::matrix(1, 2, vec![8.0, 9.0]), &[index(0.0)]),
+            input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]), &[index(0.0)]),
             Err(ProgramError::Type(TypeError {
                 message: "'dynamic_update_slice' expects one start index per input axis (2) but got 1".to_string(),
             })),
@@ -2201,12 +2193,12 @@ mod tests {
         // Slice a [1, 2] block at start (1, 1) of a [2, 3] operand: the operand is linear and the scalar start indices
         // are the known operands. The sliced output and its cotangent have shape [1, 2].
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let cotangent = TestArray::matrix(1, 2, vec![5.0, 7.0]);
+        let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]);
         let sizes = vec![1, 2];
 
         // Build `dynamic_slice(operand, start_row, start_col)` over the test enum, treat only the operand as linear,
         // and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, crate::backends::arrays::ArrayOperation<Array>>::new();
         let operand_input = builder.add_input(operand_type.clone());
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
         let col_input = builder.add_input(ArrayType::scalar(DataType::I32));
@@ -2218,11 +2210,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray, TestArray), TestArray>(
-                vec![output],
-                (Placeholder, Placeholder, Placeholder),
-                Placeholder,
-            )
+            .build::<(Array, Array, Array), Array>(vec![output], (Placeholder, Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1, "the known start indices must receive no cotangent output");
@@ -2230,7 +2218,7 @@ mod tests {
         assert_eq!(operand_cotangents.len(), 1);
         assert_eq!(*operand_cotangents[0].r#type(), operand_type);
         // The dynamic-slice adjoint writes the cotangent block back at start (1, 1) of a [2, 3] zero operand.
-        assert_eq!(operand_cotangents[0].values, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0]);
+        assert_eq!(operand_cotangents[0].to_f64s(), vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0]);
     }
 
     #[test]
@@ -2239,11 +2227,11 @@ mod tests {
         // start indices are the known operands. The output and its cotangent have shape [2, 3].
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        let cotangent = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Build `dynamic_update_slice(input, update, start_row, start_col)` over the test enum, treat the input and
         // update as linear, and interpret the pullback on `[cotangent, start_row, start_col]`.
-        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, crate::backends::arrays::ArrayOperation<Array>>::new();
         let input_input = builder.add_input(input_type.clone());
         let update_input = builder.add_input(update_type.clone());
         let row_input = builder.add_input(ArrayType::scalar(DataType::I32));
@@ -2256,7 +2244,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray, TestArray, TestArray), TestArray>(
+            .build::<(Array, Array, Array, Array), Array>(
                 vec![output],
                 (Placeholder, Placeholder, Placeholder, Placeholder),
                 Placeholder,
@@ -2269,8 +2257,8 @@ mod tests {
         assert_eq!(*cotangents[0].r#type(), input_type);
         assert_eq!(*cotangents[1].r#type(), update_type);
         // Input cotangent: the cotangent with the update window (start (0, 1), shape [1, 2]) zeroed.
-        assert_eq!(cotangents[0].values, vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]);
+        assert_eq!(cotangents[0].to_f64s(), vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]);
         // Update cotangent: the cotangent block at the update window.
-        assert_eq!(cotangents[1].values, vec![2.0, 3.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![2.0, 3.0]);
     }
 }

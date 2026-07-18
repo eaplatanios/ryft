@@ -167,7 +167,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOpera
 /// ```rust
 /// # use ryft_core::operations::manipulation::Pad;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Pad [1, 2, 3] with one leading zero, two trailing zeros, and one zero between adjacent elements. With
@@ -175,7 +175,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOpera
 /// // input elements land at output positions 1, 3, and 5.
 /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let y = x.pad(&Array::scalar(0.0), &[1], &[2], &[1])?;
-/// assert_eq!(y.values, vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
+/// assert_eq!(y.to_f64s(), vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -291,13 +291,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::tests::TestArray;
     use crate::types::DataType;
 
     use super::*;
@@ -327,12 +327,12 @@ mod tests {
 
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
-        let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
         let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[input, TestArray::scalar(9.0)])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input, Array::scalar(9.0)])
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
+        assert_eq!(output[0].to_f64s(), vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
 
         // Empty input axes hold only the edge padding (the `d == 0` case skips interior padding entirely) and
         // rank-0 inputs pass through unchanged.
@@ -341,10 +341,10 @@ mod tests {
             (&empty_type).pad(&padding_value_type, &[1], &[2], &[1]),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
         );
-        let empty = TestArray::new(empty_type, vec![]).pad(&TestArray::scalar(7.0), &[1], &[2], &[1]).unwrap();
-        assert_eq!(empty.values, vec![7.0, 7.0, 7.0]);
-        let scalar = TestArray::scalar(42.0).pad(&TestArray::scalar(7.0), &[], &[], &[]).unwrap();
-        assert_eq!(scalar.values, vec![42.0]);
+        let empty = Array::from_f64s(empty_type, vec![]).pad(&Array::scalar(7.0), &[1], &[2], &[1]).unwrap();
+        assert_eq!(empty.to_f64s(), vec![7.0, 7.0, 7.0]);
+        let scalar = Array::scalar(42.0).pad(&Array::scalar(7.0), &[], &[], &[]).unwrap();
+        assert_eq!(scalar.to_f64s(), vec![42.0]);
 
         // Invalid construction and inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -387,9 +387,9 @@ mod tests {
             }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -397,13 +397,13 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes all three padding vectors.
-        let mut builder = ProgramBuilder::<TestArray, PadOperation>::new();
+        let mut builder = ProgramBuilder::<Array, PadOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
         let program_output =
             builder.add_instruction(operation, Vec::new(), vec![program_input, program_padding_value]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -420,14 +420,14 @@ mod tests {
     fn test_pad_test_array_kernel() {
         // A rank-2 pad exercises the odometer across axes with different padding amounts: rows gain one interior
         // row and columns gain asymmetric edge padding.
-        let input = TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        let output = input.pad(&TestArray::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
+        let input = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+        let output = input.pad(&Array::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
         assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
-        assert_eq!(output.values, vec![0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0],);
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0],);
 
         // The kernel validates the padding value shape eagerly.
         assert_eq!(
-            TestArray::vector(vec![1.0, 2.0]).pad(&TestArray::vector(vec![0.0]), &[0], &[0], &[0]),
+            Array::vector(vec![1.0, 2.0]).pad(&Array::vector(vec![0.0]), &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError {
                 message: "'pad' padding value must be a scalar but has type f64[1]".to_string(),
             })),

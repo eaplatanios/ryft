@@ -836,6 +836,7 @@ mod tests {
     use crate::batching::BatchingContext;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::ForwardModeDifferentiate;
@@ -843,27 +844,25 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
     use crate::tracing::Trace;
 
     use super::*;
 
-    type TestOperation = ArrayOperation<TestArray>;
-    type TestEagerContext = EagerContext<TestArray, TestOperation>;
-    type TestScanOperation = ScanOperation<TestArray>;
+    type TestOperation = ArrayOperation<Array>;
+    type TestEagerContext = EagerContext<Array, TestOperation>;
+    type TestScanOperation = ScanOperation<Array>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`.
-    fn product_body() -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
+    fn product_body() -> Program<Array, TestOperation, Vec<Array>, Vec<Array>> {
         product_body_with_type(ArrayType::scalar(DataType::F64))
     }
 
     /// Builds a cumulative-product body over `r#type` that maps `[carry, x]` to
     /// `[carry * x, carry * x]`.
-    fn product_body_with_type(r#type: ArrayType) -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+    fn product_body_with_type(r#type: ArrayType) -> Program<Array, TestOperation, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         let carry = builder.add_input(r#type.clone());
         let x = builder.add_input(r#type);
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
@@ -874,11 +873,11 @@ mod tests {
 
     /// Builds a body for zero-length scan tests whose first stacked result follows the carry's mapped axis and whose
     /// second stacked result is a replicated constant.
-    fn zero_length_body(r#type: ArrayType) -> Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+    fn zero_length_body(r#type: ArrayType) -> Program<Array, TestOperation, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         let carry = builder.add_input(r#type.clone());
         let _x = builder.add_input(r#type.clone());
-        let constant = builder.add_constant(TestArray::new(r#type, vec![7.0]));
+        let constant = builder.add_constant(Array::from_f64s(r#type, vec![7.0]));
         builder
             .build(
                 vec![carry, carry, constant],
@@ -897,13 +896,13 @@ mod tests {
     /// payload-free operation together with its body region program.
     fn product_scan_with_lengths(
         lengths: &[usize],
-    ) -> (ScanOperation<TestArray>, Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>) {
+    ) -> (ScanOperation<Array>, Program<Array, TestOperation, Vec<Array>, Vec<Array>>) {
         assert!(!lengths.is_empty());
         if lengths.len() == 1 {
             return (TestScanOperation::new(1, lengths[0]), product_body());
         }
         let (inner_scan, inner_body) = product_scan_with_lengths(&lengths[1..]);
-        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
         let inner_body_region = builder.import_region(inner_body.entry_region_ref());
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let xs = builder.add_input(f64_type(&lengths[1..]));
@@ -917,17 +916,17 @@ mod tests {
 
     /// Builds the cumulative-product [`ScanOperation`] over three iterations used by the differentiation tests,
     /// returning the payload-free operation together with its body region program.
-    fn product_scan() -> (ScanOperation<TestArray>, Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>) {
+    fn product_scan() -> (ScanOperation<Array>, Program<Array, TestOperation, Vec<Array>, Vec<Array>>) {
         product_scan_with_lengths(&[3])
     }
 
     /// Batches `scan` through the public [`BatchingContext::bind`] path with `body` as an owned attached region.
     fn batch_scan(
         context: &BatchingContext<TestEagerContext>,
-        scan: ScanOperation<TestArray>,
-        body: Program<TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>>,
-        inputs: Vec<ArrayBatch<TestArray>>,
-    ) -> Vec<ArrayBatch<TestArray>> {
+        scan: ScanOperation<Array>,
+        body: Program<Array, TestOperation, Vec<Array>, Vec<Array>>,
+        inputs: Vec<ArrayBatch<Array>>,
+    ) -> Vec<ArrayBatch<Array>> {
         let tracer_inputs =
             inputs.into_iter().map(|input| BatchingTracer::new(context.clone(), input)).collect::<Vec<_>>();
         context
@@ -940,16 +939,16 @@ mod tests {
 
     #[test]
     fn test_reorder_program_boundary_supports_nullary_programs() {
-        let mut builder = ProgramBuilder::<TestArray, TestOperation>::new();
-        let first = builder.add_constant(TestArray::scalar(1.0));
-        let second = builder.add_constant(TestArray::scalar(2.0));
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+        let first = builder.add_constant(Array::scalar(1.0));
+        let second = builder.add_constant(Array::scalar(2.0));
         let program = builder.build(vec![first, second], Vec::new(), vec![Placeholder, Placeholder]).unwrap();
 
         let reordered = reorder_program_boundary(program, &[], &[1, 0]).unwrap();
 
         assert_eq!(reordered.input_count(), 0);
         assert_eq!(
-            reordered.outputs().map(|output| output.as_constant().unwrap().values.clone()).collect::<Vec<_>>(),
+            reordered.outputs().map(|output| output.as_constant().unwrap().to_f64s()).collect::<Vec<_>>(),
             vec![vec![2.0], vec![1.0]],
         );
     }
@@ -964,10 +963,10 @@ mod tests {
         use crate::types::{Shape, Size};
 
         let (scan, scan_body) = product_scan();
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |(init, xs): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| {
                 let mut outputs = init.context().stage_operation(
                     TestOperation::Scan(scan),
@@ -1011,7 +1010,7 @@ mod tests {
         // products are `[2, 6, 24]`. A unit tangent on `init` propagates as `d(init * x0 * x1 * x2)/d(init) = 24`
         // on the final carry and `[2, 6, 24]` on the stacked outputs.
         let (scan, scan_body) = product_scan();
-        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1022,19 +1021,19 @@ mod tests {
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
-                (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0])),
             )
             .unwrap();
-        assert_eq!(carry.values, vec![24.0]);
-        assert_eq!(ys.values, vec![2.0, 6.0, 24.0]);
-        assert_eq!(carry_tangent.values, vec![24.0]);
-        assert_eq!(ys_tangent.values, vec![2.0, 6.0, 24.0]);
+        assert_eq!(carry.to_f64s(), vec![24.0]);
+        assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0]);
+        assert_eq!(carry_tangent.to_f64s(), vec![24.0]);
+        assert_eq!(ys_tangent.to_f64s(), vec![2.0, 6.0, 24.0]);
 
         // A unit tangent on `xs[1]` propagates as `d(init * x0 * x1 * x2)/d(x1) = init * x0 * x2 = 8` on the final
         // carry and `[0, 2, 8]` on the stacked outputs (`y0` does not depend on `x1`).
         let (scan, scan_body) = product_scan();
-        let ((carry, _), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let ((carry, _), (carry_tangent, ys_tangent)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1045,13 +1044,13 @@ mod tests {
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
-                (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 1.0, 0.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(0.0), Array::vector(vec![0.0, 1.0, 0.0])),
             )
             .unwrap();
-        assert_eq!(carry.values, vec![24.0]);
-        assert_eq!(carry_tangent.values, vec![8.0]);
-        assert_eq!(ys_tangent.values, vec![0.0, 2.0, 8.0]);
+        assert_eq!(carry.to_f64s(), vec![24.0]);
+        assert_eq!(carry_tangent.to_f64s(), vec![8.0]);
+        assert_eq!(ys_tangent.to_f64s(), vec![0.0, 2.0, 8.0]);
     }
 
     #[test]
@@ -1060,7 +1059,7 @@ mod tests {
         // The final carry is the product of every element, and a unit tangent on the initial carry follows the same
         // cumulative-product path through both scan levels.
         let (scan, scan_body) = product_scan_with_lengths(&[2, 3]);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1071,14 +1070,14 @@ mod tests {
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
-                (TestArray::scalar(1.0), TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
-                (TestArray::scalar(1.0), TestArray::matrix(2, 3, vec![0.0; 6])),
+                (Array::scalar(1.0), Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
+                (Array::scalar(1.0), Array::matrix(2, 3, vec![0.0; 6])),
             )
             .unwrap();
-        assert_eq!(carry.values, vec![5040.0]);
-        assert_eq!(ys.values, vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0]);
-        assert_eq!(carry_tangent.values, vec![5040.0]);
-        assert_eq!(ys_tangent.values, vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0]);
+        assert_eq!(carry.to_f64s(), vec![5040.0]);
+        assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0]);
+        assert_eq!(carry_tangent.to_f64s(), vec![5040.0]);
+        assert_eq!(ys_tangent.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0]);
     }
 
     #[test]
@@ -1087,7 +1086,7 @@ mod tests {
         // linear body contains another scan whose body also has scan-local residual references.
         let (scan, scan_body) = product_scan_with_lengths(&[2, 2, 2]);
         let xs_type = f64_type(&[2, 2, 2]);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1098,14 +1097,14 @@ mod tests {
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
-                (TestArray::scalar(1.0), TestArray::new(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])),
-                (TestArray::scalar(1.0), TestArray::new(xs_type, vec![0.0; 8])),
+                (Array::scalar(1.0), Array::from_f64s(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])),
+                (Array::scalar(1.0), Array::from_f64s(xs_type, vec![0.0; 8])),
             )
             .unwrap();
-        assert_eq!(carry.values, vec![362880.0]);
-        assert_eq!(ys.values, vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);
-        assert_eq!(carry_tangent.values, vec![362880.0]);
-        assert_eq!(ys_tangent.values, vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);
+        assert_eq!(carry.to_f64s(), vec![362880.0]);
+        assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);
+        assert_eq!(carry_tangent.to_f64s(), vec![362880.0]);
+        assert_eq!(ys_tangent.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);
     }
 
     #[test]
@@ -1116,18 +1115,18 @@ mod tests {
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 3);
         let carries = {
-            let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+            let value = Array::vector(vec![1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let stacked_inputs = ArrayBatch::replicated(TestArray::vector(vec![2.0, 3.0, 4.0]));
+        let stacked_inputs = ArrayBatch::replicated(Array::vector(vec![2.0, 3.0, 4.0]));
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![24.0, 48.0, 72.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 48.0, 72.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
         assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(3)]);
-        assert_eq!(outputs[1].value().values, vec![2.0, 4.0, 6.0, 6.0, 12.0, 18.0, 24.0, 48.0, 72.0]);
+        assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 4.0, 6.0, 6.0, 12.0, 18.0, 24.0, 48.0, 72.0]);
     }
 
     #[test]
@@ -1136,34 +1135,34 @@ mod tests {
         // leading axis (physical axis 1 when the batch axis sits at 0), so every batch item scans its own row.
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
-        let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
+        let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
-            let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
         assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(2)]);
-        assert_eq!(outputs[1].value().values, vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
+        assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
 
         // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
         // outputs are identical.
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
-        let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
+        let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
-            let value = TestArray::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]);
+            let value = Array::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![24.0, 210.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[1].value().values, vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
+        assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
     }
 
     #[test]
@@ -1172,20 +1171,20 @@ mod tests {
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let carries = {
-            let value = TestArray::vector(vec![1.0, 10.0]);
+            let value = Array::vector(vec![1.0, 10.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let stacked_inputs = {
-            let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![24.0, 2100.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 2100.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[1].value().values, vec![2.0, 50.0, 6.0, 300.0, 24.0, 2100.0]);
+        assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 50.0, 6.0, 300.0, 24.0, 2100.0]);
     }
 
     #[test]
@@ -1196,16 +1195,16 @@ mod tests {
         let (scan, scan_body) = product_scan();
         let scan = scan.with_reverse(true);
         let context = BatchingContext::new(TestEagerContext::new(), 2);
-        let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
+        let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
-            let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
+            let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
-        assert_eq!(outputs[0].value().values, vec![24.0, 24.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 24.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[1].value().values, vec![24.0, 24.0, 12.0, 12.0, 4.0, 4.0]);
+        assert_eq!(outputs[1].value().to_f64s(), vec![24.0, 24.0, 12.0, 12.0, 4.0, 4.0]);
     }
 
     #[test]
@@ -1220,10 +1219,10 @@ mod tests {
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
-                ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
+                ArrayBatch::new(carry_type.clone(), Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
                     .unwrap();
             let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, vec![2.0, 3.0, 4.0]));
+            let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, vec![2.0, 3.0, 4.0]));
             let context =
                 BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -1236,14 +1235,14 @@ mod tests {
 
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
-            assert_eq!(outputs[0].value().values, vec![24.0, 48.0]);
+            assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 48.0]);
             assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
             assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(2)]);
             assert_eq!(
                 outputs[1].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
             );
-            assert_eq!(outputs[1].value().values, vec![2.0, 4.0, 6.0, 12.0, 24.0, 48.0]);
+            assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 4.0, 6.0, 12.0, 24.0, 48.0]);
         }
     }
 
@@ -1259,10 +1258,10 @@ mod tests {
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let carries =
-                ArrayBatch::new(carry_type.clone(), TestArray::new(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
+                ArrayBatch::new(carry_type.clone(), Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
                     .unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let stacked_inputs = ArrayBatch::replicated(TestArray::new(stack_type, Vec::new()));
+            let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, Vec::new()));
             let context =
                 BatchingContext::new(TestEagerContext::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -1277,18 +1276,18 @@ mod tests {
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2)]);
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
-            assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
+            assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0]);
             assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
             assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
             assert_eq!(
                 outputs[1].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
             );
-            assert!(outputs[1].value().values.is_empty());
+            assert!(outputs[1].value().values().is_empty());
             assert_eq!(outputs[2].batch_axis(), BatchAxis::replicated());
             assert_eq!(outputs[2].r#type().shape().dimensions(), &[Size::Static(0)]);
             assert_eq!(outputs[2].r#type().sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
-            assert!(outputs[2].value().values.is_empty());
+            assert!(outputs[2].value().values().is_empty());
         }
     }
 
@@ -1308,7 +1307,7 @@ mod tests {
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let parent = TracingContext::<TestArray, TestOperation>::new();
+            let parent = TracingContext::<Array, TestOperation>::new();
             let builder = parent.builder().clone();
             let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
             let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
@@ -1334,7 +1333,7 @@ mod tests {
 
             let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
             let program = builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
+                .build::<Vec<Array>, Vec<Array>>(
                     output_atoms,
                     vec![Placeholder, Placeholder],
                     vec![Placeholder, Placeholder, Placeholder],

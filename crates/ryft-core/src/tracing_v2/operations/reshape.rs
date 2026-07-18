@@ -181,10 +181,9 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
     use super::*;
@@ -195,9 +194,9 @@ mod tests {
         // which we reshape to per-item [2, 3]. The combined effect should be a [2, 2, 3] tensor
         // whose leading axis is the original batch dimension.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(2, 6, x_data.clone());
+        let x = Array::matrix(2, 6, x_data.clone());
 
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
                 x,
@@ -208,10 +207,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
         );
         // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
-        assert_eq!(output.values, x_data);
+        assert_eq!(output.to_f64s(), x_data);
     }
 }

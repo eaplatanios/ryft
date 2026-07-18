@@ -145,9 +145,8 @@ impl<O: BatchableOperation<C>, C: Context<Type = ArrayType>> BatchableOperation<
 #[cfg(test)]
 mod tests {
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::operations::math::AddOperation;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::operations::ArrayOperation;
     use crate::types::DataType;
 
     use super::*;
@@ -155,8 +154,8 @@ mod tests {
     #[test]
     fn test_recompute_transpose_returns_zero_input_cotangents() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let operation = RecomputeOperation::new(ArrayOperation::<TestArray>::Add(AddOperation));
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let operation = RecomputeOperation::new(ArrayOperation::<Array>::Add(AddOperation));
 
         let cotangents = operation
             .transpose(

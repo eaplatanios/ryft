@@ -1141,6 +1141,7 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -1153,8 +1154,6 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::{RegionDriver, RegionRef};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::{DataType, Shape, Size};
 
@@ -1166,9 +1165,7 @@ mod tests {
     }
 
     /// Builds `f(x) = sin(x)` over one input of the provided type.
-    fn sin_program(
-        r#type: &ArrayType,
-    ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn sin_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
         let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
@@ -1177,15 +1174,13 @@ mod tests {
 
     /// Builds the deliberately wrong rule `jvp(x, dx) = (sin(x), 2 * cos(x) * dx)`, detectably different from the
     /// true derivative so tests can prove the custom rule is used.
-    fn doubled_sin_jvp_program(
-        r#type: &ArrayType,
-    ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn doubled_sin_jvp_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
         let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
         let cosine = builder.add_instruction(CosOperation, Vec::new(), vec![x]).unwrap()[0];
-        let two = builder.add_constant(TestArray::scalar(2.0));
+        let two = builder.add_constant(Array::scalar(2.0));
         let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![two, cosine]).unwrap()[0];
         let tangent = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, dx]).unwrap()[0];
         builder
@@ -1194,9 +1189,7 @@ mod tests {
     }
 
     /// Builds the forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
-    fn sin_forward_program(
-        r#type: &ArrayType,
-    ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn sin_forward_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let y = builder.add_instruction(SinOperation, Vec::new(), vec![x]).unwrap()[0];
@@ -1208,11 +1201,11 @@ mod tests {
     /// different from the true gradient so tests can prove the custom rule is used.
     fn tripled_sin_backward_program(
         r#type: &ArrayType,
-    ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
-        let three = builder.add_constant(TestArray::scalar(3.0));
+        let three = builder.add_constant(Array::scalar(3.0));
         let scaled = builder.add_instruction(MulOperation, Vec::new(), vec![three, residual]).unwrap()[0];
         let gradient = builder.add_instruction(MulOperation, Vec::new(), vec![scaled, cotangent]).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
@@ -1220,8 +1213,7 @@ mod tests {
 
     fn custom_jvp_sin(
         r#type: &ArrayType,
-    ) -> (ArrayOperation<TestArray>, Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>)
-    {
+    ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
         (
             ArrayOperation::CustomJvp(CustomJvpOperation::new()),
             vec![sin_program(r#type), doubled_sin_jvp_program(r#type)],
@@ -1230,8 +1222,7 @@ mod tests {
 
     fn custom_vjp_sin(
         r#type: &ArrayType,
-    ) -> (ArrayOperation<TestArray>, Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>)
-    {
+    ) -> (ArrayOperation<Array>, Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>) {
         (
             ArrayOperation::CustomVjp(CustomVjpOperation::new()),
             vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
@@ -1240,7 +1231,7 @@ mod tests {
 
     /// Returns the [`RegionInterface`] of the provided flat region program.
     fn custom_region_interface(
-        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
     }
@@ -1248,26 +1239,25 @@ mod tests {
     /// Test-only transposition driver exposing one backward region to direct custom-VJP transpose-rule tests.
     struct TestTranspositionDriver<'r> {
         /// Backward region exposed by this driver.
-        region: RegionRef<'r, TestArray, ArrayOperation<TestArray>>,
+        region: RegionRef<'r, Array, ArrayOperation<Array>>,
     }
 
-    impl RegionDriver<TestArray, ArrayOperation<TestArray>> for TestTranspositionDriver<'_> {
-        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestArray, ArrayOperation<TestArray>>>
+    impl RegionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
         where
-            TestArray: 'r,
-            ArrayOperation<TestArray>: 'r,
+            Array: 'r,
+            ArrayOperation<Array>: 'r,
         {
             std::iter::once(self.region)
         }
     }
 
-    impl TranspositionDriver<TestArray, ArrayOperation<TestArray>> for TestTranspositionDriver<'_> {
+    impl TranspositionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
         fn transpose_program(
             &self,
-            _region: RegionRef<'_, TestArray, ArrayOperation<TestArray>>,
+            _region: RegionRef<'_, Array, ArrayOperation<Array>>,
             _input_linearity: &[bool],
-        ) -> Result<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>, DifferentiationError>
-        {
+        ) -> Result<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "test driver does not transpose nested regions".to_string(),
             }
@@ -1354,16 +1344,15 @@ mod tests {
     fn test_custom_derivative_calls_remain_opaque_to_partial_evaluation() {
         let scalar = test_type(&[]);
         for (operation, operation_regions) in [custom_jvp_sin(&scalar), custom_vjp_sin(&scalar)] {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let region_ids = operation_regions
                 .iter()
                 .map(|region| builder.import_region(region.entry_region_ref()))
                 .collect::<Vec<_>>();
             let input = builder.add_input(scalar.clone());
             let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
-            let program = builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
             let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar.clone())]).unwrap();
 
@@ -1385,13 +1374,13 @@ mod tests {
             vec![scalar.clone()],
             vec![scalar.clone()],
         ));
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let backward_region = builder.import_region(tripled_sin_backward_program(&scalar).entry_region_ref());
         let tangent = builder.add_input(scalar.clone());
         let residual = builder.add_input(scalar.clone());
         let output = builder.add_instruction(operation, vec![backward_region], vec![tangent, residual]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         let evaluation = program
@@ -1418,7 +1407,7 @@ mod tests {
 
         let backward = tripled_sin_backward_program(&scalar);
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         assert!(matches!(
             transpose_primal_custom_vjp(
                 &CustomVjpTangentOperation::new(3, false, vec![scalar.clone()], vec![scalar.clone()]),
@@ -1435,21 +1424,21 @@ mod tests {
     #[test]
     fn test_custom_vjp_transpose_preserves_known_tangent_operands_before_residuals() {
         let scalar = test_type(&[]);
-        let mut backward_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = backward_builder.add_input(scalar.clone());
         let output_cotangent = backward_builder.add_input(scalar.clone());
         let first_input_cotangent = backward_builder
             .add_instruction(MulOperation, Vec::new(), vec![residual, output_cotangent])
             .unwrap()[0];
         let backward = backward_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![first_input_cotangent, output_cotangent],
                 vec![Placeholder; 2],
                 vec![Placeholder; 2],
             )
             .unwrap();
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let known_tangent = context.input(scalar.clone());
         let residual = context.input(scalar.clone());
         let output_cotangent = context.input(scalar.clone());
@@ -1481,16 +1470,16 @@ mod tests {
 
         // A canonical `zero` backward output is already typed in the primal input's cotangent space. Recovering its
         // structural zero must retain that type instead of dualizing its sharding a second time.
-        let mut backward_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         backward_builder.add_input(cotangent_type.clone());
         let zero = backward_builder
             .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new())
             .unwrap()[0];
         let backward = backward_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![zero], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
         let contributions = transpose_primal_custom_vjp(
             &CustomVjpTangentOperation::new(0, false, vec![tangent_type.clone()], vec![tangent_type.clone()]),
@@ -1504,15 +1493,15 @@ mod tests {
 
         // `zero_like` is equally structural even though it consumes an exemplar input. Opaque backward replay must
         // recognize it instead of turning the result into a live zero-valued tracer.
-        let mut backward_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut backward_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = backward_builder.add_input(cotangent_type.clone());
         let zero_like =
             backward_builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![output_cotangent]).unwrap()[0];
         let backward = backward_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
         let contributions = transpose_primal_custom_vjp(
             &CustomVjpTangentOperation::new(0, false, vec![tangent_type.clone()], vec![tangent_type]),
@@ -1529,61 +1518,61 @@ mod tests {
     fn test_custom_jvp_interprets_the_primal_program() {
         let scalar = test_type(&[]);
         let (operation, operation_regions) = custom_jvp_sin(&scalar);
-        let outputs = crate::EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .bind(operation, operation_regions, &[TestArray::scalar(2.0)])
+        let outputs = crate::EagerContext::<Array, ArrayOperation<Array>>::new()
+            .bind(operation, operation_regions, &[Array::scalar(2.0)])
             .unwrap();
-        assert_abs_diff_eq!(outputs[0].values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
     }
 
     #[test]
     fn test_custom_jvp_governs_forward_mode() {
         let scalar = test_type(&[]);
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x| {
                     let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
                     Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
-                TestArray::scalar(2.0),
-                TestArray::scalar(1.0),
+                Array::scalar(2.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         let _ = scalar;
-        assert_abs_diff_eq!(primal.values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(primal.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom rule doubles the true derivative, proving it is in control.
-        assert_abs_diff_eq!(tangent.values[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
     fn test_custom_jvp_governs_reverse_mode() {
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
                     x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
-                TestArray::scalar(3.0),
+                Array::scalar(3.0),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 3.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        assert_abs_diff_eq!(gradient.values[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
     fn test_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
                     x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom backward rule triples the true gradient, proving it is in control.
-        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1596,8 +1585,8 @@ mod tests {
         assert!(matches!(
         InterpretableOperation::<_>::interpret(
                         &carrier,
-                        &crate::EagerContext::<TestArray>::new(), &crate::EmptyRegionDriver,
-                                        &[TestArray::scalar(1.0)],
+                        &crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver,
+                                        &[Array::scalar(1.0)],
                     ),
                     Err(ProgramError::Type(TypeError { message }))
                         if message.starts_with("custom_vjp does not support forward-mode differentiation"),
@@ -1617,7 +1606,7 @@ mod tests {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
             },
-            TestArray::new(vector, vec![0.5, 1.0]),
+            Array::from_f64s(vector, vec![0.5, 1.0]),
         )
         .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -1760,26 +1749,26 @@ mod tests {
     #[test]
     fn test_custom_jvp_wrapper_traces_closures_lazily() {
         // No manual programs: the wrapper traces the closures at the call site, specialized to the input types.
-        let function = custom_jvp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, dx| {
+        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
                 // The deliberately wrong rule `jvp(x, dx) = (sin(x), cos(x) * dx + cos(x) * dx)` doubles the true
                 // derivative (expressed through addition to avoid constant lifting), proving the rule is in control.
                 let tangent = x.cos()? * dx;
                 Ok((x.sin()?, tangent.clone() + tangent))
             },
         );
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(|x| function.call(x), TestArray::scalar(2.0), TestArray::scalar(1.0))
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(|x| function.call(x), Array::scalar(2.0), Array::scalar(1.0))
             .unwrap();
-        assert_abs_diff_eq!(primal.values[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent.values[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(primal.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(3.0))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(3.0))
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 3.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1807,9 +1796,9 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_wrapper_governs_reverse_mode() {
-        let function = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.sin()?, x.cos()?)),
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
                 // The deliberately wrong rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the
                 // true gradient (expressed through addition to avoid constant lifting).
@@ -1817,11 +1806,11 @@ mod tests {
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(2.0))
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1830,14 +1819,14 @@ mod tests {
         // captured `triple` closure plays the role of a JAX `nondiff_argnums` argument: static configuration
         // visible to the rule closures without being differentiated or stored as a residual.
         let repeats = 3usize;
-        let function = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
             |(x, y): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| Ok(x * y),
             |(x, y): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| { Ok((x.clone() * y.clone(), (x, y))) },
             move |(x, y), cotangent| {
                 // The deliberately wrong rule repeats both cotangents `repeats` times via the captured count.
@@ -1850,16 +1839,13 @@ mod tests {
                 Ok((scaled_x, scaled_y))
             },
         );
-        let (value, (gradient_x, gradient_y)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(
-                |(x, y)| function.call((x, y)).unwrap(),
-                (TestArray::scalar(2.0), TestArray::scalar(5.0)),
-            )
+        let (value, (gradient_x, gradient_y)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|(x, y)| function.call((x, y)).unwrap(), (Array::scalar(2.0), Array::scalar(5.0)))
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 10.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 10.0, epsilon = 1e-9);
         // The custom rule triples the true gradients `(y, x)`.
-        assert_abs_diff_eq!(gradient_x.values[0], 3.0 * 5.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient_y.values[0], 3.0 * 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient_x.to_f64s()[0], 3.0 * 5.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient_y.to_f64s()[0], 3.0 * 2.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -1883,33 +1869,33 @@ mod tests {
         // Arity mismatches are compile-time errors under the structured signatures, but shape mismatches remain
         // runtime concerns: this rule produces a scalar tangent for a vector-valued function, so the traced JVP
         // program fails the signature validation that `CustomJvpOperation::new` performs at the call site.
-        let function = custom_jvp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, dx| {
+        let function = custom_jvp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
                 Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())))
             },
         );
-        let error = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), test_type(&[2]))
-            .unwrap_err();
+        let error =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), test_type(&[2])).unwrap_err();
         assert!(error.to_string().contains("custom_jvp rule output"));
     }
 
     #[test]
     fn test_custom_jvp_batches_by_rewrapping_the_call() {
         let scalar = test_type(&[]);
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |x| {
                     let (operation, operation_regions) = custom_jvp_sin(&scalar);
                     Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())
                 },
-                TestArray::vector(vec![0.5, 1.0, 1.5]),
+                Array::vector(vec![0.5, 1.0, 1.5]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
             )
             .unwrap();
-        for (actual, input) in output.values.iter().zip([0.5f64, 1.0, 1.5]) {
+        for (actual, input) in output.to_f64s().iter().zip([0.5f64, 1.0, 1.5]) {
             assert_abs_diff_eq!(*actual, input.sin(), epsilon = 1e-9);
         }
     }
@@ -1923,11 +1909,11 @@ mod tests {
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
         // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| {
                             let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
@@ -1946,12 +1932,12 @@ mod tests {
                     .unwrap();
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::vector(vec![0.5, 1.0]),
+                Array::vector(vec![0.5, 1.0]),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[1], 2.0 * 1.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 2.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1962,11 +1948,11 @@ mod tests {
 
         // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
         // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| {
                             let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
@@ -1985,12 +1971,12 @@ mod tests {
                     .unwrap();
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::vector(vec![0.5, 1.0]),
+                Array::vector(vec![0.5, 1.0]),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[1], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2000,18 +1986,18 @@ mod tests {
         // into the pullback, so seeding the pullback at `[cotangent ++ residuals]` recovers `residual * cotangent`. The
         // user backward defines the residual as `cos(x)`, so at `x = 0.7` and a unit cotangent the input cotangent is
         // `cos(0.7)`.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let function = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.sin()?, x.cos()?)),
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         );
-        let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (_, pullback) = domain.vjp(|x| function.call(x), Array::scalar(0.7)).unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        let mut pullback_inputs = vec![TestArray::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_abs_diff_eq!(input_cotangents[0].values[0], 0.7f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(input_cotangents[0].to_f64s()[0], 0.7f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2019,26 +2005,26 @@ mod tests {
         // Mapping only the first input exercises the replicated broadcast in the re-wrapping batch rule: the
         // unmapped operand is broadcast into the batch (the all-inputs-mapped-at-0 convention) and the batched call
         // still computes per-item products.
-        let function = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
+        let function = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
             |(x, y): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| Ok(x * y),
             |(x, y): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| { Ok((x.clone() * y.clone(), (x, y))) },
             |(x, y), cotangent| Ok((y * cotangent.clone(), x * cotangent)),
         );
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |(x, y)| function.call((x, y)),
-                (TestArray::vector(vec![2.0, 3.0, 4.0]), TestArray::scalar(5.0)),
+                (Array::vector(vec![2.0, 3.0, 4.0]), Array::scalar(5.0)),
                 (BatchAxis::new(0), BatchAxis::replicated()),
                 BatchAxis::new(0),
                 None,
             )
             .unwrap();
-        assert_eq!(output.values, vec![10.0, 15.0, 20.0]);
+        assert_eq!(output.to_f64s(), vec![10.0, 15.0, 20.0]);
     }
 }

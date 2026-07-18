@@ -13,6 +13,8 @@ use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingError};
 use crate::types::{ArrayType, Shape};
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
 
@@ -297,6 +299,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -304,7 +307,6 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
     use crate::types::{DataType, Size};
 
     use super::*;
@@ -351,12 +353,12 @@ mod tests {
         );
 
         // Interpretation reorders the row-major payload.
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -376,9 +378,9 @@ mod tests {
             Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[],
             ),
@@ -386,10 +388,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured permutation.
-        let mut builder = ProgramBuilder::<TestArray, TransposeOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TransposeOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -451,21 +453,24 @@ mod tests {
     #[test]
     fn test_transpose_test_array() {
         // Rank-2 swap of a row-major 2x3 payload.
-        let output = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
-        assert_eq!(output.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+        );
+        assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Rank-3 permutation moving the last axis to the front.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = TestArray::new(input_type, values).transpose(vec![2, 0, 1]).unwrap();
+        let output = Array::from_f64s(input_type, values).transpose(vec![2, 0, 1]).unwrap();
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)])),
         );
         assert_eq!(
-            output.values,
+            output.to_f64s(),
             vec![
                 0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 1.0, 5.0, 9.0, 13.0, 17.0, 21.0, 2.0, 6.0, 10.0, 14.0, 18.0, 22.0,
                 3.0, 7.0, 11.0, 15.0, 19.0, 23.0,
@@ -473,17 +478,20 @@ mod tests {
         );
 
         // Rank-0 and empty payloads pass through unchanged.
-        let output = TestArray::scalar(42.0).transpose(vec![]).unwrap();
-        assert_eq!(output.r#type, ArrayType::scalar(DataType::F64));
-        assert_eq!(output.values, vec![42.0]);
+        let output = Array::scalar(42.0).transpose(vec![]).unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(output.to_f64s(), vec![42.0]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
-        let output = TestArray::new(input_type, Vec::new()).transpose(vec![1, 0]).unwrap();
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(0)])));
-        assert_eq!(output.values, Vec::<f64>::new());
+        let output = Array::from_f64s(input_type, Vec::new()).transpose(vec![1, 0]).unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(0)]))
+        );
+        assert_eq!(output.to_f64s(), Vec::<f64>::new());
 
         // An invalid permutation is a clean error rather than an out-of-bounds panic, since the value-level transpose
         // validates the permutation through the type-level rule before indexing.
-        let matrix = || TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = || Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(matrix().transpose(vec![1]).is_err());
         assert!(matrix().transpose(vec![0, 2]).is_err());
         assert!(matrix().transpose(vec![0, 0]).is_err());
@@ -492,19 +500,22 @@ mod tests {
     #[test]
     fn test_move_axis() {
         // On a matrix, moving axis 0 to position 1 is a plain transpose: the [2, 3] payload becomes [3, 2].
-        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = matrix.move_axis(0, 1).unwrap();
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
-        assert_eq!(output.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+        );
+        assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // On a rank-3 array, moving axis 0 to the last position shifts the other axes left to preserve their relative
         // order, so [2, 3, 4] becomes [3, 4, 2] (the permutation [1, 2, 0]).
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = TestArray::new(input_type, values).move_axis(0, 2).unwrap();
+        let output = Array::from_f64s(input_type, values).move_axis(0, 2).unwrap();
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)])),
         );
 
@@ -519,10 +530,13 @@ mod tests {
     #[test]
     fn test_swap_axes() {
         // Swapping axes 0 and 1 of a matrix is a plain transpose: the [2, 3] payload becomes [3, 2].
-        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let swapped = matrix.swap_axes(0, 1).unwrap();
-        assert_eq!(swapped.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
-        assert_eq!(swapped.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(
+            swapped.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+        );
+        assert_eq!(swapped.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // Swapping is symmetric in its axis arguments.
         assert_eq!(matrix.swap_axes(1, 0).unwrap(), swapped);
@@ -532,9 +546,9 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
-        let output = TestArray::new(input_type, values).swap_axes(0, 1).unwrap();
+        let output = Array::from_f64s(input_type, values).swap_axes(0, 1).unwrap();
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
         );
 

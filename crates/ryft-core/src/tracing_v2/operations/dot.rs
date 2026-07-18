@@ -1056,13 +1056,12 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -1494,7 +1493,6 @@ mod tests {
         use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;
-        use crate::tracing_v2::ArrayOperation;
 
         let mesh = test_mesh();
         let output_sharding =
@@ -1538,11 +1536,10 @@ mod tests {
     fn test_dot_batching_preserves_materialized_batch_placement() {
         use std::rc::Rc;
 
+        use crate::backends::arrays::{Array, ArrayOperation};
         use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
-        use crate::tests::TestArray;
         use crate::tracing::TracingContext;
-        use crate::tracing_v2::ArrayOperation;
 
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
@@ -1564,7 +1561,7 @@ mod tests {
             let rhs_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]))
                 .with_sharding(Sharding::replicated(mesh, 2))
                 .unwrap();
-            let parent = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+            let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
             let builder = parent.builder().clone();
             let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
             let rhs_atom = builder.borrow_mut().add_input(rhs_type);
@@ -1583,11 +1580,7 @@ mod tests {
 
             let builder = Rc::try_unwrap(builder).expect("batching should not retain the tracing builder").into_inner();
             let program = builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
-                    vec![output_atom],
-                    vec![Placeholder, Placeholder],
-                    vec![Placeholder],
-                )
+                .build::<Vec<Array>, Vec<Array>>(vec![output_atom], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(
                 program.output_types()[0].sharding().unwrap().dimensions(),
@@ -1602,9 +1595,9 @@ mod tests {
         // we want every per-item vector dotted with itself, giving a per-item scalar; batch
         // over the leading axis then yields a length-3 vector of dot products.
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
-        let x = TestArray::matrix(3, 4, x_data);
+        let x = Array::matrix(3, 4, x_data);
 
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
                 x,
@@ -1614,9 +1607,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
-        for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
+        for (actual, expected) in output.to_f64s().iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
         }
     }
@@ -1636,28 +1629,28 @@ mod tests {
 
     #[test]
     fn test_dot_partitioned_transpose_computes_operand_adjoints() {
+        use crate::backends::arrays::{Array, ArrayOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
-        use crate::tests::TestArray;
 
         let matmul = DotDimensionNumbers::matmul();
-        let left = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let right = TestArray::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let cotangent = TestArray::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]);
+        let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let cotangent = Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]);
         let left_type = left.r#type().into_owned();
         let right_type = right.r#type().into_owned();
 
         // Known LEFT operand (linear RHS): the partition-aware transpose stages the adjoint of `t -> dot(left, t)`,
         // whose RHS cotangent is `dot(left^T, cotangent)`. Build `dot(left, right)` over the test enum, treat only the
         // RHS as linear, and interpret the pullback on `[cotangent, left]`.
-        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder
             .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
             .unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1, "the known left input must receive no cotangent output");
@@ -1665,18 +1658,18 @@ mod tests {
         assert_eq!(right_cotangents.len(), 1);
         assert_eq!(*right_cotangents[0].r#type(), right_type);
         // `left^T @ cotangent` with `left^T = [[1,4],[2,5],[3,6]]` and `cotangent = [[1,-2],[0.5,3]]`.
-        assert_eq!(right_cotangents[0].values, vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0]);
+        assert_eq!(right_cotangents[0].to_f64s(), vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0]);
 
         // Known RIGHT operand (linear LHS): the partition-aware transpose stages the adjoint of `t -> dot(t, right)`,
         // whose LHS cotangent is `dot(cotangent, right^T)`.
-        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left_input = builder.add_input(left_type.clone());
         let right_input = builder.add_input(right_type.clone());
         let product = builder
             .add_instruction(DotOperation::new(matmul.clone()), Vec::new(), vec![left_input, right_input])
             .unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1, "the known right input must receive no cotangent output");
@@ -1684,6 +1677,6 @@ mod tests {
         assert_eq!(left_cotangents.len(), 1);
         assert_eq!(*left_cotangents[0].r#type(), left_type);
         // `cotangent @ right^T` with `cotangent = [[1,-2],[0.5,3]]` and `right^T = [[7,9,11],[8,10,12]]`.
-        assert_eq!(left_cotangents[0].values, vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]);
+        assert_eq!(left_cotangents[0].to_f64s(), vec![-9.0, -11.0, -13.0, 27.5, 34.5, 41.5]);
     }
 }

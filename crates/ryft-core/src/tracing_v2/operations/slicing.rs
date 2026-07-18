@@ -664,12 +664,12 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::LinearizationTracer;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::DataType;
 
     use crate::tracing::Trace;
@@ -681,31 +681,31 @@ mod tests {
     fn index_constant<V>(exemplar: &V, value: f64) -> V
     where
         V: crate::programs::Value<Type = ArrayType>,
-        V::DispatchDomain: crate::contexts::Context<Constant = TestArray>,
+        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
         exemplar
             .dispatch_domain()
-            .lift(TestArray::new(ArrayType::scalar(DataType::I32), vec![value]))
+            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]))
             .unwrap()
     }
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
-    fn index(value: f64) -> TestArray {
-        TestArray::new(ArrayType::scalar(DataType::I32), vec![value])
+    fn index(value: f64) -> Array {
+        Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value])
     }
 
     #[test]
     fn test_slice_value_and_grad_zero_pads_cotangent() {
         // f(x) = sum(slice(x, [1], [3])): the pullback writes the all-ones cotangent into a zero array at the slice
         // offsets, so the gradient is the indicator of the sliced window.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| x.slice(&[1], &[3], &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 5.0, epsilon = 1e-9);
-        assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 5.0, epsilon = 1e-9);
+        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -713,25 +713,25 @@ mod tests {
         // f(x) = sum(slice(x, [1], [6], strides=[2]) * w) with w = [1, 2, 3]: the forward slice reads positions 1,
         // 3, and 5, so the pullback pads the weighted cotangent [1, 2, 3] with `low = 1`, `interior = 1`, and
         // `high = 0`, scattering it back to exactly those positions.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
-                    let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
+                    let weights = x.context().lift(Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
                     (x.slice(&[1], &[6], &[2]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+                Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
             )
             .unwrap();
         // f = x[1] + 2 * x[3] + 3 * x[5] = 1 + 6 + 15.
-        assert_abs_diff_eq!(value.values[0], 22.0, epsilon = 1e-9);
-        assert_eq!(gradient.values, vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 22.0, epsilon = 1e-9);
+        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]);
     }
 
     #[test]
     fn test_slice_jacfwd_selects_input_coordinates() {
         // Forward mode through `f(x) = slice(x, [1], [3])` produces the 2x4 selection Jacobian.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
@@ -743,15 +743,15 @@ mod tests {
     fn test_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(update_slice(x, u, [1])): the input gradient is the cotangent with the update window zeroed
         // and the update gradient is the slice of the cotangent at the update window.
-        let (value, (input_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, (input_gradient, update_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
+                (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 20.0, epsilon = 1e-9);
-        assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(update_gradient.values, vec![1.0, 1.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
+        assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
     }
 
     #[test]
@@ -759,30 +759,30 @@ mod tests {
         // f(x) = sum(dynamic_slice(x, [1], [2])): the integer start index is a constant of the trace (its tangent is
         // a structural zero that the JVP rule ignores), and the pullback scatters the all-ones cotangent into a zero
         // array at the captured index.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let start = index_constant(&x, 1.0);
                     x.dynamic_slice(&[start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 5.0, epsilon = 1e-9);
-        assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 5.0, epsilon = 1e-9);
+        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]
     fn test_dynamic_slice_jacfwd_selects_input_coordinates() {
         // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
         // batched basis tangents (the direct batched JVP path).
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |x| {
                     let start = index_constant(&x, 1.0);
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -795,68 +795,56 @@ mod tests {
     fn test_dynamic_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(dynamic_update_slice(x, u, [1])): the input gradient is the cotangent with the update window
         // zeroed and the update gradient is the dynamic slice of the cotangent at the captured index.
-        let (value, (input_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, (input_gradient, update_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |(x, update)| {
                     let start = index_constant(&x, 1.0);
                     x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
                 },
-                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
+                (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 20.0, epsilon = 1e-9);
-        assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(update_gradient.values, vec![1.0, 1.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
+        assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
     }
 
     #[test]
     fn test_slice_batching_lifts_batch_axis() {
         // A batched operand keeps its batch axis by slicing it fully.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input],
-            )
+            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 5.0, 6.0]);
 
         // Replicated operands pass through the unlifted rule.
-        let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[uniform],
-            )
+            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[uniform])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0]);
 
         // Strided slices keep their strides and gain a unit stride at the batch axis: each batch item keeps the
         // elements at positions 0 and 2.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
         let outputs = strided
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input],
-            )
+            .batch(&BatchingContext::new(crate::EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 2.0, 4.0, 6.0]);
     }
 
     #[test]
@@ -876,7 +864,7 @@ mod tests {
         // Each batch item slices its `x`-sharded [4] vector to [2] (2 is divisible by the `x` mesh-axis size, so the
         // slice keeps the sharding); batching restores the replicated batch axis, so the staged slice's output stays
         // sharded.
-        let (output_type, _program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let (output_type, _program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 let context = x.context().clone();
                 Ok(Batch::batch(
@@ -902,38 +890,38 @@ mod tests {
     fn test_update_slice_batching_materializes_uniform_operands() {
         // A replicated update is broadcast to gain the batch axis so each batch item writes the same block.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
+        let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
 
         // A replicated input is broadcast to gain the batch axis when only the update is batched.
-        let input = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let update = {
-            let value = TestArray::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0]);
+            let value = Array::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = UpdateSliceOperation::new(vec![1])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
     }
 
     #[test]
@@ -951,17 +939,17 @@ mod tests {
             let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
-            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+            let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
                     input_type.clone(),
-                    TestArray::new(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+                    Array::from_f64s(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
                     BatchAxis::new(0),
                 )
                 .unwrap()
             };
-            let make_update = || ArrayBatch::replicated(TestArray::new(update_type.clone(), vec![9.0, 9.0]));
+            let make_update = || ArrayBatch::replicated(Array::from_f64s(update_type.clone(), vec![9.0, 9.0]));
 
             let static_outputs = UpdateSliceOperation::new(vec![1])
                 .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
@@ -977,15 +965,15 @@ mod tests {
             for output in [static_outputs[0].clone(), dynamic_outputs[0].clone()] {
                 assert_eq!(output.batch_axis(), BatchAxis::new(0));
                 assert_eq!(output.r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions());
-                assert_eq!(output.value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+                assert_eq!(output.value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
             }
         }
     }
 
     /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.
-    fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<TestArray> {
+    fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
         let length = values.len();
-        let value = TestArray::new(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(length)])), values);
+        let value = Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(length)])), values);
         ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
     }
 
@@ -993,30 +981,30 @@ mod tests {
     fn test_dynamic_slice_batching_lifts_replicated_indices() {
         // Replicated start indices lift the batch axis with a zero start index for it.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, ArrayBatch::replicated(index(1.0))],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 5.0, 6.0]);
     }
 
     #[test]
     fn test_dynamic_slice_batching_expands_batch_varying_indices() {
         // Batch-varying start indices over a replicated operand expand per item: item 0 reads `x[0..2]` and item 1
         // reads `x[2..4]` of the shared operand, restacked along a fresh leading batch axis.
-        let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let uniform = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1024,76 +1012,76 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(2)]);
-        assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
 
         // A batched operand pairs item `i` of the operand with item `i` of the indices; item 1's start index 3 is
         // clamped to 2 so the extracted block stays in bounds.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1.0, 3.0])],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
 
         // An operand batched on a non-leading axis is realigned to the fresh leading batch axis first: the physical
         // `[4, 2]` operand carries per-item vectors `[0, 1, 2, 3]` and `[4, 5, 6, 7]` along axis 1.
         let trailing = {
-            let value = TestArray::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
+            let value = Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1.0, 2.0])],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
     }
 
     #[test]
     fn test_dynamic_update_slice_batching_materializes_uniform_operands() {
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
+        let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, update, ArrayBatch::replicated(index(1.0))],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
     }
 
     #[test]
     fn test_dynamic_update_slice_batching_expands_batch_varying_indices() {
         // A batched update with batch-varying start indices over a replicated input expands per item: item 0
         // writes `[9, 9]` at offset 0 and item 1 writes `[8, 8]` at offset 2 of the shared input.
-        let uniform_input = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
+        let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let update = {
-            let value = TestArray::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]);
+            let value = Array::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
@@ -1101,24 +1089,24 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(4)]);
-        assert_eq!(outputs[0].value().values, vec![9.0, 9.0, 2.0, 3.0, 0.0, 1.0, 8.0, 8.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![9.0, 9.0, 2.0, 3.0, 0.0, 1.0, 8.0, 8.0]);
 
         // A batched input with a replicated update writes the same block at each batch item's own offset.
         let input = {
-            let value = TestArray::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let uniform_update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
+        let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
     }
 
     #[test]
@@ -1130,34 +1118,33 @@ mod tests {
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
                     let starts = context
-                        .lift(TestArray::new(
+                        .lift(Array::from_f64s(
                             ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
                             vec![1.0, 2.0],
                         ))
                         .unwrap();
-                    let stacked: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
-                        Batch::batch(
-                            &context,
-                            |(item, start)| item.dynamic_slice(&[start], &[2]),
-                            (x, starts),
-                            (BatchAxis::replicated(), BatchAxis::new(0)),
-                            BatchAxis::new(0),
-                            None,
-                        )
-                        .unwrap();
-                    let weights = context.lift(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                    let stacked: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                        &context,
+                        |(item, start)| item.dynamic_slice(&[start], &[2]),
+                        (x, starts),
+                        (BatchAxis::replicated(), BatchAxis::new(0)),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
                     (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
-        assert_abs_diff_eq!(value.values[0], 33.0, epsilon = 1e-9);
-        assert_eq!(gradient.values, vec![0.0, 1.0, 5.0, 4.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 33.0, epsilon = 1e-9);
+        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 5.0, 4.0]);
     }
 }

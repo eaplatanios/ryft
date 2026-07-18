@@ -1,17 +1,8 @@
-/// N-dimensional broadcast differentiation and batching rules.
-pub mod broadcasting;
-
 /// Named-axis collective primitives (`psum`, `pmean`, `pmax`).
 pub mod collective;
 
 /// Axis-joining concatenation differentiation and batching rules.
 pub mod concatenation;
-
-/// Elementwise pairwise comparison primitive.
-pub mod compare;
-
-/// Complex-number construction, conjugation, and part-extraction differentiation rules.
-pub mod complex;
 
 /// Value-level identity helpers and built-in scalar constant traits.
 pub mod constants;
@@ -28,9 +19,6 @@ pub mod dot;
 /// Indexed gather differentiation rules.
 pub mod gather;
 
-/// Elementwise logical operation batching and differentiation rules.
-pub mod logical;
-
 /// Memory-space transfer primitive.
 pub mod memory;
 
@@ -38,7 +26,6 @@ pub mod memory;
 pub mod padding;
 
 /// Reusable operation types for the built-in operation set and static backend extensions.
-pub mod primitive;
 
 /// Axis-collapsing reduction primitive.
 pub mod reduce;
@@ -67,7 +54,6 @@ pub mod slicing;
 /// N-dimensional axis-permutation differentiation and batching rules.
 pub mod transpose;
 
-pub use broadcasting::lift_broadcast;
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use control_flow::transpose_primal_condition;
 pub use custom_derivatives::{
@@ -79,7 +65,6 @@ pub use dot::{
     dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, rhs_result_axes,
 };
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
-pub use primitive::ArrayOperation;
 pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};

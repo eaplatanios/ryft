@@ -1346,7 +1346,7 @@ mod tests {
     use crate::tracing::{DomainTracingContext, Trace};
     use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::test_util::scalar_scale_branch;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -1732,7 +1732,7 @@ mod tests {
     #[test]
     fn test_array_operation_condition_infers_output_types() {
         let condition_regions = vec![identity_array_branch(), identity_array_branch()];
-        let condition = ConditionOperation::<TestArray>::new();
+        let condition = ConditionOperation::<Array>::new();
         let operation = ArrayOperation::Condition(condition);
         let region_interfaces = condition_regions.iter().map(Program::interface).collect::<Vec<_>>();
 
@@ -1759,19 +1759,17 @@ mod tests {
                 .unwrap();
             let operand = ArrayBatch::new(
                 physical_type.clone(),
-                TestArray::new(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                Array::from_f64s(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
                 BatchAxis::new(0),
             )
             .unwrap();
             let logical_type = operand.unbatched_type();
-            let (_, branch) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-                |inputs: Vec<_>| Ok(inputs),
-                vec![logical_type],
-            )
-            .unwrap();
-            let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2)
+            let (_, branch) =
+                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![logical_type])
+                    .unwrap();
+            let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let predicate = ArrayBatch::replicated(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+            let predicate = ArrayBatch::replicated(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
 
             let outputs = context
                 .bind(
@@ -1794,7 +1792,7 @@ mod tests {
         // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
         // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
         // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
-        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1821,7 +1819,7 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let condition_count = program
             .instructions()
@@ -1829,11 +1827,11 @@ mod tests {
             .filter(|instruction| instruction.operation().name() == "condition")
             .count();
         assert_eq!(condition_count, 1, "{program}");
-        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
-        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
-        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
-        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![3.0, 12.0, 27.0]);
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![3.0, 12.0, 27.0]);
     }
 
     #[test]
@@ -1842,14 +1840,14 @@ mod tests {
         // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
         // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
         // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
-        let mut constant_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut constant_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         constant_builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
+        let constant_output = constant_builder.add_constant(Array::scalar(7.0));
         let constant_branch = constant_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
         let operand_atom =
@@ -1875,39 +1873,39 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<(TestArray, TestArray), TestArray>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let rendered = program.to_string();
         assert!(rendered.contains("broadcast"), "{rendered}");
-        let truthy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]);
-        let falsy = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
-        let operand = TestArray::vector(vec![1.0, 4.0, 9.0]);
-        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().values, vec![2.0, 8.0, 18.0]);
-        assert_eq!(program.interpret((falsy, operand)).unwrap().values, vec![7.0, 7.0, 7.0]);
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![7.0, 7.0, 7.0]);
     }
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::operations::compare::ComparisonDirection;
-    use crate::tests::TestArray;
 
     /// Test array operation enum used by the while tests below.
-    type TestArrayOperation = ArrayOperation<TestArray>;
+    type TestDomainOperation = ArrayOperation<Array>;
 
-    /// Eager interpreting domain over [`TestArray`] values that reports no support for primal concretization. Hybrid
+    /// Eager interpreting domain over [`Array`] values that reports no support for primal concretization. Hybrid
     /// rules (in particular the while JVP rule) therefore take their staged, non-concretizing paths while every
     /// primal bind still computes concrete values, which lets the tests below interpret linear while bodies
     /// numerically without abstract tracers.
     #[derive(Copy, Clone, Debug)]
-    struct StagedDispatchTestArrayDomain;
+    struct StagedDispatchTestDomain;
 
-    impl Domain for StagedDispatchTestArrayDomain {
+    impl Domain for StagedDispatchTestDomain {
         type Type = ArrayType;
-        type Value = TestArray;
-        type Constant = TestArray;
-        type Operation = TestArrayOperation;
+        type Value = Array;
+        type Constant = Array;
+        type Operation = TestDomainOperation;
     }
 
-    impl Context for StagedDispatchTestArrayDomain {
-        fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
+    impl Context for StagedDispatchTestDomain {
+        fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
             Ok(constant)
         }
 
@@ -1919,10 +1917,10 @@ mod tests {
         ) -> Result<Vec<Self::Value>, ProgramError> {
             // Region-carrying binds route through the eager context's own bind, which grants application-scoped region
             // access.
-            crate::EagerContext::<TestArray, Self::Operation>::new().bind(operation, driver, inputs)
+            crate::EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
-        fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {
+        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
             crate::ValueResolution::Concrete(value.clone())
         }
 
@@ -1932,33 +1930,33 @@ mod tests {
     }
 
     /// Eager-domain context capabilities, delegating to the zero-state [`crate::EagerContext`] exactly like
-    /// [`EagerContext<TestArray, ArrayOperation<TestArray>>`](crate::tests::EagerContext<TestArray, ArrayOperation<TestArray>>)'s.
-    impl crate::operations::constants::Zero<TestArray> for StagedDispatchTestArrayDomain {
-        fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Zero::zero(&crate::EagerContext::<TestArray>::new(), r#type)
+    /// `EagerContext<Array, ArrayOperation<Array>>`'s.
+    impl crate::operations::constants::Zero<Array> for StagedDispatchTestDomain {
+        fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+            crate::operations::constants::Zero::zero(&crate::EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::One<TestArray> for StagedDispatchTestArrayDomain {
-        fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::One::one(&crate::EagerContext::<TestArray>::new(), r#type)
+    impl crate::operations::constants::One<Array> for StagedDispatchTestDomain {
+        fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+            crate::operations::constants::One::one(&crate::EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::Fill<Scalar, TestArray> for StagedDispatchTestArrayDomain {
-        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Fill::fill(&crate::EagerContext::<TestArray>::new(), r#type, value)
+    impl crate::operations::constants::Fill<Scalar, Array> for StagedDispatchTestDomain {
+        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
+            crate::operations::constants::Fill::fill(&crate::EagerContext::<Array>::new(), r#type, value)
         }
     }
 
-    impl crate::operations::constants::Iota<TestArray> for StagedDispatchTestArrayDomain {
-        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Iota::iota(&crate::EagerContext::<TestArray>::new(), r#type, dimension)
+    impl crate::operations::constants::Iota<Array> for StagedDispatchTestDomain {
+        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
+            crate::operations::constants::Iota::iota(&crate::EagerContext::<Array>::new(), r#type, dimension)
         }
     }
 
-    impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for StagedDispatchTestArrayDomain {
-        fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
+    impl<Payload> crate::operations::constants::Constant<Array, Array, Payload> for StagedDispatchTestDomain {
+        fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
     }
@@ -1985,13 +1983,13 @@ mod tests {
 
     impl Domain for CountingPrintContext {
         type Type = ArrayType;
-        type Value = TestArray;
-        type Constant = TestArray;
-        type Operation = TestArrayOperation;
+        type Value = Array;
+        type Constant = Array;
+        type Operation = TestDomainOperation;
     }
 
     impl Context for CountingPrintContext {
-        fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
+        fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
             Ok(constant)
         }
 
@@ -2005,10 +2003,10 @@ mod tests {
             if matches!(operation, ArrayOperation::Print(_)) {
                 self.print_count.set(self.print_count.get() + 1);
             }
-            EagerContext::<TestArray, Self::Operation>::new().bind(operation, driver, inputs)
+            EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
-        fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {
+        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
             crate::ValueResolution::Concrete(value.clone())
         }
 
@@ -2017,43 +2015,41 @@ mod tests {
         }
     }
 
-    impl crate::operations::constants::Zero<TestArray> for CountingPrintContext {
-        fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Zero::zero(&EagerContext::<TestArray>::new(), r#type)
+    impl crate::operations::constants::Zero<Array> for CountingPrintContext {
+        fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+            crate::operations::constants::Zero::zero(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::One<TestArray> for CountingPrintContext {
-        fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::One::one(&EagerContext::<TestArray>::new(), r#type)
+    impl crate::operations::constants::One<Array> for CountingPrintContext {
+        fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+            crate::operations::constants::One::one(&EagerContext::<Array>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::Fill<Scalar, TestArray> for CountingPrintContext {
-        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Fill::fill(&EagerContext::<TestArray>::new(), r#type, value)
+    impl crate::operations::constants::Fill<Scalar, Array> for CountingPrintContext {
+        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<Array, ProgramError> {
+            crate::operations::constants::Fill::fill(&EagerContext::<Array>::new(), r#type, value)
         }
     }
 
-    impl crate::operations::constants::Iota<TestArray> for CountingPrintContext {
-        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Iota::iota(&EagerContext::<TestArray>::new(), r#type, dimension)
+    impl crate::operations::constants::Iota<Array> for CountingPrintContext {
+        fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
+            crate::operations::constants::Iota::iota(&EagerContext::<Array>::new(), r#type, dimension)
         }
     }
 
-    impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for CountingPrintContext {
-        fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
+    impl<Payload> crate::operations::constants::Constant<Array, Array, Payload> for CountingPrintContext {
+        fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
     }
 
     /// Builds the `state < threshold` while condition program over one scalar state element.
-    fn scalar_threshold_condition(
-        threshold: f64,
-    ) -> Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+    fn scalar_threshold_condition(threshold: f64) -> Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let threshold = builder.add_constant(TestArray::scalar(threshold));
+        let threshold = builder.add_constant(Array::scalar(threshold));
         let predicate = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, threshold])
             .unwrap()[0];
@@ -2064,14 +2060,14 @@ mod tests {
     fn bounded_doubling_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
-        let two = builder.add_constant(TestArray::scalar(2.0));
+        let two = builder.add_constant(Array::scalar(2.0));
         let doubled = builder.add_instruction(MulOperation, Vec::new(), vec![state, two]).unwrap()[0];
         let body = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let operation = WhileOperation::new().with_iteration_bound(bound).unwrap();
         (operation, vec![scalar_threshold_condition(threshold), body])
@@ -2079,12 +2075,12 @@ mod tests {
 
     /// Builds `while (x < 8) { print(x); x = 2 * x }`, whose input `1` executes exactly three body iterations.
     fn effectful_doubling_while_operation()
-    -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+    -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let condition = scalar_threshold_condition(8.0);
-        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let input = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let printed = body_builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![input]).unwrap()[0];
-        let two = body_builder.add_constant(TestArray::scalar(2.0));
+        let two = body_builder.add_constant(Array::scalar(2.0));
         let output = body_builder.add_instruction(MulOperation, Vec::new(), vec![printed, two]).unwrap()[0];
         let body = body_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         (WhileOperation::new(), vec![condition, body])
@@ -2096,13 +2092,13 @@ mod tests {
     fn bounded_squaring_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
         let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
         let body = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let operation = WhileOperation::new().with_iteration_bound(bound).unwrap();
         (operation, vec![scalar_threshold_condition(threshold), body])
@@ -2116,21 +2112,21 @@ mod tests {
         // their mask entries are false, so they must pass tangents through unchanged in the forward scan and cotangents
         // through unchanged in the transposed scan. Locally `f(x) = 8 x`: value 8, gradient 8.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (output, pullback) = StagedDispatchTestArrayDomain
+        let (output, pullback) = StagedDispatchTestDomain
             .vjp(
                 move |x| {
                     let mut outputs = x.context().bind(
-                        TestArrayOperation::While(while_operation),
+                        TestDomainOperation::While(while_operation),
                         while_regions.clone(),
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![8.0]);
+        assert_eq!(output.to_f64s(), vec![8.0]);
 
         // The pullback contains the transposed (reversed) linear scan and no while loop, and every cotangent seed
         // scales the hand-computed gradient 8. The direct-transpose pullback consumes `[cotangent ++ residuals]`.
@@ -2138,40 +2134,36 @@ mod tests {
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");
-        let pullback_inputs = |cotangent: TestArray| {
+        let pullback_inputs = |cotangent: Array| {
             let mut inputs = vec![cotangent];
             inputs.extend(residuals.iter().cloned());
             inputs
         };
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(1.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(1.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![8.0]),
         );
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(2.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(2.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![16.0]),
         );
 
         // `value_and_gradient` composes the same machinery end to end.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = StagedDispatchTestArrayDomain
+        let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![8.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![8.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
 
     #[test]
@@ -2182,46 +2174,43 @@ mod tests {
         // items `[2, 4, 16, 0]` — including the zero batch item beyond the trip count, which the mask must keep inert
         // in both directions. Locally `f(x) = x⁸`: value 256 and gradient `8 x⁷ = 1024`.
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 4);
-        let (output, pullback) = StagedDispatchTestArrayDomain
+        let (output, pullback) = StagedDispatchTestDomain
             .vjp(
                 move |x| {
                     let mut outputs = x.context().bind(
-                        TestArrayOperation::While(while_operation),
+                        TestDomainOperation::While(while_operation),
                         while_regions.clone(),
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![256.0]);
+        assert_eq!(output.to_f64s(), vec![256.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
-        let mut pullback_inputs = vec![TestArray::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
         pullback_inputs.extend(residuals);
-        assert_eq!(
-            pullback.interpret(pullback_inputs).map(|cotangents| cotangents[0].values.clone()),
-            Ok(vec![1024.0]),
-        );
+        assert_eq!(pullback.interpret(pullback_inputs).map(|cotangents| cotangents[0].to_f64s()), Ok(vec![1024.0]),);
 
         // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 4);
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![256.0]);
-        assert_eq!(gradient.values, vec![1024.0]);
+        assert_eq!(value.to_f64s(), vec![256.0]);
+        assert_eq!(gradient.to_f64s(), vec![1024.0]);
     }
 
     #[test]
@@ -2235,33 +2224,33 @@ mod tests {
         use crate::tracing_v2::operations::reduce::ReductionKind;
 
         let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![condition_state])
             .unwrap()[0];
-        let threshold = condition_builder.add_constant(TestArray::scalar(20.0));
+        let threshold = condition_builder.add_constant(Array::scalar(20.0));
         let predicate = condition_builder
             .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![summed, threshold])
             .unwrap()[0];
         let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(vector_f64.clone());
         let squared = body_builder.add_instruction(MulOperation, Vec::new(), vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![squared], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let while_operation = WhileOperation::new().with_iteration_bound(4).unwrap();
         let while_regions = vec![condition, body];
 
-        let (value, gradient) = StagedDispatchTestArrayDomain
+        let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     let state = outputs.remove(0);
                     let mut outputs = state
@@ -2270,11 +2259,11 @@ mod tests {
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::vector(vec![1.5, 2.0]),
+                Array::vector(vec![1.5, 2.0]),
             )
             .unwrap();
-        assert_eq!(value.values, vec![21.0625]);
-        assert_eq!(gradient.values, vec![13.5, 32.0]);
+        assert_eq!(value.to_f64s(), vec![21.0625]);
+        assert_eq!(gradient.to_f64s(), vec![13.5, 32.0]);
     }
 
     #[test]
@@ -2282,20 +2271,20 @@ mod tests {
         // The eager-domain entry point differentiates the same bounded loop to identical numbers: the loop exits
         // through its condition after three iterations, well below the bound of five.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![8.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![8.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
 
     #[test]
@@ -2307,19 +2296,19 @@ mod tests {
             .jvp(
                 move |x| {
                     let mut outputs = x.context().bind(
-                        TestArrayOperation::While(while_operation),
+                        TestDomainOperation::While(while_operation),
                         while_regions.clone(),
                         &[x.clone()],
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
 
-        assert_eq!(primal.values, vec![8.0]);
-        assert_eq!(tangent.values, vec![8.0]);
+        assert_eq!(primal.to_f64s(), vec![8.0]);
+        assert_eq!(tangent.to_f64s(), vec![8.0]);
         assert_eq!(observed_context.print_count(), 3);
     }
 
@@ -2330,49 +2319,49 @@ mod tests {
         // interpretation, the eager-domain entry point, and the staged dispatch domain (where every mask batch
         // item is true).
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let outputs = crate::EagerContext::<TestArray, TestArrayOperation>::new()
-            .bind(TestArrayOperation::While(while_operation), while_regions, &[TestArray::scalar(2.0)])
+        let outputs = crate::EagerContext::<Array, TestDomainOperation>::new()
+            .bind(TestDomainOperation::While(while_operation), while_regions, &[Array::scalar(2.0)])
             .unwrap();
-        assert_eq!(outputs[0].values, vec![16.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![16.0]);
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![16.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![16.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = StagedDispatchTestArrayDomain
+        let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
-                        .bind(TestArrayOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![16.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![16.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
 
     /// Builds the per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar state element.
-    fn countdown_while_operation()
-    -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+    fn countdown_while_operation() -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>)
+    {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![condition_state]).unwrap()[0];
         let predicate = condition_builder
@@ -2383,14 +2372,14 @@ mod tests {
             )
             .unwrap()[0];
         let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation, Vec::new(), vec![body_state]).unwrap()[0];
         let next = body_builder.add_instruction(SubOperation, Vec::new(), vec![body_state, one]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder], vec![Placeholder])
             .unwrap();
         (WhileOperation::new(), vec![condition, body])
     }
@@ -2399,11 +2388,11 @@ mod tests {
     /// and returns the staged batched program for structural and numeric assertions.
     fn batch_while_under_tracing(
         while_operation: WhileOperation,
-        while_regions: Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>,
+        while_regions: Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>,
         batch_size: usize,
-    ) -> Program<TestArray, TestArrayOperation, TestArray, TestArray> {
+    ) -> Program<Array, TestDomainOperation, Array, Array> {
         use crate::batching::Batch;
-        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
@@ -2412,7 +2401,7 @@ mod tests {
             &parent,
             |item| {
                 let mut outputs = item.context().bind(
-                    TestArrayOperation::While(while_operation),
+                    TestDomainOperation::While(while_operation),
                     while_regions.clone(),
                     &[item.clone()],
                 )?;
@@ -2425,11 +2414,7 @@ mod tests {
         )
         .unwrap();
         let output_atom = output.atom_id().unwrap();
-        builder
-            .borrow()
-            .clone()
-            .build::<TestArray, TestArray>(vec![output_atom], Placeholder, Placeholder)
-            .unwrap()
+        builder.borrow().clone().build::<Array, Array>(vec![output_atom], Placeholder, Placeholder).unwrap()
     }
 
     #[test]
@@ -2448,8 +2433,8 @@ mod tests {
         assert!(!rendered.contains("reduce_any"), "{rendered}");
         assert!(rendered.contains("%2:bool[3] = compare"), "{rendered}");
         assert_eq!(rendered.matches("sub").count(), 1, "{rendered}");
-        let output = program.interpret(TestArray::vector(vec![3.0, 1.0, 2.0])).unwrap();
-        assert_eq!(output.values, vec![0.0, 0.0, 0.0]);
+        let output = program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap();
+        assert_eq!(output.to_f64s(), vec![0.0, 0.0, 0.0]);
 
         // The semantic iteration bound is preserved on the staged batched-predicate while: every batch item performs
         // at most two body applications, so batch item 0 truncates at 1.0 — the numbers of the eager operational
@@ -2459,16 +2444,16 @@ mod tests {
             batch_while_under_tracing(countdown_operation.with_iteration_bound(2).unwrap(), countdown_regions, 3);
         let rendered = program.to_string();
         assert!(rendered.contains("iteration_bound=2"), "{rendered}");
-        let output = program.interpret(TestArray::vector(vec![3.0, 1.0, 2.0])).unwrap();
-        assert_eq!(output.values, vec![1.0, 0.0, 0.0]);
+        let output = program.interpret(Array::vector(vec![3.0, 1.0, 2.0])).unwrap();
+        assert_eq!(output.to_f64s(), vec![1.0, 0.0, 0.0]);
     }
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate
     /// depends only on the counter state element.
     fn counter_doubling_while_operation()
-    -> (WhileOperation, Vec<Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>>>) {
+    -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());
         condition_builder.add_input(scalar_f64.clone());
         let zero =
@@ -2481,20 +2466,16 @@ mod tests {
             )
             .unwrap()[0];
         let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation, Vec::new(), vec![body_counter]).unwrap()[0];
         let next_counter = body_builder.add_instruction(SubOperation, Vec::new(), vec![body_counter, one]).unwrap()[0];
         let doubled = body_builder.add_instruction(AddOperation, Vec::new(), vec![body_value, body_value]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![next_counter, doubled],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Array>, Vec<Array>>(vec![next_counter, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         (WhileOperation::new(), vec![condition, body])
     }
@@ -2507,7 +2488,7 @@ mod tests {
         // rule batches the condition and body at the state batch axes and stages one plain `while` — no mask
         // machinery (`reduce_any` / per-element `select`) appears in the staged program. Two iterations double the
         // batched value twice: [1, 2, 3] -> [4, 8, 12], with the replicated counter ending at 0.
-        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let counter_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let value_atom =
@@ -2519,7 +2500,7 @@ mod tests {
             |(counter, value)| {
                 let (while_operation, while_regions) = counter_doubling_while_operation();
                 let mut outputs = counter.context().bind(
-                    TestArrayOperation::While(while_operation),
+                    TestDomainOperation::While(while_operation),
                     while_regions,
                     &[counter.clone(), value.clone()],
                 )?;
@@ -2536,7 +2517,7 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<(TestArray, TestArray), (TestArray, TestArray)>(
+            .build::<(Array, Array), (Array, Array)>(
                 output_atoms,
                 (Placeholder, Placeholder),
                 (Placeholder, Placeholder),
@@ -2547,9 +2528,9 @@ mod tests {
         assert!(!rendered.contains("reduce_any"), "{rendered}");
         assert!(!rendered.contains("select"), "{rendered}");
         let (counter_output, value_output) =
-            program.interpret((TestArray::scalar(2.0), TestArray::vector(vec![1.0, 2.0, 3.0]))).unwrap();
-        assert_eq!(counter_output.values, vec![0.0]);
-        assert_eq!(value_output.values, vec![4.0, 8.0, 12.0]);
+            program.interpret((Array::scalar(2.0), Array::vector(vec![1.0, 2.0, 3.0]))).unwrap();
+        assert_eq!(counter_output.to_f64s(), vec![0.0]);
+        assert_eq!(value_output.to_f64s(), vec![4.0, 8.0, 12.0]);
     }
 
     #[test]
@@ -2564,9 +2545,8 @@ mod tests {
         fn batched_bounded_while<V>(x: V) -> Result<V, ProgramError>
         where
             V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
-            V::DispatchDomain:
-                Context<Type = ArrayType, Value = V, Constant = TestArray, Operation = TestArrayOperation>,
-            TestArrayOperation: BatchableOperation<V::DispatchDomain>
+            V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
+            TestDomainOperation: BatchableOperation<V::DispatchDomain>
                 + crate::batching::BatchableOperation<
                     crate::TracingContext<
                         <V::DispatchDomain as crate::Domain>::Constant,
@@ -2591,34 +2571,33 @@ mod tests {
             )?;
             Ok(mapped)
         }
-        let (primal, tangent) = StagedDispatchTestArrayDomain
-            .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
+        let (primal, tangent) = StagedDispatchTestDomain
+            .jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0]))
             .unwrap();
-        assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);
-        assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
+        assert_eq!(primal.to_f64s(), vec![8.0, 10.0, 9.0]);
+        assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 
         // The plain eager domain produces the same numbers...
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0]))
             .unwrap();
-        assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);
-        assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
+        assert_eq!(primal.to_f64s(), vec![8.0, 10.0, 9.0]);
+        assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 
         // ... and reverse mode composes through the masked linear scan: the pullback contains the reversed scan
         // and no while loop, and the per-item gradients match the tangent scales.
-        let (output, pullback) = StagedDispatchTestArrayDomain
-            .vjp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]))
-            .unwrap();
+        let (output, pullback) =
+            StagedDispatchTestDomain.vjp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0])).unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![8.0, 10.0, 9.0]);
+        assert_eq!(output.to_f64s(), vec![8.0, 10.0, 9.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");
-        let mut pullback_inputs = vec![TestArray::vector(vec![1.0, 1.0, 1.0])];
+        let mut pullback_inputs = vec![Array::vector(vec![1.0, 1.0, 1.0])];
         pullback_inputs.extend(residuals);
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_eq!(cotangents[0].values, vec![8.0, 2.0, 1.0]);
+        assert_eq!(cotangents[0].to_f64s(), vec![8.0, 2.0, 1.0]);
     }
 
     #[test]
@@ -2629,8 +2608,7 @@ mod tests {
         fn unbounded_while<V>(x: V) -> Result<V, ProgramError>
         where
             V: Value<Type = ArrayType>,
-            V::DispatchDomain:
-                Context<Type = ArrayType, Value = V, Constant = TestArray, Operation = TestArrayOperation>,
+            V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
         {
             let context = x.dispatch_domain();
             let (while_operation, while_regions) = countdown_while_operation();
@@ -2638,7 +2616,7 @@ mod tests {
             Ok(outputs.remove(0))
         }
         assert!(matches!(
-            StagedDispatchTestArrayDomain.jvp(unbounded_while, TestArray::scalar(4.0), TestArray::scalar(1.0)),
+            StagedDispatchTestDomain.jvp(unbounded_while, Array::scalar(4.0), Array::scalar(1.0)),
             Err(crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message,
             })) if message

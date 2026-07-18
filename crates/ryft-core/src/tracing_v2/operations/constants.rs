@@ -390,13 +390,12 @@ where
 mod tests {
     use indoc::indoc;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::math::{Cos, Sin};
     use crate::programs::Program;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -428,21 +427,20 @@ mod tests {
         // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
         // zero-input operation and that the post-trace replay materializes the same zero for
         // every batch item through the replicated broadcast path.
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |x| {
-                    let zero_op =
-                        ArrayOperation::<TestArray>::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64)));
+                    let zero_op = ArrayOperation::<Array>::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64)));
                     let zero = x.context().bind(zero_op, Vec::new(), &[])?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
             )
             .unwrap();
 
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0]);
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0]);
     }
 }

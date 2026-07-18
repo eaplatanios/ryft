@@ -230,12 +230,11 @@ mod tests {
     use crate::batching::BatchingContext;
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::programs::types::Typed;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::{DataType, Shape, Size};
 
@@ -264,22 +263,18 @@ mod tests {
         assert!(operation.infer_output_types(&[], &[]).is_err());
         // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
         // the value's carried type in the destination so that it matches the declared output type.
-        let input = TestArray::vector(vec![1.0, 2.0]);
+        let input = Array::vector(vec![1.0, 2.0]);
         let outputs = operation
-            .interpret(
-                &crate::EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            )
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
         assert_eq!(*outputs[0].r#type(), vector_type(2).with_memory(PINNED_HOST));
-        assert_eq!(outputs[0].values, vec![1.0, 2.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
     }
 
     #[test]
     fn test_transfer_to_memory_staging_replaces_the_memory() {
-        let (output_type, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| Ok(x.transfer_to_memory(PINNED_HOST)),
             vector_type(2),
         )
@@ -297,24 +292,24 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_jvp_moves_the_primal_and_the_tangent() {
         // Eagerly the transfer is the identity on both the primal and the tangent.
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x| Ok(x.transfer_to_memory(PINNED_HOST)),
-                TestArray::vector(vec![2.0, 3.0]),
-                TestArray::vector(vec![1.0, 0.5]),
+                Array::vector(vec![2.0, 3.0]),
+                Array::vector(vec![1.0, 0.5]),
             )
             .unwrap();
-        assert_eq!(primal.values, vec![2.0, 3.0]);
-        assert_eq!(tangent.values, vec![1.0, 0.5]);
+        assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
+        assert_eq!(tangent.to_f64s(), vec![1.0, 0.5]);
     }
 
     #[test]
     fn test_transfer_to_memory_transposition_moves_the_cotangent_back_to_the_source_memory() {
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), TestArray::vector(vec![2.0, 3.0]))
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), Array::vector(vec![2.0, 3.0]))
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![2.0, 3.0]);
+        assert_eq!(output.to_f64s(), vec![2.0, 3.0]);
         // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
         // cotangent and transfers it back to the operand's source memory.
         assert!(residuals.is_empty(), "transfer_to_memory has no residual");
@@ -335,19 +330,19 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
                     let back = on_host.transfer_to_memory(Memory::Device);
                     back.dot(&back, &DotDimensionNumbers::inner_product())
                 },
-                TestArray::vector(vec![0.5, 1.5]),
+                Array::vector(vec![0.5, 1.5]),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 2.5, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[1], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -355,22 +350,22 @@ mod tests {
         // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
         // destination — exactly like interpretation — and preserves the batch axis.
         let input = {
-            let value = TestArray::matrix(2, 3, vec![1.0; 6]);
+            let value = Array::matrix(2, 3, vec![1.0; 6]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
+        let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));
         assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
-        assert_eq!(outputs[0].value().values, vec![1.0; 6]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0; 6]);
 
         // Batching under a staging parent stages the same transfer on the physical batched value with its batch
         // axis preserved.
-        let (output_type, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 let context = x.context().clone();
                 Ok(Batch::batch(

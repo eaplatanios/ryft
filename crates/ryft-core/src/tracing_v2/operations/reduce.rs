@@ -750,12 +750,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::programs::types::Typed;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -875,7 +874,6 @@ mod tests {
         use crate::parameters::Placeholder;
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::tracing::TracingContext;
-        use crate::tracing_v2::operations::ArrayOperation;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = array_type(&[2, 3], DataType::F64)
@@ -891,7 +889,7 @@ mod tests {
 
         // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
         // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.
-        let context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let builder = context.builder().clone();
         let input_atom = builder.borrow_mut().add_input(input_type);
         let output = context.tracer(input_atom, None).reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced);
@@ -902,7 +900,7 @@ mod tests {
         let program = Rc::try_unwrap(builder)
             .expect("staging should not retain the builder")
             .into_inner()
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output_atom], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output_atom], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(program.to_string().contains(&format!("output_sharding={unreduced}")));
 
@@ -986,13 +984,9 @@ mod tests {
 
     #[test]
     fn test_reduce_operation_interprets_sum_over_axis() {
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .interpret(
-                &crate::EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&input),
-            )
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         let output = outputs.into_iter().next().unwrap();
         assert_eq!(output.r#type().shape(), &Shape::new(vec![Size::Static(2)]));
@@ -1001,11 +995,11 @@ mod tests {
 
     #[test]
     fn test_reduce_extrema_derivatives_split_ties_evenly() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for kind in [ReductionKind::Max, ReductionKind::Min] {
-            let input = TestArray::vector(vec![1.0, 1.0]);
+            let input = Array::vector(vec![1.0, 1.0]);
             let (primal, tangent) = context
-                .jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), TestArray::vector(vec![1.0, 3.0]))
+                .jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), Array::vector(vec![1.0, 3.0]))
                 .unwrap();
             assert_eq!(primal.values(), &[1.0]);
             assert_eq!(tangent.values(), &[2.0]);
@@ -1020,10 +1014,10 @@ mod tests {
 
     #[test]
     fn test_reduce_operation_batches_replicated_input_as_pass_through() {
-        let input = ArrayBatch::replicated(TestArray::matrix(2, 3, vec![1.0; 6]));
+        let input = ArrayBatch::replicated(Array::matrix(2, 3, vec![1.0; 6]));
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1040,13 +1034,13 @@ mod tests {
         let values: Vec<f64> = (0..18).map(|index| index as f64).collect();
         let physical_type = array_type(&[3, 2, 3], DataType::F64);
         let input = {
-            let value = TestArray::new(physical_type, values);
+            let value = Array::from_f64s(physical_type, values);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 3),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1060,13 +1054,13 @@ mod tests {
     #[test]
     fn test_reduce_operation_batches_a_per_item_axis_at_the_physical_batch_position() {
         let input = {
-            let value = TestArray::matrix(3, 2, vec![1.0; 6]);
+            let value = Array::matrix(3, 2, vec![1.0; 6]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = ReduceOperation::new(vec![0], ReductionKind::Sum)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 3),
                 &crate::EmptyRegionDriver,
                 std::slice::from_ref(&input),
             )
@@ -1128,7 +1122,7 @@ mod tests {
         let input_shape = Shape::new(vec![Size::Static(4)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
         let cotangent_type = ArrayType::scalar(DataType::F64);
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let transpose_builder = context.builder().clone();
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let output_cotangent = context.tracer(output_cotangent_atom, None);
@@ -1152,13 +1146,12 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program = transpose_builder
-            .build::<TestArray, TestArray>(vec![contribution_atom], Placeholder, Placeholder)
-            .unwrap();
-        let result = transpose_program.interpret(TestArray::scalar(1.0)).unwrap();
+        let transpose_program =
+            transpose_builder.build::<Array, Array>(vec![contribution_atom], Placeholder, Placeholder).unwrap();
+        let result = transpose_program.interpret(Array::scalar(1.0)).unwrap();
         assert_eq!(result.r#type().shape(), &input_shape);
-        for value in result.values() {
-            let delta = (*value - 0.25).abs();
+        for value in result.to_f64s() {
+            let delta = (value - 0.25).abs();
             assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");
         }
     }
@@ -1174,7 +1167,7 @@ mod tests {
 
         let input_shape = Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
             let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
             context.tracer(atom, None)
@@ -1202,7 +1195,7 @@ mod tests {
 
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]));
-        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
             let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
             context.tracer(atom, None)
@@ -1227,18 +1220,18 @@ mod tests {
         // Per-item scalar input of shape [3] mapped at axis 0. PMean returns the mean of the
         // three batch items as a replicated scalar.
         let input = {
-            let value = TestArray::vector(vec![2.0, 4.0, 6.0]);
+            let value = Array::vector(vec![2.0, 4.0, 6.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3)
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
             .with_axis_name("data".to_string());
         let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
             .batch(&context, &crate::EmptyRegionDriver, &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        let values = outputs[0].value().values();
+        let values = outputs[0].value().to_f64s();
         assert_eq!(values.len(), 1);
         let delta = (values[0] - 4.0).abs();
         assert!(delta < 1e-9, "expected pmean = 4.0, got {}", values[0]);

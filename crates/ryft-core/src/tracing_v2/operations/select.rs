@@ -220,7 +220,7 @@ where
 ///
 /// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`), the
 /// known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore
-/// applies to both the array [`ArrayOperation::Select`](crate::tracing_v2::ArrayOperation) and the scalar
+/// applies to both the array [`ArrayOperation::Select`](crate::backends::arrays::ArrayOperation) and the scalar
 /// [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
 impl<V: Value, O> TransposableOperation<V, O> for SelectOperation
 where
@@ -330,26 +330,27 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::operations::math::Add;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, jacrev};
+    use crate::programs::types::Typed;
+    use crate::tracing_v2::{DenseDifferentiate, jacrev};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::LinearSelectOperation;
 
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged or differentiation-dual values of any context with
-    /// [`TestArray`] semantics.
+    /// [`Array`] semantics.
     fn piecewise_select<V>(x: V) -> V
     where
         V: crate::programs::Value<Type = crate::types::ArrayType>,
         V::DispatchDomain: crate::contexts::Context<
                 Type = crate::types::ArrayType,
-                Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<TestArray>,
+                Constant = Array,
+                Operation = crate::backends::arrays::ArrayOperation<Array>,
             >,
     {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
@@ -363,10 +364,10 @@ mod tests {
         // Reverse mode through `f(x) = select(x > 0, 2x, 3x)` exercises the captured-condition select transpose:
         // the on_true cotangent is `select(condition, cotangent, 0)` and the on_false cotangent is
         // `select(condition, 0, cotangent)`.
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0)).unwrap();
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0)).unwrap();
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
@@ -380,13 +381,13 @@ mod tests {
     fn test_select_jacfwd_computes_piecewise_derivative() {
         // Forward mode through the same function exercises the captured-condition select under batched basis
         // tangents (the direct batched JVP path).
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0))
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(2.0))
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0))
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(-2.0))
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
     }
@@ -395,7 +396,7 @@ mod tests {
     fn test_select_jacrev_over_vector_masks_per_element() {
         // Per-element masking over a vector input: the Jacobian of `select(x > 0, 2x, 3x)` is diagonal with entries
         // 2 where x > 0 and 3 elsewhere.
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), TestArray::vector(vec![1.0, -1.0])).unwrap();
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::vector(vec![1.0, -1.0])).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
@@ -407,9 +408,10 @@ mod tests {
 
     #[test]
     fn test_select_jacrev_unbroadcasts_mixed_precision_scalar_branches() {
-        let scalar = TestArray::new(ArrayType::scalar(DataType::F32), vec![5.0]);
+        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![5.0]);
         let f32_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
-        let vector = TestArray::new(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
+        let vector =
+            Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
 
         let jacobian = jacrev(
             |(scalar, vector)| {
@@ -421,13 +423,13 @@ mod tests {
         .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().r#type, f32_vector_type);
-        assert_eq!(blocks[0].value().values, vec![1.0, 0.0]);
+        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
+        assert_eq!(blocks[0].value().to_f64s(), vec![1.0, 0.0]);
         assert_eq!(
-            blocks[1].value().r#type,
+            blocks[1].value().r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
-        assert_eq!(blocks[1].value().values, vec![0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0]);
 
         let jacobian = jacrev(
             |(scalar, vector)| {
@@ -439,13 +441,13 @@ mod tests {
         .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().r#type, f32_vector_type);
-        assert_eq!(blocks[0].value().values, vec![0.0, 1.0]);
+        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
+        assert_eq!(blocks[0].value().to_f64s(), vec![0.0, 1.0]);
         assert_eq!(
-            blocks[1].value().r#type,
+            blocks[1].value().r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
-        assert_eq!(blocks[1].value().values, vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -526,16 +528,16 @@ mod tests {
         use crate::programs::ProgramBuilder;
 
         // Condition `[true, false]` (known), branches and cotangent are length-two f64 vectors (linear branches).
-        let condition = TestArray::vector(vec![1.0, 0.0]).as_boolean();
+        let condition = Array::vector(vec![1.0, 0.0]).as_boolean();
         // The branches are linear operands, so only their type enters the transpose; their values are unused.
-        let on_true = TestArray::vector(vec![10.0, 20.0]);
-        let cotangent = TestArray::vector(vec![5.0, 7.0]);
-        let condition_type = <TestArray as crate::programs::types::Typed>::r#type(&condition).into_owned();
-        let branch_type = <TestArray as crate::programs::types::Typed>::r#type(&on_true).into_owned();
+        let on_true = Array::vector(vec![10.0, 20.0]);
+        let cotangent = Array::vector(vec![5.0, 7.0]);
+        let condition_type = <Array as crate::programs::types::Typed>::r#type(&condition).into_owned();
+        let branch_type = <Array as crate::programs::types::Typed>::r#type(&on_true).into_owned();
 
         // Build `select(condition, on_true, on_false)` over the test enum, treat only the branches as linear, and
         // interpret the pullback on `[cotangent, condition]`.
-        let mut builder = ProgramBuilder::<TestArray, crate::tracing_v2::ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, crate::backends::arrays::ArrayOperation<Array>>::new();
         let condition_input = builder.add_input(condition_type.clone());
         let on_true_input = builder.add_input(branch_type.clone());
         let on_false_input = builder.add_input(branch_type.clone());
@@ -543,11 +545,7 @@ mod tests {
             .add_instruction(SelectOperation, Vec::new(), vec![condition_input, on_true_input, on_false_input])
             .unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray, TestArray), TestArray>(
-                vec![output],
-                (Placeholder, Placeholder, Placeholder),
-                Placeholder,
-            )
+            .build::<(Array, Array, Array), Array>(vec![output], (Placeholder, Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
         assert_eq!(pullback.output_ids().len(), 2, "the known condition input must receive no cotangent output");
@@ -557,7 +555,7 @@ mod tests {
         // `on_true` cotangent keeps the cotangent at the true batch items and zeroes the rest (`[5, 0]`), and the
         // `on_false` cotangent does the opposite (`[0, 7]`).
         assert_eq!(branch_cotangents.len(), 2);
-        assert_eq!(branch_cotangents[0].values, vec![5.0, 0.0]);
-        assert_eq!(branch_cotangents[1].values, vec![0.0, 7.0]);
+        assert_eq!(branch_cotangents[0].to_f64s(), vec![5.0, 0.0]);
+        assert_eq!(branch_cotangents[1].to_f64s(), vec![0.0, 7.0]);
     }
 }

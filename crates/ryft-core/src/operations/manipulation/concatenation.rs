@@ -114,7 +114,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Concaten
 /// ```rust
 /// # use ryft_core::operations::manipulation::Concatenate;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Join two 1x2 matrices along axis 0 into a 2x2 matrix. This is equivalent to
@@ -123,13 +123,13 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Concaten
 /// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
 /// let z = Concatenate::concatenate(&[x, y], 0)?;
 /// // `z` has shape [2, 2] with values [[1.0, 2.0], [3.0, 4.0]].
-/// assert_eq!(z.values, vec![1.0, 2.0, 3.0, 4.0]);
+/// assert_eq!(z.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
 ///
 /// // Joining the same operands along axis 1 produces a 1x4 matrix instead.
 /// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
 /// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
 /// let z = Concatenate::concatenate(&[x, y], 1)?;
-/// assert_eq!(z.values, vec![1.0, 2.0, 3.0, 4.0]);
+/// assert_eq!(z.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -291,13 +291,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::tests::TestArray;
     use crate::types::DataType;
 
     use super::*;
@@ -326,13 +326,11 @@ mod tests {
         assert_eq!(ArrayType::concatenate(std::slice::from_ref(&first_type), 0), Ok(first_type.clone()));
 
         // Interpretation joins the row-major payloads along axis 0.
-        let first = TestArray::matrix(1, 2, vec![1.0, 2.0]);
-        let second = TestArray::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[first, second])
-            .unwrap();
+        let first = Array::matrix(1, 2, vec![1.0, 2.0]);
+        let second = Array::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let output = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first, second]).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
         // Concatenating along a middle axis keeps the leading and trailing axes and sums the middle one.
         let middle = ConcatenateOperation::new(1);
@@ -424,13 +422,13 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured axis.
-        let mut builder = ProgramBuilder::<TestArray, ConcatenateOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ConcatenateOperation>::new();
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
         let program_output =
             builder.add_instruction(operation, Vec::new(), vec![program_first, program_second]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -502,11 +500,11 @@ mod tests {
     fn test_concatenate_test_array_kernel() {
         // A rank-3 concatenation along a middle axis exercises the row-major odometer: the two operands interleave
         // their middle-axis blocks while keeping the leading and trailing axes intact.
-        let first = TestArray::new(
+        let first = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
-        let second = TestArray::new(
+        let second = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
         );
@@ -516,19 +514,19 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
         );
         // Each leading slice gets the first operand's slice followed by the second operand's two slices.
-        assert_eq!(output.values, vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
 
         // Three operands joined along axis 0 stack in order.
         let output = Concatenate::concatenate(
-            &[TestArray::vector(vec![1.0]), TestArray::vector(vec![2.0, 3.0]), TestArray::vector(vec![4.0])],
+            &[Array::vector(vec![1.0]), Array::vector(vec![2.0, 3.0]), Array::vector(vec![4.0])],
             0,
         )
         .unwrap();
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
 
         // The kernel validates its operand shapes eagerly through the type-level capability.
         assert_eq!(
-            Concatenate::concatenate(&[TestArray::vector(vec![1.0]), TestArray::scalar(2.0)], 0),
+            Concatenate::concatenate(&[Array::vector(vec![1.0]), Array::scalar(2.0)], 0),
             Err(ProgramError::Type(TypeError {
                 message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 1"
                     .to_string(),

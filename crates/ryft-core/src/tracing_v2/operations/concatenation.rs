@@ -171,13 +171,13 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::operations::manipulation::Concatenate;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape};
 
     use super::*;
@@ -188,29 +188,29 @@ mod tests {
         // f(x, y) = sum(concatenate([x, y], 0) * w) with w = [1, 2, 3, 4, 5]: the joined output is [x0, x1, y0, y1,
         // y2], so f = x0 + 2*x1 + 3*y0 + 4*y1 + 5*y2. The pullback slices the weighted cotangent [1, 2, 3, 4, 5] into
         // the first two entries for x and the last three for y.
-        let (value, (x_gradient, y_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, (x_gradient, y_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |(x, y)| {
-                    let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
+                    let weights = x.context().lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
                     (Concatenate::concatenate(&[x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
                 },
-                (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0, 4.0, 5.0])),
+                (Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])),
             )
             .unwrap();
         // f = 1 + 4 + 9 + 16 + 25 = 55.
-        assert_abs_diff_eq!(value.values[0], 55.0, epsilon = 1e-9);
-        assert_eq!(x_gradient.values, vec![1.0, 2.0]);
-        assert_eq!(y_gradient.values, vec![3.0, 4.0, 5.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 55.0, epsilon = 1e-9);
+        assert_eq!(x_gradient.to_f64s(), vec![1.0, 2.0]);
+        assert_eq!(y_gradient.to_f64s(), vec![3.0, 4.0, 5.0]);
     }
 
     #[test]
     fn test_concatenate_jacfwd_stacks_operand_coordinates() {
         // Forward mode through `f(x, y) = concatenate([x, y], 0)` over `x = [a, b]` and `y = [c]` produces one
         // selection Jacobian block per operand: `x` maps to the first two output rows and `y` to the last.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |(x, y)| Concatenate::concatenate(&[x, y], 0),
-                (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0])),
+                (Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0])),
             )
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -230,18 +230,18 @@ mod tests {
         // Two batched operands keep their batch axis at 0 and concatenate along the shifted axis 1: batch item 0 joins
         // [0, 1] with [4, 5] and batch item 1 joins [2, 3] with [6, 7].
         let first = {
-            let value = TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
+            let value = Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let second = {
-            let value = TestArray::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]);
+            let value = Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[first, second],
             )
@@ -249,37 +249,37 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(4)]);
-        assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
 
         // A replicated operand is broadcast to gain the batch axis so each batch item concatenates the same copy.
         let batched = {
-            let value = TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
+            let value = Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
+        let uniform = ArrayBatch::replicated(Array::vector(vec![8.0, 9.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[batched, uniform],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
 
         // Replicated operands pass through the unlifted rule.
-        let left = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
-        let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
+        let left = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
+        let right = ArrayBatch::replicated(Array::vector(vec![3.0]));
         let outputs = ConcatenateOperation::new(0)
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[left, right],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -296,15 +296,15 @@ mod tests {
                 .unwrap();
             let mapped = ArrayBatch::new(
                 physical_type.clone(),
-                TestArray::new(physical_type, vec![1.0, 2.0, 3.0, 4.0]),
+                Array::from_f64s(physical_type, vec![1.0, 2.0, 3.0, 4.0]),
                 BatchAxis::new(0),
             )
             .unwrap();
             let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
-            let replicated = ArrayBatch::replicated(TestArray::new(replicated_type, vec![5.0]));
-            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+            let replicated = ArrayBatch::replicated(Array::from_f64s(replicated_type, vec![5.0]));
+            let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = ConcatenateOperation::new(0)
@@ -314,7 +314,7 @@ mod tests {
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
-            assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 5.0, 3.0, 4.0, 5.0]);
+            assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 5.0, 3.0, 4.0, 5.0]);
         }
     }
 }

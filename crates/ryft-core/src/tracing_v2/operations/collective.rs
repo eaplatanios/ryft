@@ -605,19 +605,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::AxisIndex;
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{
         ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
     };
     use crate::contexts::EagerContext;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{Shape, Size};
 
     use super::*;
 
     /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
     /// contains every operation the collective batching rule may bind (notably `FillOperation` for `PMean`).
-    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<TestArray, ArrayOperation<TestArray>>> {
+    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
 
@@ -626,7 +625,7 @@ mod tests {
         // Mapped input shape [3] at axis 0: per-item scalar. PSum collapses the batch axis to a
         // replicated scalar holding the total.
         let input = {
-            let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+            let value = Array::vector(vec![1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -641,7 +640,7 @@ mod tests {
     #[test]
     fn test_collective_pmax_reduces_along_the_batch_axis() {
         let input = {
-            let value = TestArray::vector(vec![1.0, 4.0, 2.0]);
+            let value = Array::vector(vec![1.0, 4.0, 2.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -655,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_collective_passes_through_replicated_input() {
-        let input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
+        let input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
             .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
             .unwrap();
@@ -667,46 +666,44 @@ mod tests {
     #[test]
     fn test_collective_over_unbound_axis_is_rejected() {
         use crate::axes::AxisError;
+        use crate::backends::arrays::{Array, ArrayOperation};
         use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingTracer};
         use crate::contexts::EagerContext;
-        use crate::tests::TestArray;
-        use crate::tracing_v2::ArrayOperation;
 
         // The batch binds the axis `"i"`, but the collective names `"j"`, which no enclosing transform binds. Rather
         // than silently acting as identity (the pre-validation behavior), staging the collective fails fast with
         // `AxisError::UnboundAxisName`, matching JAX's error for a collective over an unbound axis name. The error
         // rides the `ProgramError::Custom` channel as a `BatchingError::Axis` and is re-typed at the public `batch`
         // boundary, so the surfaced error is exactly that variant.
-        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
-                    item.collective("j", CollectiveKind::PSum)
-                },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
-                BatchAxis::new(0),
-                BatchAxis::replicated(),
-                BatchAxisSpecification::named("i"),
-            );
+        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                item.collective("j", CollectiveKind::PSum)
+            },
+            Array::vector(vec![1.0, 2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::named("i"),
+        );
         assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
+        use crate::backends::arrays::{Array, ArrayOperation};
         use crate::batching::{Batch, BatchAxisSpecification};
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
-        use crate::tests::TestArray;
-        use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
+        use crate::tracing_v2::ReverseModeDifferentiate;
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `psum`, which re-broadcasts the cotangent across the batch items, giving `∂g/∂x_i = 1`
         // for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
-                |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                     let context = x.context().clone();
-                    let total: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let total: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| item.collective("i", CollectiveKind::PSum),
                         x,
@@ -717,31 +714,31 @@ mod tests {
                     .unwrap();
                     total
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]),
             )
             .unwrap();
-        assert_eq!(value.values, vec![6.0]);
-        assert_eq!(gradient.values, vec![1.0, 1.0, 1.0]);
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 1.0]);
     }
 
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
+        use crate::backends::arrays::{Array, ArrayOperation};
         use crate::batching::{Batch, BatchAxisSpecification};
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
-        use crate::tests::TestArray;
-        use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
+        use crate::tracing_v2::ReverseModeDifferentiate;
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `pmean`, which carries the `1/N` factor, so `∂g/∂x_i = 1/N` for every input. With `x =
         // [1, 2, 3]` (so `N = 3`) the value is `2` and the gradient is `[1/3, 1/3, 1/3]`, witnessing the `1/N`
         // scaling that distinguishes `pmean` from `psum`.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
-                |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                     let context = x.context().clone();
-                    let mean: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let mean: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| item.collective("i", CollectiveKind::PMean),
                         x,
@@ -752,22 +749,22 @@ mod tests {
                     .unwrap();
                     mean
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]),
             )
             .unwrap();
-        assert_eq!(value.values, vec![2.0]);
-        assert_eq!(gradient.values, vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
+        assert_eq!(value.to_f64s(), vec![2.0]);
+        assert_eq!(gradient.to_f64s(), vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
     }
 
     #[test]
     fn test_nested_batch_named_axes_route_collectives_to_matching_level() {
         // The inner `psum` targets the *outer* named axis, so each inner batch item must reduce over the
         // outer batch items: column sums of [[1, 2], [3, 4]].
-        let x = TestArray::new(
+        let x = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |row| {
                     let context = row.context().clone();
@@ -787,25 +784,25 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
-        assert_eq!(output.values, vec![4.0, 6.0]);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
+        assert_eq!(output.to_f64s(), vec![4.0, 6.0]);
     }
 
     #[test]
     fn test_batch_axis_index_produces_per_item_indices() {
         // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
         // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |item| item.context().axis_index("i"),
-                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                Array::vector(vec![10.0, 20.0, 30.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 BatchAxisSpecification::named("i"),
             )
             .unwrap();
-        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
-        assert_eq!(output.values, vec![0.0, 1.0, 2.0]);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -815,8 +812,8 @@ mod tests {
         // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
         // vary over inner items). The inner output is therefore declared replicated, and the
         // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
-        let x = TestArray::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |row| {
                     let context = row.context().clone();
@@ -836,21 +833,20 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
-        assert_eq!(output.values, vec![0.0, 1.0]);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0]);
     }
 
     #[test]
     fn test_batch_axis_index_rejects_unbound_axis() {
         // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
-        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .batch(
-                |item| item.context().axis_index("j"),
-                TestArray::vector(vec![10.0, 20.0, 30.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("i"),
-            );
+        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
+            |item| item.context().axis_index("j"),
+            Array::vector(vec![10.0, 20.0, 30.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        );
         assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 }

@@ -353,14 +353,14 @@ impl Operation<ArrayType> for ScatterOperation {
 /// ```rust
 /// # use ryft_core::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Add two row updates into rows 0 and 2 of a 3x2 zero matrix. Each query is a scalar row index, so the indices
 /// // have shape [2, 1] and each update window is a full row (update window axis 1).
 /// let operand = Array::matrix(3, 2, vec![0.0; 6]);
-/// let indices = Array::new(
+/// let indices = Array::from_f64s(
 ///     ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)])),
 ///     vec![0.0, 2.0],
 /// );
@@ -369,7 +369,7 @@ impl Operation<ArrayType> for ScatterOperation {
 /// let operation = ScatterOperation::new(dimensions, ScatterReductionKind::Add);
 /// let result = operand.scatter(&indices, &updates, &operation)?;
 /// // `result` is [[1, 2], [0, 0], [3, 4]].
-/// assert_eq!(result.values, vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
+/// assert_eq!(result.to_f64s(), vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -965,17 +965,17 @@ mod tests {
 
     #[test]
     fn test_scatter_eager_combiners() {
-        use crate::tests::TestArray;
+        use crate::backends::arrays::Array;
 
         // Scatter scalar updates into positions 1 and 3 of [1, 2, 3, 4]; the scattered axis is inserted (window
         // size 1), so there are no update window axes.
         let dimensions = || ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let indices = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 3.0]);
+        let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 3.0]);
         let run = |kind| {
-            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
-                .scatter(&indices, &TestArray::vector(vec![100.0, 200.0]), &ScatterOperation::new(dimensions(), kind))
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0])
+                .scatter(&indices, &Array::vector(vec![100.0, 200.0]), &ScatterOperation::new(dimensions(), kind))
                 .unwrap()
-                .values
+                .to_f64s()
         };
         assert_eq!(run(ScatterReductionKind::Add), vec![1.0, 102.0, 3.0, 204.0]);
         assert_eq!(run(ScatterReductionKind::Overwrite), vec![1.0, 100.0, 3.0, 200.0]);
@@ -984,14 +984,14 @@ mod tests {
         assert_eq!(run(ScatterReductionKind::Max), vec![1.0, 100.0, 3.0, 200.0]);
 
         // Non-unique indices accumulate under Add: both updates target position 1.
-        let repeated = TestArray::new(indices_type(vec![2, 1]), vec![1.0, 1.0]);
-        let result = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])
+        let repeated = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 1.0]);
+        let result = Array::vector(vec![1.0, 2.0, 3.0, 4.0])
             .scatter(
                 &repeated,
-                &TestArray::vector(vec![100.0, 200.0]),
+                &Array::vector(vec![100.0, 200.0]),
                 &ScatterOperation::new(dimensions(), ScatterReductionKind::Add),
             )
             .unwrap();
-        assert_eq!(result.values, vec![1.0, 302.0, 3.0, 4.0]);
+        assert_eq!(result.to_f64s(), vec![1.0, 302.0, 3.0, 4.0]);
     }
 }

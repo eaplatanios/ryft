@@ -107,14 +107,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeO
 /// ```rust
 /// # use ryft_core::operations::manipulation::Reshape;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Reshape a length-6 vector to a `[2, 3]` matrix while keeping the row-major payload unchanged.
 /// let x = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let y = x.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)]))?;
-/// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// assert_eq!(y.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -298,6 +298,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -305,7 +306,6 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::tests::TestArray;
     use crate::types::DataType;
 
     use super::*;
@@ -330,12 +330,12 @@ mod tests {
         assert_eq!(input_type.reshape(shape.clone()), Ok(output_type.clone()));
 
         // Interpretation reinterprets the row-major payload under the target shape.
-        let input = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
-        assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -347,9 +347,9 @@ mod tests {
             Err(TypeError { message: "'reshape' changes the number of elements".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
-                &EagerContext::<TestArray>::new(),
+                &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[]
             ),
@@ -357,10 +357,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured output shape.
-        let mut builder = ProgramBuilder::<TestArray, ReshapeOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ReshapeOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -397,7 +397,7 @@ mod tests {
             Err(TypeError { message: "'reshape' requires statically known output element counts".to_string() }),
         );
         assert_eq!(
-            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
             Err(ProgramError::Type(TypeError {
                 message: "'reshape' requires statically known output element counts".to_string(),
             })),

@@ -219,11 +219,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -236,34 +236,33 @@ mod tests {
         // strided slice of the weighted cotangent at the pad geometry (positions 1, 3, and 5 of w) and the
         // padding-value gradient is the sum over the padding positions, computed as sum(w) - sum(sliced w) =
         // 36 - 12 = 24.
-        let (value, (input_gradient, padding_value_gradient)) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .value_and_gradient(
-                    |(x, padding_value)| {
-                        let weights =
-                            x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
-                        (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-                    },
-                    (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
-                )
-                .unwrap();
+        let (value, (input_gradient, padding_value_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(
+                |(x, padding_value)| {
+                    let weights =
+                        x.context().lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
+                    (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
+                },
+                (Array::vector(vec![1.0, 2.0, 3.0]), Array::scalar(9.0)),
+            )
+            .unwrap();
         // f = 2 * 1 + 4 * 2 + 6 * 3 + 24 * 9 = 28 + 216.
-        assert_abs_diff_eq!(value.values[0], 244.0, epsilon = 1e-9);
-        assert_eq!(input_gradient.values, vec![2.0, 4.0, 6.0]);
-        assert_eq!(padding_value_gradient.values, vec![24.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 244.0, epsilon = 1e-9);
+        assert_eq!(input_gradient.to_f64s(), vec![2.0, 4.0, 6.0]);
+        assert_eq!(padding_value_gradient.to_f64s(), vec![24.0]);
     }
 
     #[test]
     fn test_pad_jacfwd_scatters_input_coordinates() {
         // Forward mode through `f(x) = pad(x, 0, low=[1], high=[2], interior=[1])` produces the 8x3 scatter
         // Jacobian: output positions 1, 3, and 5 hold the input coordinates.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |x| {
-                    let padding_value = x.context().lift(TestArray::scalar(0.0))?;
+                    let padding_value = x.context().lift(Array::scalar(0.0))?;
                     x.pad(&padding_value, &[1], &[2], &[1])
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]),
             )
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -288,63 +287,63 @@ mod tests {
     fn test_pad_batching_lifts_batch_axis_with_zero_paddings() {
         // A batched input keeps its batch axis by padding it with zero amounts: each batch item pads independently.
         let input = {
-            let value = TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+            let value = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let padding_value = ArrayBatch::replicated(TestArray::scalar(0.0));
+        let padding_value = ArrayBatch::replicated(Array::scalar(0.0));
         let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input.clone(), padding_value],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]);
 
         // Replicated operands pass through the unlifted rule.
-        let uniform = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
+        let uniform = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
-                &[uniform, ArrayBatch::replicated(TestArray::scalar(0.0))],
+                &[uniform, ArrayBatch::replicated(Array::scalar(0.0))],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0]);
 
         // Batch-varying padding values expand per item: item 0 pads with 8 and item 1 pads with 9.
         let batch_varying = {
-            let value = TestArray::vector(vec![8.0, 9.0]);
+            let value = Array::vector(vec![8.0, 9.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying.clone()],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
 
         // A replicated input is broadcast to gain the batch axis when only the padding value is batched.
-        let uniform_input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
+        let uniform_input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]));
         let outputs = operation
             .batch(
-                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2),
+                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
                 &crate::EmptyRegionDriver,
                 &[uniform_input, batch_varying],
             )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -361,7 +360,7 @@ mod tests {
                 .unwrap();
             let input = ArrayBatch::new(
                 input_type.clone(),
-                TestArray::new(input_type, vec![1.0, 2.0, 3.0, 4.0]),
+                Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]),
                 BatchAxis::new(0),
             )
             .unwrap();
@@ -373,10 +372,13 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let padding =
-                ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, vec![8.0, 9.0]), BatchAxis::new(0))
-                    .unwrap();
-            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 2)
+            let padding = ArrayBatch::new(
+                padding_type.clone(),
+                Array::from_f64s(padding_type, vec![8.0, 9.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
@@ -390,7 +392,7 @@ mod tests {
                 outputs[0].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             );
-            assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
+            assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
         }
     }
 
@@ -407,7 +409,8 @@ mod tests {
                 .with_sharding(physical_sharding.clone())
                 .unwrap();
             let input =
-                ArrayBatch::new(input_type.clone(), TestArray::new(input_type, Vec::new()), BatchAxis::new(0)).unwrap();
+                ArrayBatch::new(input_type.clone(), Array::from_f64s(input_type, Vec::new()), BatchAxis::new(0))
+                    .unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -417,9 +420,9 @@ mod tests {
                 )
                 .unwrap();
             let padding =
-                ArrayBatch::new(padding_type.clone(), TestArray::new(padding_type, Vec::new()), BatchAxis::new(0))
+                ArrayBatch::new(padding_type.clone(), Array::from_f64s(padding_type, Vec::new()), BatchAxis::new(0))
                     .unwrap();
-            let context = BatchingContext::new(EagerContext::<TestArray>::new(), 0)
+            let context = BatchingContext::new(EagerContext::<Array>::new(), 0)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
@@ -431,7 +434,7 @@ mod tests {
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
             assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(3)]);
-            assert!(outputs[0].value().values.is_empty());
+            assert!(outputs[0].value().values().is_empty());
         }
     }
 }

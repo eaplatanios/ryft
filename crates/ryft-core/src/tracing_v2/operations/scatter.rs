@@ -210,21 +210,21 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
-    use crate::tests::TestArray;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ArrayOperation, DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
     fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
     where
         V: crate::programs::Value<Type = ArrayType>,
-        V::DispatchDomain: crate::contexts::Context<Constant = TestArray>,
+        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
         let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
-        exemplar.dispatch_domain().lift(TestArray::new(r#type, values)).unwrap()
+        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         // Scatter-add is the identity in its operand (`∂output/∂operand = I`), so the operand gradient is the all-ones
         // cotangent unchanged, while the update gradient gathers that cotangent at the captured indices — the
         // scatter-add/gather transpose duality.
-        let (value, (operand_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, (operand_gradient, update_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |(x, updates)| {
                     let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
@@ -243,12 +243,12 @@ mod tests {
                     );
                     x.scatter(&indices, &updates, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
                 },
-                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])),
+                (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![10.0, 20.0])),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 40.0, epsilon = 1e-9);
-        assert_eq!(operand_gradient.values, vec![1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(update_gradient.values, vec![1.0, 1.0]);
+        assert_abs_diff_eq!(value.to_f64s()[0], 40.0, epsilon = 1e-9);
+        assert_eq!(operand_gradient.to_f64s(), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
     }
 
     #[test]
@@ -256,18 +256,18 @@ mod tests {
         // Forward mode through `f(x) = scatter_add(x, [[1], [3]], [10, 20])` exercises the captured-index scatter-add
         // under batched basis tangents (the per-item batch rule). Scatter-add is the identity in its operand, so the
         // Jacobian with respect to `x` is the identity matrix.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |x| {
                     let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
-                    let updates = x.context().lift(TestArray::vector(vec![10.0, 20.0]))?;
+                    let updates = x.context().lift(Array::vector(vec![10.0, 20.0]))?;
                     let operation = ScatterOperation::new(
                         ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                         ScatterReductionKind::Add,
                     );
                     Ok(x.scatter(&indices, &updates, &operation).unwrap())
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();

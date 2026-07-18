@@ -269,59 +269,60 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
-    use crate::tests::TestArray;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::programs::types::Typed;
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType};
 
     use super::ConvertElementType;
 
     #[test]
     fn test_convert_element_type_jvp_uses_differential_representations() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
-        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (output, output_tangent) =
             context.jvp(|value| value.convert_element_type(DataType::F32), primal, tangent).unwrap();
-        assert_eq!(output.r#type, ArrayType::scalar(DataType::F32));
-        assert_eq!(output_tangent, TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
-        let primal = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
-        let tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (_, output_tangent) =
             context.jvp(|value| value.convert_element_type(DataType::F8E8M0FNU), primal, tangent).unwrap();
-        assert_eq!(output_tangent, TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
     }
 
     #[test]
     fn test_convert_element_type_jvp_converts_narrower_real_and_complex_tangents() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         let (_, tangent) = context
             .jvp(
                 |value| value.convert_element_type(DataType::F32),
-                TestArray::new(ArrayType::scalar(DataType::F64), vec![2.0]),
-                TestArray::new(ArrayType::scalar(DataType::F64), vec![3.0]),
+                Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]),
+                Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]),
             )
             .unwrap();
-        assert_eq!(tangent, TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
         let (_, tangent) = context
             .jvp(
                 |value| value.convert_element_type(DataType::C64),
-                TestArray::new(ArrayType::scalar(DataType::C128), vec![2.0]),
-                TestArray::new(ArrayType::scalar(DataType::C128), vec![3.0]),
+                Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]),
+                Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]),
             )
             .unwrap();
-        assert_eq!(tangent, TestArray::new(ArrayType::scalar(DataType::C64), vec![3.0]));
+        assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]));
     }
 
     #[test]
     fn test_convert_element_type_jvp_is_zero_through_non_differentiable_types() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primal = TestArray::new(ArrayType::scalar(DataType::F64), vec![2.75]);
-        let tangent = TestArray::new(ArrayType::scalar(DataType::F64), vec![3.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]);
+        let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
         let (output, output_tangent) = context
             .jvp(
                 |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64),
@@ -329,7 +330,7 @@ mod tests {
                 tangent,
             )
             .unwrap();
-        assert_eq!(output.r#type, ArrayType::scalar(DataType::F64));
-        assert_eq!(output_tangent, TestArray::new(ArrayType::scalar(DataType::F64), vec![0.0]));
+        assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]));
     }
 }
