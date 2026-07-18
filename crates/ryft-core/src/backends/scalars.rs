@@ -39,9 +39,10 @@ use crate::operations::math::{
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
+use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::{ProgramError, Value};
+use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
@@ -49,15 +50,9 @@ use crate::tracing_v2::operations::custom_derivatives::{
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::DataType;
 
-// TODO(eaplatanios): Review `ScalarOperation` and its implementations.
+// TODO(eaplatanios): Review this module.
 
-/// Closed scalar operation type for ordinary staged scalar programs.
-///
-/// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar [`DataType`] metadata.
-/// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
-/// through array-based backends, but they are not variants of this enum. Each variant simply wraps the same-named
-/// operation payload, and the program-valued payloads (e.g., the custom-derivative calls) are boxed because they are
-/// recursively parameterized by this enum itself.
+/// Closed [`Scalar`] [`Operation`] type for ordinary staged scalar [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(differentiation, transposition))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {
@@ -91,12 +86,12 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Select(SelectOperation),
     While(WhileOperation),
     StopGradient(StopGradientOperation),
-    Tag(TagOperation),
     Print(PrintOperation),
+    Tag(TagOperation),
+    Rematerialize(RematerializeOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
     CustomVjpTangent(CustomVjpTangentOperation<DataType>),
-    Rematerialize(RematerializeOperation),
 }
 
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
