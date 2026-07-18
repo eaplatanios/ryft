@@ -792,43 +792,24 @@ macro_rules! define_tracer_operator {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
-/// Checks a concrete [`Operation`](crate::Operation) contract through Ryft's reference transform machinery. This macro
-/// is intended for operation unit tests in Ryft and downstream crates. Its selectors describe the semantic test case,
-/// while its input and output lists encode [`Operation`](crate::Operation) arity directly:
-///
-///   - `@batching @exact` / `@batching @approx(epsilon = ...)`: Applies an operation to one or more batching cases.
-///     Each input and expected output is written as `(@mapped(axis = ...), value)` or `(@replicated, value)`.
-///     The default form uses the eager [`Array`](crate::Array) reference context, an
-///     [`EmptyRegionDriver`](crate::EmptyRegionDriver), and replicated mapped-axis sharding. The extended
-///     form accepts `context`, `driver`, and `axis_sharding` expressions. Exact comparison checks complete
-///     [`ArrayBatch`](crate::ArrayBatch) equality. Approximate comparison still checks output types and
-///     batch axes exactly and applies the epsilon only to `f64` payload values.
-///   - `@partial_evaluation`: Builds a one-instruction program for each case and checks its partial-evaluation output
-///     classification, residual instruction count, and replayed values. `@partial_evaluation @fold_and_residualize`
-///     is the concise form for a single-output operation using the default partial-evaluation rule. That form checks
-///     the all-known case, every individual unknown-input position, and the all-unknown case. Explicit cases use
-///     `(@known, value)` or `(@unknown(type = ..., replay = ...))`. Outputs use `(@known, value)` or `(@residual,
-///     value)`. The default form uses the eager [`Scalar`](crate::Scalar) reference backend. The extended
-///     `backend = (Value, Operation)` form supports downstream value and operation families.
-///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
-///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands
-///     must carry the same reduced-axis markers.
-///   - `@reject @transposition`: Builds a one-instruction array program and checks that transposition
-///     reaches the operation's unsupported-transposition error. The input type list encodes arity.
-///
-/// [`Region`](crate::Region)-ful operations may use the extended batching form with their
-/// [`Instruction`](crate::Instruction)-scoped driver, but tests whose main subject is nested-region
+/// Checks how a concrete [`Operation`](crate::Operation) behaves under batching. Each input and expected output
+/// is written as `(@mapped(axis = ...), value)` or `(@replicated, value)`, so the lists encode operation arity
+/// and batch placement directly. Use `@exact` to compare complete [`ArrayBatch`](crate::ArrayBatch) values or
+/// `@approx(epsilon = ...)` to compare `f64` payloads approximately while still checking output types
+/// and batch axes exactly. The default form uses the eager [`Array`](crate::Array) reference context, an
+/// [`EmptyRegionDriver`](crate::EmptyRegionDriver), and replicated mapped-axis sharding. The extended form accepts a
+/// custom `context`, `driver`, and `axis_sharding`. [`Region`](crate::Region)-ful operations may use that form with
+/// their [`Instruction`](crate::Instruction)-scoped driver, but tests whose main subject is nested-region
 /// transformation should generally keep that setup explicit.
 ///
 /// # Example
-/// 
+///
 /// This is an example for how to use this macro to check the elementwise [`AddOperation`](crate::AddOperation):
 ///
 /// ```rust
-/// # use ryft_core::{Array, AddOperation, check_operation};
-/// check_operation!(
-///     @batching @exact,
+/// # use ryft_core::{Array, AddOperation, check_operation_batching};
+/// check_operation_batching!(
+///     @exact,
 ///     operation = AddOperation,
 ///     axis_size = 2,
 ///     cases = [
@@ -847,107 +828,105 @@ macro_rules! define_tracer_operator {
 ///
 /// # Parameters
 ///
+///   - `context = $context`: Optional parent [`Context`](crate::Context) for the extended batching form.
+///   - `driver = $driver`: Optional [`BatchingDriver`](crate::BatchingDriver) for the extended batching form.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
 ///   - `axis_size = $axis_size`: Size of the mapped batching axis. It remains explicit because no mapped input exists
 ///     from which to infer it in an all-replicated case.
-///   - `cases = $cases`: Batching or partial-evaluation cases. Every case declares its inputs and expected outputs.
-///     Partial-evaluation cases additionally declare the expected residual instruction count.
-///   - `context = $context`: Optional parent [`Context`](crate::Context) for the extended batching form.
-///   - `driver = $driver`: Optional [`BatchingDriver`](crate::BatchingDriver) for the extended batching form.
 ///   - `axis_sharding = $axis_sharding`: Optional [`ShardingDimension`](crate::ShardingDimension) assigned to the
-///     mapped axis by the extended batching form.
-///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct
-///     partial-evaluation or transposition programs for downstream operation families.
-///   - `input_types = $input_types`: Input types used by rejection checks, in operation input order.
+///     mapped axis by the extended form. It appears immediately after `axis_size` because both arguments describe the
+///     transform-owned mapped axis.
+///   - `cases = $cases`: Batching cases declaring their inputs and expected outputs.
 #[macro_export]
-macro_rules! check_operation {
+macro_rules! check_operation_batching {
     (
-        @batching @exact,
+        @exact,
         operation = $operation:expr,
         axis_size = $axis_size:expr,
         cases = $cases:tt $(,)?
     ) => {
-        $crate::check_operation!(
-            @batching_run (@exact),
+        $crate::check_operation_batching!(
+            @run (@exact),
             context = $crate::contexts::EagerContext::<
                 $crate::backends::arrays::Array,
                 $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
             >::new(),
             driver = &$crate::programs::regions::EmptyRegionDriver,
-            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
             operation = $operation,
             axis_size = $axis_size,
+            axis_sharding = $crate::sharding::ShardingDimension::Replicated,
             cases = $cases,
         )
     };
 
     (
-        @batching @approx(epsilon = $epsilon:expr),
+        @approx(epsilon = $epsilon:expr),
         operation = $operation:expr,
         axis_size = $axis_size:expr,
         cases = $cases:tt $(,)?
     ) => {
-        $crate::check_operation!(
-            @batching_run (@approx($epsilon)),
+        $crate::check_operation_batching!(
+            @run (@approx($epsilon)),
             context = $crate::contexts::EagerContext::<
                 $crate::backends::arrays::Array,
                 $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
             >::new(),
             driver = &$crate::programs::regions::EmptyRegionDriver,
+            operation = $operation,
+            axis_size = $axis_size,
             axis_sharding = $crate::sharding::ShardingDimension::Replicated,
-            operation = $operation,
-            axis_size = $axis_size,
             cases = $cases,
         )
     };
 
     (
-        @batching @exact,
+        @exact,
         context = $context:expr,
         driver = $driver:expr,
-        axis_sharding = $axis_sharding:expr,
         operation = $operation:expr,
         axis_size = $axis_size:expr,
+        axis_sharding = $axis_sharding:expr,
         cases = $cases:tt $(,)?
     ) => {
-        $crate::check_operation!(
-            @batching_run (@exact),
+        $crate::check_operation_batching!(
+            @run (@exact),
             context = $context,
             driver = $driver,
-            axis_sharding = $axis_sharding,
             operation = $operation,
             axis_size = $axis_size,
+            axis_sharding = $axis_sharding,
             cases = $cases,
         )
     };
 
     (
-        @batching @approx(epsilon = $epsilon:expr),
+        @approx(epsilon = $epsilon:expr),
         context = $context:expr,
         driver = $driver:expr,
-        axis_sharding = $axis_sharding:expr,
         operation = $operation:expr,
         axis_size = $axis_size:expr,
+        axis_sharding = $axis_sharding:expr,
         cases = $cases:tt $(,)?
     ) => {
-        $crate::check_operation!(
-            @batching_run (@approx($epsilon)),
+        $crate::check_operation_batching!(
+            @run (@approx($epsilon)),
             context = $context,
             driver = $driver,
-            axis_sharding = $axis_sharding,
             operation = $operation,
             axis_size = $axis_size,
+            axis_sharding = $axis_sharding,
             cases = $cases,
         )
     };
 
+    // Internal implementation branch of this macro.
     (
-        @batching_run $comparison:tt,
+        @run $comparison:tt,
         context = $context:expr,
         driver = $driver:expr,
-        axis_sharding = $axis_sharding:expr,
         operation = $operation:expr,
         axis_size = $axis_size:expr,
+        axis_sharding = $axis_sharding:expr,
         cases = [
             $(
                 {
@@ -964,8 +943,8 @@ macro_rules! check_operation {
         let context = $crate::batching::BatchingContext::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
-            let inputs = vec![$($crate::check_operation!(@batch_value $input)),*];
-            let expected_outputs = vec![$($crate::check_operation!(@batch_value $output)),*];
+            let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
+            let expected_outputs = vec![$($crate::check_operation_batching!(@batch_value $output)),*];
             let actual_outputs = $crate::batching::BatchableOperation::batch(
                 &operation,
                 &context,
@@ -973,24 +952,28 @@ macro_rules! check_operation {
                 inputs.as_slice(),
             )
             .unwrap();
-            $crate::check_operation!(@compare_batches $comparison, actual_outputs, expected_outputs);
+            $crate::check_operation_batching!(@compare_batches $comparison, actual_outputs, expected_outputs);
         )*
     }};
 
+    // Internal implementation branch of this macro.
     (@batch_value (@mapped(axis = $axis:expr), $value:expr)) => {{
         let value = $value;
         let r#type = $crate::programs::types::Typed::r#type(&value).into_owned();
         $crate::batching::ArrayBatch::new(r#type, value, $crate::batching::BatchAxis::new($axis)).unwrap()
     }};
 
+    // Internal implementation branch of this macro.
     (@batch_value (@replicated, $value:expr)) => {
         $crate::batching::ArrayBatch::replicated($value)
     };
 
+    // Internal implementation branch of this macro.
     (@compare_batches (@exact), $actual:expr, $expected:expr) => {{
         assert_eq!($actual, $expected);
     }};
 
+    // Internal implementation branch of this macro.
     (@compare_batches (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {{
         let actual = $actual;
         let expected = $expected;
@@ -1020,9 +1003,43 @@ macro_rules! check_operation {
             }
         }
     }};
+}
 
+/// Checks how a concrete [`Operation`](crate::Operation) behaves under partial evaluation. The concise
+/// `@fold_and_residualize` form checks the default rule for a single-output operation under which all-known inputs fold
+/// the operation, every individual unknown-input position residualizes it, and an all-unknown input set does the same.
+/// The explicit form builds a one-instruction program for each case and checks its output classification, residual
+/// instruction count, and replayed values. Inputs use `(@known, value)` or `(@unknown(type = ..., replay = ...))`.
+/// Outputs use `(@known, value)` or `(@residual, value)`. The default form uses the eager [`Scalar`](crate::Scalar)
+/// reference backend, while `backend = (Value, Operation)` supports downstream value and operation families.
+///
+/// # Example
+///
+/// This is an example for how to use this macro to check the elementwise [`NegOperation`](crate::NegOperation):
+///
+/// ```rust
+/// # use ryft_core::{NegOperation, Scalar, check_operation_partial_evaluation};
+/// check_operation_partial_evaluation!(
+///     @fold_and_residualize,
+///     operation = NegOperation,
+///     inputs = [Scalar::from(2.0)],
+///     expected = Scalar::from(-2.0),
+/// );
+/// ```
+///
+/// # Parameters
+///
+///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
+///   - `inputs = $inputs`: Concrete inputs checked by the concise `@fold_and_residualize` form.
+///   - `expected = $expected`: Expected concrete output of the concise `@fold_and_residualize` form.
+///   - `cases = $cases`: Explicit partial-evaluation cases, including expected output classifications and residual
+///     instruction counts.
+///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct programs
+///     for downstream operation families.
+#[macro_export]
+macro_rules! check_operation_partial_evaluation {
     (
-        @partial_evaluation @fold_and_residualize,
+        @fold_and_residualize,
         operation = $operation:expr,
         inputs = [$($input:expr),+ $(,)?],
         expected = $expected:expr $(,)?
@@ -1068,7 +1085,7 @@ macro_rules! check_operation {
         assert_eq!(evaluation.outputs().len(), 1);
         assert!(evaluation.outputs()[0].is_known());
         assert_eq!(evaluation.interpret(&context, &[]).unwrap(), vec![expected.clone()]);
-
+        
         for unknown_index in 0..inputs.len() {
             let mut knowledge = known.clone();
             knowledge[unknown_index] = $crate::partial::PartialValue::Unknown(
@@ -1102,12 +1119,10 @@ macro_rules! check_operation {
     }};
 
     (
-        @partial_evaluation,
         operation = $operation:expr,
         cases = $cases:tt $(,)?
     ) => {
-        $crate::check_operation!(
-            @partial_evaluation,
+        $crate::check_operation_partial_evaluation!(
             backend = (
                 $crate::backends::scalars::Scalar,
                 $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>
@@ -1118,7 +1133,6 @@ macro_rules! check_operation {
     };
 
     (
-        @partial_evaluation,
         backend = ($value:ty, $operation_family:ty),
         operation = $operation:expr,
         cases = [
@@ -1135,9 +1149,9 @@ macro_rules! check_operation {
         $(
         {
             let inputs: Vec<($crate::partial::PartialValue<$value>, Option<$value>)> =
-                vec![$($crate::check_operation!(@partial_input $value, $input)),*];
+                vec![$($crate::check_operation_partial_evaluation!(@partial_input $value, $input)),*];
             let expected_outputs: Vec<(bool, $value)> =
-                vec![$($crate::check_operation!(@partial_output $output)),*];
+                vec![$($crate::check_operation_partial_evaluation!(@partial_output $output)),*];
             let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
             let input_ids = inputs
                 .iter()
@@ -1181,24 +1195,57 @@ macro_rules! check_operation {
         )*
     }};
 
+    // Internal implementation branch of this macro.
     (@partial_input $value:ty, (@known, $input:expr)) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::partial::PartialValue::Known(input), Option::<$value>::None)
     }};
 
+    // Internal implementation branch of this macro.
     (@partial_input $value:ty, (@unknown(type = $r#type:expr, replay = $input:expr))) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::partial::PartialValue::Unknown($r#type), Some(input))
     }};
 
+    // Internal implementation branch of this macro.
     (@partial_output (@known, $output:expr)) => {
         (true, ::core::convert::Into::into($output))
     };
 
+    // Internal implementation branch of this macro.
     (@partial_output (@residual, $output:expr)) => {
         (false, ::core::convert::Into::into($output))
     };
+}
 
+// TODO(eaplatanios): Review this macro.
+/// Checks rejection contracts shared by concrete [`Operation`](crate::Operation) implementations:
+///
+///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
+///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands must carry the
+///     same reduced-axis markers.
+///   - `@reject @transposition`: Builds a one-instruction array program and checks that transposition reaches the
+///     operation's unsupported-transposition error. The input type list encodes arity.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation};
+/// check_operation!(
+///     @reject @unreduced,
+///     operation = SinOperation,
+///     input_types = [ArrayType::scalar(DataType::F64)],
+/// );
+/// ```
+///
+/// # Parameters
+///
+///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
+///   - `input_types = $input_types`: Input types used by the selected rejection check, in operation input order.
+///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct a
+///     transposition program for a downstream operation family.
+#[macro_export]
+macro_rules! check_operation {
     (
         @reject @unreduced,
         operation = $operation:expr,
@@ -1549,10 +1596,10 @@ macro_rules! check_gradient {
 }
 
 pub use crate::{
-    check_builders, check_count, check_gradient, check_operation, check_sharding, check_types,
-    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
-    impl_nullary_transposable_operation,
+    check_builders, check_count, check_gradient, check_operation, check_operation_batching,
+    check_operation_partial_evaluation, check_sharding, check_types, define_elementwise_capability,
+    define_elementwise_operation, define_tracer_operator, impl_non_differentiable_operation,
+    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
 };
 
 #[cfg(test)]
@@ -2104,8 +2151,8 @@ mod tests {
             }
         }
 
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             operation = ZeroOperation::new(ArrayType::scalar(DataType::F64)),
             axis_size = 2,
             cases = [{
@@ -2114,13 +2161,13 @@ mod tests {
             }],
         );
 
-        check_operation!(
-            @batching @exact,
+        check_operation_batching!(
+            @exact,
             context = EagerContext::<Array>::new(),
             driver = &EmptyRegionDriver,
-            axis_sharding = crate::ShardingDimension::Replicated,
             operation = TestPairOperation,
             axis_size = 2,
+            axis_sharding = crate::ShardingDimension::Replicated,
             cases = [
                 {
                     inputs = [
@@ -2143,8 +2190,8 @@ mod tests {
             ],
         );
 
-        check_operation!(
-            @batching @approx(epsilon = 1e-9),
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
             operation = SubOperation,
             axis_size = 2,
             cases = [
@@ -2187,8 +2234,8 @@ mod tests {
             ],
         );
 
-        check_operation!(
-            @batching @approx(epsilon = 1e-9),
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
             operation = SinOperation,
             axis_size = 2,
             cases = [
@@ -2207,15 +2254,14 @@ mod tests {
     // TODO(eaplatanios): Review this test.
     #[test]
     fn test_check_operation_partial_evaluation() {
-        check_operation!(
-            @partial_evaluation @fold_and_residualize,
+        check_operation_partial_evaluation!(
+            @fold_and_residualize,
             operation = NegOperation,
             inputs = [Scalar::from(2.0)],
             expected = Scalar::from(-2.0),
         );
 
-        check_operation!(
-            @partial_evaluation,
+        check_operation_partial_evaluation!(
             operation = AddOperation,
             cases = [
                 {
