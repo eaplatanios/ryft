@@ -31,7 +31,7 @@ use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
-use crate::operations::math::{Add, AddOperation};
+use crate::operations::math::{Add, AddOperation, Reduce, ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -45,7 +45,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`WhileOperation`].
@@ -3041,7 +3040,7 @@ mod tests {
         // `while (sum(x) < 20, iteration_bound = 4) { x = x * x }` at `x = [1.5, 2]` squares twice (sums visit 3.5
         // and 6.25 before reaching 21.0625), so `f(x) = sum(x⁴)` locally: value `1.5⁴ + 2⁴ = 21.0625` and gradient
         // `4 x³ = [13.5, 32]`, with trip count 2 strictly below the bound 4.
-        use crate::tracing_v2::operations::reduce::ReductionKind;
+        use crate::operations::math::ReductionKind;
 
         let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();

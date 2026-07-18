@@ -1335,7 +1335,7 @@ mod tests {
 
     #[test]
     fn test_jit_transfer_to_memory_round_trip_runs_end_to_end() {
-        use ryft_core::tracing_v2::operations::TransferToMemory;
+        use ryft_core::operations::memory::TransferToMemory;
         use ryft_core::types::Memory;
 
         let plugin = load_cpu_plugin().unwrap();

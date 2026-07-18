@@ -237,10 +237,9 @@ mod tests {
     use ryft_core::operations::manipulation::{
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
     };
-    use ryft_core::operations::math::{Abs, Atan2, Cos, Exp, Log, Sin, Sqrt};
+    use ryft_core::operations::math::{Abs, Atan2, Cos, Exp, Log, Reduce, ReductionKind, Sin, Sqrt};
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use ryft_core::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};

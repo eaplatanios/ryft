@@ -12,13 +12,13 @@
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
 use crate::operations::manipulation::{Broadcast, ConvertElementType, Reshape, Transpose};
+use crate::operations::math::{Reduce, ReductionKind};
 use crate::operations::sharding::Reshard;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, DataType, Size};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an

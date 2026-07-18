@@ -1053,9 +1053,10 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::operations::math::{Reduce, ReductionKind};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::linear::DenseDifferentiate;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;

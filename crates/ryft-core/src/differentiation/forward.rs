@@ -1554,14 +1554,13 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::BooleanLike;
+    use crate::operations::collectives::{CollectiveKind, CollectiveOperation};
     use crate::operations::differentiation::{StopGradient, StopGradientOperation};
-    use crate::operations::math::{MulOperation, Sin, SinOperation};
+    use crate::operations::math::{Dot, DotDimensionNumbers, MulOperation, Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::tracing::{NestedTracingContext, Trace};
-    use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
-    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::DataType;
 
     use super::*;

@@ -33,12 +33,7 @@ pub use linear::{
     jacrev_with_aux,
 };
 pub use operations::RecomputeOperation;
-pub use operations::collective::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
-    forward_collective_to_parent,
-};
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
-pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
     NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,

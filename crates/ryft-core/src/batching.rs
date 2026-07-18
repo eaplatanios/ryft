@@ -1731,12 +1731,11 @@ mod tests {
     use crate::differentiation::forward::{ForwardModeDifferentiate, LinearizationTracer};
     use crate::differentiation::reverse::ReverseModeDifferentiate;
     use crate::operations::constants::OneLike;
-    use crate::operations::math::{AddOperation, NegOperation};
+    use crate::operations::math::{AddOperation, NegOperation, Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{DomainTracingContext, Trace};
-    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;

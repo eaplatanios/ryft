@@ -9,6 +9,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -149,7 +150,7 @@ where
     O: Operation<ArrayType>
         + From<BroadcastOperation>
         + From<ConvertElementTypeOperation>
-        + From<crate::tracing_v2::operations::reduce::ReduceOperation>
+        + From<ReduceOperation>
         + From<TransposeOperation>
         + From<ReshapeOperation>
         + From<ReshardOperation>,
@@ -521,6 +522,9 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::forward::ForwardModeDifferentiate;
+    use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
@@ -528,8 +532,6 @@ mod tests {
     use crate::programs::{Program, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
-    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Memory};
 
     use super::*;

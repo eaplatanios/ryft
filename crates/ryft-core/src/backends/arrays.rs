@@ -27,6 +27,7 @@ use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
+use crate::operations::collectives::{AxisIndexOperation, CollectiveOperation};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -45,11 +46,14 @@ use crate::operations::manipulation::{
     GatherScatterMode, Pad, PadOperation, Reshape, ReshapeOperation, Scatter, ScatterOperation, ScatterReductionKind,
     Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
+use crate::operations::math::dot::dot_general_evaluate;
+use crate::operations::math::reduce::reduce_evaluate;
 use crate::operations::math::{
-    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Exp,
-    ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub,
-    SubOperation,
+    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Dot,
+    DotDimensionNumbers, DotOperation, Exp, ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation,
+    Reduce, ReduceOperation, ReductionKind, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation,
 };
+use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -58,13 +62,9 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
-use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
-use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, DotOperation, dot_general_evaluate};
-use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
-use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind, reduce_evaluate};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
 use crate::{Select, SelectCondition};

@@ -18,9 +18,10 @@ use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, GatherOperation, GatherScatterMode, Reshape,
     ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
+use ryft_core::operations::collectives::{AxisIndexOperation, CollectiveKind, CollectiveOperation};
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
-    NegOperation, SinOperation, SqrtOperation, SubOperation,
+    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, DotOperation, ExpOperation, LogOperation,
+    MulOperation, NegOperation, ReductionKind, SinOperation, SqrtOperation, SubOperation,
 };
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::operations::Operation;
@@ -28,9 +29,6 @@ use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing_v2::operations::DotOperation;
-use ryft_core::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveKind, CollectiveOperation};
-use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::types::{ArrayType, DataType, Memory, Size};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
@@ -6879,12 +6877,11 @@ mod tests {
         BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation,
         SliceOperation, Transpose, UpdateSliceOperation,
     };
-    use ryft_core::operations::math::{Atan2Operation, Cos, DivOperation, Sin};
+    use ryft_core::operations::math::{Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, Sin};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::ReverseModeDifferentiate;
-    use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::types::{Shape, Size};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -9209,7 +9206,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_lowers_to_device_placement_annotations() {
-        use ryft_core::tracing_v2::operations::TransferToMemory;
+        use ryft_core::operations::memory::TransferToMemory;
 
         // A compute-flanked host-and-back round trip lowers to one `annotate_device_placement` custom call per
         // transfer, carrying the destination kind in the `_xla_buffer_placement` frontend attribute — including the
@@ -9437,7 +9434,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_vjp_pullback_lowers_with_a_placement_annotation() {
-        use ryft_core::tracing_v2::operations::TransferToMemory;
+        use ryft_core::operations::memory::TransferToMemory;
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.

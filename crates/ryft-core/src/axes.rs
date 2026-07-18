@@ -6,6 +6,8 @@ use crate::differentiation::forward::{DifferentiableOperation, DifferentiationCo
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+// TODO(eaplatanios): Should we move `AxisIndexOperation` to this module?
+use crate::operations::collectives::AxisIndexOperation;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -13,8 +15,6 @@ use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
-// TODO(eaplatanios): Should we move `AxisIndexOperation` to this module?
-use crate::tracing_v2::operations::collective::AxisIndexOperation;
 use crate::types::ArrayType;
 
 /// Represents axis-related errors.

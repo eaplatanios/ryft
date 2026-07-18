@@ -15,6 +15,9 @@ use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this file.
 
+/// Named-axis collective operations (e.g., `psum`, `pmean`, `pmax`, and `axis_index`) and capability traits.
+pub mod collectives;
+
 /// Elementwise pairwise comparison operations and capability traits.
 pub mod compare;
 
@@ -39,8 +42,11 @@ pub mod logical;
 /// Array shape and axis manipulation operations and capability traits.
 pub mod manipulation;
 
-/// Elementwise arithmetic and trigonometric math operations and capability traits.
+/// Arithmetic, trigonometric, reduction, and tensor-contraction math operations and capability traits.
 pub mod math;
+
+/// Memory-placement operations (moving values between memory spaces) and capability traits.
+pub mod memory;
 
 /// Shared marker types for operations with payload-dependent interpretation.
 pub mod payloads;
@@ -54,6 +60,10 @@ pub mod tag;
 // TODO(eaplatanios): We should be importing specific symbols here.
 // The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
 // they do not shadow their `std::ops` counterparts; reach them through `crate::operations::math` instead.
+pub use collectives::{
+    AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
+    forward_collective_to_parent,
+};
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
@@ -62,6 +72,7 @@ pub use differentiation::*;
 pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
+pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 

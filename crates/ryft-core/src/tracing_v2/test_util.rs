@@ -49,7 +49,7 @@ mod tests {
         // Per-item semantics: dot(lhs_row, rhs) over the shared K=3 dimension. The batching rule
         // should broadcast the RHS to gain a singleton batch axis at position 0, then thread the
         // batch axis through `lift_dot_dimensions`.
-        use crate::tracing_v2::operations::dot::{DotDimensionNumbers, DotOperation};
+        use crate::operations::math::{DotDimensionNumbers, DotOperation};
         let lhs = {
             let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn test_reduce_sum_jvp_linearizes_to_itself() {
         // Verify the linear reduce rule directly over a concrete tangent value.
-        use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
+        use crate::operations::math::{ReduceOperation, ReductionKind};
         let primal = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let tangent_value = Array::vector(vec![0.5, 0.5, 0.5, 0.5]);
 
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_dot_general_evaluates_batched_matmul() {
-        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+        use crate::operations::math::{Dot, DotDimensionNumbers};
 
         // Batched matmul: [2, 2, 3] @ [2, 3, 2] -> [2, 2, 2] with axis 0 batched.
         let lhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_jacrev_over_dot_batches_adjoint_dots() {
-        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+        use crate::operations::math::{Dot, DotDimensionNumbers};
 
         // jacrev internally batches the pullback's adjoint `dot` operations (their known operands riding as
         // replicated pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_jacfwd_over_dot_batches_basis_tangents_through_the_pushforward() {
-        use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+        use crate::operations::math::{Dot, DotDimensionNumbers};
 
         // jacfwd linearizes the function once, then replays all input-coordinate basis tangents through the
         // pushforward in one batched pass. A dot-product scalar output exercises captured-factor (product-rule)

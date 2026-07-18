@@ -30,8 +30,8 @@ use ryft_core::operations::manipulation::{
     SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, ExpOperation, LogOperation, MulOperation,
-    NegOperation, SinOperation, SqrtOperation, SubOperation,
+    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, DotOperation, ExpOperation, LogOperation,
+    MulOperation, NegOperation, ReduceOperation, SinOperation, SqrtOperation, SubOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::partial::{
@@ -46,16 +46,15 @@ use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
+use ryft_core::operations::collectives::{AxisIndexOperation, CollectiveOperation};
 use ryft_core::operations::debugging::PrintOperation;
+use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{TypeError, Typed};
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
-use ryft_core::tracing_v2::operations::memory::TransferToMemoryOperation;
-use ryft_core::tracing_v2::operations::reduce::ReduceOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::tracing_v2::{AxisIndexOperation, CollectiveOperation, DotOperation};
 use ryft_core::types::ArrayType;
 
 use crate::experimental::operations::ShardMapOperation;

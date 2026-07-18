@@ -249,13 +249,13 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
     use crate::macros::check_gradient;
+    use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;

@@ -3887,7 +3887,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_collective_outside_a_mapping_context() {
-        use ryft_core::tracing_v2::operations::{CollectiveKind, CollectiveOperation};
+        use ryft_core::operations::collectives::{CollectiveKind, CollectiveOperation};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();

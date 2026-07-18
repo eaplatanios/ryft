@@ -1216,7 +1216,7 @@ mod tests {
     #[test]
     fn test_collective_pmean_divides_by_batch_size() {
         use crate::contexts::EagerContext;
-        use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
+        use crate::operations::collectives::{CollectiveKind, CollectiveOperation};
         // Per-item scalar input of shape [3] mapped at axis 0. PMean returns the mean of the
         // three batch items as a replicated scalar.
         let input = {

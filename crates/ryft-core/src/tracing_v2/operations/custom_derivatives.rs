@@ -1148,13 +1148,13 @@ mod tests {
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{Cos, CosOperation, MulOperation, Sin, SinOperation};
+    use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
     use crate::programs::regions::{RegionDriver, RegionRef};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -1904,7 +1904,7 @@ mod tests {
     fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::operations::math::{Reduce, ReductionKind};
 
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
         // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
@@ -1944,7 +1944,7 @@ mod tests {
     fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::operations::math::{Reduce, ReductionKind};
 
         // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
         // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.

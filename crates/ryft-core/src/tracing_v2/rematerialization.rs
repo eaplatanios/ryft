@@ -54,6 +54,8 @@ use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
+use crate::operations::math::DotOperation;
+use crate::operations::memory::TransferToMemoryOperation;
 use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -68,8 +70,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
-use crate::tracing_v2::operations::dot::DotOperation;
-use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
 use crate::types::{ArrayType, Memory};
 
 /// Higher-order operation used by checkpointing/rematerialization.
@@ -876,7 +876,7 @@ where
     }
 }
 
-/// Save residuals produced by dot contractions whose [`DotDimensionNumbers`](crate::tracing_v2::operations::dot::DotDimensionNumbers)
+/// Save residuals produced by dot contractions whose [`DotDimensionNumbers`](crate::operations::math::DotDimensionNumbers)
 /// have no batch dimensions and recompute the rest. Batched contractions behave more like cheap elementwise work per
 /// batch element, so saving only the unbatched ones targets the genuinely expensive matrix products. Matches JAX's
 /// `dots_with_no_batch_dims_saveable`.
@@ -1134,7 +1134,7 @@ where
 }
 
 /// Offloads residuals produced by dot contractions whose
-/// [`DotDimensionNumbers`](crate::tracing_v2::operations::dot::DotDimensionNumbers) have no batch dimensions to
+/// [`DotDimensionNumbers`](crate::operations::math::DotDimensionNumbers) have no batch dimensions to
 /// `destination` and recomputes the rest. Matches JAX's `offload_dot_with_no_batch_dims`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OffloadDotsWithNoBatchDims {
@@ -1974,10 +1974,9 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::math::{Cos, Sin};
+    use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Memory, Shape, Size};
 
@@ -2114,7 +2113,7 @@ mod tests {
             let row = builder.add_input(vector_type(2));
             let dot = builder
                 .add_instruction(
-                    crate::tracing_v2::operations::DotOperation::new(DotDimensionNumbers::inner_product()),
+                    crate::operations::math::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
                 )
@@ -2172,7 +2171,7 @@ mod tests {
         use crate::operations::control_flow::ConditionOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
-        use crate::tracing_v2::operations::dot::DotOperation;
+        use crate::operations::math::DotOperation;
 
         let vector_type = vector_type(2);
         let branch = |tag_output| {
@@ -2787,7 +2786,7 @@ mod tests {
     fn test_rematerialized_gradients_are_correct_through_batching() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::operations::math::{Reduce, ReductionKind};
 
         // `grad(vmap(rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
         // backward program and matches the analytic per-item gradients.
@@ -3227,7 +3226,7 @@ mod tests {
     fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use crate::operations::math::{Reduce, ReductionKind};
 
         // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
@@ -3330,7 +3329,7 @@ mod tests {
             let row = builder.add_input(row_type.clone());
             let dot = builder
                 .add_instruction(
-                    crate::tracing_v2::operations::DotOperation::new(DotDimensionNumbers::inner_product()),
+                    crate::operations::math::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
                 )

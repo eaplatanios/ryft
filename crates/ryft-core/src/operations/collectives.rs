@@ -1,28 +1,41 @@
-use std::fmt::{Debug, Display};
+//! Contains the named-axis collective operations: [`CollectiveOperation`], which reduces a value across a named
+//! axis (`psum` / `pmean` / `pmax`), and [`AxisIndexOperation`], which produces the current batch item's or device
+//! shard's index along a named axis, together with their interpretation, partial-evaluation, batching, forward-mode
+//! differentiation, and transposition rules. These are the analogues of
+//! [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators) `jax.lax.psum`,
+//! `jax.lax.pmean`, `jax.lax.pmax`, and `jax.lax.axis_index`.
+//!
+//! Collectives reference an enclosing named-axis binder by name, validated against the active
+//! [`NamedAxes`](crate::axes::NamedAxes) environment at staging time. A name bound by an enclosing `batch` level is
+//! resolved at trace time by the operations' batching rules, which collapse or materialize the mapped batch axis at
+//! the binding level, while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged
+//! body and lowers to cross-device collectives over that mesh axis.
+
+use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::axes::{AxisError, NamedAxes};
 use crate::backends::scalars::Scalar;
-use crate::batching::BatchingError;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::constants::{FillOperation, IotaOperation};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::operations::math::{Reduce, ReductionKind};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-
-use crate::batching::{BatchingContext, BatchingDriver};
-use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::interpretation::InterpretationDriver;
-use crate::programs::types::{TypeError, Typed};
-use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-use crate::types::{ArrayType, DataType};
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 /// Kind of collective performed by a [`CollectiveOperation`].
 ///
@@ -71,44 +84,6 @@ impl CollectiveKind {
 impl Display for CollectiveKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.name())
-    }
-}
-
-/// Value-level entry point for staging a collective operation.
-///
-/// The staged operation references an enclosing named-axis binder by name and the name is validated against the active
-/// [`NamedAxes`] environment at staging time: an unbound name fails fast rather than silently acting as identity. A
-/// name bound by an enclosing `batch` level is collapsed at trace time by
-/// [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) (which reduces the mapped batch axis),
-/// while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged body program and lowers
-/// to a cross-device `all_reduce` over that mesh axis.
-pub trait Collective: Sized {
-    /// Stages a collective of the given kind referencing axis `axis_name`, validating that the name is bound by an
-    /// enclosing transform. Returns [`AxisError::UnboundAxisName`] (surfaced as
-    /// [`BatchingError::Axis`] riding a [`ProgramError::Custom`] payload) when no
-    /// enclosing binder binds `axis_name`.
-    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError>;
-}
-
-/// Any context-carrying value applies a collective by validating the axis name against the active [`NamedAxes`]
-/// environment and binding a [`CollectiveOperation`] through its own context: a staged tracer records the operation,
-/// a batching tracer resolves the named axis against the batching context stack, and a JVP dual forwards to the
-/// primal-side resolution. An unbound name fails fast with [`AxisError::UnboundAxisName`] rather than silently acting
-/// as identity.
-impl<V: Value> Collective for V
-where
-    V::DispatchDomain: Context + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<CollectiveOperation>,
-{
-    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
-        if context.named_axis(axis_name).is_none() {
-            return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
-        }
-        let mut outputs =
-            context.bind(CollectiveOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
     }
 }
 
@@ -208,27 +183,118 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Collecti
 {
 }
 
-/// Re-stages this collective of the same axis name and kind on a single tracer operand, returning its single output.
+/// Batching rule for [`CollectiveOperation`]. This rule owns named-axis resolution: when the active context's
+/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name, the mapped batch
+/// axis is consumed; otherwise the collective targets an outer `batch` level (or a device mesh axis) and is forwarded
+/// untouched to the parent context via [`forward_collective_to_parent`].
 ///
-/// Both the forward-mode (`jvp`) and the transpose rules below re-stage the collective on a tracer (the primal, the
-/// tangent, or the output cotangent), which is exactly one operation with one input and one output.
-fn stage_collective<C>(
-    context: &C,
-    axis_name: &str,
-    kind: CollectiveKind,
-    operand: &C::Value,
-) -> Result<C::Value, ProgramError>
+/// The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `PMean`'s `1 / N`
+/// rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
+/// trace under a staging parent — so one rule serves eager and staged batching alike.
+impl<C> BatchableOperation<C> for CollectiveOperation
 where
     C: Context<Type = ArrayType>,
-    C::Operation: From<CollectiveOperation>,
+    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
+    <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
 {
-    let mut outputs = context.bind(
-        CollectiveOperation::new(axis_name.to_string(), kind),
-        Vec::new(),
-        std::slice::from_ref(operand),
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            let parent_operation = C::Operation::from(CollectiveOperation::new(self.axis_name.clone(), self.kind));
+            return forward_collective_to_parent(context, parent_operation, inputs);
+        }
+        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
+            // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
+            // parent, staged into the enclosing trace under a staging parent.
+            context
+                .parent()
+                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), Vec::new(), &[])?
+                .into_iter()
+                .next()
+                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
+        })
+    }
+}
+
+/// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
+///
+/// Under nested `batch` levels, a collective is consumed by the level whose
+/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through
+/// every inner level untouched: each inner batch item participates in the outer collective independently, so the
+/// operands' mapped axes are preserved as-is on the forwarded outputs. The parent may itself be another
+/// [`BatchingContext`] — whose own rule dispatch repeats this name
+/// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
+/// operations should use this helper for their "not my axis" arm.
+pub fn forward_collective_to_parent<C>(
+    context: &BatchingContext<C>,
+    parent_operation: C::Operation,
+    inputs: &[ArrayBatch<<C as Domain>::Value>],
+) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+{
+    let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
+    let parent_outputs = context.parent().bind(parent_operation, Vec::new(), &parent_input_values)?;
+    check_count!("output", parent_outputs, inputs.len(), ProgramError);
+    parent_outputs
+        .into_iter()
+        .zip(inputs.iter())
+        .map(|(parent_value, input_batch)| {
+            let physical_type = parent_value.r#type().into_owned();
+            ArrayBatch::new(physical_type, parent_value, input_batch.batch_axis())
+        })
+        .collect()
+}
+
+/// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching. It collapses the mapped batch
+/// axis with the kind's [`ReductionKind`] and, for `PMean`, scales the replicated result by `1 / N` using a
+/// `make_pmean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
+/// Outside a matching batching context (no mapped axis), it is an identity pass-through.
+fn collective_reduce_batch<V, MakePMeanFactor>(
+    kind: CollectiveKind,
+    inputs: &[ArrayBatch<V>],
+    make_pmean_factor: MakePMeanFactor,
+) -> Result<Vec<ArrayBatch<V>>, BatchingError>
+where
+    V: Value<Type = ArrayType> + Reduce + Mul<Output = V>,
+    MakePMeanFactor: FnOnce(ArrayType, f64) -> Result<V, ProgramError>,
+{
+    check_count!("input", inputs, 1, ProgramError);
+    let input = &inputs[0];
+    let Some(batch_axis) = input.batch_axis_position() else {
+        // Outside any matching batching context: identity pass-through.
+        return Ok(vec![input.clone()]);
+    };
+    // Reduce along the mapped batch axis with the corresponding reduction kind. The output is replicated: every
+    // batch item sees the same reduced value, matching JAX's `psum`/`pmean`/`pmax` broadcast semantics.
+    let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind());
+    if matches!(kind, CollectiveKind::PMean) {
+        // PMean divides the summed value by the batch size, which must be statically known to scale by `1 / N`.
+        let inverse_axis_size = 1.0 / pmean_batch_size(input)? as f64;
+        let factor_type = pmean_factor_type(output_value.r#type().data_type());
+        output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
+    }
+    let output_type = output_value.r#type().into_owned();
+    Ok(vec![ArrayBatch::new(output_type, output_value, None)?])
+}
+
+/// Returns the static batch size for a `PMean` over the mapped batch axis of `input`, erroring when
+/// the batch size is dynamic (a mean cannot be scaled by `1 / N` without a static `N`).
+fn pmean_batch_size<V: Value<Type = ArrayType>>(
+    input: &ArrayBatch<V>,
+) -> Result<usize, BatchingError> {
+    input.batch_size()?.ok_or_else(|| BatchingError::UnsupportedOperation {
+        message: "pmean requires a static batch size; the staged batch axis is dynamic".to_string(),
+    })
+}
+
+/// Builds the rank-0 [`ArrayType`] of `data_type` used to hold a `PMean`'s `1 / N` factor.
+fn pmean_factor_type(data_type: DataType) -> ArrayType {
+    ArrayType::new(data_type, Shape::scalar())
 }
 
 /// Forward-mode (JVP) rule for [`CollectiveOperation`]. `PSum`/`PMean` are linear and self-adjoint, so the tangent is
@@ -304,118 +370,65 @@ where
     }
 }
 
-/// Batching rule for [`CollectiveOperation`]. This rule owns named-axis resolution: when the active context's
-/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name, the mapped batch
-/// axis is consumed; otherwise the collective targets an outer `batch` level (or a device mesh axis) and is forwarded
-/// untouched to the parent context via [`forward_collective_to_parent`].
+/// Re-stages this collective of the same axis name and kind on a single tracer operand, returning its single output.
 ///
-/// The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `PMean`'s `1 / N`
-/// rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
-/// trace under a staging parent — so one rule serves eager and staged batching alike.
-impl<C> crate::batching::BatchableOperation<C> for CollectiveOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
-    <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
-{
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        context: &BatchingContext<C>,
-        _driver: &D,
-        inputs: &[crate::batching::ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<<C as Domain>::Value>>, crate::batching::BatchingError> {
-        if context.axis_name() != Some(self.axis_name.as_str()) {
-            let parent_operation = C::Operation::from(CollectiveOperation::new(self.axis_name.clone(), self.kind));
-            return forward_collective_to_parent(context, parent_operation, inputs);
-        }
-        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
-            // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
-            // parent, staged into the enclosing trace under a staging parent.
-            context
-                .parent()
-                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), Vec::new(), &[])?
-                .into_iter()
-                .next()
-                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
-        })
-    }
-}
-
-/// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
-///
-/// Under nested `batch` levels, a collective is consumed by the level whose
-/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through
-/// every inner level untouched: each inner batch item participates in the outer collective independently, so the
-/// operands' mapped axes are preserved as-is on the forwarded outputs. The parent may itself be another
-/// [`BatchingContext`] — whose own rule dispatch repeats this name
-/// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
-/// operations should use this helper for their "not my axis" arm.
-pub fn forward_collective_to_parent<C>(
-    context: &crate::batching::BatchingContext<C>,
-    parent_operation: C::Operation,
-    inputs: &[crate::batching::ArrayBatch<<C as Domain>::Value>],
-) -> Result<Vec<crate::batching::ArrayBatch<<C as Domain>::Value>>, crate::batching::BatchingError>
-where
-    C: Context<Type = ArrayType>,
-{
-    let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
-    let parent_outputs = context.parent().bind(parent_operation, Vec::new(), &parent_input_values)?;
-    check_count!("output", parent_outputs, inputs.len(), ProgramError);
-    parent_outputs
-        .into_iter()
-        .zip(inputs.iter())
-        .map(|(parent_value, input_batch)| {
-            let physical_type = parent_value.r#type().into_owned();
-            crate::batching::ArrayBatch::new(physical_type, parent_value, input_batch.batch_axis())
-        })
-        .collect()
-}
-
-/// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching. It collapses the mapped batch
-/// axis with the kind's [`ReductionKind`] and, for `PMean`, scales the replicated result by `1 / N` using a
-/// `make_pmean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
-/// Outside a matching batching context (no mapped axis), it is an identity pass-through.
-fn collective_reduce_batch<V, MakePMeanFactor>(
+/// Both the forward-mode (`jvp`) and the transpose rules below re-stage the collective on a tracer (the primal, the
+/// tangent, or the output cotangent), which is exactly one operation with one input and one output.
+fn stage_collective<C>(
+    context: &C,
+    axis_name: &str,
     kind: CollectiveKind,
-    inputs: &[crate::batching::ArrayBatch<V>],
-    make_pmean_factor: MakePMeanFactor,
-) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError>
+    operand: &C::Value,
+) -> Result<C::Value, ProgramError>
 where
-    V: Value<Type = ArrayType> + Reduce + Mul<Output = V>,
-    MakePMeanFactor: FnOnce(ArrayType, f64) -> Result<V, ProgramError>,
+    C: Context<Type = ArrayType>,
+    C::Operation: From<CollectiveOperation>,
 {
-    check_count!("input", inputs, 1, ProgramError);
-    let input = &inputs[0];
-    let Some(batch_axis) = input.batch_axis_position() else {
-        // Outside any matching batching context: identity pass-through.
-        return Ok(vec![input.clone()]);
-    };
-    // Reduce along the mapped batch axis with the corresponding reduction kind. The output is replicated: every
-    // batch item sees the same reduced value, matching JAX's `psum`/`pmean`/`pmax` broadcast semantics.
-    let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind());
-    if matches!(kind, CollectiveKind::PMean) {
-        // PMean divides the summed value by the batch size, which must be statically known to scale by `1 / N`.
-        let inverse_axis_size = 1.0 / pmean_batch_size(input)? as f64;
-        let factor_type = pmean_factor_type(output_value.r#type().data_type());
-        output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
+    let mut outputs = context.bind(
+        CollectiveOperation::new(axis_name.to_string(), kind),
+        Vec::new(),
+        std::slice::from_ref(operand),
+    )?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
+/// Value-level entry point for staging a collective operation.
+///
+/// The staged operation references an enclosing named-axis binder by name and the name is validated against the active
+/// [`NamedAxes`] environment at staging time: an unbound name fails fast rather than silently acting as identity. A
+/// name bound by an enclosing `batch` level is collapsed at trace time by
+/// [`BatchableOperation::batch`](crate::batching::BatchableOperation::batch) (which reduces the mapped batch axis),
+/// while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged body program and lowers
+/// to a cross-device `all_reduce` over that mesh axis.
+pub trait Collective: Sized {
+    /// Stages a collective of the given kind referencing axis `axis_name`, validating that the name is bound by an
+    /// enclosing transform. Returns [`AxisError::UnboundAxisName`] (surfaced as
+    /// [`BatchingError::Axis`] riding a [`ProgramError::Custom`] payload) when no
+    /// enclosing binder binds `axis_name`.
+    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError>;
+}
+
+/// Any context-carrying value applies a collective by validating the axis name against the active [`NamedAxes`]
+/// environment and binding a [`CollectiveOperation`] through its own context: a staged tracer records the operation,
+/// a batching tracer resolves the named axis against the batching context stack, and a JVP dual forwards to the
+/// primal-side resolution. An unbound name fails fast with [`AxisError::UnboundAxisName`] rather than silently acting
+/// as identity.
+impl<V: Value> Collective for V
+where
+    V::DispatchDomain: Context + NamedAxes,
+    <V::DispatchDomain as Domain>::Operation: From<CollectiveOperation>,
+{
+    fn collective(&self, axis_name: &str, kind: CollectiveKind) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        if context.named_axis(axis_name).is_none() {
+            return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
+        }
+        let mut outputs =
+            context.bind(CollectiveOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
-    let output_type = output_value.r#type().into_owned();
-    Ok(vec![crate::batching::ArrayBatch::new(output_type, output_value, None)?])
-}
-
-/// Returns the static batch size for a `PMean` over the mapped batch axis of `input`, erroring when
-/// the batch size is dynamic (a mean cannot be scaled by `1 / N` without a static `N`).
-fn pmean_batch_size<V: Value<Type = ArrayType>>(
-    input: &crate::batching::ArrayBatch<V>,
-) -> Result<usize, crate::batching::BatchingError> {
-    input.batch_size()?.ok_or_else(|| crate::batching::BatchingError::UnsupportedOperation {
-        message: "pmean requires a static batch size; the staged batch axis is dynamic".to_string(),
-    })
-}
-
-/// Builds the rank-0 [`ArrayType`] of `data_type` used to hold a `PMean`'s `1 / N` factor.
-fn pmean_factor_type(data_type: DataType) -> ArrayType {
-    ArrayType::new(data_type, crate::types::Shape::scalar())
 }
 
 /// Canonical operation name for [`AxisIndexOperation`].
@@ -508,12 +521,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for AxisInde
 where
     C::Operation: From<AxisIndexOperation>,
 {
-    fn partially_evaluate<D: crate::partial::PartialEvaluationDriver<C>>(
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
-        context: &crate::partial::PartialEvaluationContext<C>,
+        context: &PartialEvaluationContext<C>,
         _driver: &D,
-        inputs: &[crate::partial::PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<crate::partial::PartialEvaluationValue<C::Value>>, ProgramError> {
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         context.residualize(self.clone(), Vec::new(), inputs)
     }
 }
@@ -531,7 +544,7 @@ impl_nullary_transposable_operation!(AxisIndexOperation);
 /// repeats the same resolution, ultimately materializing at the binding `batch` level or surviving into the staged
 /// body for a mesh axis) and presented as replicated across this level's batch items. The name is validated by the
 /// [`AxisIndex`](crate::axes::AxisIndex) reader before staging, so no name lookup is needed here.
-impl<C> crate::batching::BatchableOperation<C> for AxisIndexOperation
+impl<C> BatchableOperation<C> for AxisIndexOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>,
@@ -540,26 +553,26 @@ where
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
-        _inputs: &[crate::batching::ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<<C as Domain>::Value>>, crate::batching::BatchingError> {
+        _inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis: the per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
             let size = context.axis_size();
             let physical_type =
-                ArrayType::new(DataType::U64, crate::types::Shape::new(vec![crate::types::Size::Static(size)]));
+                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
             let mut index_vector =
                 context.parent().bind(IotaOperation::new(physical_type.clone(), 0), Vec::new(), &[])?;
             check_count!("output", index_vector, 1, ProgramError);
-            Ok(vec![crate::batching::ArrayBatch::new(physical_type, index_vector.remove(0), Some(0))?])
+            Ok(vec![ArrayBatch::new(physical_type, index_vector.remove(0), Some(0))?])
         } else {
             // The axis is bound by an outer `batch` level or a device mesh: re-bind into the parent, which repeats the
             // resolution, and present the forwarded index as replicated across this level.
             let mut outputs =
                 context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), Vec::new(), &[])?;
             check_count!("output", outputs, 1, ProgramError);
-            Ok(vec![crate::batching::ArrayBatch::replicated(outputs.remove(0))])
+            Ok(vec![ArrayBatch::replicated(outputs.remove(0))])
         }
     }
 }

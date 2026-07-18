@@ -1,24 +1,29 @@
+//! Contains the memory-placement operation: [`TransferToMemoryOperation`], which moves a value into a destination
+//! [`Memory`] space, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
+//! and transposition rules. This is the analogue of placing a value with
+//! [JAX's `jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) and a
+//! memory-kind-bearing sharding. Like the sharding-control operations (see
+//! [`operations::sharding`](crate::operations::sharding)), memory placement is metadata about *where* a value
+//! lives, never about its contents.
+
 use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
 };
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-
-use crate::batching::{BatchingContext, BatchingDriver};
-use crate::differentiation::{DifferentiationDriver, DifferentiationDual, TranspositionDriver};
-use crate::interpretation::InterpretationDriver;
-use crate::programs::types::{TypeError, Typed};
 use crate::types::{ArrayType, Memory};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
@@ -107,50 +112,6 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Transfer
 {
 }
 
-/// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for
-/// [`TransferToMemoryOperation`] that [`Sin`](crate::operations::math::Sin) fills for
-/// [`SinOperation`](crate::operations::math::SinOperation): on concrete values it keeps the payload
-/// unchanged (eager domains have no memory hierarchy) while re-placing the carried type in the destination when
-/// the value stores one, and on traced values it stages a transfer whose staged type carries the destination
-/// [`Memory`]. Tracers only implement this capability when their operation type implements
-/// [`From<TransferToMemoryOperation>`], so transfers over (for example) scalar staging contexts are type errors
-/// rather than silent passthroughs.
-pub trait TransferToMemory: Sized {
-    /// Returns this value moved into the provided destination [`Memory`].
-    fn transfer_to_memory(&self, destination: Memory) -> Self;
-}
-
-macro_rules! impl_transfer_to_memory_identity {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl TransferToMemory for $ty {
-                #[inline]
-                fn transfer_to_memory(&self, _destination: Memory) -> Self {
-                    *self
-                }
-            }
-        )*
-    };
-}
-
-impl_transfer_to_memory_identity!(bf16, f16, f32, f64);
-
-/// Any context-carrying value transfers to memory by binding a [`TransferToMemoryOperation`] through its own context.
-/// The `From<TransferToMemoryOperation>` bound makes this disjoint from the eager value types (whose context operation
-/// is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> TransferToMemory for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<TransferToMemoryOperation>,
-{
-    fn transfer_to_memory(&self, destination: Memory) -> Self {
-        self.dispatch_domain()
-            .bind(TransferToMemoryOperation::new(destination), Vec::new(), &[self.clone()])
-            .expect("`transfer_to_memory` operation failed")
-            .remove(0)
-    }
-}
-
 /// Batching rule for [`TransferToMemoryOperation`]: memory placement is metadata that applies identically to every
 /// batch item, so the rule moves the packed value through the value-level [`TransferToMemory`] capability and
 /// preserves the operand's batch axis. On traced values this stages the transfer on the batched physical value; on
@@ -225,20 +186,62 @@ where
     }
 }
 
+/// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for
+/// [`TransferToMemoryOperation`] that [`Sin`](crate::operations::math::Sin) fills for
+/// [`SinOperation`](crate::operations::math::SinOperation): on concrete values it keeps the payload
+/// unchanged (eager domains have no memory hierarchy) while re-placing the carried type in the destination when
+/// the value stores one, and on traced values it stages a transfer whose staged type carries the destination
+/// [`Memory`]. Tracers only implement this capability when their operation type implements
+/// [`From<TransferToMemoryOperation>`], so transfers over (for example) scalar staging contexts are type errors
+/// rather than silent passthroughs.
+pub trait TransferToMemory: Sized {
+    /// Returns this value moved into the provided destination [`Memory`].
+    fn transfer_to_memory(&self, destination: Memory) -> Self;
+}
+
+macro_rules! impl_transfer_to_memory_identity {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl TransferToMemory for $ty {
+                #[inline]
+                fn transfer_to_memory(&self, _destination: Memory) -> Self {
+                    *self
+                }
+            }
+        )*
+    };
+}
+
+impl_transfer_to_memory_identity!(bf16, f16, f32, f64);
+
+/// Any context-carrying value transfers to memory by binding a [`TransferToMemoryOperation`] through its own context.
+/// The `From<TransferToMemoryOperation>` bound makes this disjoint from the eager value types (whose context operation
+/// is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> TransferToMemory for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<TransferToMemoryOperation>,
+{
+    fn transfer_to_memory(&self, destination: Memory) -> Self {
+        self.dispatch_domain()
+            .bind(TransferToMemoryOperation::new(destination), Vec::new(), &[self.clone()])
+            .expect("`transfer_to_memory` operation failed")
+            .remove(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::batching::BatchingContext;
     use approx::assert_abs_diff_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation};
+    use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::programs::types::Typed;
-    use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::types::{DataType, Shape, Size};
-
     use crate::tracing::Trace;
+    use crate::types::{DataType, Shape, Size};
 
     use super::*;
 
@@ -287,6 +290,50 @@ mod tests {
         assert_eq!(operation.destination(), PINNED_HOST);
         let output_types: Vec<_> = program.outputs().map(|atom| atom.r#type().into_owned()).collect();
         assert_eq!(output_types, vec![vector_type(2).with_memory(PINNED_HOST)]);
+    }
+
+    #[test]
+    fn test_transfer_to_memory_batching_preserves_the_operation_and_the_memory() {
+        // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
+        // destination — exactly like interpretation — and preserves the batch axis.
+        let input = {
+            let value = Array::matrix(2, 3, vec![1.0; 6]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));
+        assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0; 6]);
+
+        // Batching under a staging parent stages the same transfer on the physical batched value with its batch
+        // axis preserved.
+        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let context = x.context().clone();
+                Ok(Batch::batch(
+                    &context,
+                    |item| Ok(item.transfer_to_memory(PINNED_HOST)),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap())
+            },
+            matrix_type(2, 3),
+        )
+        .unwrap();
+        assert_eq!(output_type, matrix_type(2, 3).with_memory(PINNED_HOST));
+        assert_eq!(program.instructions().len(), 1);
+        let ArrayOperation::TransferToMemory(operation) = program.instructions()[0].operation() else {
+            panic!("expected the batched program to stage a transfer_to_memory operation");
+        };
+        assert_eq!(operation.destination(), PINNED_HOST);
     }
 
     #[test]
@@ -345,47 +392,5 @@ mod tests {
         assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);
     }
 
-    #[test]
-    fn test_transfer_to_memory_batching_preserves_the_operation_and_the_memory() {
-        // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
-        // destination — exactly like interpretation — and preserves the batch axis.
-        let input = {
-            let value = Array::matrix(2, 3, vec![1.0; 6]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));
-        assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0; 6]);
 
-        // Batching under a staging parent stages the same transfer on the physical batched value with its batch
-        // axis preserved.
-        let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| {
-                let context = x.context().clone();
-                Ok(Batch::batch(
-                    &context,
-                    |item| Ok(item.transfer_to_memory(PINNED_HOST)),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap())
-            },
-            matrix_type(2, 3),
-        )
-        .unwrap();
-        assert_eq!(output_type, matrix_type(2, 3).with_memory(PINNED_HOST));
-        assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::TransferToMemory(operation) = program.instructions()[0].operation() else {
-            panic!("expected the batched program to stage a transfer_to_memory operation");
-        };
-        assert_eq!(operation.destination(), PINNED_HOST);
-    }
 }

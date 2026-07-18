@@ -223,9 +223,8 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
     }
 }
 
-/// Canonical operation name reported by the generalized dot product type-inference rule. The captured-factor linear
-/// forms shared this rule and reported under the same name.
-const DOT_OPERATION_NAME: &str = "dot";
+/// Canonical operation name for [`DotOperation`].
+pub const DOT_OPERATION_NAME: &str = "dot";
 
 /// Computes the abstract output type of one generalized dot product.
 ///

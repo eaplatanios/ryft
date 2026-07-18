@@ -2070,6 +2070,7 @@ mod tests {
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::LinearizationTracer;
+    use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -2077,7 +2078,6 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
 
     use super::*;
