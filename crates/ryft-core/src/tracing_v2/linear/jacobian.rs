@@ -196,17 +196,16 @@ impl<'a, T: Type, V> JacobianBlock<'a, T, V> {
     }
 }
 
-/// Type-family capability required to materialize dense derivatives through one packed program replay.
+/// Type-family capability required to materialize dense derivatives like [`Jacobian`](crate::Jacobian)s and
+/// [`Hessian`](crate::Hessian)s. [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values,
+/// but they do not state that a leaf (i.e., a [`Parameter`]) has a finite coordinate space, that several directions can
+/// be represented by one value, or how packed replay results become public derivative blocks. Implementations of this
+/// trait provide only those representation-specific operations. The Jacobian algorithms retain ownership of structure
+/// traversal, differentiation, ordering, and result construction.
 ///
-/// [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values, but they do not state that a
-/// leaf has a finite coordinate space, that several directions can be represented by one value, or how packed replay
-/// results become public derivative blocks. Implementations of this trait provide only those representation-specific
-/// operations. The Jacobian algorithms retain ownership of structure traversal, differentiation, ordering, and result
-/// construction.
-///
-/// `ArrayType` currently provides the sole implementation. `DataType` remains usable as Jacobian metadata, but scalar
-/// operation families do not yet have a packed batching representation and therefore intentionally do not implement
-/// this capability.
+/// [`ArrayType`] currently provides the sole implementation. [`DataType`] remains usable as Jacobian metadata, but
+/// scalar operation families do not yet have a packed batching representation and therefore intentionally do not
+/// implement this capability.
 pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// Packed value used during one multi-direction derivative replay.
     type PackedValue;
@@ -262,33 +261,10 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
 
-    /// Validates the physical type of one forward-mode dense derivative block.
-    ///
-    /// # Parameters
-    ///
-    ///   - `block_type`: Physical type of the materialized derivative value.
-    ///   - `output_type`: Type of the differentiated output leaf.
-    ///   - `input_type`: Input-leaf type whose coordinate axes follow the output axes in the block.
-    fn validate_forward_block_type(
-        block_type: &Self,
-        output_type: &Self,
-        input_type: &Self,
-    ) -> Result<(), DifferentiationError>;
-
-    /// Validates the physical type of one reverse-mode dense derivative block.
-    ///
-    /// # Parameters
-    ///
-    ///   - `block_type`: Physical type of the materialized derivative value.
-    ///   - `output_type`: Type of the differentiated output leaf whose coordinate axes prefix the block.
-    ///   - `input_type`: Type of the differentiated input leaf whose cotangent type supplies the block values.
-    fn validate_reverse_block_type(
-        block_type: &Self,
-        output_type: &Self,
-        input_type: &Self,
-    ) -> Result<(), DifferentiationError>;
-
-    /// Validates the physical type of one forward-over-reverse dense Hessian block.
+    /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the
+    /// values of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite
+    /// layout check is the one block validation that cannot live inside [`forward_block`](Self::forward_block) or
+    /// [`reverse_block`](Self::reverse_block) (which validate their own results).
     ///
     /// # Parameters
     ///
@@ -303,7 +279,9 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         second_input_type: &Self,
     ) -> Result<(), DifferentiationError>;
 
-    /// Extracts one forward-mode output/input block from a packed pushforward output.
+    /// Extracts one forward-mode output/input block from a packed pushforward output, validating that the returned
+    /// block carries the output leaf's tangent values with the output coordinate axes followed by the input
+    /// coordinate axes.
     ///
     /// # Parameters
     ///
@@ -320,7 +298,8 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         output_type: &Self,
     ) -> Result<C::Value, DifferentiationError>;
 
-    /// Extracts one reverse-mode output/input block from a packed pullback output.
+    /// Extracts one reverse-mode output/input block from a packed pullback output, validating that the returned
+    /// block carries the input leaf's cotangent values with the output coordinate axes prefixing the input axes.
     ///
     /// # Parameters
     ///
@@ -426,48 +405,6 @@ where
             .map_err(ProgramError::from)?)
     }
 
-    fn validate_forward_block_type(
-        block_type: &Self,
-        output_type: &Self,
-        input_type: &Self,
-    ) -> Result<(), DifferentiationError> {
-        let output_tangent_type = output_type.tangent();
-        if output_tangent_type.is_zero_space() {
-            return Err(TypeError {
-                message: format!("forward Jacobian output type {output_type} has no tangent type"),
-            }
-            .into());
-        }
-        validate_array_block_type(
-            DerivativeTransform::JacobianForward,
-            block_type,
-            &output_tangent_type,
-            &[],
-            &[input_type],
-        )
-    }
-
-    fn validate_reverse_block_type(
-        block_type: &Self,
-        output_type: &Self,
-        input_type: &Self,
-    ) -> Result<(), DifferentiationError> {
-        let input_cotangent_type = input_type.cotangent();
-        if input_cotangent_type.is_zero_space() {
-            return Err(TypeError {
-                message: format!("reverse Jacobian input type {input_type} has no cotangent type"),
-            }
-            .into());
-        }
-        validate_array_block_type(
-            DerivativeTransform::JacobianReverse,
-            block_type,
-            &input_cotangent_type,
-            &[output_type],
-            &[],
-        )
-    }
-
     fn validate_hessian_block_type(
         block_type: &Self,
         output_type: &Self,
@@ -513,6 +450,13 @@ where
             .chain(0..input_shape.rank())
             .collect::<Vec<_>>();
         let value = value.transpose(permutation)?;
+        validate_array_block_type(
+            DerivativeTransform::JacobianForward,
+            value.r#type().as_ref(),
+            &output_tangent_type,
+            &[],
+            &[input_type],
+        )?;
         Ok(value)
     }
 
@@ -534,6 +478,13 @@ where
         }
         let value =
             basis_range_value(packed, batch_size, coordinate_offset, output_shape.dimensions(), &input_cotangent_type)?;
+        validate_array_block_type(
+            DerivativeTransform::JacobianReverse,
+            value.r#type().as_ref(),
+            &input_cotangent_type,
+            &[output_type],
+            &[],
+        )?;
         Ok(value)
     }
 }
@@ -746,7 +697,6 @@ where
                 input_type,
                 output_type,
             )?;
-            C::Type::validate_forward_block_type(value.r#type().as_ref(), output_type, input_type)?;
             values.push(value);
         }
     }
@@ -856,7 +806,6 @@ where
                 output_type,
                 input_type,
             )?;
-            C::Type::validate_reverse_block_type(value.r#type().as_ref(), output_type, input_type)?;
             values.push(value);
         }
     }
@@ -1323,6 +1272,7 @@ define_reverse_jacobian_with_aux!(
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::batching::{ArrayBatch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DerivativeTransform, DifferentiableType, DifferentiationError, DifferentiationParameterRole,
@@ -1374,8 +1324,9 @@ mod tests {
     fn test_dense_type_validation_reports_block_and_coordinate_overflow_errors() {
         type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
 
-        let error = <ArrayType as DenseDifferentiableType<TestContext>>::validate_forward_block_type(
+        let error = <ArrayType as DenseDifferentiableType<TestContext>>::validate_hessian_block_type(
             &ArrayType::new(F32, Shape::new(vec![Size::Static(2)])),
+            &ArrayType::scalar(F32),
             &ArrayType::scalar(F32),
             &ArrayType::scalar(F32),
         )
@@ -1440,21 +1391,37 @@ mod tests {
         let input_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
         let wrong_block_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
 
-        <ArrayType as DenseDifferentiableType<TestContext>>::validate_forward_block_type(
-            &wrong_block_type,
-            &output_type,
-            &input_type,
-        )
-        .unwrap();
+        // Forward blocks carry the output leaf's tangent values while reverse blocks carry the input leaf's
+        // cotangent values, so a packed replay output that stays in the narrow `f8e8m0fnu` storage type is rejected
+        // by both extractors, whose expected per-item type is the widened `f32` differential representation.
+        let narrow_type = ArrayType::scalar(DataType::F8E8M0FNU);
+        let physical_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(1)]));
+        let packed =
+            ArrayBatch::new(physical_type.clone(), TestArray::new(physical_type, vec![2.0]), BatchAxis::new(0))
+                .unwrap();
         assert_eq!(
-            <ArrayType as DenseDifferentiableType<TestContext>>::validate_reverse_block_type(
-                &wrong_block_type,
-                &output_type,
-                &input_type,
+            <ArrayType as DenseDifferentiableType<TestContext>>::forward_block(
+                &packed,
+                1,
+                0,
+                &narrow_type,
+                &narrow_type,
             )
             .unwrap_err()
             .to_string(),
-            "derivative block has type f64[2, 3] but expected f32[2, 3]",
+            "batched derivative output has per-item type f8e8m0fnu[] but expected f32[]",
+        );
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<TestContext>>::reverse_block(
+                &packed,
+                1,
+                0,
+                &narrow_type,
+                &narrow_type,
+            )
+            .unwrap_err()
+            .to_string(),
+            "batched derivative output has per-item type f8e8m0fnu[] but expected f32[]",
         );
 
         let first_input_type = ArrayType::scalar(F32);
