@@ -446,10 +446,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tests::TestArray;
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -486,7 +486,7 @@ mod tests {
             Ok(vec![ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]))]),
         );
 
-        // Concrete interpretation constructs the complex scalar, and `TestArray` (real-only storage) rejects it.
+        // Concrete interpretation constructs the complex value in both the scalar and the array universes.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -496,14 +496,14 @@ mod tests {
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f32, -2.0f32))]),
         );
-        assert!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(1.5), TestArray::scalar(-2.0)],
-            )
-            .is_err()
+                &[Array::scalar(1.5), Array::scalar(-2.0)],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))]),
         );
     }
 
@@ -522,7 +522,7 @@ mod tests {
             Err(TypeError { message: "'conjugate' requires a complex operand but got f64".to_string() }),
         );
 
-        // Concrete interpretation negates the imaginary part.
+        // Concrete interpretation negates the imaginary part, in both the scalar and the array universes.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -531,6 +531,15 @@ mod tests {
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(ComplexNumber::new(1.5f64, 2.0f64))]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)])]),
         );
     }
 
@@ -558,7 +567,8 @@ mod tests {
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))]),
         );
 
-        // Concrete interpretation extracts the real part.
+        // Concrete interpretation extracts the real part, in both the scalar and the array universes (where the
+        // output element data type maps to the part data type).
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -567,6 +577,15 @@ mod tests {
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(1.5f64)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![1.5f64, 0.5f64])]),
         );
     }
 
@@ -585,7 +604,8 @@ mod tests {
             Err(TypeError { message: "'imaginary' requires a complex operand but got bool".to_string() }),
         );
 
-        // Concrete interpretation extracts the imaginary part.
+        // Concrete interpretation extracts the imaginary part, in both the scalar and the array universes (where the
+        // output element data type maps to the part data type).
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -594,6 +614,15 @@ mod tests {
                 &[Scalar::from(ComplexNumber::new(1.5f64, -2.0f64))],
             ),
             Ok(vec![Scalar::from(-2.0f64)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64])]),
         );
     }
 }

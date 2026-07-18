@@ -203,9 +203,9 @@ impl<'a, T: Type, V> JacobianBlock<'a, T, V> {
 /// trait provide only those representation-specific operations. The Jacobian algorithms retain ownership of structure
 /// traversal, differentiation, ordering, and result construction.
 ///
-/// [`ArrayType`] currently provides the sole implementation. [`DataType`] remains usable as Jacobian metadata, but
-/// scalar operation families do not yet have a packed batching representation and therefore intentionally do not
-/// implement this capability.
+/// [`ArrayType`] currently provides the sole implementation. [`DataType`](crate::DataType) remains usable as Jacobian
+/// metadata, but scalar operation families do not yet have a packed batching representation and therefore intentionally
+/// do not implement this capability.
 pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// Packed value used during one multi-direction derivative replay.
     type PackedValue;
@@ -1272,15 +1272,15 @@ define_reverse_jacobian_with_aux!(
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DerivativeTransform, DifferentiableType, DifferentiationError, DifferentiationParameterRole,
     };
     use crate::parameters::{ParameterPath, Parameterized};
+    use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_dense_type_validation_reports_block_and_coordinate_overflow_errors() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
 
         let error = <ArrayType as DenseDifferentiableType<TestContext>>::validate_hessian_block_type(
             &ArrayType::new(F32, Shape::new(vec![Size::Static(2)])),
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn test_dense_array_basis_uses_the_requested_value_type() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let coordinate_type = ArrayType::scalar(F32)
@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_dense_array_block_validation_uses_transform_value_types() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
 
         let output_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2)]));
         let input_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
@@ -1397,7 +1397,7 @@ mod tests {
         let narrow_type = ArrayType::scalar(DataType::F8E8M0FNU);
         let physical_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(1)]));
         let packed =
-            ArrayBatch::new(physical_type.clone(), TestArray::new(physical_type, vec![2.0]), BatchAxis::new(0))
+            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, vec![2.0]), BatchAxis::new(0))
                 .unwrap();
         assert_eq!(
             <ArrayType as DenseDifferentiableType<TestContext>>::forward_block(
@@ -1440,12 +1440,12 @@ mod tests {
 
     #[test]
     fn test_jacfwd_packs_all_coordinate_directions() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let jacobian = context.jacfwd(|input| Ok(input), TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let jacobian = context.jacfwd(|input| Ok(input), Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
-            block.value().r#type,
+            block.value().r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
         );
         assert_eq!(block.value().values(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);

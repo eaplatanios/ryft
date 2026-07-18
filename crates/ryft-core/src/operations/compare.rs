@@ -208,11 +208,11 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -308,22 +308,22 @@ mod tests {
             Ok(vec![Scalar::from(true)])
         );
 
-        // Test using `TestArray`s.
-        let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
+        // Test using `Array`s.
+        let lhs = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let rhs = Array::vector(vec![2.0, 2.0, 2.0, 2.0]);
         let outputs = CompareOperation::new(ComparisonDirection::LessThan)
-            .interpret(&EagerContext::<TestArray>::new(), &EmptyRegionDriver, &[lhs, rhs])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[lhs, rhs])
             .unwrap();
-        assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(outputs[0].values(), &[true, false, false, false]);
 
         // Test the convenience functions provided by `Compare`.
-        let left = || TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let right = || TestArray::vector(vec![2.0, 2.0, 2.0]);
-        assert_eq!(left().equal(&right()).unwrap().values(), &[0.0, 1.0, 0.0]);
-        assert_eq!(left().not_equal(&right()).unwrap().values(), &[1.0, 0.0, 1.0]);
-        assert_eq!(left().less_than(&right()).unwrap().values(), &[1.0, 0.0, 0.0]);
-        assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[1.0, 1.0, 0.0]);
-        assert_eq!(left().greater_than(&right()).unwrap().values(), &[0.0, 0.0, 1.0]);
-        assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[0.0, 1.0, 1.0]);
+        let left = || Array::vector(vec![1.0, 2.0, 3.0]);
+        let right = || Array::vector(vec![2.0, 2.0, 2.0]);
+        assert_eq!(left().equal(&right()).unwrap().values(), &[false, true, false]);
+        assert_eq!(left().not_equal(&right()).unwrap().values(), &[true, false, true]);
+        assert_eq!(left().less_than(&right()).unwrap().values(), &[true, false, false]);
+        assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[true, true, false]);
+        assert_eq!(left().greater_than(&right()).unwrap().values(), &[false, false, true]);
+        assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[false, true, true]);
     }
 }

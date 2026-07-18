@@ -190,11 +190,11 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOpera
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tests::TestArray;
     use crate::tracing::{DomainTracer, Trace};
-    use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
+    use crate::tracing_v2::ReverseModeDifferentiate;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -223,8 +223,8 @@ mod tests {
 
     #[test]
     fn test_print_interprets_as_the_identity() {
-        let context = EagerContext::<TestArray>::new();
-        let input = TestArray::scalar(3.0);
+        let context = EagerContext::<Array>::new();
+        let input = Array::scalar(3.0);
         let outputs =
             PrintOperation::new("x").interpret(&context.clone(), &EmptyRegionDriver, &[input.clone()]).unwrap();
         assert_eq!(outputs, vec![input]);
@@ -235,16 +235,16 @@ mod tests {
         // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
         // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
         // the gradient) exercises the effect keep-alive of the partition projections.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let (value, gradient) = domain.value_and_gradient(print_square, TestArray::scalar(3.0)).unwrap();
-        assert_eq!(value.values[0], 9.0);
-        assert_eq!(gradient.values[0], 6.0);
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (value, gradient) = domain.value_and_gradient(print_square, Array::scalar(3.0)).unwrap();
+        assert_eq!(value.to_f64s()[0], 9.0);
+        assert_eq!(gradient.to_f64s()[0], 6.0);
     }
 
     #[test]
     fn test_print_stages_through_the_tracer_capability() {
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.print("x")),
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.print("x")),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -262,8 +262,8 @@ mod tests {
         // Linearizing `print_square` partitions its jvp program into primal and tangent stages: the dead print rides
         // the primal (known) stage through the partition projections' effect keep-alive, and the tangent stage stays
         // print-free because the JVP rule keeps the effect on the primal side.
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(print_square(x)),
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(print_square(x)),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
