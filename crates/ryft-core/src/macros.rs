@@ -1342,33 +1342,328 @@ macro_rules! check_operation_batching {
     }};
 }
 
-/// Checks how a concrete [`Operation`](crate::Operation) behaves under transposition. The `@rejected` selector builds
-/// a one-instruction program and checks that transposition reaches the operation's unsupported-transposition error. The
-/// input type list encodes operation arity. The default form uses the eager [`Array`](crate::Array) reference backend,
-/// while `backend = (Value, Operation)` supports downstream value and operation families.
+/// Checks how a concrete [`Operation`](crate::Operation) behaves under forward-mode differentiation. Each
+/// case builds a single [`Instruction`](crate::Instruction) [`Program`](crate::Program), transforms it with
+/// [`Program::jvp`](crate::Program::jvp), interprets the fused primal-and-tangent program, and checks the declared
+/// primal and tangent outputs. The macro independently checks the tangent outputs against the central directional
+/// finite difference `(f(x + h·ẋ) - f(x - h·ẋ)) / (2h)`, so the numerical oracle never uses the differentiation rule
+/// being tested. An optional `jvp` string checks the transformed program's symbolic form. The default form uses the
+/// eager [`Array`](crate::Array) reference backend, while `backend = (Value, Operation)` supports downstream value and
+/// operation families whose values implement the arithmetic and approximate-equality operations used by the check.
 ///
 /// # Example
 ///
-/// This is an example of how to use this macro to check the elementwise [`SinOperation`](crate::SinOperation):
+/// This is an example of how to use this macro to check the elementwise [`MulOperation`](crate::MulOperation):
 ///
 /// ```rust
-/// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation_transposition};
-/// check_operation_transposition!(
-///     @rejected,
-///     operation = SinOperation,
-///     input_types = [ArrayType::scalar(DataType::F64)],
+/// # use indoc::indoc;
+/// # use ryft_core::{Array, MulOperation, check_operation_differentiation};
+/// check_operation_differentiation!(
+///     @approx(step = 1e-6, epsilon = 1e-6),
+///     operation = MulOperation,
+///     cases = [{
+///         primals = [Array::scalar(2.0), Array::scalar(5.0)],
+///         tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
+///         primal_outputs = [Array::scalar(10.0)],
+///         tangent_outputs = [Array::scalar(13.0)],
+///         jvp = indoc! {"
+///             lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+///             let %4:f64[] = mul %0 %1
+///                 %5:f64[] = mul %1 %2
+///                 %6:f64[] = mul %0 %3
+///                 %7:f64[] = add %5 %6
+///             in (%4, %7)
+///         "},
+///     }],
 /// );
 /// ```
 ///
 /// # Parameters
 ///
-///   - `$selector`: Transposition behavior to check. The only currently supported selector is `@rejected`.
+///   - `$selector`: Numerical check configuration, written as `@approx(step = ..., epsilon = ...)`, where `step` is
+///     the central finite-difference spacing and `epsilon` is the absolute comparison tolerance.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
+///   - `cases = $cases`: Differentiation cases declaring primal inputs, input tangents, primal outputs, tangent outputs,
+///     and an optional `jvp` rendering.
+///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct programs
+///     for a downstream operation family.
+#[macro_export]
+macro_rules! check_operation_differentiation {
+    (
+        @approx(step = $step:expr, epsilon = $epsilon:expr),
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation_differentiation!(
+            @approx(step = $step, epsilon = $epsilon),
+            backend = (
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+            ),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @approx(step = $step:expr, epsilon = $epsilon:expr),
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        cases = [
+            $(
+                {
+                    primals = [$($primal:expr),+ $(,)?],
+                    tangents = [$($tangent:expr),+ $(,)?],
+                    primal_outputs = [$($primal_output:expr),+ $(,)?],
+                    tangent_outputs = [$($tangent_output:expr),+ $(,)?]
+                    $(, jvp = $jvp:expr)? $(,)?
+                }
+            ),+ $(,)?
+        ] $(,)?) => {{
+        let operation = $operation;
+        let step: f64 = $step;
+        let epsilon: f64 = $epsilon;
+        assert!(step > 0.0, "finite-difference step must be positive");
+        assert!(epsilon >= 0.0, "comparison epsilon must be nonnegative");
+        $(
+        {
+            let primals: Vec<$value> = vec![$(::core::convert::Into::into($primal)),+];
+            let tangents: Vec<$value> = vec![$(::core::convert::Into::into($tangent)),+];
+            assert_eq!(primals.len(), tangents.len(), "primal and tangent input counts differ");
+            let expected_primals: Vec<$value> = vec![$(::core::convert::Into::into($primal_output)),+];
+            let expected_tangents: Vec<$value> = vec![$(::core::convert::Into::into($tangent_output)),+];
+            assert_eq!(
+                expected_primals.len(),
+                expected_tangents.len(),
+                "primal and tangent output counts differ",
+            );
+
+            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
+            let input_ids = primals
+                .iter()
+                .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
+                .collect::<Vec<_>>();
+            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            assert_eq!(output_ids.len(), expected_primals.len(), "declared output count is incorrect");
+            let output_count = output_ids.len();
+            let program = builder
+                .build::<Vec<$value>, Vec<$value>>(
+                    output_ids,
+                    vec![$crate::parameters::Placeholder; primals.len()],
+                    vec![$crate::parameters::Placeholder; output_count],
+                )
+                .unwrap();
+            let jvp = program.jvp().unwrap();
+            $(assert_eq!(jvp.to_string(), $jvp.trim_end());)?
+
+            let jvp_inputs = primals.iter().cloned().chain(tangents.iter().cloned()).collect::<Vec<_>>();
+            let actual = jvp.interpret(jvp_inputs).unwrap();
+            assert_eq!(actual.len(), 2 * output_count);
+            let (actual_primals, actual_tangents) = actual.split_at(output_count);
+            for (actual, expected) in actual_primals.iter().zip(expected_primals.iter()) {
+                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+            }
+            for (actual, expected) in actual_tangents.iter().zip(expected_tangents.iter()) {
+                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+            }
+
+            let plus_inputs = primals
+                .iter()
+                .cloned()
+                .zip(tangents.iter().cloned())
+                .map(|(primal, tangent)| primal + tangent * step)
+                .collect::<Vec<_>>();
+            let minus_inputs = primals
+                .iter()
+                .cloned()
+                .zip(tangents.iter().cloned())
+                .map(|(primal, tangent)| primal - tangent * step)
+                .collect::<Vec<_>>();
+            let plus_outputs = program.interpret(plus_inputs).unwrap();
+            let minus_outputs = program.interpret(minus_inputs).unwrap();
+            assert_eq!(plus_outputs.len(), output_count);
+            assert_eq!(minus_outputs.len(), output_count);
+            for ((actual, plus), minus) in actual_tangents
+                .iter()
+                .zip(plus_outputs.into_iter())
+                .zip(minus_outputs.into_iter())
+            {
+                let estimate = (plus - minus) * (1.0 / (2.0 * step));
+                ::approx::assert_abs_diff_eq!(actual, &estimate, epsilon = epsilon);
+            }
+        }
+        )+
+    }};
+}
+
+/// Checks how a concrete [`Operation`](crate::Operation) behaves under transposition. Supported cases build a single
+/// [`Instruction`](crate::Instruction) [`Program`](crate::Program), classify each input as `@linear` or `@known`,
+/// transpose with respect to the linear inputs, and check the interpreted input cotangents. The pullback receives
+/// output cotangents followed by the concrete known inputs in source-input order, and returns cotangents in
+/// linear-input order. An optional `pullback` string checks the transformed program's symbolic form. Use `@exact`
+/// for complete value equality or `@approx(epsilon = ...)` for approximate equality. The `@rejected` selector checks
+/// that transposition reaches the operation's unsupported-transposition error. The default forms use the eager
+/// [`Array`](crate::Array) reference backend, while `backend = (Value, Operation)` supports downstream value
+/// and operation families.
+///
+/// # Example
+///
+/// This is an example of how to use this macro to check the elementwise [`MulOperation`](crate::MulOperation):
+///
+/// ```rust
+/// # use indoc::indoc;
+/// # use ryft_core::{Array, ArrayType, DataType, MulOperation, check_operation_transposition};
+/// check_operation_transposition!(
+///     @exact,
+///     operation = MulOperation,
+///     cases = [{
+///         inputs = [
+///             (@known, Array::scalar(4.0)),
+///             (@linear(type = ArrayType::scalar(DataType::F64))),
+///         ],
+///         output_cotangents = [Array::scalar(3.0)],
+///         input_cotangents = [Array::scalar(12.0)],
+///         pullback = indoc! {"
+///             lambda %0:f64[], %1:f64[] .
+///             let %2:f64[] = mul %1 %0
+///             in (%2)
+///         "},
+///     }],
+/// );
+/// ```
+///
+/// # Parameters
+///
+///   - `$selector`: Output comparison to perform for supported cases (`@exact` or `@approx(epsilon = ...)`), or the
+///     `@rejected` unsupported-operation contract.
+///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
+///   - `cases = $cases`: Supported transposition cases declaring known and linear inputs, output cotangents, expected
+///     input cotangents, and an optional `pullback` rendering.
 ///   - `input_types = $input_types`: Input types used to build the transposed program, in operation input order.
 ///   - `backend = ($value, $operation_family)`: Optional value and operation-family types used to construct a
 ///     transposition program for a downstream operation family.
 #[macro_export]
 macro_rules! check_operation_transposition {
+    (
+        @exact,
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation_transposition!(
+            @run (@exact),
+            backend = (
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+            ),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @approx(epsilon = $epsilon:expr),
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?
+    ) => {
+        $crate::check_operation_transposition!(
+            @run (@approx($epsilon)),
+            backend = (
+                $crate::backends::arrays::Array,
+                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+            ),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @exact,
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?) => {
+        $crate::check_operation_transposition!(
+            @run (@exact),
+            backend = ($value, $operation_family),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @approx(epsilon = $epsilon:expr),
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        cases = $cases:tt $(,)?) => {
+        $crate::check_operation_transposition!(
+            @run (@approx($epsilon)),
+            backend = ($value, $operation_family),
+            operation = $operation,
+            cases = $cases,
+        )
+    };
+
+    (
+        @run $comparison:tt,
+        backend = ($value:ty, $operation_family:ty),
+        operation = $operation:expr,
+        cases = [
+            $(
+                {
+                    inputs = [$($input:tt),+ $(,)?],
+                    output_cotangents = [$($output_cotangent:expr),+ $(,)?],
+                    input_cotangents = [$($input_cotangent:expr),+ $(,)?]
+                    $(, pullback = $pullback:expr)? $(,)?
+                }
+            ),+ $(,)?
+        ] $(,)?) => {{
+        let operation = $operation;
+        $(
+        {
+            let inputs: Vec<(_, bool, Option<$value>)> =
+                vec![$($crate::check_operation_transposition!(@input $value, $input)),+];
+            let linear_indices = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, linear, _))| linear.then_some(index))
+                .collect::<Vec<_>>();
+            assert!(!linear_indices.is_empty(), "a supported transposition case needs at least one linear input");
+            let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
+            let input_ids = inputs
+                .iter()
+                .map(|(r#type, _, _)| builder.add_input(r#type.clone()))
+                .collect::<Vec<_>>();
+            let operation: $operation_family = ::core::convert::Into::into(operation.clone());
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            let output_count = output_ids.len();
+            let program = builder
+                .build::<Vec<$value>, Vec<$value>>(
+                    output_ids,
+                    vec![$crate::parameters::Placeholder; inputs.len()],
+                    vec![$crate::parameters::Placeholder; output_count],
+                )
+                .unwrap();
+            let pullback = program.transpose_with_respect_to(linear_indices.as_slice()).unwrap();
+            $(assert_eq!(pullback.to_string(), $pullback.trim_end());)?
+
+            let output_cotangents: Vec<$value> =
+                vec![$(::core::convert::Into::into($output_cotangent)),+];
+            assert_eq!(output_cotangents.len(), output_count, "declared output cotangent count is incorrect");
+            let expected: Vec<$value> = vec![$(::core::convert::Into::into($input_cotangent)),+];
+            assert_eq!(expected.len(), linear_indices.len(), "declared input cotangent count is incorrect");
+            let pullback_inputs = output_cotangents
+                .into_iter()
+                .chain(inputs.into_iter().filter_map(|(_, _, value)| value))
+                .collect::<Vec<_>>();
+            let actual = pullback.interpret(pullback_inputs).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                $crate::check_operation_transposition!(@assert $comparison, actual, expected);
+            }
+        }
+        )+
+    }};
+
     (
         @rejected,
         operation = $operation:expr,
@@ -1417,6 +1712,27 @@ macro_rules! check_operation_transposition {
             )) if message == format!("operation `{descriptor}` is not transposable"),
         ));
     }};
+
+    // Internal implementation branch of this macro.
+    (@input $value:ty, (@linear(type = $r#type:expr))) => {
+        ($r#type, true, Option::<$value>::None)
+    };
+
+    // Internal implementation branch of this macro.
+    (@input $value:ty, (@known, $input:expr)) => {{
+        let input: $value = ::core::convert::Into::into($input);
+        ($crate::programs::types::Typed::r#type(&input).into_owned(), false, Some(input))
+    }};
+
+    // Internal implementation branch of this macro.
+    (@assert (@exact), $actual:expr, $expected:expr) => {
+        assert_eq!($actual, $expected)
+    };
+
+    // Internal implementation branch of this macro.
+    (@assert (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {
+        ::approx::assert_abs_diff_eq!($actual, $expected, epsilon = $epsilon)
+    };
 }
 
 /// Asserts that the reverse-mode gradient of a function at an input matches a central finite-difference estimate of its
@@ -1641,9 +1957,9 @@ macro_rules! check_gradient {
 }
 
 pub use crate::{
-    check_builders, check_count, check_gradient, check_operation_batching, check_operation_partial_evaluation,
-    check_operation_transposition, check_operation_type_inference, check_sharding, check_types,
-    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
+    check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
+    check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
@@ -1669,7 +1985,7 @@ mod tests {
     use crate::operations::constants::ZeroOperation;
     use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
     use crate::operations::math::{
-        Abs, Add, AddOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, SubOperation,
+        Abs, Add, AddOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, SubOperation,
     };
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
@@ -2365,7 +2681,64 @@ mod tests {
     }
 
     #[test]
+    fn test_check_operation_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            backend = (Array, crate::backends::arrays::ArrayOperation<Array>),
+            operation = MulOperation,
+            cases = [
+                {
+                    primals = [Array::scalar(2.0), Array::scalar(5.0)],
+                    tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
+                    primal_outputs = [Array::scalar(10.0)],
+                    tangent_outputs = [Array::scalar(13.0)],
+                    jvp = "lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .\n\
+                           let %4:f64[] = mul %0 %1\n    \
+                               %5:f64[] = mul %1 %2\n    \
+                               %6:f64[] = mul %0 %3\n    \
+                               %7:f64[] = add %5 %6\n\
+                           in (%4, %7)",
+                },
+                {
+                    primals = [Array::scalar(2.0), Array::vector(vec![1.0, 3.0])],
+                    tangents = [Array::scalar(0.5), Array::vector(vec![2.0, -1.0])],
+                    primal_outputs = [Array::vector(vec![2.0, 6.0])],
+                    tangent_outputs = [Array::vector(vec![4.5, -0.5])],
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_check_operation_transposition() {
+        check_operation_transposition!(
+            @exact,
+            backend = (Array, crate::backends::arrays::ArrayOperation<Array>),
+            operation = MulOperation,
+            cases = [{
+                inputs = [
+                    (@known, Array::scalar(4.0)),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(12.0)],
+                pullback = "lambda %0:f64[], %1:f64[] .\n\
+                            let %2:f64[] = mul %1 %0\n\
+                            in (%2)",
+            }],
+        );
+        check_operation_transposition!(
+            @approx(epsilon = 1e-9),
+            operation = AddOperation,
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(3.0), Array::scalar(3.0)],
+            }],
+        );
         check_operation_transposition!(
             @rejected,
             operation = SinOperation,
