@@ -615,12 +615,12 @@ macro_rules! define_tracer_operator {
 ///     real `f64` array (i.e., the only shape the plain [`gradient`](crate::gradient) entry point accepts).
 ///   - `$function`: Closure literal (or generic function) to differentiate.
 ///   - `$input`: Expression convertible into the selected universe's value, at which the gradient is checked.
-///   - `$step`: Central finite-difference spacing `h`.
-///   - `$tolerance`: Absolute tolerance for the comparison. Pick one compatible with the `O($step²)` truncation
+///   - `step = $step`: Central finite-difference spacing `h`.
+///   - `tolerance = $tolerance`: Absolute tolerance for the comparison. Pick one compatible with the `O($step²)` truncation
 ///     error of the central difference.
 #[macro_export]
 macro_rules! check_gradient {
-    (@scalar, $function:expr, $input:expr, $step:expr, $tolerance:expr $(,)?) => {
+    (@scalar, $function:expr, $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
                 $crate::backends::scalars::Scalar,
@@ -631,7 +631,7 @@ macro_rules! check_gradient {
         )
     };
 
-    (@array, $function:expr, $input:expr, $step:expr, $tolerance:expr $(,)?) => {
+    (@array, $function:expr, $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
                 $crate::backends::arrays::Array,
