@@ -684,7 +684,7 @@ impl<'o> Value for Array<'o> {
     // operations through `dispatch_domain()`, which is what makes every operation on concrete arrays execute
     // eagerly, op by op, through the domain recovered below, while free transform entry points (e.g.,
     // `ryft_core::batching::batch`) recover the same domain through `execution_domain()`. `ryft-core`'s own
-    // `TestArray` instead keeps the constant-only `EagerContext` dispatch domain and provides direct host kernels
+    // `ryft_core::backends::arrays::Array` instead keeps the constant-only `EagerContext` dispatch domain and provides direct host kernels
     // for each capability, relying on in-crate coherence between those direct impls and the blankets; a downstream
     // backend crate cannot take that route because the coherence check cannot rule out future
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager

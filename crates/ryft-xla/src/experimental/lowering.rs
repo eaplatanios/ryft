@@ -3,6 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "benchmarking"))]
+use ryft_core::backends::arrays::Array as CpuArray;
+use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
@@ -25,9 +28,6 @@ use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-#[cfg(any(test, feature = "benchmarking"))]
-use ryft_core::tests::TestArray;
-use ryft_core::tracing_v2::ArrayOperation;
 use ryft_core::tracing_v2::operations::DotOperation;
 use ryft_core::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveKind, CollectiveOperation};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
@@ -3223,32 +3223,33 @@ impl MlirLowerableValue for ArrayType {
 
 /// Concrete test/benchmark value lowering used by MLIR snapshot tooling.
 #[cfg(any(test, feature = "benchmarking"))]
-impl MlirLowerableValue for TestArray {
+impl MlirLowerableValue for CpuArray {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        // Integer-typed payloads (e.g., dynamic slicing start indices) are stored in-band as `f64` values, so they
-        // convert through integer dense attributes matching the lowered integer tensor type.
-        let data_type = self.r#type.data_type();
+        // The snapshot tooling views real-valued payloads through `f64` and converts integer-typed payloads (e.g.,
+        // dynamic slicing start indices) through integer dense attributes matching the lowered integer tensor type.
+        let data_type = self.r#type().data_type();
+        let values = self.to_f64s();
         let attribute = match data_type {
             DataType::I32 => {
-                let values = self.values.iter().map(|value| *value as i32).collect::<Vec<_>>();
+                let values = values.iter().map(|value| *value as i32).collect::<Vec<_>>();
                 context
                     .dense_i32_elements_attribute(tensor_type, values.as_slice())
                     .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
                     .cast::<DenseElementsAttributeRef>()
             }
             DataType::I64 => {
-                let values = self.values.iter().map(|value| *value as i64).collect::<Vec<_>>();
+                let values = values.iter().map(|value| *value as i64).collect::<Vec<_>>();
                 context
                     .dense_i64_elements_attribute(tensor_type, values.as_slice())
                     .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
                     .cast::<DenseElementsAttributeRef>()
             }
             _ => context
-                .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
+                .dense_f64_elements_attribute(tensor_type, values.as_slice())
                 .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
                 .cast::<DenseElementsAttributeRef>(),
         };
@@ -3260,7 +3261,7 @@ impl MlirLowerableValue for TestArray {
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        if self.values.len() != 1 {
+        if self.values().len() != 1 {
             return Ok(None);
         }
         Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
@@ -6865,6 +6866,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::EagerContext;
+    use ryft_core::backends::arrays::Array as CpuArray;
+    use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::Context;
     use ryft_core::operations::compare::CompareOperation;
     use ryft_core::operations::constants::{
@@ -6880,9 +6883,8 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tests::TestArray;
+    use ryft_core::tracing_v2::ReverseModeDifferentiate;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
     use ryft_core::types::{Shape, Size};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -6988,13 +6990,13 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = ryft_core::ProgramBuilder::<TestArray, BroadcastOperation>::new();
+        let mut builder = ryft_core::ProgramBuilder::<CpuArray, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -8808,23 +8810,23 @@ mod tests {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }
 
-    static TEST_ARRAY_DOMAIN: EagerContext<TestArray, ArrayOperation<TestArray>> =
-        EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+    static TEST_ARRAY_DOMAIN: EagerContext<CpuArray, ArrayOperation<CpuArray>> =
+        EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new();
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let (_, compiled): (
-            TestArray,
+            CpuArray,
             ryft_core::programs::Program<
-                TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray>,
-                (TestArray, TestArray),
-                TestArray,
+                CpuArray,
+                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
+                (CpuArray, CpuArray),
+                CpuArray,
             >,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+                (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),
             )
             .unwrap();
 
@@ -8847,12 +8849,12 @@ mod tests {
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let (_, compiled): (
-            TestArray,
+            CpuArray,
             ryft_core::programs::Program<
-                TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray>,
-                TestArray,
-                TestArray,
+                CpuArray,
+                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
+                CpuArray,
+                CpuArray,
             >,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
@@ -8860,7 +8862,7 @@ mod tests {
                     let context = x.context().clone();
                     Ok(context.gradient(scalar_quartic_plus_sin, x).expect("scalar gradient should succeed"))
                 },
-                TestArray::scalar(2.0),
+                CpuArray::scalar(2.0),
             )
             .unwrap();
 
@@ -9013,8 +9015,8 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -9035,8 +9037,8 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -9055,13 +9057,13 @@ mod tests {
 
         // The pad pullback splits the cotangent into the strided slice at the pad geometry (for the input) and the
         // full-sum-minus-sliced-sum subtraction (for the padding value), all of which lower to StableHLO.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
                 |(x, padding_value)| {
                     use ryft_core::operations::manipulation::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
-                (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
+                (CpuArray::vector(vec![1.0, 2.0, 3.0]), CpuArray::scalar(9.0)),
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
@@ -9085,13 +9087,14 @@ mod tests {
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
         // integer constants through `lower_literal_value`.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
                 |x| {
-                    let start = x.context().lift(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0])).unwrap();
+                    let start =
+                        x.context().lift(CpuArray::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0])).unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
-                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
@@ -9120,8 +9123,8 @@ mod tests {
         // backward pass as `stablehlo.multiply`s of the cotangent against those residual inputs rather than baking the
         // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
         // explicit arguments.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (CpuArray::scalar(2.0), CpuArray::scalar(3.0)))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
 
@@ -9172,13 +9175,13 @@ mod tests {
             }
         "#};
 
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let function = rematerialize::<EagerContext<CpuArray, ArrayOperation<CpuArray>>, _, _, _>(
+            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
                 Ok((x.clone() * x).sin()?)
             },
         );
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| function.call(x), TestArray::scalar(2.0))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|x| function.call(x), CpuArray::scalar(2.0))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -9190,14 +9193,14 @@ mod tests {
         assert_eq!(stablehlo, expected);
 
         // Disabling `prevent_cse` changes nothing about the reverse pullback: the hint only affects forward lowering.
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let function = rematerialize::<EagerContext<CpuArray, ArrayOperation<CpuArray>>, _, _, _>(
+            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
                 Ok((x.clone() * x).sin()?)
             },
         )
         .with_prevent_cse(false);
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| function.call(x), TestArray::scalar(2.0))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|x| function.call(x), CpuArray::scalar(2.0))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -9213,8 +9216,8 @@ mod tests {
         // identity-looking transfer back to device memory, which `HostOffloader` needs to see. The program mirrors
         // the JAX example in `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom
         // calls are byte-identical to the ones JAX emits for it.
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let (_, program) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::trace(
+            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true });
                 let back = on_host.transfer_to_memory(Memory::Device);
@@ -9387,14 +9390,13 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = TestArray::new(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
+            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder
                 .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new())
                 .unwrap()[0];
-            let program = builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap();
+            let program =
+                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -9415,12 +9417,11 @@ mod tests {
             (Memory::Host { pinned: true }, Some("pinned_host")),
             (Memory::Host { pinned: false }, Some("unpinned_host")),
         ] {
-            let value = TestArray::new(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let value = CpuArray::from_f64s(test_vector_type(4).with_memory(memory), vec![1.0, 2.0, 3.0, 4.0]);
+            let mut builder = ProgramBuilder::<CpuArray, ArrayOperation<CpuArray>>::new();
             let output = builder.add_constant(value);
-            let program = builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap();
+            let program =
+                builder.build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
             let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(
@@ -9440,8 +9441,8 @@ mod tests {
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), TestArray::scalar(2.0))
+        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0))
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -9454,12 +9455,12 @@ mod tests {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the traced value-and-gradient path that traces through vjp+pullback.
         let (_, compiled): (
-            (TestArray, TestArray),
+            (CpuArray, CpuArray),
             ryft_core::programs::Program<
-                TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray>,
-                (TestArray, TestArray),
-                (TestArray, TestArray),
+                CpuArray,
+                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
+                (CpuArray, CpuArray),
+                (CpuArray, CpuArray),
             >,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
@@ -9467,7 +9468,7 @@ mod tests {
                     let context = inputs.0.context().clone();
                     Ok(context.gradient(scalar_bilinear_sin, inputs).expect("scalar gradient should succeed"))
                 },
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+                (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),
             )
             .unwrap();
 

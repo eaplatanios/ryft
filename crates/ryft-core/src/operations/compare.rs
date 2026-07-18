@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::operations::{BooleanLike, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
@@ -135,6 +135,10 @@ where
 
 impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation {}
 
+impl_non_differentiable_operation!(CompareOperation);
+
+impl_non_transposable_operation!(CompareOperation);
+
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
 /// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must be broadcast-compatible,
@@ -208,14 +212,27 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::differentiation::DifferentiationTracer;
+    use crate::operations::constants::ZeroLike;
+    use crate::operations::control_flow::Select;
+    use crate::programs::ProgramError;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
+
+    /// `f(x) = select(x > 0, 2x, 3x)` expressed over JVP duals of the eager [`Array`] context.
+    fn piecewise_select(
+        x: DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+    ) -> Result<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
+    }
 
     #[test]
     fn test_compare() {
@@ -325,5 +342,22 @@ mod tests {
         assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[true, true, false]);
         assert_eq!(left().greater_than(&right()).unwrap().values(), &[false, false, true]);
         assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[false, true, true]);
+    }
+
+    #[test]
+    fn test_compare_differentiation() {
+        // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
+        // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(piecewise_select, Array::scalar(2.0), Array::scalar(1.0))
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![4.0]);
+        assert_eq!(tangent.to_f64s(), vec![2.0]);
+
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(piecewise_select, Array::scalar(-2.0), Array::scalar(1.0))
+            .unwrap();
+        assert_eq!(primal.to_f64s(), vec![-6.0]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
     }
 }

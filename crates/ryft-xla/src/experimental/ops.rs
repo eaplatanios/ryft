@@ -43,6 +43,7 @@ use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface};
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::debugging::PrintOperation;
@@ -54,7 +55,7 @@ use ryft_core::tracing_v2::operations::custom_derivatives::{
 use ryft_core::tracing_v2::operations::memory::TransferToMemoryOperation;
 use ryft_core::tracing_v2::operations::reduce::ReduceOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::tracing_v2::{ArrayOperation, AxisIndexOperation, CollectiveOperation, DotOperation};
+use ryft_core::tracing_v2::{AxisIndexOperation, CollectiveOperation, DotOperation};
 use ryft_core::types::ArrayType;
 
 use crate::experimental::operations::ShardMapOperation;

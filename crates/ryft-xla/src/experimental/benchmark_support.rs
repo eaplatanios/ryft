@@ -1,13 +1,14 @@
+use ryft_core::backends::arrays::Array as CpuArray;
+use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::contexts::{Context, EagerContext};
 use ryft_core::operations::math::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
+use ryft_core::tracing_v2::{Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
 
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
@@ -146,9 +147,9 @@ where
 
 /// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)` through the canonical XLA MLIR lowering path.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+    let context = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new();
     let (_, pushforward) =
-        context.linearize(|x| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?), TestArray::scalar(2.0))?;
+        context.linearize(|x| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?), CpuArray::scalar(2.0))?;
     let (pushforward, residuals) = pushforward.into_parts();
     let (_, closed_pushforward) = context.interpret_and_trace(
         move |tangent| {
@@ -164,7 +165,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
             let mut outputs = pushforward.interpret_in_context(&tracing_context, inputs)?;
             Ok(outputs.remove(0))
         },
-        TestArray::scalar(1.0),
+        CpuArray::scalar(1.0),
     )?;
     let summary = summarize_program(&closed_pushforward)?;
     let mlir = to_mlir_module_for_plain_program(&closed_pushforward, "main")

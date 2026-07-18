@@ -87,7 +87,7 @@ impl BooleanLike for Array<'_> {
 }
 
 /// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
-/// [`TestArray`](ryft_core::tests::TestArray): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
+/// [`Array`](ryft_core::backends::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
 /// `or` via device-to-host readback of every shard, and [`WhilePredicate::mask_select`] broadcasts the predicate
 /// against the operands along its leading (prefix) axes on device before selecting.
 impl WhilePredicate for Array<'_> {
@@ -228,12 +228,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::Sharding;
+    use ryft_core::backends::arrays::Array as CpuArray;
+    use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::operations::constants::OneLike;
     use ryft_core::operations::control_flow::SelectCondition;
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
-    use ryft_core::operations::manipulation::{Concatenate, Pad, Reshape, Slice, Transpose, UpdateSlice};
-    use ryft_core::operations::math::{Abs, Atan2, Cos, Sin};
+    use ryft_core::operations::manipulation::{
+        Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
+    };
+    use ryft_core::operations::math::{Abs, Atan2, Cos, Exp, Log, Sin, Sqrt};
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -399,6 +403,93 @@ mod tests {
         let cosine = read_c64s(&extreme.cos().unwrap())[0];
         assert!(cosine.re.is_infinite() && cosine.re.is_sign_positive());
         assert_eq!(cosine.im, 0.0);
+    }
+
+    /// Asserts elementwise value agreement between the XLA-backed eager array backend and the `ryft-core`
+    /// reference array backend ([`CpuArray`]) over a scoped operation list: the twelve math operations,
+    /// element-type conversion, selection, and reduction — including one complex and one `f8` case. This is the
+    /// value-level counterpart of the reference-backend parity rule: the reference backend must agree with the
+    /// pinned XLA semantics wherever both implement an operation.
+    #[test]
+    fn test_eager_value_parity_with_reference_backend() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let left_values = [0.5f32, 1.25, 2.0, 3.75];
+        let right_values = [4.0f32, 0.25, -1.5, 2.5];
+        let left = f32_vector(&client, &mesh, &left_values);
+        let right = f32_vector(&client, &mesh, &right_values);
+        let reference_left = CpuArray::vector(left_values.to_vec());
+        let reference_right = CpuArray::vector(right_values.to_vec());
+
+        // Both backends compute in `f32`, so agreement is checked within a small `f32`-scale tolerance (the two
+        // implementations may round transcendental functions differently in the last unit of precision).
+        let assert_parity = |device: &Array<'_>, reference: &CpuArray| {
+            let device_values = read_f32s(device);
+            let reference_values = reference.to_f64s();
+            assert_eq!(device_values.len(), reference_values.len());
+            for (index, (device_value, reference_value)) in
+                device_values.iter().zip(reference_values.iter()).enumerate()
+            {
+                assert!(
+                    (f64::from(*device_value) - reference_value).abs() < 1e-5,
+                    "element {index} disagrees: XLA computed {device_value} but the reference backend computed \
+                     {reference_value}",
+                );
+            }
+        };
+
+        assert_parity(&left.add(&right).unwrap(), &reference_left.add(&reference_right).unwrap());
+        assert_parity(&left.sub(&right).unwrap(), &reference_left.sub(&reference_right).unwrap());
+        assert_parity(&left.mul(&right).unwrap(), &reference_left.mul(&reference_right).unwrap());
+        assert_parity(&left.div(&right).unwrap(), &reference_left.div(&reference_right).unwrap());
+        assert_parity(&right.neg().unwrap(), &reference_right.neg().unwrap());
+        assert_parity(&right.abs().unwrap(), &reference_right.abs().unwrap());
+        assert_parity(&left.sin().unwrap(), &reference_left.sin().unwrap());
+        assert_parity(&left.cos().unwrap(), &reference_left.cos().unwrap());
+        assert_parity(&left.atan2(&right).unwrap(), &reference_left.atan2(&reference_right).unwrap());
+        assert_parity(&left.exp().unwrap(), &reference_left.exp().unwrap());
+        assert_parity(&left.log().unwrap(), &reference_left.log().unwrap());
+        assert_parity(&left.sqrt().unwrap(), &reference_left.sqrt().unwrap());
+
+        // Element-type conversion agrees, including the exact `f8e4m3fn` encodings: the device payload bytes match
+        // the reference backend's encoded bits bit for bit.
+        let converted = left.convert_element_type(DataType::F8E4M3FN).unwrap();
+        let converted_bytes = shard_host_bytes(&converted.addressable_shards().next().unwrap()).unwrap();
+        let reference_bits = reference_left
+            .convert_element_type(DataType::F8E4M3FN)
+            .unwrap()
+            .values()
+            .iter()
+            .map(|value| value.low_precision_float_bits().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(converted_bytes, reference_bits);
+
+        // Selection agrees.
+        let condition_values = [true, false, true, false];
+        let condition = boolean_vector(&client, &mesh, &condition_values);
+        let reference_condition = CpuArray::vector(condition_values.to_vec());
+        assert_parity(
+            &Select::select(&condition, &left, &right).unwrap(),
+            &Select::select(&reference_condition, &reference_left, &reference_right).unwrap(),
+        );
+
+        // Reduction agrees.
+        assert_parity(&left.reduce(&[0], ReductionKind::Sum), &reference_left.reduce(&[0], ReductionKind::Sum));
+
+        // Complex multiplication agrees.
+        let complex_left_value = num_complex::Complex::new(1.5f32, -2.0);
+        let complex_right_value = num_complex::Complex::new(0.5f32, 3.0);
+        let complex_left = c64_scalar(&client, &mesh, complex_left_value);
+        let complex_right = c64_scalar(&client, &mesh, complex_right_value);
+        let device_product = read_c64s(&complex_left.mul(&complex_right).unwrap())[0];
+        let reference_product =
+            CpuArray::scalar(complex_left_value).mul(&CpuArray::scalar(complex_right_value)).unwrap();
+        let Scalar::C64(reference_product) = reference_product.values()[0] else {
+            panic!("expected a c64 reference product");
+        };
+        assert!((device_product - reference_product).norm() < 1e-5);
     }
 
     #[test]
