@@ -6,10 +6,10 @@ use ryft_macros::Parameterized;
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DerivativeTransform, DifferentiableOperation, DifferentiableType, DifferentiationError,
-    DifferentiationParameterRole, LinearizationTracer, TransposableOperation,
-};
+use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
+use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation};
+use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::differentiation::CoordinateBasisOperation;
@@ -18,39 +18,38 @@ use crate::operations::math::AddOperation;
 use crate::parameters::ParameterizedFamily;
 use crate::parameters::{Parameter, ParameterPath, Parameterized};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
 use crate::programs::regions::RegionRef;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::{ProgramError, Value};
+use crate::programs::values::Value;
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
-use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::{ArrayType, Shape, Size, StaticShape};
 
 use super::DenseDifferentiate;
 
-/// Dense Jacobian of a structured function, represented as the Cartesian product of its output and input leaves.
-///
-/// `I` and `O` retain the input and output type trees. Derivative values are stored in deterministic
-/// output-major/input-minor order and remain parameters so that the complete Jacobian can cross tracing and
-/// compilation boundaries or participate in higher-order transforms.
-///
-/// The physical representation of a block is defined by [`DenseDifferentiableType`]. For [`ArrayType`], the block for
-/// an output leaf with shape `O` and an input leaf with shape `I` has shape `O ++ I`.
+/// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I`
+/// and `O` retain the input and output [`Type`] trees. Derivative values are stored in deterministic output-major /
+/// input-minor order and remain [`Parameter`]s so that the complete Jacobian can cross tracing and compilation
+/// boundaries as well as participate in higher-order transforms. The physical representation of a block is defined by
+/// [`DenseDifferentiableType`]. For [`ArrayType`], the block for an output leaf with shape `O` and an input leaf with
+/// shape `I` has shape `O` concatenated with `I`.
 #[derive(Parameterized, Clone, Debug)]
-#[ryft(crate = "crate::parameters")]
 pub struct Jacobian<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> {
-    /// Type tree of the differentiated inputs.
-    input_types: I,
+    /// [`Type`] of the differentiated inputs.
+    input_type: I,
 
-    /// Type tree of the differentiated outputs.
-    output_types: O,
+    /// [`Type`] of the differentiated outputs.
+    output_type: O,
 
     /// Derivative values in output-major/input-minor order.
     values: Vec<V>,
 
-    /// Descriptor-family marker. The input and output fields use `T` only through their bounds.
+    /// [`PhantomData`] marker for `T`, needed because the input and output fields use `T` only through their bounds.
     _type: PhantomData<fn() -> T>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> Jacobian<T, V, I, O> {
     /// Constructs a [`Jacobian`] from its input/output type trees and derivative values.
@@ -71,19 +70,19 @@ impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterize
                 message: format!("jacobian requires {expected_count} derivative values but got {}", values.len()),
             });
         }
-        Ok(Self { input_types, output_types, values, _type: PhantomData })
+        Ok(Self { input_type: input_types, output_type: output_types, values, _type: PhantomData })
     }
 
     /// Returns the type tree of the differentiated inputs.
     #[inline]
     pub fn input_types(&self) -> &I {
-        &self.input_types
+        &self.input_type
     }
 
     /// Returns the type tree of the differentiated outputs.
     #[inline]
     pub fn output_types(&self) -> &O {
-        &self.output_types
+        &self.output_type
     }
 
     /// Returns the derivative values in output-major/input-minor order.
@@ -100,12 +99,12 @@ impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterize
 
     /// Returns borrowed views of all derivative blocks in output-major/input-minor order.
     pub fn iter_blocks(&self) -> impl Iterator<Item = JacobianBlock<'_, T, V>> {
-        let input_count = self.input_types.parameter_count();
-        self.output_types
+        let input_count = self.input_type.parameter_count();
+        self.output_type
             .named_parameters()
             .enumerate()
             .flat_map(move |(output_index, (output_path, output_type))| {
-                self.input_types.named_parameters().enumerate().map(move |(input_index, (input_path, input_type))| {
+                self.input_type.named_parameters().enumerate().map(move |(input_index, (input_path, input_type))| {
                     JacobianBlock {
                         output_path: output_path.clone(),
                         output_type,
@@ -120,10 +119,10 @@ impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterize
     /// Returns the derivative block for the specified output and input paths, or `None` if either path is absent.
     pub fn block(&self, output_path: &ParameterPath, input_path: &ParameterPath) -> Option<JacobianBlock<'_, T, V>> {
         let (output_index, (_, output_type)) =
-            self.output_types.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
-        let input_count = self.input_types.parameter_count();
+            self.output_type.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
+        let input_count = self.input_type.parameter_count();
         let (input_index, (_, input_type)) =
-            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == input_path)?;
+            self.input_type.named_parameters().enumerate().find(|(_, (path, _))| path == input_path)?;
         Some(JacobianBlock {
             output_path: output_path.clone(),
             output_type,

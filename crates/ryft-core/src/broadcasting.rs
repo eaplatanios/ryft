@@ -723,7 +723,6 @@ mod tests {
     #[test]
     fn test_parameterized_array_type_broadcastable() {
         #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
-        #[ryft(crate = "crate::parameters")]
         enum TestEnum<P: Parameter> {
             Wrapped { inner: P },
             Pair { left: P, right: P },

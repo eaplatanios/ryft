@@ -29,7 +29,6 @@ use super::jacobian::{
 /// The physical representation of a block is defined by [`DenseDifferentiableType`]. For
 /// [`ArrayType`](crate::types::ArrayType), the block for shapes `O`, `I1`, and `I2` has shape `O ++ I1 ++ I2`.
 #[derive(Parameterized, Clone, Debug)]
-#[ryft(crate = "crate::parameters")]
 pub struct Hessian<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> {
     /// Type tree of the differentiated inputs.
     input_types: I,
