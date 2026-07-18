@@ -47,7 +47,7 @@ use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingD
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -56,9 +56,9 @@ use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, 
 use crate::operations::math::AddOperation;
 use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
-use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId, MaybeZero};
+use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
@@ -66,7 +66,7 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{Region, RegionId, RegionInterface};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
-use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
+use crate::tracing::{DomainTracer, Trace, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{batch_rewrapped_program, stage_rewrapped_custom_call};
 use crate::tracing_v2::operations::dot::DotOperation;
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
@@ -279,28 +279,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
     }
 }
 
-/// Transpose rule for [`RematerializeOperation`]: the call is a higher-order primal boundary rather than a linear
-/// map, so a tangent program never contains it on a linear operand (linearization replays the derived forward and
-/// tangent programs instead) and the rule reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<W, OLinear> TransposableOperation<W, OLinear> for RematerializeOperation
-where
-    W: Value,
-    OLinear: Operation<W::Type>,
-{
-    fn transpose<D: TranspositionDriver<W, OLinear>>(
-        &self,
-        _context: &mut TracingContext<W, OLinear>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "operation `rematerialize` has no partition-aware transpose rule".to_string(),
-        }
-        .into())
-    }
-}
+crate::impl_non_transposable_operation!(RematerializeOperation);
 
 /// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see

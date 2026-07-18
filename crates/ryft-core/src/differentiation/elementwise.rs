@@ -412,3 +412,315 @@ pub fn binary_elementwise_jvp<
     };
     Ok(vec![DifferentiationDual::new(primal, output_tangent)?])
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::backends::scalars::Scalar;
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::manipulation::ConvertElementType;
+    use crate::operations::math::{AddOperation, SinOperation};
+    use crate::programs::atoms::MaybeZero;
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, DataType, Shape, Size};
+
+    use super::*;
+
+    #[test]
+    fn test_scalar_elementwise_derivative_alignment() {
+        let value = Scalar::from(1.5f64);
+        assert_eq!(value.align_tangent(&DataType::F64), Ok(value));
+        assert_eq!(value.align_tangent(&DataType::F32), Ok(Scalar::from(1.5f32)));
+
+        let value = Scalar::from(1.5f32);
+        assert_eq!(value.unalign_cotangent(&DataType::F32), Ok(value));
+        assert_eq!(value.unalign_cotangent(&DataType::F64), Ok(Scalar::from(1.5f64)));
+    }
+
+    #[test]
+    fn test_array_elementwise_derivative_alignment() {
+        let scalar = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(scalar.align_tangent(&target), Ok(TestArray::new(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0])),);
+
+        let cotangent = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+        let target = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]));
+        assert_eq!(cotangent.unalign_cotangent(&target), Ok(TestArray::new(target, vec![5.0, 7.0, 9.0])),);
+
+        let value = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        assert!(matches!(
+            value.align_tangent(&target),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+                if message == "cannot align tangent type f64[2, 3] to output type f64[3]",
+        ));
+    }
+
+    #[test]
+    fn test_broadcast_derivative_alignment() {
+        let cotangent = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(
+            cotangent.unalign_cotangent_along(&target, &[1, 0]),
+            Ok(TestArray::new(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])),
+        );
+
+        let cotangent = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
+            (1..=24).map(|value| value as f64).collect(),
+        );
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        assert_eq!(cotangent.unalign_cotangent_along(&target, &[1, 2]), Ok(TestArray::new(target, vec![126.0, 174.0])));
+
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        assert!(matches!(
+            cotangent.unalign_cotangent_along(&target, &[3]),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+                if message
+                    == "cannot unalign cotangent type f64[3, 2, 4] to input cotangent type f64[2] using output axes [3]",
+        ));
+    }
+
+    #[test]
+    fn test_unary_elementwise_jvp() {
+        #[derive(Clone)]
+        struct BooleanOutputOperation;
+
+        impl Operation<DataType> for BooleanOutputOperation {
+            fn name(&self) -> &'static str {
+                "boolean_output"
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[DataType],
+                _region_interfaces: &[crate::programs::regions::RegionInterface<DataType>],
+            ) -> Result<Vec<DataType>, TypeError> {
+                Ok(vec![DataType::Boolean])
+            }
+        }
+
+        let tangent_calls = Cell::new(0);
+        let outputs = unary_elementwise_jvp(
+            &SinOperation,
+            &[DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f64))],
+            |input| Ok(*input),
+            |_| {
+                tangent_calls.set(tangent_calls.get() + 1);
+                Ok(Scalar::from(1.0f64))
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Scalar::from(2.0f64));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F64)));
+        assert_eq!(tangent_calls.get(), 0);
+
+        let primal_evaluations = Cell::new(0);
+        let outputs = unary_elementwise_jvp(
+            &SinOperation,
+            &[DifferentiationDual::new(Scalar::from(2.0f64), Scalar::from(3.0f64)).unwrap()],
+            |input| {
+                primal_evaluations.set(primal_evaluations.get() + 1);
+                Ok(*input)
+            },
+            |operands| {
+                tangent_calls.set(tangent_calls.get() + 1);
+                Ok(operands.output_primal_at_tangent_type()? * operands.input_tangent()?)
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Scalar::from(2.0f64));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Scalar::from(6.0f64)));
+        assert_eq!(tangent_calls.get(), 1);
+        assert_eq!(primal_evaluations.get(), 1);
+
+        let primal_evaluations = Cell::new(0);
+        let input_primal = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let outputs = unary_elementwise_jvp(
+            &SinOperation,
+            &[DifferentiationDual::new(input_primal, Scalar::from(3.0f32)).unwrap()],
+            |input| {
+                primal_evaluations.set(primal_evaluations.get() + 1);
+                Ok(*input)
+            },
+            |operands| operands.output_primal_at_tangent_type(),
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &input_primal);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Scalar::from(2.0f32)));
+        assert_eq!(primal_evaluations.get(), 2);
+
+        let outputs = unary_elementwise_jvp(
+            &BooleanOutputOperation,
+            &[DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f64))],
+            |_| Ok(Scalar::Bool(true)),
+            |_| -> Result<Scalar, DifferentiationError> {
+                panic!("zero-space output invoked its tangent function for a structural-zero input tangent")
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Scalar::Bool(true));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::Zero)));
+
+        assert!(matches!(
+            unary_elementwise_jvp(
+                &BooleanOutputOperation,
+                &[DifferentiationDual::new(Scalar::from(2.0f64), Scalar::from(3.0f64)).unwrap()],
+                |_| Ok(Scalar::Bool(true)),
+                |_| -> Result<Scalar, DifferentiationError> { panic!("zero-space output invoked its tangent function") },
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "'boolean_output' output type bool has no tangent space",
+        ));
+        assert!(matches!(
+            unary_elementwise_jvp(&SinOperation, &[], |input: &Scalar| Ok(*input), |_| Ok(Scalar::from(1.0f64)),),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        ));
+    }
+
+    #[test]
+    fn test_binary_elementwise_jvp() {
+        let left_calls = Cell::new(0);
+        let right_calls = Cell::new(0);
+        let left_primal = Scalar::from(2.0f64);
+        let right_primal = Scalar::from(5.0f64);
+        let compare = CompareOperation::new(ComparisonDirection::LessThan);
+
+        let outputs = binary_elementwise_jvp(
+            &AddOperation,
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal),
+                DifferentiationDual::new_with_zero_tangent(right_primal),
+            ],
+            |left, right| Ok(*left + *right),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Scalar::from(7.0f64));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F64)));
+        assert_eq!((left_calls.get(), right_calls.get()), (0, 0));
+
+        let outputs = binary_elementwise_jvp(
+            &compare,
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal),
+                DifferentiationDual::new_with_zero_tangent(right_primal),
+            ],
+            |left, right| Ok(Scalar::Bool(left < right)),
+            |_, _| -> Result<Scalar, DifferentiationError> {
+                panic!("zero-space output invoked its left tangent term function for structural-zero input tangents")
+            },
+            |_, _| -> Result<Scalar, DifferentiationError> {
+                panic!("zero-space output invoked its right tangent term function for structural-zero input tangents")
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs[0].primal(), &Scalar::Bool(true));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::Zero)));
+
+        let outputs = binary_elementwise_jvp(
+            &AddOperation,
+            &[
+                DifferentiationDual::new(left_primal, Scalar::from(3.0f64)).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal),
+            ],
+            |left, right| Ok(*left + *right),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Scalar::from(3.0f64)));
+        assert_eq!((left_calls.get(), right_calls.get()), (1, 0));
+
+        let outputs = binary_elementwise_jvp(
+            &AddOperation,
+            &[
+                DifferentiationDual::new_with_zero_tangent(left_primal),
+                DifferentiationDual::new(right_primal, Scalar::from(4.0f64)).unwrap(),
+            ],
+            |left, right| Ok(*left + *right),
+            |_, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(tangent)
+            },
+            |_, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Scalar::from(4.0f64)));
+        assert_eq!((left_calls.get(), right_calls.get()), (1, 1));
+
+        let outputs = binary_elementwise_jvp(
+            &AddOperation,
+            &[
+                DifferentiationDual::new(left_primal, Scalar::from(3.0f64)).unwrap(),
+                DifferentiationDual::new(right_primal, Scalar::from(4.0f64)).unwrap(),
+            ],
+            |left, right| Ok(*left + *right),
+            |operands, tangent| {
+                left_calls.set(left_calls.get() + 1);
+                Ok(operands.right_primal()? * tangent)
+            },
+            |operands, tangent| {
+                right_calls.set(right_calls.get() + 1);
+                Ok(operands.left_primal()? * tangent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(value) if value == &Scalar::from(23.0f64)));
+        assert_eq!((left_calls.get(), right_calls.get()), (2, 2));
+
+        assert!(matches!(
+            binary_elementwise_jvp(
+                &compare,
+                &[
+                    DifferentiationDual::new(left_primal, Scalar::from(3.0f64)).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(right_primal),
+                ],
+                |left, right| Ok(Scalar::Bool(left < right)),
+                |_, _| -> Result<Scalar, DifferentiationError> {
+                    panic!("zero-space output invoked its left tangent term function")
+                },
+                |_, _| -> Result<Scalar, DifferentiationError> {
+                    panic!("zero-space output invoked its right tangent term function")
+                },
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "'compare' output type bool has no tangent space",
+        ));
+        assert!(matches!(
+            binary_elementwise_jvp(
+                &AddOperation,
+                &[DifferentiationDual::new_with_zero_tangent(left_primal)],
+                |left, right| Ok(*left + *right),
+                |_, tangent| Ok(tangent),
+                |_, tangent| Ok(tangent),
+            ),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 })),
+        ));
+    }
+}

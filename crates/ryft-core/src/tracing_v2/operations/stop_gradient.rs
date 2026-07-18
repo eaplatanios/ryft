@@ -1,13 +1,10 @@
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
-    TranspositionDriver,
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
 };
+use crate::impl_non_transposable_operation;
 use crate::operations::stop_gradient::StopGradientOperation;
-use crate::partial::PartialValue;
 use crate::programs::operations::Operation;
-use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
 
 /// Forward-mode rule for [`StopGradientOperation`]: the operation is the identity on the primal but severs the
 /// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.
@@ -34,26 +31,7 @@ where
     }
 }
 
-/// Transpose rule for [`StopGradientOperation`]: the operation severs the tangent, so a tangent program never
-/// contains a primal `stop_gradient` on a linear operand (its forward pairs the replayed primal with a zero tangent)
-/// and the rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for StopGradientOperation
-where
-    StopGradientOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        }
-        .into())
-    }
-}
+impl_non_transposable_operation!(StopGradientOperation);
 
 #[cfg(test)]
 mod tests {
