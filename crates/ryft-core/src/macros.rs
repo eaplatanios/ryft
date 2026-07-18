@@ -1970,6 +1970,7 @@ mod tests {
     use std::marker::PhantomData;
     use std::rc::Rc;
 
+    use indoc::indoc;
     use num_complex::Complex;
 
     use crate::backends::arrays::Array;
@@ -2692,12 +2693,14 @@ mod tests {
                     tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
                     primal_outputs = [Array::scalar(10.0)],
                     tangent_outputs = [Array::scalar(13.0)],
-                    jvp = "lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .\n\
-                           let %4:f64[] = mul %0 %1\n    \
-                               %5:f64[] = mul %1 %2\n    \
-                               %6:f64[] = mul %0 %3\n    \
-                               %7:f64[] = add %5 %6\n\
-                           in (%4, %7)",
+                    jvp = indoc! {"
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = mul %0 %1
+                            %5:f64[] = mul %1 %2
+                            %6:f64[] = mul %0 %3
+                            %7:f64[] = add %5 %6
+                        in (%4, %7)
+                    "},
                 },
                 {
                     primals = [Array::scalar(2.0), Array::vector(vec![1.0, 3.0])],
@@ -2722,9 +2725,11 @@ mod tests {
                 ],
                 output_cotangents = [Array::scalar(3.0)],
                 input_cotangents = [Array::scalar(12.0)],
-                pullback = "lambda %0:f64[], %1:f64[] .\n\
-                            let %2:f64[] = mul %1 %0\n\
-                            in (%2)",
+                pullback = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                "},
             }],
         );
         check_operation_transposition!(
