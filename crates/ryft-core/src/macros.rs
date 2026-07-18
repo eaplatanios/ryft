@@ -1013,7 +1013,7 @@ macro_rules! check_operation_batching {
 /// Outputs use `(@known, value)` or `(@residual, value)`. The default form uses the eager [`Scalar`](crate::Scalar)
 /// reference backend, while `backend = (Value, Operation)` supports downstream value and operation families.
 ///
-/// # Example
+/// # Examples
 ///
 /// This is an example for how to use this macro to check the elementwise [`NegOperation`](crate::NegOperation):
 ///
@@ -1024,6 +1024,26 @@ macro_rules! check_operation_batching {
 ///     operation = NegOperation,
 ///     inputs = [Scalar::from(2.0)],
 ///     expected = Scalar::from(-2.0),
+/// );
+/// ```
+///
+/// For more control, explicit cases specify the partial-evaluation state of every input and expected output. In the
+/// following example, the left input is known while the right input is unknown. Partial evaluation must therefore leave
+/// one residual instruction and classify its output as residual. The `replay` value is then supplied for the unknown
+/// input when interpreting that residual program, and the resulting output is compared with the declared value:
+///
+/// ```rust
+/// # use ryft_core::{AddOperation, DataType, Scalar, check_operation_partial_evaluation};
+/// check_operation_partial_evaluation!(
+///     operation = AddOperation,
+///     cases = [{
+///         inputs = [
+///             (@known, Scalar::from(2.0)),
+///             (@unknown(type = DataType::F64, replay = Scalar::from(3.0))),
+///         ],
+///         outputs = [(@residual, Scalar::from(5.0))],
+///         residual_instructions = 1,
+///     }],
 /// );
 /// ```
 ///
@@ -1085,7 +1105,7 @@ macro_rules! check_operation_partial_evaluation {
         assert_eq!(evaluation.outputs().len(), 1);
         assert!(evaluation.outputs()[0].is_known());
         assert_eq!(evaluation.interpret(&context, &[]).unwrap(), vec![expected.clone()]);
-        
+
         for unknown_index in 0..inputs.len() {
             let mut knowledge = known.clone();
             knowledge[unknown_index] = $crate::partial::PartialValue::Unknown(
