@@ -398,8 +398,12 @@ pub(crate) trait WhilePartialEvaluation<C: Context>: Type {
 /// [`iteration_bound`](WhileOperation::iteration_bound) is preserved. The rewrite is emitted over the original while
 /// inputs unchanged.
 ///
-/// If no state element is loop-invariant-known and neither nested program shrank, the rule defers to the default
-/// residualize-unchanged behavior.
+/// If no state element is loop-invariant-known and neither nested program shrank, the rule attempts the
+/// *closed-knownness split* before residualizing unchanged: when a known state subset's next values and the trip
+/// predicate fold from known state alone, the loop separates into a known loop bound on the known side and the
+/// residual loop kept whole (see `split_while_by_closed_knownness`). This is the split that makes
+/// [`Program::linearize`] total over the fused doubled-state loops staged by the unbounded `while` forward-mode
+/// rule.
 impl<V, O, C> WhilePartialEvaluation<C> for ArrayType
 where
     V: Value<Type = ArrayType>,
@@ -432,10 +436,10 @@ where
         let state_count = state_types.len();
 
         // The invariance fixed point below probes by folding the condition and body through the *live* known-side
-        // context. For an effectful loop each probe round would execute (eager) or stage (staging) the loop's
-        // effects once more, so effectful loops skip invariance probing and residualize unchanged (see the effect
-        // placement contract on `PartialEvaluationContext::fold_or_residualize`); `while` has no known-ness
-        // split to fall back to.
+        // context, and the closed-knownness split's known loop re-runs the known part of every iteration. For an
+        // effectful loop the probes would execute (eager) or stage (staging) the loop's effects once more and the
+        // split would run them twice, so effectful loops skip both and residualize unchanged (see the effect
+        // placement contract on `PartialEvaluationContext::fold_or_residualize`).
         if !condition.effects().is_pure() || !body.effects().is_pure() {
             return context.fold_or_residualize(
                 O::from(*operation),
@@ -443,6 +447,21 @@ where
                 inputs,
             );
         }
+
+        // Every pure fallback below first attempts the closed-knownness split — a known state subset whose next
+        // values and trip predicate fold from known state alone separates into a known loop bound on the known side
+        // and the residual loop kept whole (see `split_while_by_closed_knownness`) — and only residualizes the loop
+        // unchanged when the split does not apply.
+        let split_or_residualize = |context: &PartialEvaluationContext<C>| match split_while_by_closed_knownness(
+            context, operation, condition, body, inputs, driver,
+        )? {
+            Some(outputs) => Ok(outputs),
+            None => context.fold_or_residualize(
+                O::from(*operation),
+                vec![condition.to_program(), body.to_program()],
+                inputs,
+            ),
+        };
 
         // A state element can only fold if its init input is known *and* concretizable in the known-side context:
         // the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic knowns also keeps
@@ -456,14 +475,12 @@ where
         // Monotonically narrow the set of loop-invariant-known state elements to a fixed point. A round binds each
         // invariant element to its init, leaves everything else unknown, and keeps an element only if the body
         // reproduces its init as the next-state value. With no invariance candidates at all there is nothing the
-        // rebuild below could embed, so skip the live-context probe entirely and residualize unchanged.
+        // rebuild below could embed, so skip the live-context probe entirely — in particular, under a staging
+        // known-side context every symbolic known init lands here, which is where the closed-knownness split serves
+        // `Program::linearize`.
         let mut invariant = state_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
         if invariant.iter().all(|candidate| !candidate) {
-            return context.fold_or_residualize(
-                O::from(*operation),
-                vec![condition.to_program(), body.to_program()],
-                inputs,
-            );
+            return split_or_residualize(context);
         }
         let state_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
             (0..state_count)
@@ -474,17 +491,16 @@ where
                 .collect()
         };
 
-        // A probe failure falls back to residualizing the loop unchanged: the body may never run at runtime (the
+        // A probe failure falls back through `split_or_residualize`: the body may never run at runtime (the
         // condition can be false on entry), so an erroring known-side fold (e.g., an integer division by a known
         // zero) must not fail partial evaluation — the branch's work, and its error if the loop is ever entered,
         // stays behind the condition. Both programs are pure here (the effects gate above), so partially completed
-        // probe folds are safe to discard.
-        let residualize_unchanged = |context: &PartialEvaluationContext<C>| {
-            context.fold_or_residualize(O::from(*operation), vec![condition.to_program(), body.to_program()], inputs)
-        };
+        // probe folds are safe to discard, and the split stays error-consistent: its partitions stage through fresh
+        // contexts without executing known work, and its known loop replays the loop's exact runtime semantics
+        // (running nothing when the condition is false on entry).
         let Ok(mut body_evaluation) = driver.partially_evaluate_program(context, body, &state_knowledge(&invariant))
         else {
-            return residualize_unchanged(context);
+            return split_or_residualize(context);
         };
         loop {
             let refined = (0..state_count)
@@ -502,7 +518,7 @@ where
             invariant = refined;
             body_evaluation = match driver.partially_evaluate_program(context, body, &state_knowledge(&invariant)) {
                 Ok(evaluation) => evaluation,
-                Err(_) => return residualize_unchanged(context),
+                Err(_) => return split_or_residualize(context),
             };
         }
 
@@ -510,26 +526,22 @@ where
         let condition_evaluation =
             match driver.partially_evaluate_program(context, condition, &state_knowledge(&invariant)) {
                 Ok(evaluation) => evaluation,
-                Err(_) => return residualize_unchanged(context),
+                Err(_) => return split_or_residualize(context),
             };
 
-        // Nothing folded: defer to the default residualize-unchanged behavior. A loop-invariant-known element always
-        // shrinks the body (its uses fold to constants), so the only way nothing folds is an empty invariant set whose
-        // residual condition and body did not shrink either. The rebuild below embeds the probes' known values as
-        // inline program constants, which is only possible when they are all concrete — under a staging known-side
-        // context a probe can fold a constant-only chain into a live-trace tracer — so a non-concrete probe takes
-        // the same fallback.
+        // Nothing folded: defer to the split-or-residualize fallback. A loop-invariant-known element always shrinks
+        // the body (its uses fold to constants), so the only way nothing folds is an empty invariant set whose
+        // residual condition and body did not shrink either — a time-varying known chain lands here and is what the
+        // closed-knownness split recovers. The rebuild below embeds the probes' known values as inline program
+        // constants, which is only possible when they are all concrete — under a staging known-side context a probe
+        // can fold a constant-only chain into a live-trace tracer — so a non-concrete probe takes the same fallback.
         if (invariant.iter().all(|folded| !folded)
             && body_evaluation.program.instructions().len() >= body.instructions().len()
             && condition_evaluation.program.instructions().len() >= condition.instructions().len())
             || !context.all_knowns_are_concrete(&body_evaluation)
             || !context.all_knowns_are_concrete(&condition_evaluation)
         {
-            return context.fold_or_residualize(
-                O::from(*operation),
-                vec![condition.to_program(), body.to_program()],
-                inputs,
-            );
+            return split_or_residualize(context);
         }
 
         // The residual while keeps the same state set, so its output arity matches the original while. The condition
@@ -566,10 +578,11 @@ where
     }
 }
 
-/// Partial evaluation of a scalar [`WhileOperation`] over [`DataType`] defers to the default fold-or-residualize
-/// behavior of [`Program::partially_evaluate`]. Scalar `DataType` has no array-stack metadata for the loop-invariant
-/// folding rewrite to rebuild residual state with, so a scalar while folds entirely when its inputs are all known
-/// and otherwise residualizes unchanged.
+/// Partial evaluation of a scalar [`WhileOperation`] over [`DataType`]. Scalar `DataType` has no array-stack
+/// metadata for the loop-invariant folding rewrite to rebuild residual state with, so a scalar while folds entirely
+/// when its inputs are all known and otherwise attempts the closed-knownness split (see
+/// `split_while_by_closed_knownness`) for pure mixed-knownness loops — this is what linearizes the fused
+/// doubled-state loops the scalar forward-mode rule stages — before residualizing unchanged.
 impl<C: Context<Type = DataType>> WhilePartialEvaluation<C> for DataType
 where
     C::Operation: From<WhileOperation>,
@@ -580,9 +593,21 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let condition = driver.region(0)?;
+        let body = driver.region(1)?;
+        // The split's known loop re-runs the known part of every iteration, so it is only sound for pure loops (see
+        // the effect placement contract on `PartialEvaluationContext::fold_or_residualize`).
+        if inputs.iter().any(PartialEvaluationValue::is_known)
+            && !inputs.iter().all(PartialEvaluationValue::is_known)
+            && condition.effects().is_pure()
+            && body.effects().is_pure()
+            && let Some(outputs) = split_while_by_closed_knownness(context, operation, condition, body, inputs, driver)?
+        {
+            return Ok(outputs);
+        }
         context.fold_or_residualize(
             C::Operation::from(*operation),
-            driver.regions().map(|region| region.to_program()).collect(),
+            vec![condition.to_program(), body.to_program()],
             inputs,
         )
     }
@@ -629,6 +654,179 @@ fn rebuild_while_program<C: Context<Type = ArrayType>>(
             PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
         })
         .collect()
+}
+
+/// Splits a pure `while` loop whose known state subset is *closed* — every known state element's next-state value
+/// and the trip predicate fold from the known state alone — into a *known* loop bound in the enclosing known-side
+/// context and the *residual* loop kept whole, returning `None` when the split does not apply.
+///
+/// The known state subset is found by a monotonic fixed point mirroring the
+/// [scan known-ness split](super::scan)'s: a state element stays known iff its init is known and the body computes
+/// its next value from known state alone, with each round partitioning the body through a **fresh** staging context
+/// (via [`PartialEvaluationDriver::partition_program`]) so no probe work leaks into the caller's context. Unlike the
+/// loop-*invariance* rewrite, known-ness needs neither concretizability nor value equality, so symbolic known inits
+/// (tracers into a live outer trace) participate fully — this is what makes the split fire under
+/// [`Program::linearize`]. After convergence the split additionally requires the *predicate* to fold from the known
+/// state alone; only then does the known loop run the original trip count, since its trip decision is byte-for-byte
+/// the original one over state it computes itself.
+///
+/// The known loop is the projection of the original loop onto the known subset: its body maps the known state
+/// elements to their known next values and its condition is the known projection of the original condition. It is
+/// bound whole into the enclosing known-side context over the original known inits (executing under an eager
+/// context and staging into the outer program under a staging one), and its outputs are the known state elements'
+/// final values. The residual loop is the **original loop unchanged**: its unknown outputs are the unknown state
+/// elements' finals, and any known per-iteration values the unknown side reads are *recomputed inside the loop*
+/// rather than streamed as residual edges, because a loop with a data-dependent trip count has no statically shaped
+/// residual stream. This primal duplication is exactly what
+/// [JAX's `_while_partial_eval`](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/control_flow/loops.py)
+/// accepts when linearizing `lax.while_loop`, and it is what makes [`Program::linearize`] total over the fused
+/// doubled-state loops staged by the unbounded `while` forward-mode rule: the known (primal) side recovers the
+/// primal outputs while the tangent program keeps the fused loop whole. The known-state outputs of the residual
+/// loop are left dead.
+///
+/// The split does not apply — and the caller residualizes unchanged — when the converged known subset is empty or
+/// complete (an all-known loop folds whole through the default rule), or when the predicate reads unknown state.
+/// Callers must ensure both regions are pure: the known loop re-runs the known part of every iteration and the
+/// residual loop runs all of it again, so an effectful loop would observe its effects twice.
+fn split_while_by_closed_knownness<V, O, C, D>(
+    context: &PartialEvaluationContext<C>,
+    operation: &WhileOperation,
+    condition: RegionRef<'_, V, O>,
+    body: RegionRef<'_, V, O>,
+    inputs: &[PartialEvaluationValue<C::Value>],
+    driver: &D,
+) -> Result<Option<Vec<PartialEvaluationValue<C::Value>>>, ProgramError>
+where
+    V: Value,
+    C: Context<Constant = V, Operation = O>,
+    O: Operation<V::Type> + From<WhileOperation>,
+    D: PartialEvaluationDriver<C>,
+{
+    let state_types = body.input_types();
+    let state_count = state_types.len();
+
+    // Fixed point over state known-ness: a state element can only be demoted as more are demoted, so the loop
+    // converges in at most `state_count` rounds.
+    let mut state_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+    let partition = loop {
+        let partition = driver.partition_program(body, state_known.as_slice())?;
+        let refined = (0..state_count)
+            .map(|index| {
+                state_known[index] && matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)))
+            })
+            .collect::<Vec<bool>>();
+        if refined == state_known {
+            break partition;
+        }
+        state_known = refined;
+    };
+
+    // The split only applies to a genuinely mixed converged state: an all-known loop folds whole through the
+    // default rule and an all-unknown state leaves no known side to recover.
+    if state_known.iter().all(|&known| known) || !state_known.iter().any(|&known| known) {
+        return Ok(None);
+    }
+
+    // The predicate must fold from the known state alone; otherwise the known loop cannot reproduce the original
+    // trip count and the split does not apply.
+    let condition_partition = driver.partition_program(condition, state_known.as_slice())?;
+    let (condition_known_program, _, condition_known_input_indices, _, condition_outputs) =
+        condition_partition.into_parts();
+    check_count!("output", condition_outputs, 1, ProgramError);
+    let PartialEvaluationOutput::Known(predicate_output) = condition_outputs[0] else {
+        return Ok(None);
+    };
+
+    let (known_program, _, known_input_indices, _, partition_outputs) = partition.into_parts();
+    check_count!("output", partition_outputs, state_count, ProgramError);
+    let known_state_indices = (0..state_count).filter(|&index| state_known[index]).collect::<Vec<_>>();
+    if known_input_indices != known_state_indices || condition_known_input_indices != known_state_indices {
+        return Err(ProgramError::MalformedProgram(format!(
+            "while body partition reported known input indices {known_input_indices:?} and its condition partition \
+             reported {condition_known_input_indices:?} but the converged known state expects {known_state_indices:?}",
+        )));
+    }
+
+    // Project the known body onto the known state subset: its inputs are the known state elements in state order
+    // and its outputs are their known next values (the partition's trailing feeder-edge outputs are dropped — the
+    // residual loop recomputes them).
+    let known_state_types = known_state_indices.iter().map(|&index| state_types[index].clone()).collect::<Vec<_>>();
+    let mut known_body_builder = ProgramBuilder::<V, O>::new();
+    let known_body_inputs = known_state_types
+        .iter()
+        .map(|state_type| known_body_builder.add_input(state_type.clone()))
+        .collect::<Vec<_>>();
+    let known_program_outputs = known_body_builder.splice_program(&known_program, known_body_inputs.as_slice())?;
+    let known_body_outputs = known_state_indices
+        .iter()
+        .map(|&index| match &partition_outputs[index] {
+            PartialEvaluationOutput::Known(output) => known_program_outputs.get(*output).copied().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "while body partition output {index} references missing known-program output {output}",
+                ))
+            }),
+            PartialEvaluationOutput::Unknown(_) => Err(ProgramError::MalformedProgram(
+                "while known-ness fixed point converged with an unknown next value for a known state element"
+                    .to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let known_count = known_body_outputs.len();
+    let known_body = known_body_builder.build::<Vec<V>, Vec<V>>(
+        known_body_outputs,
+        vec![Placeholder; known_count],
+        vec![Placeholder; known_count],
+    )?;
+
+    // Project the known condition the same way: the known state elements in state order to the folded predicate.
+    let mut known_condition_builder = ProgramBuilder::<V, O>::new();
+    let known_condition_inputs = known_state_types
+        .iter()
+        .map(|state_type| known_condition_builder.add_input(state_type.clone()))
+        .collect::<Vec<_>>();
+    let known_condition_outputs =
+        known_condition_builder.splice_program(&condition_known_program, known_condition_inputs.as_slice())?;
+    let predicate_atom = known_condition_outputs.get(predicate_output).copied().ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "while condition partition references missing known-program output {predicate_output}",
+        ))
+    })?;
+    let known_condition = known_condition_builder.build::<Vec<V>, Vec<V>>(
+        vec![predicate_atom],
+        vec![Placeholder; known_count],
+        vec![Placeholder; 1],
+    )?;
+
+    // Bind the known loop into the enclosing known-side context over the original known inits, and emit the
+    // original loop unchanged into the residual program for the unknown state elements' finals.
+    let known_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
+    let known_inputs = known_state_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+    let known_outputs = context.fold_or_residualize(
+        O::from(known_while),
+        vec![known_condition, known_body],
+        known_inputs.as_slice(),
+    )?;
+    check_count!("output", known_outputs, known_count, ProgramError);
+    let residual_outputs =
+        context.residualize(O::from(*operation), vec![condition.to_program(), body.to_program()], inputs)?;
+    check_count!("output", residual_outputs, state_count, ProgramError);
+
+    // Assemble the loop's outputs in state order: known finals from the known loop, unknown finals from the
+    // residual loop.
+    let mut known_outputs = known_outputs.into_iter();
+    let outputs = residual_outputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, residual_output)| match state_known[index] {
+            true => known_outputs.next().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "while known loop is missing the final value of known state element {index}",
+                ))
+            }),
+            false => Ok(residual_output),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(outputs))
 }
 
 /// Batching rule for [`WhileOperation`]. The rule builds batched loop *structure* and binds it into the parent
@@ -806,11 +1004,12 @@ where
 }
 
 /// Forward-mode (JVP) rule for [`WhileOperation`]. An [eager](Context::is_eager) context
-/// runs the loop directly at the concrete duals (see the crate-private `jvp_while_eagerly`), so eager forward mode is total over
-/// data-dependent `while` loops with no iteration bound. Staging contexts — and eager contexts whose loop
-/// predicate is batched and therefore has no single trip decision — dispatch to the loop's type family through
-/// `WhileJvp` type family: array loops stage the hybrid bounded rule documented on that trait's [`ArrayType`] implementation,
-/// and scalar loops report an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+/// runs the loop directly at the concrete duals (see the crate-private `jvp_while_eagerly`), so eager forward mode is
+/// total over data-dependent `while` loops with no iteration bound. Staging contexts — and eager contexts whose loop
+/// predicate is batched and therefore has no single trip decision — dispatch to the loop's type family through the
+/// `WhileJvp` trait: bounded array loops stage the reverse-capable hybrid rule documented on that trait's
+/// [`ArrayType`] implementation, while unbounded array loops and scalar loops stage the forward-only fused
+/// doubled-state loop (see the crate-private `jvp_while_fused`).
 impl<C> DifferentiableOperation<C> for WhileOperation
 where
     C: Context + Zero<C::Value>,
@@ -869,13 +1068,14 @@ where
 /// stacked scanned inputs, so no symbolic capture is ever introduced. The enclosing partial-evaluation split then
 /// discovers the residual operand edges structurally, exactly as it does for the scan and condition rules.
 ///
-/// **The unbounded case is rejected.** This staged rule is only reached when the context is not
-/// [eager](Context::is_eager) (eager contexts run the loop directly through
-/// [`jvp_while_eagerly`], with no bound needed), and without a semantic
+/// **The unbounded case stages the fused doubled-state loop instead.** This staged rule is only reached when the
+/// context is not [eager](Context::is_eager) (eager contexts run the loop directly through [`jvp_while_eagerly`],
+/// with no bound needed), and without a semantic
 /// [`iteration_bound`](crate::operations::control_flow::WhileOperation::with_iteration_bound) there is no statically
-/// shaped residual stack and no transposable form, so the rule reports
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation), preserving the non-transposable staged
-/// unbounded-while boundary.
+/// shaped residual stack for the bounded strategy below, so the rule defers to [`jvp_while_fused`]: one `while` over
+/// `[primal_state..., tangent_state...]` whose trip decision reads the primal half, forward-total but not
+/// transposable — reverse mode through a staged unbounded loop still reports the transposition error, exactly like
+/// JAX's `lax.while_loop`.
 ///
 /// For a bound `B`, the rule linearizes the body capture-free through its instruction-scoped driver,
 /// giving a primal body `[state] -> [next_state, residuals...]` and a tangent body
@@ -929,6 +1129,14 @@ where
         let state_count = state_types.len();
         check_count!("input", inputs, state_count, ProgramError);
 
+        // An unbounded loop has no statically shaped residual stacks for the bounded hybrid rule below, so it stages
+        // the fused doubled-state loop instead (see `jvp_while_fused`). The fused path needs no batched-predicate
+        // rewrite: the fused state doubles every prefix-shaped state element, so a per-item predicate still satisfies
+        // the relaxed predicate contract over the doubled state.
+        let Some(bound) = operation.iteration_bound() else {
+            return jvp_while_fused(operation, condition, context, driver, inputs);
+        };
+
         // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
         // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
         // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked normal form over
@@ -956,19 +1164,6 @@ where
             outputs.truncate(state_count);
             return Ok(outputs);
         }
-
-        // An unbounded while loop has no statically shaped residual stack and no transposable form, so it has no
-        // capture-free forward-mode rule.
-        let Some(bound) = operation.iteration_bound() else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` has no capture-free forward-mode linearization rule unless it carries an \
-                     iteration bound; an unbounded while loop has no forward-mode rule",
-                    Operation::<ArrayType>::name(operation),
-                ),
-            }
-            .into());
-        };
 
         // Linearize the body capture-free. The primal body produces `[next_state..., residuals...]` and the
         // tangent body consumes `[state_tangent..., residuals...]`; the residual count is the number of trailing
@@ -1111,27 +1306,94 @@ where
     }
 }
 
-/// Forward-mode (JVP) rule for the scalar [`WhileOperation`]: the scalar `while` loop carries a tangent that is not
-/// expressible as primal-enum operand arithmetic (there is no scalar residual-stack representation backing the
-/// masked tangent scan the bounded array rule stages), so the rule reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<C: Context<Type = DataType>> WhileJvp<C> for DataType {
+/// Forward-mode (JVP) rule for the scalar [`WhileOperation`]: scalar `DataType` has no array-stack representation
+/// for the bounded array rule's stored residuals, so every staged scalar loop — bounded or not — stages the fused
+/// doubled-state loop (see [`jvp_while_fused`]), which is forward-total but not transposable.
+impl<C: Context<Type = DataType> + Zero<C::Value>> WhileJvp<C> for DataType
+where
+    C::Operation: From<ZeroOperation<DataType>> + From<WhileOperation>,
+{
     fn jvp_while<D: DifferentiationDriver<C>>(
         operation: &WhileOperation,
-        _condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         _body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "operation `{}` has no capture-free forward-mode linearization rule",
-                Operation::<DataType>::name(operation),
-            ),
-        }
-        .into())
+        jvp_while_fused(operation, condition, context, driver, inputs)
     }
+}
+
+/// Stages **one fused** doubled-state forward-mode `while` as an ordinary primal-enum operation over the shared
+/// builder — the analogue of
+/// [JAX's `jvp` of `lax.while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html), which
+/// runs the pushforward alongside the primal loop instead of storing per-iteration residuals. The fused state is
+/// `[primal_state..., tangent_state...]`: the body is the loop body's fused forward-mode program (built through the
+/// instruction-scoped driver) and the condition is the original condition extended with ignored tangent-state
+/// inputs, so the trip decision reads the primal half alone and the fused loop runs exactly as long as the primal
+/// loop. Because no residuals are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`],
+/// and a semantic bound (the scalar `DataType` family routes bounded loops here too) is simply preserved on the
+/// fused loop.
+///
+/// The primal/tangent separation that linearization needs is recovered by partial evaluation rather than by this
+/// rule: the fused loop's primal half is *closed* (its next state and the predicate fold from primal state alone),
+/// so the `while` closed-knownness split (see the crate-private `split_while_by_closed_knownness`) rebinds a known
+/// primal-only loop on the known side and keeps the fused loop whole on the residual side, recomputing primal state
+/// there — the same primal duplication JAX's linearize-of-`while_loop` performs. Because the fused loop stores no
+/// per-iteration residuals, its linearized form is **not transposable**: reverse mode through a staged unbounded
+/// loop still reports the `while` transposition error, exactly like JAX's `lax.while_loop`.
+fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
+    operation: &WhileOperation,
+    condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    context: &C,
+    driver: &D,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+where
+    C: Context + Zero<C::Value>,
+    C::Type: DifferentiableType,
+    C::Operation: From<ZeroOperation<C::Type>> + From<WhileOperation>,
+{
+    let state_count = inputs.len();
+
+    // Build the fused body over the doubled state `[primal_state..., tangent_state...]` through the
+    // instruction-scoped driver (region 1 is the loop body).
+    let fused_body = driver.jvp_program(driver.region(1)?)?;
+    let fused_state_types = fused_body.input_types();
+    check_count!("input", fused_state_types, 2 * state_count, ProgramError);
+
+    // Extend the condition over the doubled state: the original condition reads the primal half and the
+    // tangent-state inputs are ignored, so the fused loop's trip count is driven by the primal half alone.
+    let mut condition_builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+    let condition_inputs =
+        fused_state_types.into_iter().map(|r#type| condition_builder.add_input(r#type)).collect::<Vec<_>>();
+    let condition_outputs = condition_builder.splice_program(condition, &condition_inputs[..state_count])?;
+    let condition_output_count = condition_outputs.len();
+    let fused_condition = condition_builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+        condition_outputs,
+        vec![Placeholder; 2 * state_count],
+        vec![Placeholder; condition_output_count],
+    )?;
+
+    // Stage the fused loop over the operand primals followed by their materialized tangents — the fused body takes
+    // every operand tangent as a real program input, so structural zeros are materialized — and zip the output
+    // halves back into `DifferentiationDual`s in the original state order.
+    let fused_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
+    let mut operands = Vec::with_capacity(2 * state_count);
+    operands.extend(inputs.iter().map(|input| input.primal().clone()));
+    for input in inputs {
+        operands.push(input.tangent().clone().materialize(context)?);
+    }
+    let outputs = context.bind(C::Operation::from(fused_while), vec![fused_condition, fused_body], &operands)?;
+    check_count!("output", outputs, 2 * state_count, ProgramError);
+    let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
+    Ok(primal_outputs
+        .iter()
+        .cloned()
+        .zip(tangent_outputs.iter().cloned())
+        .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Runs a `while` loop's forward-mode rule directly at concrete duals for an
@@ -1965,6 +2227,97 @@ mod tests {
     }
 
     #[test]
+    fn test_while_partial_evaluation_splits_closed_known_state_from_the_residual_loop() {
+        // The loop carries `[counter, acc]` and runs while `counter > 0`; its body computes
+        // `next_counter = counter - 1` and `next_acc = acc + counter`. The `counter` element is *time-varying* known
+        // (its value changes every iteration, so the loop-invariant rewrite cannot fold it) but *closed*: its next
+        // value and the trip predicate fold from it alone. With `counter` known (`3`) and `acc` unknown, the
+        // closed-knownness split runs the known counter loop on the known side — folding the final counter to the
+        // known value `0` — and keeps the whole loop residual for `acc`, recomputing the counter chain inside it
+        // (there is no statically shaped residual stream to feed `acc + counter` with).
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let counter = builder.add_input(scalar());
+            let _acc = builder.add_input(scalar());
+            let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![counter]).unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
+                    Vec::new(),
+                    vec![counter, zero],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let counter = builder.add_input(scalar());
+            let acc = builder.add_input(scalar());
+            let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![counter]).unwrap()[0];
+            let next_counter = builder.add_instruction(SubOperation, Vec::new(), vec![counter, one]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, counter]).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![next_counter, next_acc],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let counter_init = builder.add_input(scalar());
+        let acc_init = builder.add_input(scalar());
+        let outputs = builder
+            .add_instruction(
+                ArrayOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![counter_init, acc_init],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let knowledge = vec![PartialValue::Known(Array::scalar(3.0)), PartialValue::Unknown(scalar())];
+        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+
+        // The known side ran the projected counter loop to completion (3 -> 2 -> 1 -> 0), so the final counter is a
+        // *known* output, while the final accumulator stays residual.
+        assert!(
+            matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if *value == Array::scalar(0.0))
+        );
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(_)));
+
+        // The residual program keeps the original loop whole: one while instruction whose body still carries the
+        // full two-element state and all three body instructions, recomputing the known counter chain internally.
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let residual_instruction = &evaluation.program.instructions()[0];
+        assert!(matches!(residual_instruction.operation(), ArrayOperation::While(_)));
+        let residual_body = evaluation.program.region_ref(residual_instruction.regions()[1]).unwrap().to_program();
+        assert_eq!(residual_body.input_types().len(), 2);
+        assert_eq!(residual_body.instructions().len(), 3);
+
+        // Interpreting the residual program reproduces the original loop's accumulator: from `acc = 10` the loop
+        // adds 3, 2, and 1, so the final accumulator is 16.
+        let arguments = evaluation
+            .inputs
+            .iter()
+            .map(|residual_input| match residual_input {
+                PartialEvaluationInput::Known(value) => value.clone(),
+                PartialEvaluationInput::Unknown(_) => Array::scalar(10.0),
+            })
+            .collect::<Vec<_>>();
+        let residual_outputs = evaluation.program.interpret(arguments).unwrap();
+        assert_eq!(residual_outputs.last().unwrap().to_f64s(), vec![16.0]);
+    }
+
+    #[test]
     fn test_while_accepts_batched_predicate_and_interprets_with_masked_semantics() {
         // A `bool[3]` predicate over an `f64[3]` state satisfies the predicate-prefix rule, and interpretation runs
         // the masked loop: it continues while any per-item predicate is true, and items whose predicate is false
@@ -2555,6 +2908,22 @@ mod tests {
         (operation, vec![scalar_threshold_condition(threshold), body])
     }
 
+    /// Builds the *unbounded* `while (x < threshold) { x = x * x }` loop. Squaring makes the pushforward read the
+    /// primal state every iteration, so staged forward mode through this loop exercises the fused doubled-state
+    /// rule's primal/tangent coupling, and linearizing it exercises the closed-knownness split's primal
+    /// recomputation inside the residual loop.
+    fn unbounded_squaring_while_operation(
+        threshold: f64,
+    ) -> (WhileOperation, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
+        let state = builder.add_input(ArrayType::scalar(DataType::F64));
+        let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        (WhileOperation::new(), vec![scalar_threshold_condition(threshold), body])
+    }
+
     #[test]
     fn test_bounded_while_value_and_grad_computes_gradient_through_staged_masked_scan() {
         // The headline bounded-while capability: end-to-end reverse mode through a *staged* while loop.
@@ -3052,27 +3421,177 @@ mod tests {
     }
 
     #[test]
-    fn test_unbounded_while_staged_jvp_reports_unsupported_operation() {
-        // Phase 0 boundary pin for the first-class-program-regions plan: an unbounded while loop has no staged
-        // forward-mode rule (the eager path executes concrete duals instead), so no while-produced residual can reach a staged
-        // linearization boundary through this path. The lazy residual-origin design relies on this rejection.
-        fn unbounded_while<V>(x: V) -> Result<V, ProgramError>
-        where
-            V: Value<Type = ArrayType>,
-            V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
-        {
-            let context = x.dispatch_domain();
-            let (while_operation, while_regions) = countdown_while_operation();
-            let mut outputs = context.bind(while_operation, while_regions, &[x])?;
-            Ok(outputs.remove(0))
-        }
+    fn test_unbounded_while_staged_jvp_stages_one_fused_doubled_state_loop() {
+        // JAX-parity forward mode through a *staged* unbounded while loop: the rule stages one fused doubled-state
+        // loop whose trip decision reads the primal half. For `f(x) = while (x < 16) { x = x * x }` at `x = 2` the
+        // loop runs twice (2 -> 4 -> 16), so locally `f(x) = x^4`: primal 16, tangent `4 x^3 = 32`.
+        let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
+        let (output, tangent) = StagedDispatchTestDomain
+            .jvp(
+                move |x| {
+                    let mut outputs = x.context().bind(
+                        TestDomainOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[x.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                Array::scalar(2.0),
+                Array::scalar(1.0),
+            )
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![16.0]);
+        assert_eq!(tangent.to_f64s(), vec![32.0]);
+
+        // Structurally, the fused forward-mode program contains exactly one while loop over the doubled state
+        // `[primal, tangent]` — no unroll and no residual stacks — and its trip count stays data-dependent:
+        // interpreting the same fused program at `x = 0.5` never enters the loop (0.5 * 0.5 < 0.5 is off-path), so
+        // the state passes through unchanged.
+        let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
+        let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
+        let condition_region = builder.import_region(while_regions[0].entry_region_ref());
+        let body_region = builder.import_region(while_regions[1].entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestDomainOperation::While(while_operation),
+                vec![condition_region, body_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let fused = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let rendered = fused.to_string();
+        assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
+        assert_eq!(fused.input_types().len(), 2);
+        assert_eq!(fused.output_types().len(), 2);
+        let outputs = fused.interpret(vec![Array::scalar(2.0), Array::scalar(1.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![16.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![32.0]);
+        let outputs = fused.interpret(vec![Array::scalar(16.0), Array::scalar(1.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![16.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_unbounded_while_staged_linearization_recovers_the_primal_loop_through_the_closed_knownness_split() {
+        // Linearization of a staged unbounded loop composes the fused doubled-state forward-mode rule with the
+        // `while` closed-knownness split: the fused loop's primal half is closed under the body and the condition
+        // reads only it, so the split rebinds the primal loop on the known (primal) side while the tangent program
+        // keeps the fused loop whole, recomputing primal state internally. Same function as above: primal 16 and
+        // pushforward scaling 32 at `x = 2`.
+        let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
+        let (output, pushforward) = StagedDispatchTestDomain
+            .linearize(
+                move |x| {
+                    let mut outputs = x.context().bind(
+                        TestDomainOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[x.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                Array::scalar(2.0),
+            )
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![16.0]);
+        assert_eq!(pushforward.apply(Array::scalar(1.0)).map(|tangent| tangent.to_f64s()), Ok(vec![32.0]));
+        assert_eq!(pushforward.apply(Array::scalar(2.0)).map(|tangent| tangent.to_f64s()), Ok(vec![64.0]));
+    }
+
+    #[test]
+    fn test_unbounded_while_staged_reverse_mode_reports_the_transposition_error() {
+        // Reverse mode through a staged unbounded loop linearizes (through the fused rule and the closed-knownness
+        // split) but has no transposable tangent loop — the fused loop stores no per-iteration residuals — so the
+        // `while` transposition rule reports its error, exactly like JAX's `lax.while_loop`.
+        let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
         assert!(matches!(
-            StagedDispatchTestDomain.jvp(unbounded_while, Array::scalar(4.0), Array::scalar(1.0)),
+            StagedDispatchTestDomain.vjp(
+                move |x| {
+                    let mut outputs = x.context().bind(
+                        TestDomainOperation::While(while_operation),
+                        while_regions.clone(),
+                        &[x.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                Array::scalar(2.0),
+            ),
             Err(crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message,
             })) if message
-                == "operation `while` has no capture-free forward-mode linearization rule unless it carries an \
-                    iteration bound; an unbounded while loop has no forward-mode rule",
+                == "while does not support transposition (reverse-mode differentiation through staged unbounded \
+                    while loops is not supported; eager differentiation executes concrete duals, and loops built \
+                    with `with_iteration_bound` stage a transposable masked scan)",
         ));
+    }
+
+    #[test]
+    fn test_unbounded_while_staged_scalar_jvp_and_linearization_stage_the_fused_loop() {
+        // The scalar `DataType` family has no array-stack representation for the bounded rule's residuals, so every
+        // staged scalar loop takes the fused doubled-state rule, and the scalar partial-evaluation rule's
+        // closed-knownness split linearizes it. Same squaring loop as the array tests, over `Scalar` values:
+        // `f(x) = while (x < 16) { x = x * x }` at `x = 2` gives primal 16 and tangent 32.
+        use crate::backends::scalars::ScalarOperation;
+
+        let condition = {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let state = builder.add_input(DataType::F64);
+            let threshold = builder.add_constant(Scalar::F64(16.0));
+            let predicate = builder
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![state, threshold],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Scalar>, Vec<Scalar>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+            let state = builder.add_input(DataType::F64);
+            let squared = builder.add_instruction(MulOperation, Vec::new(), vec![state, state]).unwrap()[0];
+            builder
+                .build::<Vec<Scalar>, Vec<Scalar>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(DataType::F64);
+        let output = builder
+            .add_instruction(
+                ScalarOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The fused forward-mode program contains exactly one while loop over the doubled `[primal, tangent]` state.
+        let fused = program.jvp().unwrap();
+        let rendered = fused.to_string();
+        assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
+        let outputs = fused.interpret(vec![Scalar::F64(2.0), Scalar::F64(1.0)]).unwrap();
+        assert_eq!(outputs, vec![Scalar::F64(16.0), Scalar::F64(32.0)]);
+
+        // Linearization splits the fused loop through the scalar closed-knownness split: the primal program stages
+        // the recovered primal loop and the tangent program keeps the fused loop whole over `[tangent, residuals...]`.
+        let (primal_program, tangent_program, residual_count) = program.linearize().unwrap().into_parts();
+        let mut primal_outputs = primal_program.interpret(vec![Scalar::F64(2.0)]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![Scalar::F64(16.0)]);
+        assert_eq!(residuals.len(), residual_count);
+        let mut tangent_inputs = vec![Scalar::F64(1.0)];
+        tangent_inputs.extend(residuals);
+        let tangent_outputs = tangent_program.interpret(tangent_inputs).unwrap();
+        assert_eq!(tangent_outputs, vec![Scalar::F64(32.0)]);
     }
 }
