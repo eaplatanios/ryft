@@ -21,7 +21,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{
-    Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
+    Broadcast, BroadcastOperation, Reshape, ReshapeOperation, Slice, SliceOperation, Transpose, TransposeOperation,
+    UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -1272,17 +1273,43 @@ where
         .collect()
 }
 
-/// Batching rule for [`ScanOperation`]: the scan loop is replayed per iteration through
-/// `batch_scan_with_interpreter`, with each body instruction re-entering this operation family's batching rules
-/// against the same active context. Constants lift and stacked-output accumulators seed (via the parent's [`Zero`])
-/// through `context.parent()`, so an eager parent runs the batched scan operationally while a staging parent stages
-/// the per-iteration work into the enclosing trace.
+/// Batching rule for [`ScanOperation`]. Under a *staging* parent, a capture-free scan is batched *structurally*,
+/// staging one batched scan into the enclosing trace (the shape of JAX's `_scan_batching_rule`), so the batched
+/// program's size stays independent of the trip count:
+///
+///   1. Every batched carry init is realigned to batch axis 0, and every stacked input whose batch axis would
+///      displace the leading scan dimension is realigned to batch axis 1, so per-iteration slices keep their batch
+///      placement when the leading scan dimension is dropped.
+///   2. The body is batched at `[carry_axes..., slice_axes...]` and the carry axes are iterated to a fixed point: a
+///      scan's carry types are loop-invariant, so a replicated carry whose next-carry output is batched *becomes*
+///      batched, and the rule widens that carry's input axis and re-batches until the body is axis-invariant (the
+///      iteration count is bounded by the carry count because every non-final pass widens at least one carry —
+///      JAX's `carry_bat` fixed point). A final pass instantiates the body's outputs at the joined axes
+///      ([`ProgramBatchingOutputAxesPolicy::AlignEachTo`], mirroring JAX's `instantiate=carry_bat`).
+///   3. Widened parent carry inits gain their batch axis through staged broadcasts, and one [`ScanOperation`] over
+///      the batched body is bound into the parent with the same carry count, length, `reverse`, and (lowering-only)
+///      `unroll` factor. Final carries come back at the carry axes, and stacked outputs at their per-iteration axes
+///      shifted right by the new leading scan dimension. The staged stacked outputs carry the scan's *declared*
+///      output types, whose optional sharding metadata is left for sharding propagation to resolve (the
+///      `scan_output_types` contract).
+///
+/// Under an *eager* parent — and for *captured* linear scans under any parent, whose bodies read scan-local capture
+/// references that a structurally batched body cannot re-slice — the scan loop is instead replayed per iteration
+/// through `batch_scan_with_interpreter`, with each body instruction re-entering this operation family's batching
+/// rules against the same active context. This is the operational path eager batched scans execute either way, and
+/// its physical stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
+/// accumulators seed (via the parent's [`Zero`]) through `context.parent()`.
 impl<C> BatchableOperation<C> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
-    <C as Domain>::Value: Slice + UpdateSlice + Reshape,
-    C::Operation:
-        From<ZeroOperation<ArrayType>> + From<SliceOperation> + From<UpdateSliceOperation> + From<ReshapeOperation>,
+    <C as Domain>::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
+    C::Operation: From<ZeroOperation<ArrayType>>
+        + From<BroadcastOperation>
+        + From<TransposeOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ReshapeOperation>
+        + From<ScanOperation<C::Constant>>,
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -1291,6 +1318,103 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         let body = driver.region(0)?;
+        let carry_count = self.carry_count();
+        if self.captures().is_empty() && !context.parent().is_eager() {
+            check_count!("input", inputs, body.input_types().len(), ProgramError);
+            let body_output_count = body.output_types().len();
+
+            // Realign batched carries to batch axis 0 and batched stacks off the leading scan dimension, so the
+            // fixed point below only ever distinguishes replicated from batched-at-0 carries and every
+            // per-iteration slice keeps its batch placement when the leading scan dimension is dropped.
+            let mut carries =
+                inputs[..carry_count].iter().map(|input| input.move_axis(0)).collect::<Result<Vec<_>, _>>()?;
+            let stacks = inputs[carry_count..]
+                .iter()
+                .map(|input| if input.batch_axis().axis() == Some(0) { input.move_axis(1) } else { Ok(input.clone()) })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut carry_axes = carries.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
+            let slice_axes =
+                stacks.iter().map(|stack| scan_iteration_batch_axis(stack.batch_axis())).collect::<Vec<_>>();
+
+            // Iterate the carry batch axes to a fixed point (bounded by the carry count; see the rule doc). Each
+            // pass discovers the body's natural output axes; the pass that widens nothing determines the stacked
+            // outputs' per-iteration axes.
+            let mut y_axes = None;
+            for _ in 0..=carry_count {
+                let mut iteration_axes = carry_axes.clone();
+                iteration_axes.extend(slice_axes.iter().copied());
+                let (_, output_axes) = driver.batch_program(
+                    context,
+                    body,
+                    iteration_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?;
+                check_count!("output", output_axes, body_output_count, ProgramError);
+                let mut widened = false;
+                for (carry_axis, output_axis) in carry_axes.iter_mut().zip(output_axes.iter()) {
+                    if carry_axis.is_replicated() && !output_axis.is_replicated() {
+                        *carry_axis = BatchAxis::new(0);
+                        widened = true;
+                    }
+                }
+                if !widened {
+                    y_axes = Some(output_axes[carry_count..].to_vec());
+                    break;
+                }
+            }
+            let Some(y_axes) = y_axes else {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
+                    ),
+                });
+            };
+
+            // Instantiate the body's outputs at the joined axes so its next-carry outputs align with its carry
+            // inputs across iterations.
+            let mut iteration_axes = carry_axes.clone();
+            iteration_axes.extend(slice_axes.iter().copied());
+            let mut target_axes = carry_axes.clone();
+            target_axes.extend(y_axes.iter().copied());
+            let (batched_body, _) = driver.batch_program(
+                context,
+                body,
+                iteration_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(target_axes),
+            )?;
+
+            // Widen the parent carry inits whose elements became batched (their batch axis is materialized through
+            // a staged broadcast) and stage one batched scan over the batched body.
+            for (carry, carry_axis) in carries.iter_mut().zip(carry_axes.iter()) {
+                if !carry_axis.is_replicated() && carry.batch_axis().is_replicated() {
+                    *carry = carry.broadcast(0, context.axis_size(), context.axis_sharding().clone())?;
+                }
+            }
+            let batched_scan = ScanOperation::<C::Constant>::new(carry_count, self.length())
+                .with_reverse(self.reverse())
+                .with_unroll(self.unroll())?;
+            let mut values = carries.iter().map(|carry| carry.value().clone()).collect::<Vec<_>>();
+            values.extend(stacks.iter().map(|stack| stack.value().clone()));
+            let outputs = context.parent().bind(batched_scan, vec![batched_body], &values)?;
+            check_count!("output", outputs, carry_count + y_axes.len(), ProgramError);
+
+            // Final carries come back at the carry axes; each stacked output gains the leading scan dimension,
+            // shifting its per-iteration batch axis right by one.
+            let mut output_axes = carry_axes;
+            output_axes.extend(y_axes.iter().map(|axis| match axis.axis() {
+                Some(axis) => BatchAxis::new(axis + 1),
+                None => BatchAxis::replicated(),
+            }));
+            return outputs
+                .into_iter()
+                .zip(output_axes)
+                .map(|(output, axis)| {
+                    let physical_type = output.r#type().into_owned();
+                    ArrayBatch::new(physical_type, output, axis)
+                })
+                .collect();
+        }
+
         if self.length() == 0 {
             check_count!("input", inputs, body.input_types().len(), ProgramError);
 
@@ -2072,7 +2196,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::BatchingTracer;
+    use crate::batching::{Batch, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -3304,6 +3428,60 @@ mod tests {
         }
     }
 
+    /// Batching a capture-free scan under a staging parent stages exactly one batched scan — with the replicated
+    /// carry widened through a staged broadcast and the batched stacked input realigned off the leading scan
+    /// dimension — instead of unrolling the loop into per-iteration body copies.
+    #[test]
+    fn test_scan_batching_stages_one_batched_scan_under_tracing() {
+        let parent = DomainTracingContext::<TestEagerContext>::new();
+        let builder = parent.builder().clone();
+        let carry_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let xs_atom = builder.borrow_mut().add_input(f64_type(&[2, 3]));
+        let carry_tracer = parent.tracer(carry_atom, None);
+        let xs_tracer = parent.tracer(xs_atom, None);
+        let (final_carry, ys) = Batch::batch(
+            &parent,
+            |(carry, xs)| {
+                let mut outputs = carry.context().bind(
+                    TestOperation::Scan(TestScanOperation::new(1, 3)),
+                    vec![product_body()],
+                    &[carry.clone(), xs.clone()],
+                )?;
+                Ok((outputs.remove(0), outputs.remove(0)))
+            },
+            (carry_tracer, xs_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        let output_atoms = vec![final_carry.atom_id().unwrap(), ys.atom_id().unwrap()];
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Vec<Array>>(
+                output_atoms,
+                (Placeholder, Placeholder),
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+
+        // Exactly one scan is staged and the loop body is not unrolled into the enclosing trace.
+        let scan_count =
+            program.instructions().iter().filter(|instruction| instruction.operation().name() == "scan").count();
+        assert_eq!(scan_count, 1, "{program}");
+        let unrolled_body_count =
+            program.instructions().iter().filter(|instruction| instruction.operation().name() == "mul").count();
+        assert_eq!(unrolled_body_count, 0, "{program}");
+
+        // Interpreting the staged program computes per-item cumulative products, with the replicated carry
+        // broadcast across the batch.
+        let xs = Array::from_f64s(f64_type(&[2, 3]), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let outputs = program.interpret((Array::scalar(1.0), xs)).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![24.0, 210.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![2.0, 6.0, 24.0, 5.0, 30.0, 210.0]);
+    }
+
     #[test]
     fn test_scan_batching_infers_zero_length_mapped_and_replicated_outputs_eagerly() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
@@ -3357,8 +3535,6 @@ mod tests {
 
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let logical_type =
-                ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
             let carry_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
                 .unwrap()
                 .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
@@ -3372,6 +3548,9 @@ mod tests {
             let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
             let carries = ArrayBatch::new(carry_type, parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
+            // The body's boundary types derive from the carry's unbatched per-item type (like a traced-over-inputs
+            // body would), so its metadata — including any varying-manual-axes marker — matches the actual carries.
+            let logical_type = carries.unbatched_type();
             let tracer_inputs =
                 [BatchingTracer::new(context.clone(), carries), BatchingTracer::new(context.clone(), stacked_inputs)];
             let outputs = context
@@ -3402,13 +3581,13 @@ mod tests {
             assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
             assert_eq!(output_types[0].shape().dimensions(), &[Size::Static(2)]);
             assert_eq!(output_types[0].sharding().unwrap().dimensions(), carry_sharding.dimensions());
+            // The staged batched scan's stacked outputs carry the scan's *declared* output types, whose optional
+            // sharding metadata is left unspecified for sharding propagation to resolve (the `scan_output_types`
+            // contract); only the batch axes and shapes are pinned structurally.
             assert_eq!(output_types[1].shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
-            assert_eq!(
-                output_types[1].sharding().unwrap().dimensions(),
-                &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-            );
+            assert_eq!(output_types[1].sharding(), None);
             assert_eq!(output_types[2].shape().dimensions(), &[Size::Static(0)]);
-            assert_eq!(output_types[2].sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
+            assert_eq!(output_types[2].sharding(), None);
         }
     }
 }
