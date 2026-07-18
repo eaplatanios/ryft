@@ -13,12 +13,16 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
@@ -290,16 +294,18 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
+    use crate::macros::check_gradient;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -326,13 +332,13 @@ mod tests {
             Ok(vec![Scalar::from(7.0f64)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
+                &[Array::scalar(2.0), Array::scalar(3.5)],
             ),
-            Ok(vec![TestArray::scalar(7.0)]),
+            Ok(vec![Array::scalar(7.0)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -416,11 +422,11 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(2.0)]
+                &[Array::scalar(2.0)]
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
@@ -584,7 +590,16 @@ mod tests {
         fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
             input.clone() * input
         }
-        check_gradient!(square, 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, square, at = 0.7, step = 1e-6, tolerance = 1e-6);
+        // The array universe agrees: the gradient of `sum(x ⊙ x)` is `2x`, and the finite-difference oracle perturbs
+        // each input element independently.
+        check_gradient!(
+            @array,
+            |x| square(x).reduce(&[0], ReductionKind::Sum),
+            at = Array::vector(vec![0.7, -1.3, 2.1]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
         let input = Complex::new(0.7f64, -0.3);
         assert_eq!(gradient_holomorphic(square, Scalar::from(input)), Ok(Scalar::from(input * 2.0)));
 
@@ -595,12 +610,12 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(MulOperation, Vec::new(), vec![left, right]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
@@ -616,6 +631,30 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
+        // `c128` payloads, and the reverse-mode pullback applies the bilinear (conjugation-free) transpose pairing.
+        let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let left = Complex::new(1.0f64, 2.0);
+        let right = Complex::new(0.5f64, -1.0);
+        let left_tangent = Complex::new(-0.5f64, 0.25);
+        let right_tangent = Complex::new(2.0f64, 1.0);
+        let (primal, tangent) = array_context
+            .jvp(
+                |(left, right)| Ok(left * right),
+                (Array::vector(vec![left]), Array::vector(vec![right])),
+                (Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])),
+            )
+            .unwrap();
+        assert_eq!(primal, Array::vector(vec![left * right]));
+        assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]));
+        let (_, pullback) = array_context
+            .vjp(|(left, right)| Ok(left * right), (Array::vector(vec![left]), Array::vector(vec![right])))
+            .unwrap();
+        let cotangent = Complex::new(0.5f64, 3.0);
+        let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent])).unwrap();
+        assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]));
+        assert_eq!(right_cotangent, Array::vector(vec![cotangent * left]));
     }
 
     #[test]
@@ -626,12 +665,12 @@ mod tests {
     #[test]
     fn test_mul_transposition() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = builder.add_input(scalar_type.clone());
         let tangent = builder.add_input(scalar_type);
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
         assert_eq!(pullback.output_ids().len(), 1);
@@ -645,18 +684,15 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(
-            pullback.interpret(vec![TestArray::scalar(1.0), TestArray::scalar(4.0)]),
-            Ok(vec![TestArray::scalar(4.0)]),
-        );
+        assert_eq!(pullback.interpret(vec![Array::scalar(1.0), Array::scalar(4.0)]), Ok(vec![Array::scalar(4.0)]),);
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = builder.add_input(vector_type.clone());
         let tangent = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![residual, tangent]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![product], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![product], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[1]).unwrap();
         // The pullback multiplies elementwise and sum-reduces back to the scalar linear operand.
@@ -672,10 +708,10 @@ mod tests {
         );
         assert_eq!(
             pullback.interpret(vec![
-                TestArray::new(vector_type.clone(), vec![2.0, 3.0, 4.0]),
-                TestArray::new(vector_type, vec![1.0, 2.0, 3.0]),
+                Array::from_f64s(vector_type.clone(), vec![2.0, 3.0, 4.0]),
+                Array::from_f64s(vector_type, vec![1.0, 2.0, 3.0]),
             ]),
-            Ok(vec![TestArray::scalar(20.0)]),
+            Ok(vec![Array::scalar(20.0)]),
         );
     }
 }

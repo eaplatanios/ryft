@@ -10,6 +10,8 @@ use crate::programs::operations::Operation;
 
 use super::Cos;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`SinOperation`].
 pub const SIN_OPERATION_NAME: &str = "sin";
 
@@ -63,10 +65,12 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_gradient;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -74,8 +78,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{TypeError, Typed};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -112,13 +115,13 @@ mod tests {
             Ok(vec![Scalar::from(0.5f64.sin())]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(0.5)]
+                &[Array::scalar(0.5)]
             ),
-            Ok(vec![TestArray::scalar(0.5f64.sin())]),
+            Ok(vec![Array::scalar(0.5f64.sin())]),
         );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
@@ -160,7 +163,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -209,7 +212,7 @@ mod tests {
         let (primal, tangent) = context.jvp(|input| input.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_abs_diff_eq!(primal, 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-        check_gradient!(|input| input.sin().unwrap(), 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, |input| input.sin(), at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
             gradient_holomorphic(|input| input.sin().unwrap(), Scalar::from(input)),
@@ -223,19 +226,20 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (_, tangent) = context.jvp(|input| input.sin(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(tangent.values()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
+        assert_abs_diff_eq!(tangent.values()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-6);
 
         // The plain staged tangent program computes the coefficient directly on the input.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
@@ -252,11 +256,11 @@ mod tests {
         );
 
         // The widened staged tangent program computes the coefficient in the widened differential representation.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(SinOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();

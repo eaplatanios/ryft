@@ -112,7 +112,7 @@ impl WhileTypeSemantics for DataType {
 ///
 /// The default implementations are the scalar-predicate semantics, expressed through [`BooleanLike`]: the predicate's
 /// own truth decides continuation, and a true predicate takes the candidate wholesale. Value types with genuinely
-/// batched payloads (e.g. [`TestArray`](crate::tests::TestArray)) override both methods with per-item semantics, and
+/// batched payloads (e.g. [`Array`](crate::backends::arrays::Array)) override both methods with per-item semantics, and
 /// symbolic values (tracers and capture references) inherit the defaults, which surface [`BooleanLike::boolean`]'s
 /// concretization errors — a staged while is consumed by staging and lowering rather than by this eager loop.
 pub trait WhilePredicate: BooleanLike + Clone + Sized {
@@ -634,6 +634,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -641,16 +642,15 @@ mod tests {
     use crate::operations::math::{AddOperation, MulOperation, SubOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
 
     /// Builds a condition program that maps a scalar `f64` state to the scalar Boolean predicate `state > 0`.
-    fn greater_than_zero_condition() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    fn greater_than_zero_condition() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
         let predicate = builder
@@ -660,8 +660,8 @@ mod tests {
     }
 
     /// Builds a body program that maps a scalar `f64` state to `state - 1`.
-    fn subtract_one_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    fn subtract_one_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
         let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
@@ -670,7 +670,7 @@ mod tests {
 
     /// Returns the [`RegionInterface`] of the provided flat region program.
     fn region_interface(
-        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
     }
@@ -713,7 +713,7 @@ mod tests {
 
         // Inference rejects mismatched condition/body state signatures, non-Boolean condition outputs,
         // multi-output conditions, and body outputs that do not match the state signature.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
         let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -736,7 +736,7 @@ mod tests {
                 message: "'while' condition output type must be a Boolean array, but got f64[]".to_string(),
             }),
         );
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let multi_output_condition =
             builder.build(vec![state, state], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
@@ -774,24 +774,23 @@ mod tests {
         assert_eq!(format!("{bounded}"), "while [iteration_bound=2]");
 
         // Eager binding iterates the body until the condition produces false.
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let outputs = context.bind(operation, [condition.clone(), body.clone()], &[TestArray::scalar(3.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![0.0]);
-        let outputs =
-            context.bind(operation, vec![condition.clone(), body.clone()], &[TestArray::scalar(-1.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![-1.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let outputs = context.bind(operation, [condition.clone(), body.clone()], &[Array::scalar(3.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![0.0]);
+        let outputs = context.bind(operation, vec![condition.clone(), body.clone()], &[Array::scalar(-1.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![-1.0]);
 
         // A bounded while runs at most `bound` iterations by definition: the subtract-one loop at 5 would run five
         // iterations on its own, but the bound of 2 truncates it at 3 even though the condition is still true.
-        let outputs = context.bind(bounded, vec![condition.clone(), body.clone()], &[TestArray::scalar(5.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![3.0]);
+        let outputs = context.bind(bounded, vec![condition.clone(), body.clone()], &[Array::scalar(5.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![3.0]);
         // A loop that exits before reaching the bound is unaffected by it.
-        let outputs = context.bind(bounded, vec![condition.clone(), body.clone()], &[TestArray::scalar(1.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![0.0]);
+        let outputs = context.bind(bounded, vec![condition.clone(), body.clone()], &[Array::scalar(1.0)]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![0.0]);
 
         // Staging imports the condition and body programs as attached regions of the staged instruction instead of
         // trying to drive the loop with a concrete predicate.
-        let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
         let staged_state = context.input(state_type.clone());
         let outputs = context
@@ -807,7 +806,7 @@ mod tests {
 
         // Program rendering shows the attached condition and body regions at the instruction with their declared
         // slot names, with the iteration bound rendered on the operation itself.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let program_state = builder.add_input(state_type);
@@ -815,7 +814,7 @@ mod tests {
             .add_instruction(ArrayOperation::While(bounded), vec![condition_region, body_region], vec![program_state])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![program_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![program_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -843,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_eager_unbounded_while_linearization_and_transposition_follow_the_executed_iterations() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = LinearizationTracer<TestContext>;
 
         let context = TestContext::new();
@@ -855,13 +854,13 @@ mod tests {
             )?;
             Ok(outputs.remove(0))
         };
-        let (output, pushforward) = context.linearize(function, TestArray::scalar(3.5)).unwrap();
-        assert_eq!(output, TestArray::scalar(-0.5));
-        assert_eq!(pushforward.apply(TestArray::scalar(2.0)), Ok(TestArray::scalar(2.0)));
+        let (output, pushforward) = context.linearize(function, Array::scalar(3.5)).unwrap();
+        assert_eq!(output, Array::scalar(-0.5));
+        assert_eq!(pushforward.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
 
-        let (output, pullback) = context.vjp(function, TestArray::scalar(3.5)).unwrap();
-        assert_eq!(output, TestArray::scalar(-0.5));
-        assert_eq!(pullback.apply(TestArray::scalar(2.0)), Ok(TestArray::scalar(2.0)));
+        let (output, pullback) = context.vjp(function, Array::scalar(3.5)).unwrap();
+        assert_eq!(output, Array::scalar(-0.5));
+        assert_eq!(pullback.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
     }
 
     /// With a *loop-invariant known* state element, a `while` partially evaluates by folding that element's value into
@@ -881,7 +880,7 @@ mod tests {
 
         // Condition `[counter, acc, k] -> [counter > 0]` (reads only the counter).
         let condition = || {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let counter = builder.add_input(scalar());
             let _acc = builder.add_input(scalar());
             let _k = builder.add_input(scalar());
@@ -894,13 +893,13 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
 
         // Body `[counter, acc, k] -> [counter - 1, acc + k * k, k]`.
         let body = || {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let counter = builder.add_input(scalar());
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
@@ -909,7 +908,7 @@ mod tests {
             let ksq = builder.add_instruction(MulOperation, Vec::new(), vec![k, k]).unwrap()[0];
             let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, ksq]).unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
+                .build::<Vec<Array>, Vec<Array>>(
                     vec![next_counter, next_acc, k],
                     vec![Placeholder; 3],
                     vec![Placeholder; 3],
@@ -921,7 +920,7 @@ mod tests {
         // `[counter, acc, k]` state.
         let operation = WhileOperation::new().with_iteration_bound(8).unwrap();
         let original_body_instructions = body().instructions().len();
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let condition_region = builder.import_region(condition().entry_region_ref());
         let body_region = builder.import_region(body().entry_region_ref());
         let counter_init = builder.add_input(scalar());
@@ -936,13 +935,13 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
 
         let knowledge = vec![
             PartialValue::Unknown(scalar()),
             PartialValue::Unknown(scalar()),
-            PartialValue::Known(TestArray::scalar(3.0)),
+            PartialValue::Known(Array::scalar(3.0)),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
@@ -970,15 +969,15 @@ mod tests {
         assert_eq!(residual_body.instructions().len(), 3);
 
         // Correctness: interpreting the residual program reproduces the original program on the same concrete inputs.
-        let runtime = |counter: f64, acc: f64| -> Vec<TestArray> {
+        let runtime = |counter: f64, acc: f64| -> Vec<Array> {
             let arguments = evaluation
                 .inputs
                 .iter()
                 .map(|residual_input| match residual_input {
                     PartialEvaluationInput::Known(value) => value.clone(),
                     PartialEvaluationInput::Unknown(index) => match index {
-                        0 => TestArray::scalar(counter),
-                        _ => TestArray::scalar(acc),
+                        0 => Array::scalar(counter),
+                        _ => Array::scalar(acc),
                     },
                 })
                 .collect::<Vec<_>>();
@@ -993,22 +992,20 @@ mod tests {
                 .collect()
         };
         let original = |counter: f64, acc: f64, k: f64| {
-            program
-                .interpret(vec![TestArray::scalar(counter), TestArray::scalar(acc), TestArray::scalar(k)])
-                .unwrap()
+            program.interpret(vec![Array::scalar(counter), Array::scalar(acc), Array::scalar(k)]).unwrap()
         };
 
         let reassembled = runtime(4.0, 1.0);
         let expected = original(4.0, 1.0, 3.0);
         assert_eq!(
-            reassembled.iter().map(|value| value.values.clone()).collect::<Vec<_>>(),
-            expected.iter().map(|value| value.values.clone()).collect::<Vec<_>>(),
+            reassembled.iter().map(|value| value.to_f64s()).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.to_f64s()).collect::<Vec<_>>(),
         );
         // The loop runs four times (counter `4 -> 0`): `counter` lands at `0`, `acc` threads
         // `1 -> 1 + 9 -> 19 -> 28 -> 37`, and the loop-invariant `k` final state stays `3`.
-        assert_eq!(reassembled[0].values, vec![0.0]);
-        assert_eq!(reassembled[1].values, vec![37.0]);
-        assert_eq!(reassembled[2].values, vec![3.0]);
+        assert_eq!(reassembled[0].to_f64s(), vec![0.0]);
+        assert_eq!(reassembled[1].to_f64s(), vec![37.0]);
+        assert_eq!(reassembled[2].to_f64s(), vec![3.0]);
     }
 
     #[test]
@@ -1019,7 +1016,7 @@ mod tests {
         // iterations.
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let condition = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
@@ -1028,7 +1025,7 @@ mod tests {
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
@@ -1037,17 +1034,17 @@ mod tests {
         let operation = WhileOperation::new();
         assert_eq!(region_interface(&condition).output_types()[0].shape().rank(), 1);
 
-        let context = crate::contexts::EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = crate::contexts::EagerContext::<Array, ArrayOperation<Array>>::new();
         let outputs = context
-            .bind(operation, vec![condition.clone(), body.clone()], &[TestArray::vector(vec![3.0, 1.0, 2.0])])
+            .bind(operation, vec![condition.clone(), body.clone()], &[Array::vector(vec![3.0, 1.0, 2.0])])
             .unwrap();
-        assert_eq!(outputs[0].values, vec![0.0, 0.0, 0.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![0.0, 0.0, 0.0]);
 
         // The semantic iteration bound truncates the shared masked iterations: item 0 stops at 1.0 after two body
         // applications while items 1 and 2 finish on their own predicates first.
         let bounded = operation.with_iteration_bound(2).unwrap();
-        let outputs = context.bind(bounded, vec![condition, body], &[TestArray::vector(vec![3.0, 1.0, 2.0])]).unwrap();
-        assert_eq!(outputs[0].values, vec![1.0, 0.0, 0.0]);
+        let outputs = context.bind(bounded, vec![condition, body], &[Array::vector(vec![3.0, 1.0, 2.0])]).unwrap();
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1060,7 +1057,7 @@ mod tests {
         use crate::operations::debugging::PrintOperation;
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let condition = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
@@ -1069,7 +1066,7 @@ mod tests {
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let effectful_body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             let one = builder.add_instruction(OneLikeOperation, Vec::new(), vec![state]).unwrap()[0];
             let next_state = builder.add_instruction(SubOperation, Vec::new(), vec![state, one]).unwrap()[0];
@@ -1097,7 +1094,7 @@ mod tests {
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
         let condition = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(state_type.clone());
             let predicate = builder
                 .add_instruction(crate::operations::constants::ZeroOperation::new(predicate_type), Vec::new(), vec![])
@@ -1105,7 +1102,7 @@ mod tests {
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
             builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap()
         };

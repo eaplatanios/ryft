@@ -10,13 +10,16 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &str = "neg";
@@ -168,16 +171,17 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
+    use crate::macros::check_gradient;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -215,13 +219,13 @@ mod tests {
             Ok(vec![Scalar::from(u8::MAX)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(2.0)],
+                &[Array::scalar(2.0)],
             ),
-            Ok(vec![TestArray::scalar(-2.0)]),
+            Ok(vec![Array::scalar(-2.0)]),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -272,7 +276,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -351,7 +355,7 @@ mod tests {
         let (primal, tangent) = context.jvp(|x| Ok(-x), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, -2.0);
         assert_eq!(tangent, -3.0);
-        check_gradient!(|x| -x, 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, |x| -x, at = 0.7, step = 1e-6, tolerance = 1e-6);
         assert_eq!(
             gradient_holomorphic(|input| -input, Scalar::from(Complex::new(0.7f64, -0.3))),
             Ok(Scalar::from(Complex::new(-1.0, 0.0))),
@@ -364,11 +368,11 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
@@ -391,10 +395,10 @@ mod tests {
 
     #[test]
     fn test_neg_transposition() {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         // The pullback negates the output cotangent.
         assert_eq!(
@@ -406,6 +410,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(pullback.interpret(vec![TestArray::scalar(3.0)]), Ok(vec![TestArray::scalar(-3.0)]));
+        assert_eq!(pullback.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(-3.0)]));
     }
 }

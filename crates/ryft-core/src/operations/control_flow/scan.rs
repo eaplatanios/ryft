@@ -1251,6 +1251,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -1258,26 +1259,25 @@ mod tests {
     use crate::operations::math::{AddOperation, MulOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Memory};
 
     use super::*;
 
-    type TestScanOperation = ScanOperation<TestArray>;
+    type TestScanOperation = ScanOperation<Array>;
 
     /// Returns the [`RegionInterface`] of the provided flat region program.
     fn region_interface(
-        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
     }
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
-    fn product_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    fn product_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
@@ -1287,8 +1287,8 @@ mod tests {
     }
 
     /// Builds a carry-only body program that maps `[carry]` to `[carry + carry]` with no stacked inputs or outputs.
-    fn doubling_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    fn doubling_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -1364,16 +1364,16 @@ mod tests {
         let unrolled = TestScanOperation::new(1, 3).with_unroll(3).unwrap();
         assert_eq!(unrolled.unroll(), 3);
         assert_eq!(format!("{unrolled}"), "scan [carry_count=1, length=3, reverse=false, unroll=3]");
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let outputs = context
             .bind(
                 ArrayOperation::Scan(unrolled),
                 vec![body.clone()],
-                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+                &[Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![24.0]);
-        assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![24.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![2.0, 6.0, 24.0]);
 
         // Inference rejects carry counts that exceed the body signature, mismatched carry types, and dynamically
         // sized body slice types over the attached region interface.
@@ -1382,19 +1382,19 @@ mod tests {
                 .infer_output_types(&[scalar_f64.clone(), stacked_f64.clone()], interfaces.as_slice()),
             Err(TypeError { message: "scan carry count 3 exceeds the body input count 2".to_string() }),
         );
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
         let product = builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         let no_output_body = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             TestScanOperation::new(2, 3)
                 .infer_output_types(&[scalar_f64.clone(), scalar_f64.clone()], &[region_interface(&no_output_body)],),
             Err(TypeError { message: "scan carry count 2 exceeds the body output count 1".to_string() }),
         );
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
         let mismatched_output =
             builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![mismatched_carry]).unwrap()[0];
@@ -1406,7 +1406,7 @@ mod tests {
             )
             .unwrap()[0];
         let mismatched_body = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![mismatched_output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![mismatched_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             TestScanOperation::new(1, 3)
@@ -1415,11 +1415,11 @@ mod tests {
                 message: "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
             }),
         );
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         let dynamic_carry = builder.add_input(dynamic_type.clone());
         let dynamic_body = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![dynamic_carry], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![dynamic_carry], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             TestScanOperation::new(1, 3)
@@ -1435,11 +1435,11 @@ mod tests {
             .bind(
                 ArrayOperation::Scan(operation.clone()),
                 vec![body.clone()],
-                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+                &[Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![24.0]);
-        assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![24.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![2.0, 6.0, 24.0]);
 
         // A reversed scan visits the slices from the back while keeping output slice `i` aligned with input slice
         // `i`: the running products visit `4, 3, 2` and land in iterations `2, 1, 0`.
@@ -1448,19 +1448,19 @@ mod tests {
             .bind(
                 ArrayOperation::Scan(reversed),
                 vec![body.clone()],
-                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+                &[Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![24.0]);
-        assert_eq!(outputs[1].values, vec![24.0, 12.0, 4.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![24.0]);
+        assert_eq!(outputs[1].to_f64s(), vec![24.0, 12.0, 4.0]);
 
         // A carry-only scan with no stacked inputs or outputs applies the body `length` times.
         let carry_only = TestScanOperation::new(1, 3);
         let outputs = context
-            .bind(ArrayOperation::Scan(carry_only), vec![doubling_body()], &[TestArray::scalar(1.0)])
+            .bind(ArrayOperation::Scan(carry_only), vec![doubling_body()], &[Array::scalar(1.0)])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].values, vec![8.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![8.0]);
 
         // A zero-length scan returns the initial carries and empty stacked outputs.
         let empty = TestScanOperation::new(1, 0);
@@ -1469,15 +1469,15 @@ mod tests {
             .bind(
                 ArrayOperation::Scan(empty),
                 vec![body.clone()],
-                &[TestArray::scalar(1.0), TestArray::new(empty_stacked_f64, vec![])],
+                &[Array::scalar(1.0), Array::from_f64s(empty_stacked_f64, vec![])],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![1.0]);
-        assert_eq!(outputs[1].values, Vec::<f64>::new());
+        assert_eq!(outputs[0].to_f64s(), vec![1.0]);
+        assert_eq!(outputs[1].to_f64s(), Vec::<f64>::new());
 
         // Staging imports the body program as an attached region of the staged instruction instead of running scan
         // iterations eagerly over staged values.
-        let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
         let staged_carry = context.input(scalar_f64.clone());
         let staged_xs = context.input(stacked_f64.clone());
@@ -1497,7 +1497,7 @@ mod tests {
         assert_eq!(outputs[1].atom_id(), Ok(builder.instructions()[0].outputs()[1]));
 
         // Program rendering shows the attached body region at the instruction with its declared slot name.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let program_carry = builder.add_input(scalar_f64);
         let program_xs = builder.add_input(stacked_f64);
@@ -1506,7 +1506,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 program_outputs,
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn test_scan_linearization_and_transposition_preserve_carry_derivatives() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = LinearizationTracer<TestContext>;
 
         let context = TestContext::new();
@@ -1543,12 +1543,12 @@ mod tests {
             )?;
             Ok((outputs.remove(0), outputs.remove(0)))
         };
-        let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
+        let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
         let (outputs, pushforward) = context.linearize(function, primals.clone()).unwrap();
-        assert_eq!(outputs, (TestArray::scalar(24.0), TestArray::vector(vec![2.0, 6.0, 24.0])));
+        assert_eq!(outputs, (Array::scalar(24.0), Array::vector(vec![2.0, 6.0, 24.0])));
         assert_eq!(
-            pushforward.apply((TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0]))),
-            Ok((TestArray::scalar(24.0), TestArray::vector(vec![2.0, 6.0, 24.0]))),
+            pushforward.apply((Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0]))),
+            Ok((Array::scalar(24.0), Array::vector(vec![2.0, 6.0, 24.0]))),
         );
 
         let (final_carry, pullback) = context
@@ -1564,11 +1564,8 @@ mod tests {
                 primals,
             )
             .unwrap();
-        assert_eq!(final_carry, TestArray::scalar(24.0));
-        assert_eq!(
-            pullback.apply(TestArray::scalar(1.0)),
-            Ok((TestArray::scalar(24.0), TestArray::vector(vec![12.0, 8.0, 6.0]))),
-        );
+        assert_eq!(final_carry, Array::scalar(24.0));
+        assert_eq!(pullback.apply(Array::scalar(1.0)), Ok((Array::scalar(24.0), Array::vector(vec![12.0, 8.0, 6.0]))),);
     }
 
     /// Scan input validation compares the declared types derived from the body signature against actual input types
@@ -1632,7 +1629,7 @@ mod tests {
         // Body `[acc, k, x] -> [acc + (print(k) * k) * x, k, acc + (print(k) * k) * x]`: the print sits inside the
         // otherwise-known `k * k` chain.
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
@@ -1641,7 +1638,7 @@ mod tests {
             let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
             let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
+                .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
                     vec![Placeholder; 3],
                     vec![Placeholder; 3],
@@ -1650,7 +1647,7 @@ mod tests {
         };
 
         let scan = TestScanOperation::new(2, 3);
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let acc_init = builder.add_input(scalar());
         let k_init = builder.add_input(scalar());
@@ -1660,10 +1657,10 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
 
-        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
         let known_carry = outer.input(scalar());
         let knowledge =
             vec![PartialValue::Unknown(scalar()), PartialValue::Known(known_carry), PartialValue::Unknown(stacked)];
@@ -1700,16 +1697,16 @@ mod tests {
         let scalar = || ArrayType::scalar(DataType::F64);
         let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
 
-        let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = body_builder.add_input(scalar());
         let input = body_builder.add_input(scalar());
         body_builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![carry], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert!(body.partition(&[true, false]).unwrap().residual_program().effects().is_ordered());
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry_init = builder.add_input(scalar());
         let inputs = builder.add_input(stacked.clone());
@@ -1721,10 +1718,10 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
         let symbolic_carry = outer.input(scalar());
         let evaluation = program
             .partially_evaluate_in_context(
@@ -1759,7 +1756,7 @@ mod tests {
 
         // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`, as in the loop-invariant test below.
         let body = || {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
@@ -1767,7 +1764,7 @@ mod tests {
             let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
             let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
+                .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
                     vec![Placeholder; 3],
                     vec![Placeholder; 3],
@@ -1776,7 +1773,7 @@ mod tests {
         };
 
         let scan = TestScanOperation::new(2, 3);
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body().entry_region_ref());
         let acc_init = builder.add_input(scalar());
         let k_init = builder.add_input(scalar());
@@ -1786,10 +1783,10 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
 
-        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
         let known_carry = outer.input(scalar());
         let knowledge = vec![
             PartialValue::Unknown(scalar()),
@@ -1848,17 +1845,17 @@ mod tests {
 
         // Body `[c, x] -> [c + x * x, x * x]` over an unknown accumulator `c` and known stacked `xs`.
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let c = builder.add_input(scalar());
             let x = builder.add_input(scalar());
             let xsq = builder.add_instruction(MulOperation, Vec::new(), vec![x, x]).unwrap()[0];
             let next = builder.add_instruction(AddOperation, Vec::new(), vec![c, xsq]).unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![next, xsq], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Array>, Vec<Array>>(vec![next, xsq], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
         let scan = TestScanOperation::new(1, 3);
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let c_init = builder.add_input(scalar());
         let xs = builder.add_input(stacked.clone());
@@ -1867,11 +1864,10 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let knowledge =
-            vec![PartialValue::Unknown(scalar()), PartialValue::Known(TestArray::vector(vec![1.0, 2.0, 3.0]))];
+        let knowledge = vec![PartialValue::Unknown(scalar()), PartialValue::Known(Array::vector(vec![1.0, 2.0, 3.0]))];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
         // The stacked squares were computed *during* partial evaluation by the known scan: they surface both as the
@@ -1880,25 +1876,22 @@ mod tests {
         assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(
             &evaluation.outputs[1],
-            PartialEvaluationOutput::Known(value) if value.values == vec![1.0, 4.0, 9.0]
+            PartialEvaluationOutput::Known(value) if value.to_f64s() == vec![1.0, 4.0, 9.0]
         ));
         assert_eq!(evaluation.inputs.len(), 2);
         assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
         assert!(matches!(
             &evaluation.inputs[1],
-            PartialEvaluationInput::Known(value) if value.values == vec![1.0, 4.0, 9.0]
+            PartialEvaluationInput::Known(value) if value.to_f64s() == vec![1.0, 4.0, 9.0]
         ));
 
         // The residual (unknown) scan accumulates the stacked squares: interpreting it at `c = 10` reproduces the
         // full interpretation of the original program.
-        let residual_outputs = evaluation
-            .program
-            .interpret(vec![TestArray::scalar(10.0), TestArray::vector(vec![1.0, 4.0, 9.0])])
-            .unwrap();
-        let expected =
-            program.interpret(vec![TestArray::scalar(10.0), TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
-        assert_eq!(residual_outputs[0].values, expected[0].values);
-        assert_eq!(residual_outputs[0].values, vec![24.0]);
+        let residual_outputs =
+            evaluation.program.interpret(vec![Array::scalar(10.0), Array::vector(vec![1.0, 4.0, 9.0])]).unwrap();
+        let expected = program.interpret(vec![Array::scalar(10.0), Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(residual_outputs[0].to_f64s(), expected[0].to_f64s());
+        assert_eq!(residual_outputs[0].to_f64s(), vec![24.0]);
     }
 
     /// With a *loop-invariant known* carry, a scan partially evaluates by folding that carry's value into the body: the
@@ -1918,7 +1911,7 @@ mod tests {
 
         // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`.
         let body = || {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
             let x = builder.add_input(scalar());
@@ -1926,7 +1919,7 @@ mod tests {
             let kx = builder.add_instruction(MulOperation, Vec::new(), vec![ksq, x]).unwrap()[0];
             let next_acc = builder.add_instruction(AddOperation, Vec::new(), vec![acc, kx]).unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(
+                .build::<Vec<Array>, Vec<Array>>(
                     vec![next_acc, k, next_acc],
                     vec![Placeholder; 3],
                     vec![Placeholder; 3],
@@ -1937,7 +1930,7 @@ mod tests {
         // Flat program over `[acc_init, k_init, xs]` staging the scan (two carries, one scanned input, length 3); its
         // outputs are `[final_acc, final_k, stacked_acc]`.
         let scan = TestScanOperation::new(2, 3);
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body_region = builder.import_region(body().entry_region_ref());
         let acc_init = builder.add_input(scalar());
         let k_init = builder.add_input(scalar());
@@ -1947,12 +1940,12 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
 
         let knowledge = vec![
             PartialValue::Unknown(scalar()),
-            PartialValue::Known(TestArray::scalar(2.0)),
+            PartialValue::Known(Array::scalar(2.0)),
             PartialValue::Unknown(stacked.clone()),
         ];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
@@ -1981,15 +1974,15 @@ mod tests {
         assert_eq!(residual_body.instructions().len(), 2);
 
         // Correctness: interpreting the residual program reproduces the original program on the same concrete inputs.
-        let runtime = |acc: f64, xs: Vec<f64>| -> Vec<TestArray> {
+        let runtime = |acc: f64, xs: Vec<f64>| -> Vec<Array> {
             let arguments = evaluation
                 .inputs
                 .iter()
                 .map(|residual_input| match residual_input {
                     PartialEvaluationInput::Known(value) => value.clone(),
                     PartialEvaluationInput::Unknown(index) => match index {
-                        0 => TestArray::scalar(acc),
-                        _ => TestArray::vector(xs.clone()),
+                        0 => Array::scalar(acc),
+                        _ => Array::vector(xs.clone()),
                     },
                 })
                 .collect::<Vec<_>>();
@@ -2004,21 +1997,19 @@ mod tests {
                 .collect()
         };
         let original = |acc: f64, k: f64, xs: Vec<f64>| {
-            program
-                .interpret(vec![TestArray::scalar(acc), TestArray::scalar(k), TestArray::vector(xs)])
-                .unwrap()
+            program.interpret(vec![Array::scalar(acc), Array::scalar(k), Array::vector(xs)]).unwrap()
         };
 
         let reassembled = runtime(1.0, vec![5.0, 6.0, 7.0]);
         let expected = original(1.0, 2.0, vec![5.0, 6.0, 7.0]);
         assert_eq!(
-            reassembled.iter().map(|value| value.values.clone()).collect::<Vec<_>>(),
-            expected.iter().map(|value| value.values.clone()).collect::<Vec<_>>()
+            reassembled.iter().map(|value| value.to_f64s()).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.to_f64s()).collect::<Vec<_>>()
         );
         // `acc` threads `1 -> 1 + 4*5 -> 21 + 4*6 -> 45 + 4*7 = 73`; the stacked output records `[21, 45, 73]`; the
         // loop-invariant `k` final carry stays `2`.
-        assert_eq!(reassembled[0].values, vec![73.0]);
-        assert_eq!(reassembled[1].values, vec![2.0]);
-        assert_eq!(reassembled[2].values, vec![21.0, 45.0, 73.0]);
+        assert_eq!(reassembled[0].to_f64s(), vec![73.0]);
+        assert_eq!(reassembled[1].to_f64s(), vec![2.0]);
+        assert_eq!(reassembled[2].to_f64s(), vec![21.0, 45.0, 73.0]);
     }
 }

@@ -14,10 +14,12 @@ use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, One, Zero};
 use crate::operations::control_flow::Select;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Size};
 
@@ -294,15 +296,15 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Coordina
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tests::TestArray;
     use crate::types::DataType::{Boolean, F8E8M0FNU, F32, I32};
     use crate::types::{ArrayType, Shape, Size};
 
-    use super::CoordinateBasisOperation;
+    use super::*;
 
     #[test]
     fn test_coordinate_basis_operation_infers_packed_type() {
@@ -386,11 +388,10 @@ mod tests {
         let leaf_type =
             ArrayType::new(F32, Shape::new(vec![Size::Static(0), Size::Static(usize::MAX), Size::Static(2)]));
         let operation = CoordinateBasisOperation::new(leaf_type.clone(), 0, 0);
-        let context = EagerContext::<TestArray, CoordinateBasisOperation<ArrayType>>::new();
-
+        let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[]).unwrap(),
-            vec![TestArray::new(leaf_type.with_inserted_dimension(0, Size::Static(0)).unwrap(), Vec::new(),)],
+            vec![Array::from_f64s(leaf_type.with_inserted_dimension(0, Size::Static(0)).unwrap(), Vec::new(),)],
         );
     }
 }

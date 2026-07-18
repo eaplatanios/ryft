@@ -1,29 +1,17 @@
 use crate::programs::types::TypeError;
 use crate::types::{ArrayType, DataType};
 
-/// Elementwise absolute-value operation.
 pub mod abs;
-/// Elementwise addition operation.
 pub mod add;
-/// Elementwise two-argument arc-tangent operation.
 pub mod atan2;
-/// Elementwise cosine operation.
 pub mod cos;
-/// Elementwise division operation.
 pub mod div;
-/// Elementwise natural-exponential operation.
 pub mod exp;
-/// Elementwise natural-logarithm operation.
 pub mod log;
-/// Elementwise multiplication operation.
 pub mod mul;
-/// Elementwise negation operation.
 pub mod neg;
-/// Elementwise sine operation.
 pub mod sin;
-/// Elementwise square-root operation.
 pub mod sqrt;
-/// Elementwise subtraction operation.
 pub mod sub;
 
 pub use abs::{ABS_OPERATION_NAME, Abs, AbsOperation};
@@ -38,6 +26,8 @@ pub use neg::{NEG_OPERATION_NAME, Neg, NegOperation};
 pub use sin::{SIN_OPERATION_NAME, Sin, SinOperation};
 pub use sqrt::{SQRT_OPERATION_NAME, Sqrt, SqrtOperation};
 pub use sub::{SUB_OPERATION_NAME, Sub, SubOperation};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates that all provided input types are ordinary numeric data types supported by arithmetic operations.
 /// Tokens, structural-zero values, and Booleans have separate operation families and do not participate in numeric
@@ -154,6 +144,7 @@ pub(crate) fn validate_linear_reduction_state(
 pub(crate) mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
@@ -166,24 +157,22 @@ pub(crate) mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Checks the shared elementwise batching rule for a unary operation over a mapped vector of scalar batch items.
     pub(crate) fn assert_unary_batching<O>(operation: O, input: &[f64], expected: &[f64])
     where
-        O: BatchableOperation<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+        O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>>,
     {
         let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(input.len())]));
         let input =
-            ArrayBatch::new(physical_type.clone(), TestArray::new(physical_type, input.to_vec()), BatchAxis::new(0))
+            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, input.to_vec()), BatchAxis::new(0))
                 .unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), expected.len());
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), expected.len());
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        for (actual, expected) in outputs[0].value().values().iter().zip(expected) {
+        for (actual, expected) in outputs[0].value().to_f64s().iter().zip(expected) {
             assert_abs_diff_eq!(actual, expected, epsilon = 1e-9);
         }
     }
@@ -191,20 +180,19 @@ pub(crate) mod tests {
     /// Checks the shared elementwise batching rule for a binary operation with one mapped and one replicated operand.
     pub(crate) fn assert_binary_batching<O>(operation: O, left: &[f64], right: f64, expected: &[f64])
     where
-        O: BatchableOperation<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+        O: BatchableOperation<EagerContext<Array, ArrayOperation<Array>>>,
     {
         let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(left.len())]));
         let left =
-            ArrayBatch::new(physical_type.clone(), TestArray::new(physical_type, left.to_vec()), BatchAxis::new(0))
+            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, left.to_vec()), BatchAxis::new(0))
                 .unwrap();
         let right =
-            ArrayBatch::new(ArrayType::scalar(DataType::F64), TestArray::scalar(right), BatchAxis::replicated())
-                .unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), expected.len());
+            ArrayBatch::new(ArrayType::scalar(DataType::F64), Array::scalar(right), BatchAxis::replicated()).unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), expected.len());
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        for (actual, expected) in outputs[0].value().values().iter().zip(expected) {
+        for (actual, expected) in outputs[0].value().to_f64s().iter().zip(expected) {
             assert_abs_diff_eq!(actual, expected, epsilon = 1e-9);
         }
     }
@@ -284,16 +272,16 @@ pub(crate) mod tests {
 
     /// Checks that a nonlinear elementwise operation cannot be transposed before it has been linearized by its JVP
     /// rule.
-    pub(crate) fn assert_rejects_nonlinear_transposition<O: Into<ArrayOperation<TestArray>>>(
+    pub(crate) fn assert_rejects_nonlinear_transposition<O: Into<ArrayOperation<Array>>>(
         operation: O,
         operation_name: &str,
         input_count: usize,
     ) {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = (0..input_count).map(|_| builder.add_input(ArrayType::scalar(DataType::F64))).collect::<Vec<_>>();
         let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(vec![output], vec![Placeholder; input_count], Placeholder)
+            .build::<Vec<Array>, Array>(vec![output], vec![Placeholder; input_count], Placeholder)
             .unwrap();
         let input_indices = (0..input_count).collect::<Vec<_>>();
         assert!(matches!(

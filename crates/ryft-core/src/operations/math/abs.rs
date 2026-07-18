@@ -14,11 +14,15 @@ use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
 use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";

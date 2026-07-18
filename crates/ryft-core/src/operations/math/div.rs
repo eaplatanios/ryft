@@ -8,10 +8,14 @@ use crate::differentiation::{
 };
 use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
 use crate::partial::PartialValue;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::Typed;
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &str = "div";
@@ -128,10 +132,12 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_gradient;
     use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
     use crate::parameters::Placeholder;
@@ -141,8 +147,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -169,13 +174,13 @@ mod tests {
             Ok(vec![Scalar::from(3.5f64)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(7.0), TestArray::scalar(2.0)],
+                &[Array::scalar(7.0), Array::scalar(2.0)],
             ),
-            Ok(vec![TestArray::scalar(3.5)]),
+            Ok(vec![Array::scalar(3.5)]),
         );
         assert_abs_diff_eq!(
             match InterpretableOperation::<EagerContext<Scalar>>::interpret(
@@ -263,11 +268,11 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(2.0)]
+                &[Array::scalar(2.0)]
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
@@ -395,7 +400,7 @@ mod tests {
         {
             input.clone() / (input.clone() + input.one_like())
         }
-        check_gradient!(normalized_ratio, 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, normalized_ratio, at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = Complex::new(0.7f64, -0.3);
         let holomorphic_gradient = gradient_holomorphic(normalized_ratio, Scalar::from(input)).unwrap();
         assert_abs_diff_eq!(
@@ -419,12 +424,12 @@ mod tests {
         assert_eq!(primal, Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Scalar::from(-0.5f32));
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
         let denominator = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
@@ -452,12 +457,12 @@ mod tests {
 
     #[test]
     fn test_div_transposition() {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
         let denominator = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         // The pullback divides the output cotangent by the residual denominator.
@@ -471,17 +476,17 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            pullback.interpret(vec![TestArray::scalar(2.0), TestArray::scalar(3.0)]),
-            Ok(vec![TestArray::scalar(2.0 / 3.0)]),
+            pullback.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]),
+            Ok(vec![Array::scalar(2.0 / 3.0)]),
         );
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let numerator = builder.add_input(ArrayType::scalar(DataType::F64));
         let denominator = builder.add_input(vector_type.clone());
         let output = builder.add_instruction(DivOperation, Vec::new(), vec![numerator, denominator]).unwrap()[0];
         let program = builder
-            .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         // The pullback divides the output cotangent elementwise and sum-reduces it back to the scalar numerator.
@@ -497,10 +502,10 @@ mod tests {
         );
         assert_eq!(
             pullback.interpret(vec![
-                TestArray::new(vector_type.clone(), vec![2.0, 4.0, 10.0]),
-                TestArray::new(vector_type, vec![2.0, 4.0, 5.0]),
+                Array::from_f64s(vector_type.clone(), vec![2.0, 4.0, 10.0]),
+                Array::from_f64s(vector_type, vec![2.0, 4.0, 5.0]),
             ]),
-            Ok(vec![TestArray::scalar(4.0)]),
+            Ok(vec![Array::scalar(4.0)]),
         );
     }
 }

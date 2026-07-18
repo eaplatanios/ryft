@@ -21,6 +21,8 @@ use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 use crate::types::ArrayType;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
 
@@ -797,6 +799,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -804,18 +808,17 @@ mod tests {
     use crate::operations::math::{AddOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
 
     /// Builds a single-input flat program that maps its scalar `f64` input through `operation`.
     fn scalar_branch(
-        operation: ArrayOperation<TestArray>,
-    ) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        operation: ArrayOperation<Array>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let inputs = if matches!(operation, ArrayOperation::Add(_)) { vec![input, input] } else { vec![input] };
         let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
@@ -824,16 +827,16 @@ mod tests {
 
     /// Returns the [`RegionInterface`] of the provided flat branch program.
     fn branch_interface(
-        program: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> RegionInterface<ArrayType> {
         program.interface()
     }
 
     /// Builds a scalar branch that returns whether its input is greater than zero.
-    fn boolean_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    fn boolean_branch() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_constant(TestArray::scalar(0.0));
+        let zero = builder.add_constant(Array::scalar(0.0));
         let output = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
             .unwrap()[0];
@@ -844,7 +847,7 @@ mod tests {
     fn test_condition() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
-        let operation = ConditionOperation::<TestArray>::new();
+        let operation = ConditionOperation::<Array>::new();
         let true_branch = scalar_branch(ArrayOperation::Add(AddOperation));
         let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation));
         let interfaces = vec![branch_interface(&true_branch), branch_interface(&false_branch)];
@@ -899,7 +902,7 @@ mod tests {
         );
 
         // Inference rejects branch interfaces with mismatched output signatures.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![input]).unwrap()[0];
         let boolean_output = builder
@@ -919,32 +922,32 @@ mod tests {
 
         // Eager binding interprets the predicate-selected branch through detached region access, and interpretation
         // without a predicate input is rejected.
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let predicate = |value: f64| TestArray::new(predicate_type.clone(), vec![value]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let predicate = |value: f64| Array::from_f64s(predicate_type.clone(), vec![value]);
         let outputs = context
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(1.0), TestArray::scalar(4.0)],
+                &[predicate(1.0), Array::scalar(4.0)],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![8.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![8.0]);
         let outputs = context
             .bind(
                 operation.clone(),
                 vec![true_branch.clone(), false_branch.clone()],
-                &[predicate(0.0), TestArray::scalar(4.0)],
+                &[predicate(0.0), Array::scalar(4.0)],
             )
             .unwrap();
-        assert_eq!(outputs[0].values, vec![0.0]);
+        assert_eq!(outputs[0].to_f64s(), vec![0.0]);
         assert_eq!(
-            operation.interpret(&context.clone(), &crate::EmptyRegionDriver, &[] as &[TestArray]),
+            operation.interpret(&context.clone(), &crate::EmptyRegionDriver, &[] as &[Array]),
             Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
         );
 
         // Staging imports the branch programs as attached regions of the staged instruction instead of trying to
         // concretize the staged predicate.
-        let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = context.builder().clone();
         let staged_predicate = context.input(predicate_type.clone());
         let staged_operand = context.input(operand_type.clone());
@@ -967,7 +970,7 @@ mod tests {
         assert_eq!(outputs[0].atom_id(), Ok(builder.instructions()[0].outputs()[0]));
 
         // Program rendering shows the attached branch regions at the instruction with their declared slot names.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let program_predicate = builder.add_input(predicate_type);
@@ -980,11 +983,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![program_output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Array>, Vec<Array>>(vec![program_output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
@@ -1010,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_condition_linearization_replays_the_selected_branch() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = LinearizationTracer<TestContext>;
 
         for (predicate, expected_value, expected_tangent) in
@@ -1019,7 +1018,7 @@ mod tests {
             let (value, pushforward) = TestContext::new()
                 .linearize(
                     move |input: TestTracer| {
-                        let predicate = input.context().lift(TestArray::new(
+                        let predicate = input.context().lift(Array::from_f64s(
                             ArrayType::scalar(DataType::Boolean),
                             vec![if predicate { 1.0 } else { 0.0 }],
                         ))?;
@@ -1033,24 +1032,24 @@ mod tests {
                         )?;
                         Ok(outputs.remove(0))
                     },
-                    TestArray::scalar(0.7),
+                    Array::scalar(0.7),
                 )
                 .unwrap();
-            assert_eq!(value, TestArray::scalar(expected_value));
-            assert_eq!(pushforward.apply(TestArray::scalar(1.5)), Ok(TestArray::scalar(expected_tangent)));
+            assert_eq!(value, Array::scalar(expected_value));
+            assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
         }
     }
 
     #[test]
     fn test_condition_jvp_preserves_zero_space_output_tangents() {
-        type TestContext = EagerContext<TestArray, ArrayOperation<TestArray>>;
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = DifferentiationTracer<TestContext>;
 
         let (primal, tangent) = TestContext::new()
             .jvp(
                 |input: TestTracer| {
                     let predicate =
-                        input.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                        input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
                     let mut outputs = input.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
                         vec![boolean_branch(), boolean_branch()],
@@ -1058,12 +1057,12 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(2.0),
-                TestArray::scalar(3.0),
+                Array::scalar(2.0),
+                Array::scalar(3.0),
             )
             .unwrap();
-        assert_eq!(primal, TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
-        assert_eq!(tangent, TestArray::new(ArrayType::scalar(DataType::Zero), vec![0.0]));
+        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+        assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
     }
 
     /// A known-symbolic predicate splits known branch results from residual branch work without dropping an
@@ -1077,20 +1076,18 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
         let branch = |label| {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
             builder.add_instruction(PrintOperation::new(label), Vec::new(), vec![input]).unwrap();
-            let output = builder.add_constant(TestArray::scalar(1.0));
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+            let output = builder.add_constant(Array::scalar(1.0));
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let true_branch = branch("true");
         let false_branch = branch("false");
         assert!(true_branch.partition(&[false]).unwrap().residual_program().effects().is_ordered());
         assert!(false_branch.partition(&[false]).unwrap().residual_program().effects().is_ordered());
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone());
@@ -1103,10 +1100,10 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
         let symbolic_predicate = outer.input(predicate_type);
         let evaluation = program
             .partially_evaluate_in_context(

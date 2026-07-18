@@ -132,15 +132,16 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
+    use crate::differentiation::forward::ForwardModeDifferentiate;
+    use crate::differentiation::reverse::ReverseModeDifferentiate;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -176,13 +177,13 @@ mod tests {
             Ok(vec![Scalar::from(Complex::new(1.0f64, -2.0))]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(2.0)],
+                &[Array::scalar(2.0)],
             ),
-            Ok(vec![TestArray::scalar(2.0)]),
+            Ok(vec![Array::scalar(2.0)]),
         );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
@@ -224,7 +225,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -292,16 +293,16 @@ mod tests {
         crate::operations::math::tests::assert_unary_batching(StopGradientOperation, &[1.0, -2.0], &[1.0, -2.0]);
 
         // Gradient stopping composes with batching: `x * stop_gradient(x)` batches like `x * x`.
-        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(
                 |x| Ok(x.clone() * x.stop_gradient()),
-                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                Array::vector(vec![1.0, 2.0, 3.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
             )
             .unwrap();
-        assert_eq!(output.values, vec![1.0, 4.0, 9.0]);
+        assert_eq!(output.to_f64s(), vec![1.0, 4.0, 9.0]);
     }
 
     #[test]
@@ -321,11 +322,11 @@ mod tests {
 
         // The staged tangent program replays the primal operation and stages no tangent computation: the severed
         // tangent output materializes as a canonical zero.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(StopGradientOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();

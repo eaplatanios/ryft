@@ -6,9 +6,13 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
 };
 use crate::macros::{check_count, define_elementwise_operation, impl_non_transposable_operation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::Typed;
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::values::Value;
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`Atan2Operation`].
 pub const ATAN2_OPERATION_NAME: &str = "atan2";
@@ -120,10 +124,12 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient, value_and_gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_gradient;
     use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
     use crate::parameters::Placeholder;
@@ -132,8 +138,6 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -187,13 +191,13 @@ mod tests {
             Ok(vec![Scalar::from(0.5f64.atan2(-0.25f64))]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(0.5), TestArray::scalar(-0.25)],
+                &[Array::scalar(0.5), Array::scalar(-0.25)],
             ),
-            Ok(vec![TestArray::scalar(0.5f64.atan2(-0.25f64))]),
+            Ok(vec![Array::scalar(0.5f64.atan2(-0.25f64))]),
         );
 
         // Array type inference preserves shape, layout, and sharding metadata for its identical inputs.
@@ -258,7 +262,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -323,7 +327,7 @@ mod tests {
         assert_abs_diff_eq!(value, y.atan2(x), epsilon = 1e-9);
         assert_abs_diff_eq!(y_gradient, x / (x * x + y * y), epsilon = 1e-9);
         assert_abs_diff_eq!(x_gradient, -y / (x * x + y * y), epsilon = 1e-9);
-        check_gradient!(|y| y.atan2(&y.one_like()).unwrap(), 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, |y| y.atan2(&y.one_like()), at = 0.7, step = 1e-6, tolerance = 1e-6);
 
         // Second-order differentiation recovers d²(atan2(y, 1))/dy² = -2y / (1 + y²)².
         assert_abs_diff_eq!(
@@ -362,12 +366,12 @@ mod tests {
         let Scalar::F32(tangent) = tangent else { panic!("expected an f32 tangent") };
         assert_abs_diff_eq!(tangent, 0.1f32, epsilon = 1e-6);
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let y = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(Atan2Operation, Vec::new(), vec![y, x]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();

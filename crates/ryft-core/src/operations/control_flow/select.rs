@@ -156,7 +156,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for SelectOperation where C::O
 /// # use ryft_core::operations::control_flow::Select;
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::scalars::Scalar;
-/// # use ryft_core::tests::{TestArray as Array};
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
@@ -166,11 +166,11 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for SelectOperation where C::O
 ///
 /// // Array values pair with a Boolean-typed condition array of the same shape.
 /// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
-/// let condition = Array::new(condition_type, vec![1.0, 0.0, 1.0]);
+/// let condition = Array::from_f64s(condition_type, vec![1.0, 0.0, 1.0]);
 /// let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
 /// let output = Array::select(&condition, &on_true, &on_false)?;
-/// assert_eq!(output.values, vec![1.0, 5.0, 3.0]);
+/// assert_eq!(output.to_f64s(), vec![1.0, 5.0, 3.0]);
 /// # Ok(())
 /// # }
 /// ```
@@ -244,12 +244,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::operations::BooleanLike;
     use crate::parameters::Placeholder;
     use crate::programs::types::Typed;
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::tests::TestArray;
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -359,49 +359,37 @@ mod tests {
         );
 
         // Interpretation picks per-element between the two branches.
-        let condition = TestArray::new(condition_type.clone(), vec![1.0, 0.0, 1.0]);
-        let on_true = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
+        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
+        let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
+        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(
-                &crate::EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                &[condition, on_true, on_false],
-            )
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
 
         // Interpretation broadcasts a size-1 branch up to the condition/other-branch shape, matching the broadcasting
         // type-inference contract.
-        let condition = TestArray::new(condition_type.clone(), vec![1.0, 0.0, 1.0]);
-        let on_true = TestArray::new(scalar_branch.clone(), vec![7.0]);
-        let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
+        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
+        let on_true = Array::from_f64s(scalar_branch.clone(), vec![7.0]);
+        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(
-                &crate::EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                &[condition, on_true, on_false],
-            )
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].values, vec![7.0, 5.0, 7.0]);
+        assert_eq!(output[0].to_f64s(), vec![7.0, 5.0, 7.0]);
 
         // Interpretation promotes mixed-but-promotable branch data types, so the output carries the promoted (`f64`)
         // data type of the two branches.
-        let condition = TestArray::new(condition_type.clone(), vec![1.0, 0.0, 1.0]);
+        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
         let on_true =
-            TestArray::new(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])), vec![1.0, 2.0, 3.0]);
-        let on_false = TestArray::vector(vec![4.0, 5.0, 6.0]);
+            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])), vec![1.0, 2.0, 3.0]);
+        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
         let output = operation
-            .interpret(
-                &crate::EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                &[condition, on_true, on_false],
-            )
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
             .unwrap();
         assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].values, vec![1.0, 5.0, 3.0]);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
 
         // The scalar implementation selects on plain `bool` conditions.
         assert_eq!(Scalar::select(&true, &Scalar::from(2.0), &Scalar::from(3.0)), Ok(Scalar::from(2.0)));
@@ -465,9 +453,9 @@ mod tests {
             Ok(vec![branch_type.clone()]),
         );
         assert_eq!(
-            InterpretableOperation::<crate::EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<crate::EagerContext<Array>>::interpret(
                 &operation,
-                &crate::EagerContext::<TestArray>::new(),
+                &crate::EagerContext::<Array>::new(),
                 &crate::EmptyRegionDriver,
                 &[]
             ),
@@ -475,7 +463,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<TestArray, SelectOperation>::new();
+        let mut builder = ProgramBuilder::<Array, SelectOperation>::new();
         let program_condition = builder.add_input(condition_type);
         let program_on_true = builder.add_input(branch_type.clone());
         let program_on_false = builder.add_input(branch_type);
@@ -483,11 +471,7 @@ mod tests {
             .add_instruction(operation, Vec::new(), vec![program_condition, program_on_true, program_on_false])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, TestArray>(
-                vec![program_output],
-                vec![Placeholder, Placeholder, Placeholder],
-                Placeholder,
-            )
+            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert_eq!(
             program.to_string(),

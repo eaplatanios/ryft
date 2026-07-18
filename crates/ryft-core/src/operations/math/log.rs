@@ -8,6 +8,8 @@ use crate::differentiation::{
 use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
 use crate::programs::operations::Operation;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`LogOperation`].
 pub const LOG_OPERATION_NAME: &str = "log";
 
@@ -61,18 +63,19 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_gradient;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{TypeError, Typed};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -112,13 +115,13 @@ mod tests {
             Ok(vec![Scalar::from(0.7f64.ln())]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(0.7)],
+                &[Array::scalar(0.7)],
             ),
-            Ok(vec![TestArray::scalar(0.7f64.ln())]),
+            Ok(vec![Array::scalar(0.7f64.ln())]),
         );
 
         let mesh = LogicalMesh::new(vec![
@@ -154,7 +157,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -202,7 +205,7 @@ mod tests {
         let (primal, tangent) = context.jvp(|input| input.log(), Scalar::from(0.7), Scalar::from(3.0)).unwrap();
         assert_abs_diff_eq!(primal, 0.7f64.ln(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 3.0 / 0.7, epsilon = 1e-9);
-        check_gradient!(|input| input.log().unwrap(), 0.7, 1e-6, 1e-6);
+        check_gradient!(@scalar, |input| input.log(), at = 0.7, step = 1e-6, tolerance = 1e-6);
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
             gradient_holomorphic(|input| input.log().unwrap(), Scalar::from(input)),
@@ -216,19 +219,19 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (_, tangent) = context.jvp(|input| input.log(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.values()[0], 1.5, epsilon = 1e-9);
 
         // The plain staged tangent program divides the tangent directly by the input.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
@@ -245,11 +248,11 @@ mod tests {
 
         // The widened staged tangent program divides by the input converted to the widened differential
         // representation.
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(LogOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
