@@ -3,11 +3,9 @@ use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_non_transposable_operation};
+use crate::macros::{check_count, check_types, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
@@ -146,31 +144,27 @@ where
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Operation: From<AbsOperation> {}
 
-impl<C: Context> DifferentiableOperation<C> for AbsOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Abs
-        + Compare<Output = C::Value>
-        + Complex
-        + Conjugate
-        + Imaginary
-        + Real
-        + Select<Condition = <C::Value as SelectCondition>::Condition>
-        + SelectCondition
-        + ZeroLike
-        + OneLike
-        + StandardNeg<Output = C::Value>
-        + StandardMul<Output = C::Value>
-        + StandardDiv<Output = C::Value>
-        + ElementwiseDerivativeAlignment<C::Type>,
-    AbsOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+impl_differentiable_elementwise_operation! {
+    @custom
+    impl<C> AbsOperation
+    where {
+        C::Type: DifferentiableType,
+        C::Value: Abs
+            + Compare<Output = C::Value>
+            + Complex
+            + Conjugate
+            + Imaginary
+            + Real
+            + Select<Condition = <C::Value as SelectCondition>::Condition>
+            + SelectCondition
+            + ZeroLike
+            + OneLike
+            + StandardNeg<Output = C::Value>
+            + StandardMul<Output = C::Value>
+            + StandardDiv<Output = C::Value>
+            + ElementwiseDerivativeAlignment<C::Type>,
+    }
+    jvp |_operation, _context, _driver, inputs| {
         // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ
         // map with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`; at the
         // complex origin, replace the zero denominator with one so the zero numerator yields zero. These conventions
@@ -217,9 +211,8 @@ where
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
+    transpose = @nonlinear;
 }
-
-impl_non_transposable_operation!(AbsOperation);
 
 /// Value-level elementwise absolute-value capability. [`Abs`] fills the same role for [`AbsOperation`] that
 /// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).

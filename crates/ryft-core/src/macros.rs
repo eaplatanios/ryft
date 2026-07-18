@@ -462,6 +462,967 @@ macro_rules! define_elementwise_capability {
     };
 }
 
+// TODO(eaplatanios): Review this macro.
+/// Implements the forward-mode differentiation (Jacobian-Vector Product; JVP) and primitive transposition rules for
+/// an elementwise [`Operation`](crate::Operation). The macro keeps the operation-specific mathematical rule at the
+/// invocation site while generating the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
+/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse-mode differentiation
+/// needs no separate rule because it is derived by linearizing and then transposing the staged tangent program.
+///
+/// Unary and binary JVP forms replay the primal operation through the active [`Context`](crate::Context), preserve
+/// structural-zero tangents, and delegate type promotion, broadcasting, and sharding alignment to the shared
+/// elementwise differentiation helpers. Each JVP contribution is written as a closure over `(primal, tangent)` pairs.
+/// An `_` pattern declares that a contribution does not consume that value, so the macro does not evaluate or align it.
+/// Contributions are invoked independently and lazily: a structural-zero tangent neither evaluates its contribution nor
+/// stages conversions for the primals that contribution would consume. Unary rules use the concise `jvp = |...| ...;`
+/// form and may additionally bind the primal output after `->`. That value is evaluated at the output tangent type only
+/// when the contribution is live. Binary rules use a block that lists the left-tangent contribution first and the
+/// right-tangent contribution second. The tangent slot for the other operand is `_` in each contribution, making the
+/// contribution's dependency explicit at the call site.
+///
+/// `@signed_linear` implements both JVP and transposition from signed coefficients: unary rules take one `@positive` or
+/// `@negative` coefficient, binary rules take two, and every sign combination is supported. Binary rules combine live
+/// tangents with the operation's natural signed combination (e.g., a single staged `sub` for a `[@positive, @negative]`
+/// rule) so that the staged tangent program mirrors the primal operation. `@non_differentiable` replays the primal and
+/// assigns structural-zero output tangents, while rejecting primitive transposition. `@constant_like` represents a
+/// unary, single-output operation whose result is constant with respect to its exemplar input. Its transpose therefore
+/// returns a structural-zero exemplar cotangent.
+///
+/// Binary rules may describe transposition as knownness cases. Each supported case marks one operand `@linear` and the
+/// other `@known`, then gives the contribution to the linear operand as an ordinary Rust expression. The macro aligns
+/// the known value to the live output cotangent, unaligns the contribution to the linear operand's cotangent type, and
+/// returns structural zeros for known operands. Symmetric bilinear rules provide both operand orderings. One-sided
+/// linear rules provide only the supported ordering. The `errors` block keeps operation-specific diagnostics explicit.
+///
+/// `@nonlinear` implements the standard erroring primitive transpose rule: reverse-mode differentiation remains
+/// available by transposing the linear operations produced by the JVP. `@custom` is the escape hatch for elementwise
+/// operations whose tangent or cotangent behavior cannot be represented as independent arithmetic terms. Its generated
+/// shells are fully general [`DifferentiableOperation`](crate::DifferentiableOperation) and
+/// [`TransposableOperation`](crate::TransposableOperation) implementations that do not themselves impose elementwise
+/// structure on the provided bodies (the form exists so that elementwise operation modules keep a single entry point).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// impl_differentiable_elementwise_operation! {
+///     @unary
+///     impl<C> SinOperation
+///     where {
+///         C::Value: Sin + Cos + std::ops::Mul<Output = C::Value>,
+///     }
+///     {
+///         jvp = |(input, input_tangent)| input.cos()? * input_tangent;
+///
+///         transpose = @nonlinear;
+///     }
+/// }
+/// ```
+///
+/// # Parameters
+///
+///   - `@non_differentiable`: Selects a structural-zero JVP and unsupported primitive transposition rule.
+///   - `@constant_like`: Selects a unary constant-in-its-input JVP and structural-zero transposition rule.
+///   - `@signed_linear`: Selects a fully linear unary or binary rule with the provided signed coefficients.
+///   - `@unary`: Selects a unary JVP with one lazily evaluated tangent term.
+///   - `@binary`: Selects a binary JVP with one lazily evaluated term per input tangent.
+///   - `@custom`: Selects caller-provided JVP and, optionally, transposition bodies.
+///   - `@nonlinear`: Selects the standard unsupported primitive transposition rule.
+///   - `$context`: Generic parameter used for the generated differentiation context.
+///   - `$operation`: Elementwise operation type for which the rules are generated.
+///   - `$bounds`: Additional bounds required by the operation-specific formulas.
+///   - `$input_primal`: Name bound to an aligned input primal. `_` omits that value without evaluating it.
+///   - `$input_tangent`: Name bound to the live, aligned tangent whose contribution is being evaluated.
+///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
+///   - `$left_primal`, `$right_primal`: Names bound to aligned binary input primals. `_` omits a primal without
+///     evaluating it.
+///   - `$left_tangent`, `$right_tangent`: Names bound to the live, aligned tangent for the corresponding binary
+///     contribution. The other contribution's tangent slot must be `_`.
+///   - `$term`: Ordinary Rust expression computing one tangent contribution.
+///   - `@linear`: Marks an operand that is unknown because it belongs to the linear program being transposed.
+///   - `@known`: Marks an operand that is available as a known primal value during transposition.
+///   - `$output_cotangent`: Name bound to the live output cotangent in a transposition case.
+///   - `errors`: Operation-specific errors provider for unsupported knownness patterns and missing cotangent spaces.
+#[macro_export]
+macro_rules! impl_differentiable_elementwise_operation {
+    (@non_differentiable $operation:ty $(,)?) => {
+        $crate::impl_non_differentiable_operation!($operation);
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    (@constant_like $operation:ty $(,)?) => {
+        $crate::impl_non_differentiable_operation!($operation);
+
+        impl<T: $crate::DifferentiableType, V: $crate::Value<Type = T>, O: $crate::Operation<T>>
+            $crate::TransposableOperation<V, O> for $operation
+        where
+            $operation: $crate::Operation<T>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![$crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                    $crate::Typed::r#type(&inputs[0]).as_ref(),
+                ))])
+            }
+        }
+    };
+
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@positive $(,)?];
+        }
+    ) => {
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                let mut primals = $crate::Context::bind(
+                    context,
+                    self.clone(),
+                    Vec::new(),
+                    ::std::slice::from_ref(inputs[0].primal()),
+                )?;
+                $crate::check_count!("output", primals, 1, ProgramError);
+                Ok(vec![$crate::DifferentiationDual::new(
+                    primals.remove(0),
+                    inputs[0].tangent().clone(),
+                )?])
+            }
+        }
+
+        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T>>
+            $crate::TransposableOperation<V, O> for $operation
+        where
+            $operation: $crate::Operation<T>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                // A unary elementwise operation preserves its operand type exactly, so the output cotangent already
+                // has the input's cotangent type and passes through without unaligning.
+                Ok(vec![outputs[0].clone()])
+            }
+        }
+    };
+
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@negative $(,)?];
+        }
+    ) => {
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <$context as $crate::Domain>::Value:
+                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                let mut primals = $crate::Context::bind(
+                    context,
+                    self.clone(),
+                    Vec::new(),
+                    ::std::slice::from_ref(inputs[0].primal()),
+                )?;
+                $crate::check_count!("output", primals, 1, ProgramError);
+                let primal = primals.remove(0);
+                let tangent = inputs[0].tangent().clone().map(::std::ops::Neg::neg);
+                Ok(vec![$crate::DifferentiationDual::new(primal, tangent)?])
+            }
+        }
+
+        impl<
+            T: $crate::DifferentiableType,
+            V: $crate::Value<Type = T>,
+            O: $crate::Operation<T> + ::std::convert::From<$crate::NegOperation>,
+        > $crate::TransposableOperation<V, O> for $operation
+        where
+            $operation: $crate::Operation<T>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                // A unary elementwise operation preserves its operand type exactly, so the negated output cotangent
+                // already has the input's cotangent type and needs no unaligning.
+                Ok(vec![outputs[0].clone().map(::std::ops::Neg::neg)])
+            }
+        }
+    };
+
+    // The four binary sign combinations below dispatch to the shared `@signed_linear_binary` shell, each passing the
+    // minimal value and operation bounds that its signed tangent and cotangent formulas need.
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@positive, @positive $(,)?];
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @signed_linear_binary [positive, positive]
+            impl<$context> $operation
+            where { ::std::ops::Add<Output = <$context as $crate::Domain>::Value> }
+            transpose_operation_bounds {}
+        }
+    };
+
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@positive, @negative $(,)?];
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @signed_linear_binary [positive, negative]
+            impl<$context> $operation
+            where {
+                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <$context as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@negative, @positive $(,)?];
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @signed_linear_binary [negative, positive]
+            impl<$context> $operation
+            where {
+                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <$context as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    (
+        @signed_linear
+        impl<$context:ident> $operation:ty {
+            rule = [@negative, @negative $(,)?];
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @signed_linear_binary [negative, negative]
+            impl<$context> $operation
+            where {
+                ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
+                    + ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    (
+        @signed_linear_binary [$left_sign:ident, $right_sign:ident]
+        impl<$context:ident> $operation:ty
+        where { $($value_bounds:tt)* }
+        transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
+    ) => {
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <$context as $crate::Domain>::Value: $($value_bounds)*
+                + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 2, ProgramError);
+                let mut primals = $crate::Context::bind(
+                    context,
+                    self.clone(),
+                    Vec::new(),
+                    &[inputs[0].primal().clone(), inputs[1].primal().clone()],
+                )?;
+                $crate::check_count!("output", primals, 1, ProgramError);
+                let primal = primals.remove(0);
+                let target = $crate::DifferentiableType::tangent($crate::Typed::r#type(&primal).as_ref());
+                let left = inputs[0].tangent().as_value();
+                let right = inputs[1].tangent().as_value();
+                if $crate::DifferentiableType::is_zero_space(&target) && (left.is_some() || right.is_some()) {
+                    return Err($crate::ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "'{}' output type {} has no tangent space",
+                            $crate::Operation::name(self),
+                            $crate::Typed::r#type(&primal),
+                        ),
+                    }
+                    .into());
+                }
+                // This rule combines live tangents with the operation's natural signed combination (e.g., a single
+                // staged `sub` for a `[@positive, @negative]` rule) instead of delegating to
+                // `binary_elementwise_jvp`, which always sums its per-side contributions and would therefore stage
+                // `add(left, neg(right))` here. Staged tangent program shapes are part of an operation's
+                // differentiation contract, so this difference is load-bearing and not a consolidation candidate.
+                let tangent = match (left, right) {
+                    (Some(left), Some(right)) => {
+                        let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target)?;
+                        let right = $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target)?;
+                        $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
+                            @combine_signed_tangents [$left_sign, $right_sign], left, right
+                        ))
+                    }
+                    (Some(tangent), None) => {
+                        let tangent = $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target)?;
+                        $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
+                            @apply_tangent_sign $left_sign, tangent
+                        ))
+                    }
+                    (None, Some(tangent)) => {
+                        let tangent = $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target)?;
+                        $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
+                            @apply_tangent_sign $right_sign, tangent
+                        ))
+                    }
+                    (None, None) => $crate::MaybeZero::Zero(target),
+                };
+                Ok(vec![$crate::DifferentiationDual::new(primal, tangent)?])
+            }
+        }
+
+        impl<
+            T: $crate::DifferentiableType,
+            V: $crate::Value<Type = T>,
+            O: $crate::Operation<T> $($transpose_operation_bounds)*,
+        > $crate::TransposableOperation<V, O> for $operation
+        where
+            $crate::Tracer<$crate::TracingContext<V, O>>: $crate::ElementwiseDerivativeAlignment<T>,
+            $operation: $crate::Operation<T>,
+        {
+            fn transpose<D: $crate::TranspositionDriver<V, O>>(
+                &self,
+                _context: &mut $crate::TracingContext<V, O>,
+                _driver: &D,
+                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
+                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::check_count!("input", inputs, 2, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                match &outputs[0] {
+                    $crate::MaybeZero::Zero(_) =>
+                        Ok(inputs
+                            .iter()
+                            .map(|input| {
+                                $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                                    $crate::Typed::r#type(input).as_ref(),
+                                ))
+                            })
+                            .collect()),
+                    $crate::MaybeZero::Value(cotangent) => {
+                        let operation_name = $crate::Operation::<T>::name(self);
+                        Ok(vec![
+                            $crate::impl_differentiable_elementwise_operation!(
+                                @signed_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
+                            ),
+                            $crate::impl_differentiable_elementwise_operation!(
+                                @signed_transpose_contribution $right_sign, operation_name, &inputs[1], cotangent
+                            ),
+                        ])
+                    }
+                }
+            }
+        }
+    };
+
+    (@combine_signed_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
+
+    (@combine_signed_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
+
+    (@combine_signed_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
+
+    (@combine_signed_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
+
+    (@apply_tangent_sign positive, $tangent:expr) => { $tangent };
+
+    (@apply_tangent_sign negative, $tangent:expr) => { -$tangent };
+
+    (@signed_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
+        let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
+        if $crate::DifferentiableType::is_zero_space(&target) {
+            return Err($crate::ProgramError::UnsupportedOperation {
+                message: format!("'{}' input has no cotangent space", $operation_name),
+            }
+            .into());
+        }
+        let contribution = $crate::impl_differentiable_elementwise_operation!(
+            @apply_tangent_sign $sign, $cotangent.clone()
+        );
+        $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
+    }};
+
+    (
+        @unary
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        {
+            jvp = |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr;
+
+            transpose = @nonlinear;
+        }
+    ) => {
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <$context as $crate::Domain>::Value:
+                $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($bounds)*
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::unary_elementwise_jvp(
+                    self,
+                    inputs,
+                    |input| {
+                        let mut outputs = $crate::Context::bind(
+                            context,
+                            self.clone(),
+                            Vec::new(),
+                            ::std::slice::from_ref(input),
+                        )?;
+                        $crate::check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs.remove(0))
+                    },
+                    |operands| {
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_unary_input_primal operands, $input_primal
+                        }
+                        $($crate::impl_differentiable_elementwise_operation! {
+                            @bind_unary_output_primal operands, $output_primal
+                        })?
+                        let $input_tangent = operands.input_tangent()?;
+                        Ok($term)
+                    },
+                )
+            }
+        }
+
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    (
+        @binary
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        {
+            jvp { $($jvp:tt)* }
+
+            transpose = @nonlinear;
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_jvp
+            impl<$context> $operation
+            where { $($bounds)* }
+            jvp { $($jvp)* }
+        }
+
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    (
+        @binary
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        {
+            jvp { $($jvp:tt)* }
+
+            transpose<$value:ident, $operations:ident>
+            where { $($transpose_bounds:tt)* }
+            {
+                [$transpose_left:ident = @linear, $transpose_right:ident = @known] =>
+                    |$left_output_cotangent:ident| $left_contribution:expr;
+                [$transpose_left_again:ident = @known, $transpose_right_again:ident = @linear] =>
+                    |$right_output_cotangent:ident| $right_contribution:expr;
+
+                errors {
+                    no_cotangent = $no_cotangent_message:expr;
+                    both_linear = $both_linear_message:expr;
+                    no_linear = $no_linear_message:expr;
+                }
+            }
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_jvp
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            jvp { $($jvp)* }
+        }
+
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_transpose
+            impl<$value, $operations> $operation
+            where { $($transpose_bounds)* }
+            |_operation, _context, _driver, inputs, outputs| {
+                $crate::check_count!("input", inputs, 2, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                let (linear_index, contribution) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
+                    (true, false) => {
+                        let target = $crate::DifferentiableType::cotangent(
+                            $crate::Typed::r#type(&inputs[0]).as_ref(),
+                        );
+                        let contribution = match &outputs[0] {
+                            $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
+                            $crate::MaybeZero::Value($left_output_cotangent) => {
+                                if $crate::DifferentiableType::is_zero_space(&target) {
+                                    return Err($crate::ProgramError::UnsupportedOperation {
+                                        message: $no_cotangent_message.to_string(),
+                                    }
+                                    .into());
+                                }
+                                // The surrounding knownness match guarantees that this operand is known.
+                                let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
+                                    inputs[1].as_known().unwrap(),
+                                    $crate::Typed::r#type($left_output_cotangent).as_ref(),
+                                )?;
+                                let contribution = $left_contribution;
+                                $crate::MaybeZero::Value(
+                                    $crate::ElementwiseDerivativeAlignment::unalign_cotangent(
+                                        &contribution,
+                                        &target,
+                                    )?,
+                                )
+                            }
+                        };
+                        (0, contribution)
+                    }
+                    (false, true) => {
+                        let target = $crate::DifferentiableType::cotangent(
+                            $crate::Typed::r#type(&inputs[1]).as_ref(),
+                        );
+                        let contribution = match &outputs[0] {
+                            $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
+                            $crate::MaybeZero::Value($right_output_cotangent) => {
+                                if $crate::DifferentiableType::is_zero_space(&target) {
+                                    return Err($crate::ProgramError::UnsupportedOperation {
+                                        message: $no_cotangent_message.to_string(),
+                                    }
+                                    .into());
+                                }
+                                // The surrounding knownness match guarantees that this operand is known.
+                                let $transpose_left_again = $crate::ElementwiseDerivativeAlignment::align_tangent(
+                                    inputs[0].as_known().unwrap(),
+                                    $crate::Typed::r#type($right_output_cotangent).as_ref(),
+                                )?;
+                                let contribution = $right_contribution;
+                                $crate::MaybeZero::Value(
+                                    $crate::ElementwiseDerivativeAlignment::unalign_cotangent(
+                                        &contribution,
+                                        &target,
+                                    )?,
+                                )
+                            }
+                        };
+                        (1, contribution)
+                    }
+                    (true, true) => {
+                        return Err($crate::ProgramError::UnsupportedOperation {
+                            message: $both_linear_message.to_string(),
+                        }
+                        .into());
+                    }
+                    (false, false) => {
+                        return Err($crate::ProgramError::UnsupportedOperation {
+                            message: $no_linear_message.to_string(),
+                        }
+                        .into());
+                    }
+                };
+                let mut contributions = inputs
+                    .iter()
+                    .map(|input| {
+                        $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                            $crate::Typed::r#type(input).as_ref(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                contributions[linear_index] = contribution;
+                Ok(contributions)
+            }
+        }
+    };
+
+    (
+        @binary
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        {
+            jvp { $($jvp:tt)* }
+
+            transpose<$value:ident, $operations:ident>
+            where { $($transpose_bounds:tt)* }
+            {
+                [$transpose_left:ident = @linear, $transpose_right:ident = @known] =>
+                    |$output_cotangent:ident| $contribution:expr;
+
+                errors {
+                    no_cotangent = $no_cotangent_message:expr;
+                    nonlinear_right = $nonlinear_right_message:expr;
+                    no_linear = $no_linear_message:expr;
+                }
+            }
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_jvp
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            jvp { $($jvp)* }
+        }
+
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_transpose
+            impl<$value, $operations> $operation
+            where { $($transpose_bounds)* }
+            |_operation, _context, _driver, inputs, outputs| {
+                $crate::check_count!("input", inputs, 2, ProgramError);
+                $crate::check_count!("output", outputs, 1, ProgramError);
+                if !inputs[0].is_unknown() {
+                    return Err($crate::ProgramError::UnsupportedOperation {
+                        message: $no_linear_message.to_string(),
+                    }
+                    .into());
+                }
+                if inputs[1].is_unknown() {
+                    return Err($crate::ProgramError::UnsupportedOperation {
+                        message: $nonlinear_right_message.to_string(),
+                    }
+                    .into());
+                }
+                let target = $crate::DifferentiableType::cotangent(
+                    $crate::Typed::r#type(&inputs[0]).as_ref(),
+                );
+                let contribution = match &outputs[0] {
+                    $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
+                    $crate::MaybeZero::Value($output_cotangent) => {
+                        if $crate::DifferentiableType::is_zero_space(&target) {
+                            return Err($crate::ProgramError::UnsupportedOperation {
+                                message: $no_cotangent_message.to_string(),
+                            }
+                            .into());
+                        }
+                        // The checks above guarantee that the right operand is known.
+                        let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
+                            inputs[1].as_known().unwrap(),
+                            $crate::Typed::r#type($output_cotangent).as_ref(),
+                        )?;
+                        let contribution = $contribution;
+                        $crate::MaybeZero::Value(
+                            $crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?,
+                        )
+                    }
+                };
+                Ok(vec![
+                    contribution,
+                    $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                        $crate::Typed::r#type(&inputs[1]).as_ref(),
+                    )),
+                ])
+            }
+        }
+    };
+
+    (
+        @binary
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        {
+            jvp { $($jvp:tt)* }
+
+            $(#[$transpose_documentation:meta])*
+            transpose<$value:ident, $operations:ident>
+            where { $($transpose_bounds:tt)* }
+            |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+                $outputs:ident| $transpose_body:block
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_jvp
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            jvp { $($jvp)* }
+        }
+
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_transpose
+            $(#[$transpose_documentation])*
+            impl<$value, $operations> $operation
+            where { $($transpose_bounds)* }
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    (
+        @binary_jvp
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        jvp {
+            |($left_primal_for_left:tt, $left_tangent:ident), ($right_primal_for_left:tt, _)|
+                $left_term:expr;
+            |($left_primal_for_right:tt, _), ($right_primal_for_right:tt, $right_tangent:ident)|
+                $right_term:expr;
+        }
+    ) => {
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <$context as $crate::Domain>::Value: ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
+                + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($bounds)*
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::binary_elementwise_jvp(
+                    self,
+                    inputs,
+                    |left, right| {
+                        let mut outputs = $crate::Context::bind(
+                            context,
+                            self.clone(),
+                            Vec::new(),
+                            &[left.clone(), right.clone()],
+                        )?;
+                        $crate::check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs.remove(0))
+                    },
+                    |operands, $left_tangent| {
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_binary_left_primal operands, $left_primal_for_left
+                        }
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_binary_right_primal operands, $right_primal_for_left
+                        }
+                        Ok($left_term)
+                    },
+                    |operands, $right_tangent| {
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_binary_left_primal operands, $left_primal_for_right
+                        }
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_binary_right_primal operands, $right_primal_for_right
+                        }
+                        Ok($right_term)
+                    },
+                )
+            }
+        }
+    };
+
+    (@bind_unary_input_primal $operands:ident, _) => {};
+
+    (@bind_unary_input_primal $operands:ident, $input_primal:ident) => {
+        let $input_primal = $operands.input_primal()?;
+    };
+
+    (@bind_unary_output_primal $operands:ident, $output_primal:ident) => {
+        let $output_primal = $operands.output_primal_at_tangent_type()?;
+    };
+
+    (@bind_binary_left_primal $operands:ident, _) => {};
+
+    (@bind_binary_left_primal $operands:ident, $left_primal:ident) => {
+        let $left_primal = $operands.left_primal()?;
+    };
+
+    (@bind_binary_right_primal $operands:ident, _) => {};
+
+    (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
+        let $right_primal = $operands.right_primal()?;
+    };
+
+    (
+        @custom
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        $(#[$jvp_documentation:meta])*
+        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
+        transpose = @nonlinear;
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_jvp
+            $(#[$jvp_documentation])*
+            impl<$context> $operation
+            where { $($bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    (
+        @custom
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        $(#[$jvp_documentation:meta])*
+        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
+        where { $($transpose_bounds:tt)* }
+        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_jvp
+            $(#[$jvp_documentation])*
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_transpose
+            $(#[$transpose_documentation])*
+            impl<$value, $operations> $operation
+            where { $($transpose_bounds)* }
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    (
+        @custom_jvp
+        $(#[$documentation:meta])*
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $body:block
+    ) => {
+        $(#[$documentation])*
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($bounds)*
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                $jvp_context: &$context,
+                $jvp_driver: &D,
+                $inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                let $self = self;
+                $body
+            }
+        }
+    };
+
+    (
+        @custom_transpose
+        $(#[$documentation:meta])*
+        impl<$value:ident, $operations:ident> $operation:ty
+        where { $($bounds:tt)* }
+        |$self:ident, $context:ident, $driver:ident, $inputs:ident, $outputs:ident| $body:block
+    ) => {
+        $(#[$documentation])*
+        impl<
+            $value: $crate::Value,
+            $operations: $crate::Operation<<$value as $crate::Typed>::Type>,
+        > $crate::TransposableOperation<$value, $operations> for $operation
+        where
+            $operation: $crate::Operation<<$value as $crate::Typed>::Type>,
+            $($bounds)*
+        {
+            fn transpose<D: $crate::TranspositionDriver<$value, $operations>>(
+                &self,
+                $context: &mut $crate::TracingContext<$value, $operations>,
+                $driver: &D,
+                $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
+                $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
+                $crate::DifferentiationError,
+            > {
+                let $self = self;
+                $body
+            }
+        }
+    };
+}
+
 /// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs carry
 /// no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier. The primal operation is replayed
 /// on the input primals, and each output is paired with a structural zero tangent, which stays symbolic and stages
@@ -1960,8 +2921,8 @@ pub use crate::{
     check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
-    impl_nullary_transposable_operation,
+    impl_differentiable_elementwise_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_nullary_batchable_operation, impl_nullary_transposable_operation,
 };
 
 #[cfg(test)]
@@ -1974,7 +2935,7 @@ mod tests {
     use num_complex::Complex;
 
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingTracer};
     use crate::contexts::{Domain, EagerContext, StagingContext};
     use crate::differentiation::{
@@ -1986,7 +2947,8 @@ mod tests {
     use crate::operations::constants::ZeroOperation;
     use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
     use crate::operations::math::{
-        Abs, Add, AddOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, SubOperation,
+        Abs, Add, AddOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation,
+        Sub, SubOperation,
     };
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
@@ -2032,6 +2994,45 @@ mod tests {
         /// Binary capability used to test [`define_elementwise_capability!`].
         TestBinary, test_binary, TestBinaryOperation,
     );
+
+    const TEST_REVERSED_SUB_OPERATION_NAME: &str = "test_reversed_sub";
+    const TEST_NEGATED_ADD_OPERATION_NAME: &str = "test_negated_add";
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation with a `[@negative, @positive]` differentiation rule used to test
+        /// [`impl_differentiable_elementwise_operation!`]. Interpretation reuses [`Sub`] as a stand-in because only
+        /// the generated differentiation and transposition rules are under test.
+        TestReversedSubOperation, TEST_REVERSED_SUB_OPERATION_NAME,
+        Sub, sub,
+        check_data_types = [@numeric],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation with a `[@negative, @negative]` differentiation rule used to test
+        /// [`impl_differentiable_elementwise_operation!`]. Interpretation reuses [`Add`] as a stand-in because only
+        /// the generated differentiation and transposition rules are under test.
+        TestNegatedAddOperation, TEST_NEGATED_ADD_OPERATION_NAME,
+        Add, add,
+        check_data_types = [@numeric],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    impl_differentiable_elementwise_operation! {
+        @signed_linear
+        impl<C> TestReversedSubOperation {
+            rule = [@negative, @positive];
+        }
+    }
+
+    impl_differentiable_elementwise_operation! {
+        @signed_linear
+        impl<C> TestNegatedAddOperation {
+            rule = [@negative, @negative];
+        }
+    }
 
     impl_non_differentiable_operation!(TestUnaryOperation);
     impl_non_transposable_operation!(TestUnaryOperation);
@@ -2907,6 +3908,196 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_signed_linear() {
+        let inputs = [
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = AddOperation
+            .jvp(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), &EmptyRegionDriver, &inputs)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(5.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(9.0f32)));
+
+        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let output_cotangent_id = output_cotangent.atom_id();
+        let input_cotangents = <AddOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+            &AddOperation,
+            &mut context,
+            &EmptyRegionDriver,
+            &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+            &[MaybeZero::Value(output_cotangent.clone())],
+        )
+        .unwrap();
+        assert_eq!(input_cotangents.len(), 2);
+        assert!(matches!(
+            &input_cotangents[0],
+            MaybeZero::Value(cotangent) if cotangent.atom_id() == output_cotangent_id,
+        ));
+        assert!(matches!(
+            &input_cotangents[1],
+            MaybeZero::Value(cotangent) if cotangent.atom_id() == output_cotangent_id,
+        ));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_signed_linear_negative_signs() {
+        // A `[@negative, @positive]` rule combines both live tangents as `right - left` and negates a left-only
+        // tangent. The primal values come from the stand-in `Sub` interpretation and are irrelevant to the rule.
+        let context = EagerContext::<Scalar, TestReversedSubOperation>::new();
+        let inputs = [
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(1.0f32)));
+        let inputs = [
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(Scalar::from(3.0f32)),
+        ];
+        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-4.0f32)));
+        let inputs = [
+            DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = TestReversedSubOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(5.0f32)));
+
+        // A `[@negative, @negative]` rule combines both live tangents as `-(left + right)`.
+        let context = EagerContext::<Scalar, TestNegatedAddOperation>::new();
+        let inputs = [
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = TestNegatedAddOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-9.0f32)));
+        let inputs = [
+            DifferentiationDual::new_with_zero_tangent(Scalar::from(2.0f32)),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = TestNegatedAddOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(-5.0f32)));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_signed_linear_negative_transposition() {
+        // A negative coefficient stages a negation of the output cotangent while a positive coefficient passes it
+        // through unchanged.
+        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let output_cotangent_id = output_cotangent.atom_id();
+        let input_cotangents =
+            <TestReversedSubOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &TestReversedSubOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[MaybeZero::Value(output_cotangent.clone())],
+            )
+            .unwrap();
+        assert_eq!(input_cotangents.len(), 2);
+        assert!(matches!(
+            &input_cotangents[0],
+            MaybeZero::Value(cotangent) if cotangent.atom_id() != output_cotangent_id,
+        ));
+        assert!(matches!(
+            &input_cotangents[1],
+            MaybeZero::Value(cotangent) if cotangent.atom_id() == output_cotangent_id,
+        ));
+        {
+            let builder = context.builder().borrow();
+            assert_eq!(builder.instructions().len(), 1);
+            assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "neg");
+        }
+
+        // Both coefficients of a `[@negative, @negative]` rule stage negations.
+        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let output_cotangent_id = output_cotangent.atom_id();
+        let input_cotangents =
+            <TestNegatedAddOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &TestNegatedAddOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert_eq!(input_cotangents.len(), 2);
+        for input_cotangent in &input_cotangents {
+            assert!(matches!(
+                input_cotangent,
+                MaybeZero::Value(cotangent) if cotangent.atom_id() != output_cotangent_id,
+            ));
+        }
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 2);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "neg");
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[1].operation()), "neg");
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_unary_jvp_contributions() {
+        let outputs = SinOperation
+            .jvp(
+                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(Scalar::from(0.0f32), Scalar::from(4.0f32)).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(0.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(4.0f32)));
+
+        let outputs = ExpOperation
+            .jvp(
+                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new(Scalar::from(0.0f32), Scalar::from(3.0f32)).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(1.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(3.0f32)));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_binary_jvp_contributions() {
+        let outputs = MulOperation
+            .jvp(
+                &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+                    DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(6.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(22.0f32)));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_skips_structural_zero_contributions() {
+        let context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = context.input(DataType::F32);
+        let outputs = SinOperation
+            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input)])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "sin");
     }
 
     #[test]
