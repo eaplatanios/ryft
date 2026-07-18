@@ -217,16 +217,10 @@ macro_rules! check_builders {
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
 ///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
-///   - `check_data_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types)
-///     selectors applied to scalar input types and array element types before type inference.
-///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`](crate::check_types) selectors
-///     applied to array input types before array broadcasting.
-///   - `validate_data_types = $data_type_validator`: Optional hook that validates scalar [`DataType`](crate::DataType)
-///     inputs before type inference and array element [`DataType`](crate::DataType)s before array broadcasting when a
-///     reusable [`check_types!`](crate::check_types) selector does not express the required contract.
-///   - `validate_array_types = $array_type_validator`: Optional hook that validates [`ArrayType`](crate::ArrayType)
-///     inputs before array broadcasting when a reusable [`check_types!`](crate::check_types) selector does not express
-///     the required contract.
+///   - `check_data_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to scalar
+///     input types and array element types before type inference.
+///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to array
+///     input types before array broadcasting.
 #[macro_export]
 macro_rules! define_elementwise_operation {
     (
@@ -235,9 +229,7 @@ macro_rules! define_elementwise_operation {
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
         $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
-        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])?
-        $(, validate_data_types = $data_type_validator:path)?
-        $(, validate_array_types = $array_type_validator:path)? $(,)?
+        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
         #[derive(Clone, Debug, Default)]
@@ -264,7 +256,6 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
-                $($data_type_validator(input_types, $name)?;)?
                 Ok(vec![input_types[0]])
             }
         }
@@ -283,9 +274,7 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type()]);)*)?
-                $($data_type_validator(&[input_types[0].data_type()], $name)?;)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -324,9 +313,7 @@ macro_rules! define_elementwise_operation {
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
         $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
-        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])?
-        $(, validate_data_types = $data_type_validator:path)?
-        $(, validate_array_types = $array_type_validator:path)? $(,)?
+        $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
         #[derive(Clone, Debug, Default)]
@@ -353,7 +340,6 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
-                $($data_type_validator(input_types, $name)?;)?
                 $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
                     .map(|output| vec![output])
                     .map_err(|_| $crate::TypeError {
@@ -376,9 +362,7 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type(), input_types[1].data_type()]);)*)?
-                $($data_type_validator(&[input_types[0].data_type(), input_types[1].data_type()], $name)?;)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                $($array_type_validator(input_types, $name)?;)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -1037,12 +1021,350 @@ pub use crate::{
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::{Debug, Display, Formatter};
+    use std::marker::PhantomData;
     use std::rc::Rc;
 
+    use num_complex::Complex;
+
+    use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
+    use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingTracer};
+    use crate::contexts::{Domain, EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        DifferentiationTracer, TransposableOperation,
+    };
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::ElementwiseOperation;
+    use crate::operations::constants::ZeroOperation;
+    use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
+    use crate::operations::math::{Abs, Add, AddOperation, Neg, NegOperation, Reduce, ReductionKind};
+    use crate::partial::{
+        PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
+    };
     use crate::programs::ProgramError;
-    use crate::programs::types::TypeError;
+    use crate::programs::atoms::MaybeZero;
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::{Type, TypeError};
     use crate::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
-    use crate::types::{ArrayType, DataType};
+    use crate::tracing::{Tracer, TracingContext};
+    use crate::types::{ArrayType, DataType, Shape, Size};
+
+    const TEST_UNARY_OPERATION_NAME: &str = "test_unary";
+    const TEST_BINARY_OPERATION_NAME: &str = "test_binary";
+
+    define_elementwise_operation!(
+        @unary
+        /// Unary operation used to test [`define_elementwise_operation!`].
+        TestUnaryOperation, TEST_UNARY_OPERATION_NAME,
+        Neg, neg,
+        check_data_types = [@numeric],
+        check_array_types = [@no_unreduced],
+    );
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation used to test [`define_elementwise_operation!`].
+        TestBinaryOperation, TEST_BINARY_OPERATION_NAME,
+        Add, add,
+        check_data_types = [@numeric],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    define_elementwise_capability!(
+        @unary
+        /// Unary capability used to test [`define_elementwise_capability!`].
+        TestUnary, test_unary, TestUnaryOperation,
+    );
+
+    define_elementwise_capability!(
+        @binary
+        /// Binary capability used to test [`define_elementwise_capability!`].
+        TestBinary, test_binary, TestBinaryOperation,
+    );
+
+    impl_non_differentiable_operation!(TestUnaryOperation);
+    impl_non_transposable_operation!(TestUnaryOperation);
+    impl_non_differentiable_operation!(TestBinaryOperation);
+
+    impl From<ZeroOperation<DataType>> for TestUnaryOperation {
+        fn from(_operation: ZeroOperation<DataType>) -> Self {
+            Self
+        }
+    }
+
+    impl From<ZeroOperation<DataType>> for TestBinaryOperation {
+        fn from(_operation: ZeroOperation<DataType>) -> Self {
+            Self
+        }
+    }
+
+    impl From<TransposeOperation> for TestUnaryOperation {
+        fn from(_operation: TransposeOperation) -> Self {
+            Self
+        }
+    }
+
+    impl From<BroadcastOperation> for TestUnaryOperation {
+        fn from(_operation: BroadcastOperation) -> Self {
+            Self
+        }
+    }
+
+    impl From<NegOperation> for TestUnaryOperation {
+        fn from(_operation: NegOperation) -> Self {
+            Self
+        }
+    }
+
+    impl From<TransposeOperation> for TestBinaryOperation {
+        fn from(_operation: TransposeOperation) -> Self {
+            Self
+        }
+    }
+
+    impl From<BroadcastOperation> for TestBinaryOperation {
+        fn from(_operation: BroadcastOperation) -> Self {
+            Self
+        }
+    }
+
+    impl From<AddOperation> for TestBinaryOperation {
+        fn from(_operation: AddOperation) -> Self {
+            Self
+        }
+    }
+
+    /// Unary operator used to test [`define_tracer_operator!`].
+    trait TestUnaryOperator {
+        /// Result of applying this operator.
+        type Output;
+
+        /// Applies the operator.
+        fn apply_unary(self) -> Self::Output;
+    }
+
+    /// Binary operator used to test [`define_tracer_operator!`].
+    trait TestBinaryOperator {
+        /// Result of applying this operator.
+        type Output;
+
+        /// Applies the operator.
+        fn apply_binary(self, right: Self) -> Self::Output;
+    }
+
+    define_tracer_operator!(
+        @unary TestUnaryOperator,
+        apply_unary,
+        TestUnaryOperation,
+        "test unary operation failed",
+    );
+
+    define_tracer_operator!(
+        @binary TestBinaryOperator,
+        apply_binary,
+        TestBinaryOperation,
+        "test binary operation failed",
+    );
+
+    /// Nullary operation used to execute generated transposition and batching rules.
+    #[derive(Clone, Debug, Default)]
+    struct TestNullaryOperation;
+
+    impl Display for TestNullaryOperation {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test_nullary")
+        }
+    }
+
+    impl Operation<DataType> for TestNullaryOperation {
+        fn name(&self) -> &'static str {
+            "test_nullary"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[DataType],
+            _region_interfaces: &[crate::RegionInterface<DataType>],
+        ) -> Result<Vec<DataType>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(vec![DataType::F64, DataType::F64])
+        }
+    }
+
+    impl Operation<ArrayType> for TestNullaryOperation {
+        fn name(&self) -> &'static str {
+            "test_nullary"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            _region_interfaces: &[crate::RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)])
+        }
+    }
+
+    impl InterpretableOperation<EagerContext<Array, TestNullaryOperation>> for TestNullaryOperation {
+        fn interpret<D: crate::InterpretationDriver<EagerContext<Array, TestNullaryOperation>>>(
+            &self,
+            _context: &EagerContext<Array, TestNullaryOperation>,
+            _driver: &D,
+            inputs: &[Array],
+        ) -> Result<Vec<Array>, ProgramError> {
+            check_count!("input", inputs, 0, ProgramError);
+            Ok(vec![Array::scalar(3.0), Array::scalar(4.0)])
+        }
+    }
+
+    impl_nullary_transposable_operation!(TestNullaryOperation);
+    impl_nullary_batchable_operation!(@replicated TestNullaryOperation);
+
+    /// Nullary operation used to instantiate the non-generic `where` macro forms.
+    #[derive(Clone, Debug, Default)]
+    struct TestWhereNullaryOperation;
+
+    impl Display for TestWhereNullaryOperation {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test_where_nullary")
+        }
+    }
+
+    impl<T: Type> Operation<T> for TestWhereNullaryOperation {
+        fn name(&self) -> &'static str {
+            "test_where_nullary"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[T],
+            _region_interfaces: &[crate::RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TestWhereNullaryOperation {
+        fn interpret<D: crate::InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            check_count!("input", inputs, 0, ProgramError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl_nullary_transposable_operation!(TestWhereNullaryOperation where DataType: Type);
+    impl_nullary_batchable_operation!(@replicated TestWhereNullaryOperation where DataType: Type);
+
+    /// Generic nullary operation used to instantiate generic macro forms.
+    struct TestGenericNullaryOperation<Marker>(PhantomData<fn() -> Marker>);
+
+    impl<Marker> Clone for TestGenericNullaryOperation<Marker> {
+        fn clone(&self) -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<Marker> Debug for TestGenericNullaryOperation<Marker> {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("TestGenericNullaryOperation")
+        }
+    }
+
+    impl<Marker> Display for TestGenericNullaryOperation<Marker> {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test_generic_nullary")
+        }
+    }
+
+    impl<T: Type, Marker> Operation<T> for TestGenericNullaryOperation<Marker> {
+        fn name(&self) -> &'static str {
+            "test_generic_nullary"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[T],
+            _region_interfaces: &[crate::RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayType>, Marker> InterpretableOperation<C> for TestGenericNullaryOperation<Marker> {
+        fn interpret<D: crate::InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            check_count!("input", inputs, 0, ProgramError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl_nullary_transposable_operation!(<Marker> TestGenericNullaryOperation<Marker>);
+    impl_nullary_batchable_operation!(@replicated <Marker> TestGenericNullaryOperation<Marker>);
+
+    /// Generic nullary operation used to instantiate generic-plus-`where` macro forms.
+    struct TestBoundedNullaryOperation<Marker>(PhantomData<fn() -> Marker>);
+
+    impl<Marker> Clone for TestBoundedNullaryOperation<Marker> {
+        fn clone(&self) -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<Marker> Debug for TestBoundedNullaryOperation<Marker> {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("TestBoundedNullaryOperation")
+        }
+    }
+
+    impl<Marker> Display for TestBoundedNullaryOperation<Marker> {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test_bounded_nullary")
+        }
+    }
+
+    impl<T: Type, Marker> Operation<T> for TestBoundedNullaryOperation<Marker> {
+        fn name(&self) -> &'static str {
+            "test_bounded_nullary"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[T],
+            _region_interfaces: &[crate::RegionInterface<T>],
+        ) -> Result<Vec<T>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayType>, Marker> InterpretableOperation<C> for TestBoundedNullaryOperation<Marker> {
+        fn interpret<D: crate::InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            check_count!("input", inputs, 0, ProgramError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl_nullary_transposable_operation!(<Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
+    impl_nullary_batchable_operation!(@replicated <Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
 
     #[test]
     fn test_check_count() {
@@ -1198,6 +1520,408 @@ mod tests {
         assert_eq!(
             check_builders!(&reference, [[&same, &different].into_iter()]),
             Err(ProgramError::MismatchedProgramBuilders),
+        );
+    }
+
+    #[test]
+    fn test_define_elementwise_operation_unary() {
+        let operation = TestUnaryOperation;
+        assert_eq!(format!("{operation:?}"), "TestUnaryOperation");
+        assert_eq!(format!("{operation}"), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&operation), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(ElementwiseOperation::input_count(&operation), 1);
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Ok(vec![DataType::F32])
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
+            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean], &[]),
+            Err(TypeError { message: "'test_unary' does not support input data type bool".to_string() }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::I64], &[]),
+            Ok(vec![DataType::I64]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[matrix_type.clone()], &[]),
+            Ok(vec![matrix_type]),
+        );
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let unreduced_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_type], &[]),
+            Err(TypeError { message: "'test_unary' does not support unreduced operands".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(2.0f32)],
+            ),
+            Ok(vec![Scalar::from(-2.0f32)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
+        let outputs = operation
+            .partially_evaluate(&context, &EmptyRegionDriver, &[PartialEvaluationValue::known(Scalar::from(2.0f32))])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(-2.0f32)));
+    }
+
+    #[test]
+    fn test_define_elementwise_operation_binary() {
+        let operation = TestBinaryOperation;
+        assert_eq!(format!("{operation:?}"), "TestBinaryOperation");
+        assert_eq!(format!("{operation}"), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(Operation::<DataType>::name(&operation), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(ElementwiseOperation::input_count(&operation), 2);
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
+            Ok(vec![DataType::F64]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean, DataType::Boolean], &[]),
+            Err(TypeError { message: "'test_binary' does not support input data type bool".to_string() }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::I64, DataType::I64], &[]),
+            Ok(vec![DataType::I64]),
+        );
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type, vector_type.clone()], &[]),
+            Ok(vec![vector_type]),
+        );
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let unreduced_x = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::new(mesh.clone(), vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced_y = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["y"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_x, unreduced_y], &[]),
+            Err(TypeError { message: "'test_binary' operands must be unreduced over the same axes".to_string() }),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar, TestBinaryOperation>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Scalar::from(2.0f32), Scalar::from(3.0f32)],
+            ),
+            Ok(vec![Scalar::from(5.0f32)]),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
+        let outputs = operation
+            .partially_evaluate(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    PartialEvaluationValue::known(Scalar::from(2.0f32)),
+                    PartialEvaluationValue::known(Scalar::from(3.0f32)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(5.0f32)));
+    }
+
+    #[test]
+    fn test_define_elementwise_capability_unary() {
+        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let output = context.input(DataType::F32).test_unary().unwrap();
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].inputs().len(), 1);
+        assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_define_elementwise_capability_binary() {
+        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let left = context.input(DataType::F32);
+        let right = context.input(DataType::F32);
+        let output = left.test_binary(&right).unwrap();
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
+        assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_impl_non_differentiable_operation() {
+        let inputs = [DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap()];
+        let outputs = TestUnaryOperation
+            .jvp(&EagerContext::<Scalar, TestUnaryOperation>::new(), &EmptyRegionDriver, &inputs)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(-2.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let primal = context.input(DataType::F32);
+        let tangent = context.input(DataType::F32);
+        let inputs = [DifferentiationDual::new(primal, tangent).unwrap()];
+        let outputs = TestUnaryOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+    }
+
+    #[test]
+    fn test_impl_non_transposable_operation() {
+        let mut context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestUnaryOperation>>>; 0] = [];
+        let outputs: [MaybeZero<Tracer<TracingContext<Scalar, TestUnaryOperation>>>; 0] = [];
+        assert!(matches!(
+            <TestUnaryOperation as TransposableOperation<Scalar, TestUnaryOperation>>::transpose(
+                &TestUnaryOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `test_unary` is not transposable",
+        ));
+    }
+
+    #[test]
+    fn test_impl_nullary_transposable_operation() {
+        let mut context = TracingContext::<Scalar, TestNullaryOperation>::new();
+        let inputs: [PartialValue<Tracer<TracingContext<Scalar, TestNullaryOperation>>>; 0] = [];
+        let outputs = [MaybeZero::Zero(DataType::F64), MaybeZero::Zero(DataType::F64)];
+        let result = <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
+            &TestNullaryOperation,
+            &mut context,
+            &EmptyRegionDriver,
+            &inputs,
+            &outputs,
+        )
+        .unwrap();
+        assert!(result.is_empty());
+        let input = context.input(DataType::F64);
+        assert!(matches!(
+            <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
+                &TestNullaryOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Known(input)],
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
+        ));
+        assert!(matches!(
+            <TestNullaryOperation as TransposableOperation<Scalar, TestNullaryOperation>>::transpose(
+                &TestNullaryOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 0 })),
+        ));
+
+        fn assert_transposable<O: Operation<DataType> + TransposableOperation<Scalar, O>>() {}
+
+        assert_transposable::<TestWhereNullaryOperation>();
+        assert_transposable::<TestGenericNullaryOperation<()>>();
+        assert_transposable::<TestBoundedNullaryOperation<()>>();
+    }
+
+    #[test]
+    fn test_impl_nullary_batchable_operation() {
+        let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation>::new(), 2);
+        let outputs = <TestNullaryOperation as BatchableOperation<EagerContext<Array, TestNullaryOperation>>>::batch(
+            &TestNullaryOperation,
+            &context,
+            &EmptyRegionDriver,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].value(), &Array::scalar(3.0));
+        assert_eq!(outputs[1].value(), &Array::scalar(4.0));
+        assert!(outputs[0].batch_axis().is_replicated());
+        assert!(outputs[1].batch_axis().is_replicated());
+        assert!(matches!(
+            <TestNullaryOperation as BatchableOperation<EagerContext<Array, TestNullaryOperation>>>::batch(
+                &TestNullaryOperation,
+                &context,
+                &EmptyRegionDriver,
+                &[ArrayBatch::replicated(Array::scalar(1.0))],
+            ),
+            Err(crate::BatchingError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
+        ));
+
+        fn assert_batchable<O>()
+        where
+            O: Operation<ArrayType>
+                + InterpretableOperation<EagerContext<Array, O>>
+                + BatchableOperation<EagerContext<Array, O>>,
+        {
+        }
+
+        assert_batchable::<TestWhereNullaryOperation>();
+        assert_batchable::<TestGenericNullaryOperation<()>>();
+        assert_batchable::<TestBoundedNullaryOperation<()>>();
+    }
+
+    #[test]
+    fn test_define_tracer_operator_unary() {
+        let context = TracingContext::<Scalar, TestUnaryOperation>::new();
+        let input = context.input(DataType::F32);
+        let input_id = input.atom_id().unwrap();
+        let output = input.apply_unary();
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_UNARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].inputs(), &[input_id]);
+        drop(builder);
+
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
+        let input = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(2.0f32)));
+        assert_eq!(input.apply_unary().into_value().unwrap().as_known(), Some(&Scalar::from(-2.0f32)));
+
+        let context = BatchingContext::new(EagerContext::<Array, TestUnaryOperation>::new(), 2);
+        let input = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(2.0f32)));
+        let output = input.apply_unary().into_batch();
+        assert_eq!(output.value(), &Array::scalar(-2.0f32));
+        assert!(output.batch_axis().is_replicated());
+
+        let context = DifferentiationContext::new(EagerContext::<Scalar, TestUnaryOperation>::new());
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
+            context,
+        );
+        let output = input.apply_unary().into_dual();
+        assert_eq!(output.primal(), &Scalar::from(-2.0f32));
+        assert!(matches!(output.tangent(), MaybeZero::Zero(DataType::F32)));
+    }
+
+    #[test]
+    fn test_define_tracer_operator_binary() {
+        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let left = context.input(DataType::F32);
+        let right = context.input(DataType::F32);
+        let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];
+        let output = left.apply_binary(right);
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
+        assert_eq!(builder.instructions()[0].inputs(), &input_ids);
+        drop(builder);
+
+        let context = PartialEvaluationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
+        let left = PartialTracer::new(context.clone(), PartialEvaluationValue::known(Scalar::from(2.0f32)));
+        let right = PartialTracer::new(context, PartialEvaluationValue::known(Scalar::from(3.0f32)));
+        assert_eq!(left.apply_binary(right).into_value().unwrap().as_known(), Some(&Scalar::from(5.0f32)),);
+
+        let context = BatchingContext::new(EagerContext::<Array, TestBinaryOperation>::new(), 2);
+        let left = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(2.0f32)));
+        let right = BatchingTracer::new(context, ArrayBatch::replicated(Array::scalar(3.0f32)));
+        let output = left.apply_binary(right).into_batch();
+        assert_eq!(output.value(), &Array::scalar(5.0f32));
+        assert!(output.batch_axis().is_replicated());
+
+        let context = DifferentiationContext::new(EagerContext::<Scalar, TestBinaryOperation>::new());
+        let left = DifferentiationTracer::new(
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap(),
+            context.clone(),
+        );
+        let right = DifferentiationTracer::new(
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(1.0f32)).unwrap(),
+            context,
+        );
+        let output = left.apply_binary(right).into_dual();
+        assert_eq!(output.primal(), &Scalar::from(5.0f32));
+        assert!(matches!(output.tangent(), MaybeZero::Zero(DataType::F32)));
+    }
+
+    #[test]
+    fn test_check_gradient_scalar() {
+        fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
+            input.clone() * input
+        }
+
+        check_gradient!(@scalar, square, at = 0.7, step = 1e-6, tolerance = 1e-6);
+        check_gradient!(
+            @scalar,
+            |input| input.abs(),
+            at = Complex::new(0.7f64, -0.3),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    fn test_check_gradient_array() {
+        fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
+            input.clone() * input
+        }
+
+        check_gradient!(
+            @array,
+            |input| square(input).reduce(&[0], ReductionKind::Sum),
+            at = Array::vector(vec![0.7f64, -1.3, 2.1]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+        check_gradient!(
+            @array,
+            |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
+            at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
+    fn test_check_gradient_scalar_unsupported_input_type() {
+        check_gradient!(@scalar, |input| input, at = 0.7f32, step = 1e-3, tolerance = 1e-3);
+    }
+
+    #[test]
+    #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
+    fn test_check_gradient_array_unsupported_input_type() {
+        check_gradient!(
+            @array,
+            |input| input.reduce(&[0], ReductionKind::Sum),
+            at = Array::vector(vec![0.7f32, -1.3]),
+            step = 1e-3,
+            tolerance = 1e-3,
         );
     }
 }
