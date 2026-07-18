@@ -12,6 +12,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroLike, ZeroOperation};
+use crate::operations::control_flow::scan::render_factor_list;
 use crate::operations::manipulation::{Broadcast, PadOperation, Reshape, Transpose};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -24,7 +25,6 @@ use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::tracing_v2::operations::scan::render_factor_list;
 use crate::types::{ArrayType, DataType, Shape, Size};
 
 // TODO(eaplatanios): Review from here onwards.

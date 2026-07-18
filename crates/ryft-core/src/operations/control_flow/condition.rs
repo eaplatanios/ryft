@@ -1,38 +1,48 @@
+//! Contains the `condition` control-flow operation: [`ConditionOperation`], which evaluates one of its two attached
+//! branch [`Region`](crate::Region)s depending on a scalar Boolean predicate, together with its interpretation,
+//! partial-evaluation, batching, forward-mode differentiation, and transposition rules. This is the analogue of
+//! [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) (restricted to two branches)
+//! and lowers to [StableHLO's `if`](https://openxla.org/stablehlo/spec#if).
+
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
+};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::BooleanLike;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
-use crate::payloads::{Captured, Input};
-use crate::programs::ProgramError;
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{MaybeZero, ProgramError};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`] that evaluates one of its two attached branch [`Region`](crate::Region)s depending on a Boolean
-/// predicate. Ordinary conditions use the [`Input`] predicate payload: the predicate is supplied as the first
-/// operation input (a scalar Boolean input) and the remaining operation inputs are forwarded to the selected branch.
-/// Linearized conditions use the [`Captured`] predicate payload: the predicate is stored in the operation payload as
-/// a residual value and the operation inputs are exactly the branch input tangents or cotangents.
+/// predicate supplied as the first operation input (a scalar Boolean); the remaining operation inputs are forwarded
+/// to the selected branch.
 ///
 /// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
 /// [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
@@ -43,34 +53,28 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
 /// constant still lowers to a `stablehlo.if` operation whose constant predicate the backend folds away (via
 /// [StableHLO canonicalization](https://openxla.org/stablehlo/generated/stablehlo_passes) and XLA's conditional
-/// simplification), so `ryft` performs no predicate folding of its own.
+/// simplification), so `ryft` performs no predicate folding of its own. This is the analogue of
+/// [JAX's `lax.cond`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cond.html) restricted to two branches.
 #[derive(Clone)]
-pub struct ConditionOperation<F: Value, PredicatePayload = Input> {
-    /// Captured predicate for captured-predicate conditions, or `None` for input-predicate conditions.
-    pub(crate) predicate: Option<F>,
-
-    /// Marker describing where the predicate value lives.
-    pub(crate) predicate_payload: PhantomData<PredicatePayload>,
+pub struct ConditionOperation<F: Value> {
+    /// Marker tying the condition to the value family whose programs its enclosing operation family stages.
+    value_family: PhantomData<F>,
 }
 
-impl<F: Value, PredicatePayload> Debug for ConditionOperation<F, PredicatePayload> {
+impl<F: Value> Debug for ConditionOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut debug = formatter.debug_struct("ConditionOperation");
-        if let Some(predicate) = &self.predicate {
-            debug.field("predicate", predicate);
-        }
-        debug.finish()
+        formatter.debug_struct("ConditionOperation").finish()
     }
 }
 
 impl<F: Value> ConditionOperation<F> {
-    /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The two branch
+    /// Creates a new [`ConditionOperation`]. The two branch
     /// [`Program`]s are supplied separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]); [`Operation::infer_output_types`] validates that the branch
     /// interfaces agree and that the predicate input is a scalar Boolean.
     #[inline]
     pub fn new() -> Self {
-        Self { predicate: None, predicate_payload: PhantomData }
+        Self { value_family: PhantomData }
     }
 }
 
@@ -81,29 +85,7 @@ impl<F: Value> Default for ConditionOperation<F> {
     }
 }
 
-impl<F: Value> ConditionOperation<F, Captured> {
-    /// Creates a new [`ConditionOperation`] whose predicate is captured in the operation payload rather than supplied
-    /// as an operation input. The two branch [`Program`]s are supplied separately as the operation's attached regions
-    /// (via the region driver passed to [`Context::bind`]).
-    #[inline]
-    pub fn new_captured(predicate: F) -> Self {
-        Self { predicate: Some(predicate), predicate_payload: PhantomData }
-    }
-
-    /// Returns the captured Boolean predicate that selects the branch to run.
-    #[inline]
-    pub fn predicate(&self) -> &F {
-        self.predicate.as_ref().unwrap()
-    }
-}
-
-impl<F: Value<Type: BooleanLike>> Display for ConditionOperation<F, Input> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<F: Value<Type = ArrayType>> Display for ConditionOperation<F, Captured> {
+impl<F: Value<Type: BooleanLike>> Display for ConditionOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -126,7 +108,7 @@ fn validated_branch_interfaces<'i, T: Type>(
     Ok((true_interface, false_interface))
 }
 
-impl<F: Value> Operation<F::Type> for ConditionOperation<F, Input>
+impl<F: Value> Operation<F::Type> for ConditionOperation<F>
 where
     F::Type: BooleanLike,
 {
@@ -164,42 +146,10 @@ where
     }
 }
 
-impl<F: Value<Type = ArrayType>> Operation<ArrayType> for ConditionOperation<F, Captured> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONDITION_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
-        check_count!("input", input_types, true_interface.input_types().len(), TypeError);
-        check_types!("condition input", true_interface.input_types(), input_types);
-        Ok(true_interface.output_types().to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["true", "false"]
-    }
-
-    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        vec![
-            OutputRegionProvenance { region_index: 0, output_index },
-            OutputRegionProvenance { region_index: 1, output_index },
-        ]
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("predicate", self.predicate()))
-    }
-}
-
-impl<F, C> InterpretableOperation<C> for ConditionOperation<F, Input>
+/// Interpretation rule for [`ConditionOperation`]: extracts the concrete Boolean predicate from the first input and
+/// interprets only the selected branch region over the remaining inputs (region 0 for `true` and region 1 for
+/// `false`), so the untaken branch never runs.
+impl<F, C> InterpretableOperation<C> for ConditionOperation<F>
 where
     F: Value,
     F::Type: BooleanLike,
@@ -221,15 +171,14 @@ where
     }
 }
 
-/// Partial-evaluation override for an [`Input`]-predicate [`ConditionOperation`], whose predicate is the operation's
-/// first input.
+/// Partial-evaluation override for [`ConditionOperation`], whose predicate is the operation's first input.
 ///
 /// With a [`Known`](PartialValue::Known) predicate that the known-side context can
 /// [`resolve`](Context::resolve) to a [`Concrete`](crate::ValueResolution::Concrete) constant it selects the taken
 /// branch and inlines it via
 /// [`PartialEvaluationContext::inline_program`], so the condition disappears from the residual program; the inlined
 /// branch is fed the remaining inputs. A known predicate that is *not* concretizable — under a staging known-side
-/// context, a genuine [`Tracer`](crate::Tracer) into the outer program — cannot select a branch at
+/// context, a genuine [`Tracer`] into the outer program — cannot select a branch at
 /// partial-evaluation time; the condition is instead split by `split_condition_by_knownness` into a *known*
 /// condition bound in the enclosing known-side context (so known branch work stays behind the conditional instead of
 /// being staged speculatively for both branches) and a *residual* condition over the unknown work, connected by
@@ -246,7 +195,7 @@ where
 /// value (a [`PartialEvaluationInput::Known`]) is propagated outward as a fresh known trace value, and one fed by an
 /// unknown branch input (a [`PartialEvaluationInput::Unknown`] of branch input `k`) maps back to condition input
 /// `k + 1`.
-impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V, Input>
+impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
     V: Value<Type = ArrayType> + BooleanLike,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
@@ -307,9 +256,25 @@ where
         }
         let branch_knowledge = inputs[1..].iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let true_evaluation =
-            driver.partially_evaluate_program(context, driver.region(0)?, branch_knowledge.as_slice())?;
+            driver.partially_evaluate_program(context, driver.region(0)?, branch_knowledge.as_slice());
         let false_evaluation =
-            driver.partially_evaluate_program(context, driver.region(1)?, branch_knowledge.as_slice())?;
+            driver.partially_evaluate_program(context, driver.region(1)?, branch_knowledge.as_slice());
+        let (true_evaluation, false_evaluation) = match (true_evaluation, false_evaluation) {
+            (Ok(true_evaluation), Ok(false_evaluation)) => (true_evaluation, false_evaluation),
+            // A failed branch fold must not fail the whole partial evaluation: the predicate is unknown, so the
+            // branch whose known subcomputation errors when evaluated speculatively (e.g., an integer division by a
+            // known zero) may never run at runtime. The conditional is kept whole instead of shrunk, deferring the
+            // branch's work — and its error, if that branch is ever actually taken — to runtime, which is the
+            // semantics interpretation gives the original program. Both branches are pure here (the effects gate
+            // above), so the partially completed folds are safe to discard.
+            _ => {
+                return context.fold_or_residualize(
+                    O::from(self.clone()),
+                    vec![true_branch.to_program(), false_branch.to_program()],
+                    inputs,
+                );
+            }
+        };
 
         // Map each branch's residual inputs (true then false) back to a source feeding the rewritten condition.
         let source = |residual_input: &PartialEvaluationInput<C::Value>| match residual_input {
@@ -382,7 +347,7 @@ struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
 fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
     context: &PartialEvaluationContext<C>,
     driver: &D,
-    condition: &ConditionOperation<V, Input>,
+    condition: &ConditionOperation<V>,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
@@ -783,15 +748,372 @@ fn reconcile_branch<C: Context>(
     )
 }
 
-/// Partial-evaluation override for a [`Captured`]-predicate [`ConditionOperation`], whose predicate is stored in the
-/// operation payload rather than supplied as an input. Because the predicate is not part of the inputs offered to
-/// partial evaluation, this defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`].
-impl<F, C> PartiallyEvaluatableOperation<C> for ConditionOperation<F, Captured>
+/// Batching rule for [`ConditionOperation`]. The rule builds batched condition *structure* and binds it into the
+/// parent context — interpreted eagerly under an eager parent and staged into the enclosing trace under a staging
+/// parent:
+///
+///   - **Replicated predicate.** Both branch programs are batched at the operand batch axes via
+///     [`Program::batched`](crate::Program::batched) (the batching analog of symbolic program
+///     linearization), their per-output batch axes are
+///     normalized to a common layout by appending staged axis-moving operations at the branch tails when they
+///     disagree (a transpose for a mismatched axis, a broadcast for a replicated output paired with a batched
+///     one), and one [`ConditionOperation`] over the batched branches is bound into the parent context with the
+///     unbatched predicate passed through as its scalar Boolean operand. A staging parent therefore keeps one
+///     `condition` operation whose branches run whole batches per batch item, while an eager parent concretizes the
+///     predicate and interprets the chosen batched branch.
+///   - **Batch-varying predicate.** Both pure branches are interpreted over the operand inputs and merged per batch
+///     item via [`Select`]: every per-item primitive re-enters this operation
+///     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
+///     and staging parents alike. Effectful branches are rejected because evaluating both branches would perform
+///     effects that the per-item selection cannot mask.
+impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
 where
-    F: Value<Type = ArrayType>,
-    C: Context<Type = ArrayType>,
-    C::Operation: From<ConditionOperation<F, Captured>>,
+    C: Context<Type = ArrayType, Operation = O>,
+    <C as Domain>::Value: BooleanLike
+        + Broadcast
+        + Transpose
+        + SelectCondition<Condition = <C as Domain>::Value>
+        + Select<Condition = <C as Domain>::Value>,
+    O: Operation<ArrayType>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>
+        + From<SelectOperation>
+        + From<ConditionOperation<C::Constant>>,
 {
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "cannot batch a condition operation with no predicate input".to_string(),
+            });
+        };
+        if !predicate_batch.batch_axis().is_replicated() {
+            let true_region = driver.region(0)?;
+            let false_region = driver.region(1)?;
+            if !true_region.effects().is_pure() || !false_region.effects().is_pure() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: "cannot batch a condition with a batch-varying predicate and effectful branches because \
+                              observable effects cannot be selected per batch item"
+                        .to_string(),
+                });
+            }
+            // Batch-varying predicate: batch both branches item-agnostically through the region access and merge
+            // their outputs per batch item via `Select`.
+            return batch_condition_with_interpreter(
+                context,
+                predicate_batch,
+                operand_inputs,
+                |index, region_inputs| driver.batch_region(context, index, region_inputs),
+            );
+        }
+
+        // Replicated (abstract) predicate: batch both branches at the operand batch axes with natural output axes to
+        // discover which outputs each branch batches (the discovery programs are discarded), join the two answers into
+        // one output layout — preferring the true branch's natural axis when both are batched — and re-batch each
+        // branch instantiated at the joined targets so the branch signatures agree. This is the two-pass shape of
+        // JAX's `_cond_batching_rule` (`batch_jaxpr` with `instantiate=out_bat`).
+        let operand_axes = operand_inputs.iter().map(|input| input.batch_axis()).collect::<Vec<_>>();
+        let true_region = driver.region(0)?;
+        let false_region = driver.region(1)?;
+        let (_, true_axes) = driver.batch_program(
+            context,
+            true_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let (_, false_axes) = driver.batch_program(
+            context,
+            false_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        check_count!("output", false_axes, true_axes.len(), ProgramError);
+        let output_axes: Vec<BatchAxis> = true_axes
+            .iter()
+            .zip(false_axes.iter())
+            .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
+            .collect();
+        let (batched_true_branch, _) = driver.batch_program(
+            context,
+            true_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+        )?;
+        let (batched_false_branch, _) = driver.batch_program(
+            context,
+            false_region,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+        )?;
+
+        // Stage one condition over the batched branches with the unbatched predicate passed through.
+        let batched_condition = ConditionOperation::new();
+        let mut staged_inputs = Vec::with_capacity(inputs.len());
+        staged_inputs.push(predicate_batch.value().clone());
+        staged_inputs.extend(operand_inputs.iter().map(|input| input.value().clone()));
+        let outputs = context.parent().bind(
+            batched_condition,
+            vec![batched_true_branch, batched_false_branch],
+            &staged_inputs,
+        )?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| {
+                let physical_type = output.r#type().into_owned();
+                ArrayBatch::new(physical_type, output, axis)
+            })
+            .collect()
+    }
+}
+
+/// Batches a condition whose predicate is *batch-varying* by replaying both attached regions over the operand inputs
+/// through `batch_branch` and merging their outputs per batch item via
+/// [`Select`](crate::operations::control_flow::Select). The ordinary [`SelectOperation`] batching rule aligns every
+/// branch output with the predicate's mapped axis, broadcasts replicated branch outputs across the batch, and expands
+/// the per-item scalar predicate across non-scalar branch output shapes. The predicate must carry a mapped batch axis;
+/// the replicated case is the caller's structural staging path.
+pub(crate) fn batch_condition_with_interpreter<C, F>(
+    context: &BatchingContext<C>,
+    predicate_batch: &ArrayBatch<C::Value>,
+    operand_inputs: &[ArrayBatch<C::Value>],
+    mut batch_branch: F,
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Broadcast
+        + Transpose
+        + SelectCondition<Condition = C::Value>
+        + crate::operations::control_flow::Select<Condition = C::Value>,
+    C::Operation: From<BroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
+    F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
+{
+    let true_outputs = batch_branch(0, operand_inputs.to_vec())?;
+    let false_outputs = batch_branch(1, operand_inputs.to_vec())?;
+    check_count!("output", true_outputs, false_outputs.len(), ProgramError);
+    true_outputs
+        .into_iter()
+        .zip(false_outputs)
+        .map(|(true_output, false_output)| -> Result<ArrayBatch<C::Value>, BatchingError> {
+            let mut selected = SelectOperation.batch(
+                context,
+                &crate::EmptyRegionDriver,
+                &[predicate_batch.clone(), true_output, false_output],
+            )?;
+            check_count!("output", selected, 1, ProgramError);
+            Ok(selected.remove(0))
+        })
+        .collect()
+}
+
+/// Capture-free forward-mode (JVP) rule for [`ConditionOperation`], staging **one fused** jvp `condition` as an
+/// ordinary primal-enum operation over the shared builder.
+///
+/// The rule builds each branch's fused jvp program through its instruction-scoped differentiation driver — both
+/// branches share a signature, so the doubled `[primal_operands..., tangent_operands...] ->
+/// [primal_outputs..., tangent_outputs...]` signatures also match with no joining or padding — and stages one
+/// `condition` over the predicate primal followed by the operand primals and tangents. Pure forward mode therefore
+/// stages a single conditional and no residual plumbing.
+///
+/// The primal/tangent separation that reverse mode needs is deferred to partial evaluation: under the known-ness
+/// split of [`Program::linearize`](crate::Program::linearize) the predicate is a known (symbolic) primal, so the
+/// condition composite split (ryft's `_cond_partial_eval` analogue) separates the fused conditional into a known
+/// primal condition — producing each branch's known→unknown edges with typed zero-padding for the peer's slots —
+/// and a residual tangent condition over the operand tangents and those edges.
+///
+/// The predicate is the first operand and carries no tangent (Boolean predicates have no tangent space); the fused
+/// conditional selects the same branch for both halves because they share the same primal predicate edge.
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ConditionOperation<C::Constant>
+where
+    C::Operation: From<ZeroOperation<ArrayType>> + From<ConditionOperation<C::Constant>>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The rule requests all nested-computation work through its driver (region 0 is the `true` branch
+        // and region 1 the `false` branch); the true branch's boundary is materialized for the arity checks.
+        let true_branch = driver.region(0)?;
+        check_count!("input", inputs, true_branch.input_types().len() + 1, ProgramError);
+        let predicate_primal = inputs[0].primal().clone();
+        let operands = &inputs[1..];
+        let output_count = true_branch.output_ids().len();
+
+        // Build both fused jvp branches and stage one fused conditional over the predicate primal followed by the
+        // operand primals and tangents.
+        let fused_true = driver.jvp_program(true_branch)?;
+        let fused_false = driver.jvp_program(driver.region(1)?)?;
+        let fused_condition = ConditionOperation::new();
+        let mut condition_operands = Vec::with_capacity(2 * operands.len() + 1);
+        condition_operands.push(predicate_primal);
+        condition_operands.extend(operands.iter().map(|operand| operand.primal().clone()));
+        // The fused branches take every operand tangent as a real program input, so materialize structural zeros.
+        for operand in operands {
+            condition_operands.push(operand.tangent().clone().materialize(context)?);
+        }
+        let outputs = context.bind(fused_condition, vec![fused_true, fused_false], &condition_operands)?;
+        check_count!("output", outputs, 2 * output_count, ProgramError);
+
+        // The fused conditional's outputs are the primal outputs followed by the tangent outputs; zip the halves
+        // back into `DifferentiationDual`s in the original output order.
+        let (primal_outputs, tangent_outputs) = outputs.split_at(output_count);
+        Ok(primal_outputs
+            .iter()
+            .cloned()
+            .zip(tangent_outputs.iter().cloned())
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Partition-aware transpose rule for a *primal* input-predicate [`ConditionOperation`], forwarding to
+/// [`transpose_primal_condition`]. The predicate and the per-branch residuals ride as ordinary known operands, and the
+/// branch recursion happens through the instruction-scoped driver's transposition requests, so instantiating this
+/// implementation for a closed operation enum introduces no recursive [`TransposableOperation`] obligation on `O`.
+impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V>>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_primal_condition(context, driver, inputs, outputs).map_err(DifferentiationError::from)
+    }
+}
+
+/// Partition-aware transpose rule for a *primal* [`ConditionOperation`], used when the direct reverse transposes a
+/// tangent program in the primal operation family `O`. The predicate and the per-branch residuals are ordinary
+/// *operands* (known values supplied through the pullback), so the rule reads them from the pullback and threads
+/// them back through as known operands of a transposed condition.
+///
+/// The forward stages the tangent condition over `[predicate, branch_tangents..., residuals...]` with the
+/// predicate and the joined residual set marked known and the branch tangents marked linear, and with both branches
+/// already joined to the same input signature `[branch_tangents..., residuals...]` and output signature
+/// `[branch_tangent_outputs...]`. This rule therefore:
+///
+///   1. Splits the operands by `operand_linear` into the known predicate (operand `0`), the leading linear run of
+///      branch tangents, and the trailing known residuals.
+///   2. Transposes each branch through the driver's region-transposition request, marking the branch tangent inputs
+///      linear and the residual inputs known. Each transposed branch maps
+///      `[branch_tangent_output_cotangents..., residuals...]` to `[branch_tangent_input_cotangents...]`; because both
+///      branches shared the joined signature, their transposes share it too and form a well-typed condition.
+///   3. Re-stages a primal input-predicate [`ConditionOperation`] selecting between the two transposed branches by the
+///      same known predicate, over `[predicate, outputs..., residuals...]`. Its outputs are the branch-tangent
+///      input cotangents.
+///
+/// The returned cotangents place those branch-tangent cotangents at the linear-operand positions and a structural
+/// [`MaybeZero::Zero`] at the predicate and residual positions, which carry no cotangent. The branch recursion happens
+/// through the instruction-scoped driver in the same operation family, so it introduces no
+/// recursive [`TransposableOperation`] obligation on `O`.
+///
+/// # Parameters
+///
+///   - `operation`: Primal input-predicate condition staged into the tangent program.
+///   - `context`: Active transpose tracing context the pullback is staged into.
+///   - `inputs`: Per-operand [`PartialValue`] knowledge. The [`Unknown`](PartialValue::Unknown) entries are the branch
+///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback reads.
+///   - `outputs`: Symbolic cotangents for the condition's outputs.
+pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
+    context: &mut TracingContext<V, O>,
+    driver: &D,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V>>,
+{
+    // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
+    if outputs.iter().all(MaybeZero::is_zero) {
+        return Ok(inputs
+            .iter()
+            .map(|input| {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
+            })
+            .collect());
+    }
+
+    // The rule operates on the attached branch regions through its driver (region 0 is the `true` branch and region 1
+    // the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
+    let true_branch = driver.region(0)?;
+
+    // Operand layout is `[predicate(known), branch_tangents(linear)..., residuals(known)...]`. The branch tangents are
+    // exactly the linear operands, and the residuals are the trailing known operands after the predicate and tangents.
+    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
+    let branch_input_count = true_branch.input_types().len();
+    let branch_tangent_count = operand_linear.iter().filter(|&&linear| linear).count();
+    let residual_count = branch_input_count.checked_sub(branch_tangent_count).ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "condition transpose found {branch_tangent_count} linear operands but its branches take only \
+             {branch_input_count} inputs",
+        ))
+    })?;
+    check_count!("input", operand_linear, 1 + branch_tangent_count + residual_count, ProgramError);
+
+    // The predicate is operand `0` and the residuals are the trailing operands; both are known values read from the
+    // pullback. The dispatch guarantees a `Known` operand carries its pullback value, so each tracer is read directly.
+    let read_known = |index: usize| -> Result<Tracer<TracingContext<V, O>>, ProgramError> {
+        inputs[index]
+            .as_known()
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("condition transpose operand {index} has no known value"))
+            })
+            .cloned()
+    };
+    let predicate = read_known(0)?;
+    let residuals = (1 + branch_tangent_count..inputs.len()).map(read_known).collect::<Result<Vec<_>, _>>()?;
+
+    // Transpose each branch with the branch tangents marked linear and the residual inputs marked known. Each
+    // transposed branch maps `[branch_output_cotangents..., residuals...]` to `[branch_tangent_cotangents...]`.
+    let mut branch_linear = vec![true; branch_tangent_count];
+    branch_linear.extend(std::iter::repeat(false).take(residual_count));
+    let transposed_true = driver.transpose_program(driver.region(0)?, branch_linear.as_slice())?;
+    let transposed_false = driver.transpose_program(driver.region(1)?, branch_linear.as_slice())?;
+    let transposed_condition = ConditionOperation::new();
+
+    // Stage the transposed condition over `[predicate, outputs..., residuals...]`. Its outputs are the
+    // branch-tangent input cotangents.
+    let output_types = true_branch.output_types();
+    check_count!("output", outputs, output_types.len(), ProgramError);
+    let mut operands = Vec::with_capacity(1 + output_types.len() + residuals.len());
+    operands.push(predicate);
+    for cotangent in outputs {
+        operands.push(cotangent.clone().materialize(context)?);
+    }
+    operands.extend(residuals);
+    let branch_cotangents =
+        context.bind(O::from(transposed_condition), vec![transposed_true, transposed_false], operands.as_slice())?;
+    check_count!("output", branch_cotangents, branch_tangent_count, ProgramError);
+
+    // Reassemble one cotangent per operand: the predicate and residuals carry structural zeros, while the branch
+    // tangents receive the transposed condition's outputs in order.
+    let mut branch_cotangents = branch_cotangents.into_iter().map(MaybeZero::Value);
+    let cotangents = operand_linear
+        .iter()
+        .zip(inputs)
+        .map(|(&linear, input)| {
+            if linear {
+                branch_cotangents.next().unwrap()
+            } else {
+                let input_type = input.r#type();
+                MaybeZero::Zero(input_type.cotangent())
+            }
+        })
+        .collect();
+    Ok(cotangents)
 }
 
 #[cfg(test)]
@@ -799,17 +1121,23 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use std::borrow::Cow;
+
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
+    use crate::batching::{Batch, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
-    use crate::operations::math::{AddOperation, SinOperation};
+    use crate::operations::math::{AddOperation, DivOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
+    use crate::tracing::Trace;
     use crate::tracing_v2::ForwardModeDifferentiate;
+    use crate::tracing_v2::test_util::scalar_scale_branch;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -1007,68 +1335,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_condition_linearization_replays_the_selected_branch() {
-        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
-        type TestTracer = LinearizationTracer<TestContext>;
-
-        for (predicate, expected_value, expected_tangent) in
-            [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
-        {
-            let (value, pushforward) = TestContext::new()
-                .linearize(
-                    move |input: TestTracer| {
-                        let predicate = input.context().lift(Array::from_f64s(
-                            ArrayType::scalar(DataType::Boolean),
-                            vec![if predicate { 1.0 } else { 0.0 }],
-                        ))?;
-                        let mut outputs = input.context().bind(
-                            ArrayOperation::Condition(ConditionOperation::new()),
-                            vec![
-                                scalar_branch(ArrayOperation::Add(AddOperation)),
-                                scalar_branch(ArrayOperation::Sin(SinOperation)),
-                            ],
-                            &[predicate, input.clone()],
-                        )?;
-                        Ok(outputs.remove(0))
-                    },
-                    Array::scalar(0.7),
-                )
-                .unwrap();
-            assert_eq!(value, Array::scalar(expected_value));
-            assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
-        }
-    }
-
-    #[test]
-    fn test_condition_jvp_preserves_zero_space_output_tangents() {
-        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
-        type TestTracer = DifferentiationTracer<TestContext>;
-
-        let (primal, tangent) = TestContext::new()
-            .jvp(
-                |input: TestTracer| {
-                    let predicate =
-                        input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
-                    let mut outputs = input.context().bind(
-                        ArrayOperation::Condition(ConditionOperation::new()),
-                        vec![boolean_branch(), boolean_branch()],
-                        &[predicate, input.clone()],
-                    )?;
-                    Ok(outputs.remove(0))
-                },
-                Array::scalar(2.0),
-                Array::scalar(3.0),
-            )
-            .unwrap();
-        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
-        assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
-    }
-
     /// A known-symbolic predicate splits known branch results from residual branch work without dropping an
     /// effectful residual condition whose branches have no data outputs.
     #[test]
-    fn test_partially_evaluate_condition_preserves_zero_output_residual_effects() {
+    fn test_condition_partial_evaluation_preserves_zero_output_residual_effects() {
         use crate::operations::debugging::PrintOperation;
         use crate::partial::{PartialEvaluationOutput, PartialValue};
         use crate::tracing::TracingContext;
@@ -1127,5 +1397,342 @@ mod tests {
                 .effects()
                 .is_ordered())
         );
+    }
+
+    /// A branch whose fold fails under an unknown predicate (here an integer division by a known zero divisor in a
+    /// branch that interpretation may never take) keeps the conditional whole instead of failing partial evaluation,
+    /// so the branch's error surfaces only if that branch actually runs.
+    #[test]
+    fn test_condition_partial_evaluation_keeps_erroring_branch_folds_behind_the_predicate() {
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::scalar(DataType::I32);
+        let divide_branch = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(operand_type.clone());
+            let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]));
+            let output =
+                builder.add_instruction(ArrayOperation::Div(DivOperation), Vec::new(), vec![one, input]).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let identity_branch = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(operand_type.clone());
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let true_region = builder.import_region(divide_branch.entry_region_ref());
+        let false_region = builder.import_region(identity_branch.entry_region_ref());
+        let predicate = builder.add_input(predicate_type.clone());
+        let operand = builder.add_input(operand_type.clone());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, operand],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // The zero divisor is known, so shrinking the branches would fold `1 / 0` speculatively; the rule must fall
+        // back to residualizing the conditional whole.
+        let knowledge = vec![
+            PartialValue::Unknown(predicate_type),
+            PartialValue::Known(Array::from_f64s(operand_type.clone(), vec![0.0])),
+        ];
+        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+        assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
+
+        // Interpreting the residual program with a false predicate takes the identity branch and never divides.
+        let inputs = evaluation
+            .inputs
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Unknown(_) => Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]),
+                PartialEvaluationInput::Known(value) => value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let outputs = evaluation.program.interpret(inputs).unwrap();
+        assert_eq!(outputs[0].values(), &[Scalar::I32(0)]);
+    }
+
+    #[test]
+    fn test_condition_infers_output_types_through_operation_enum() {
+        // Inference dispatches through the closed operation enum exactly like through the bare operation.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let identity_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let operation = ArrayOperation::Condition(ConditionOperation::<Array>::new());
+        assert_eq!(
+            operation.infer_output_types(
+                &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64)],
+                &[identity_branch.interface(), identity_branch.interface()],
+            ),
+            Ok(vec![ArrayType::scalar(DataType::F64)]),
+        );
+    }
+
+    #[test]
+    fn test_condition_region_batching_preserves_mapped_axis_sharding() {
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let physical_sharding =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
+            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_sharding(physical_sharding)
+                .unwrap();
+            let operand = ArrayBatch::new(
+                physical_type.clone(),
+                Array::from_f64s(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                BatchAxis::new(0),
+            )
+            .unwrap();
+            let logical_type = operand.unbatched_type();
+            let (_, branch) =
+                EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![logical_type])
+                    .unwrap();
+            let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+                .with_axis_sharding(ShardingDimension::sharded(["x"]));
+            let predicate = ArrayBatch::replicated(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+
+            let outputs = context
+                .bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![branch.clone(), branch],
+                    &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+                )
+                .unwrap();
+
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].batch().r#type(), Cow::Borrowed(&physical_type));
+        }
+    }
+
+    #[test]
+    fn test_condition_batching_stages_replicated_predicates() {
+        // A replicated *abstract* condition predicate under trace-time batching cannot be concretized to pick one
+        // branch (previously this surfaced a `Concretization` error), so the staged batching rule batches both
+        // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
+        // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
+        // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
+        let operand_atom = builder.borrow_mut().add_input(operand_type);
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let condition_count = program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "condition")
+            .count();
+        assert_eq!(condition_count, 1, "{program}");
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![3.0, 12.0, 27.0]);
+    }
+
+    #[test]
+    fn test_condition_batching_normalizes_replicated_branch_output_axes() {
+        // The two branches of a staged batched condition may disagree on their natural output batch axes: here the
+        // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
+        // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
+        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
+        let mut constant_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        constant_builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant_output = constant_builder.add_constant(Array::scalar(7.0));
+        let constant_branch = constant_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
+        let builder = parent.builder().clone();
+        let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
+        let operand_atom =
+            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
+        let output = Batch::batch(
+            &parent,
+            |(predicate, x)| {
+                let condition_regions = vec![scalar_scale_branch(2.0), constant_branch];
+                let condition = ConditionOperation::new();
+                let op = ArrayOperation::Condition(condition);
+                let outputs = x.context().bind(op, condition_regions, &[predicate.clone(), x.clone()])?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (predicate_tracer, operand_tracer),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        let output_atom = output.atom_id().unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Array, Array), Array>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let rendered = program.to_string();
+        assert!(rendered.contains("broadcast"), "{rendered}");
+        let truthy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]);
+        let falsy = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let operand = Array::vector(vec![1.0, 4.0, 9.0]);
+        assert_eq!(program.interpret((truthy, operand.clone())).unwrap().to_f64s(), vec![2.0, 8.0, 18.0]);
+        assert_eq!(program.interpret((falsy, operand)).unwrap().to_f64s(), vec![7.0, 7.0, 7.0]);
+    }
+
+    /// A batch-varying predicate cannot select one branch for the whole batch, so batching runs both pure branches
+    /// and merges their outputs per batch item through the `Select` batching rule.
+    #[test]
+    fn test_condition_batching_selects_branch_outputs_per_item_for_batch_varying_predicates() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let output = context
+            .batch(
+                |(predicate, x)| {
+                    let outputs = x.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+                        &[predicate.clone(), x.clone()],
+                    )?;
+                    Ok(outputs.into_iter().next().unwrap())
+                },
+                (Array::vector(vec![true, false, true]), Array::vector(vec![1.0, 4.0, 9.0])),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![2.0, 12.0, 18.0]);
+    }
+
+    /// Effectful branches cannot be batched under a batch-varying predicate: both branches would run for the whole
+    /// batch and their observable effects cannot be selected per batch item.
+    #[test]
+    fn test_condition_batching_rejects_batch_varying_predicates_with_effectful_branches() {
+        use crate::operations::debugging::PrintOperation;
+
+        let effectful_branch = |label| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            builder
+                .add_instruction(ArrayOperation::Print(PrintOperation::new(label)), Vec::new(), vec![input])
+                .unwrap();
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let result: Result<Array, BatchingError> = context.batch(
+            |(predicate, x)| {
+                let outputs = x.context().bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![effectful_branch("true"), effectful_branch("false")],
+                    &[predicate.clone(), x.clone()],
+                )?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (Array::vector(vec![true, false]), Array::vector(vec![1.0, 2.0])),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "cannot batch a condition with a batch-varying predicate and effectful branches because observable \
+                 effects cannot be selected per batch item"
+            ),
+            "{error}",
+        );
+    }
+
+    #[test]
+    fn test_condition_linearization_replays_the_selected_branch() {
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
+        type TestTracer = LinearizationTracer<TestContext>;
+
+        for (predicate, expected_value, expected_tangent) in
+            [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
+        {
+            let (value, pushforward) = TestContext::new()
+                .linearize(
+                    move |input: TestTracer| {
+                        let predicate = input.context().lift(Array::from_f64s(
+                            ArrayType::scalar(DataType::Boolean),
+                            vec![if predicate { 1.0 } else { 0.0 }],
+                        ))?;
+                        let mut outputs = input.context().bind(
+                            ArrayOperation::Condition(ConditionOperation::new()),
+                            vec![
+                                scalar_branch(ArrayOperation::Add(AddOperation)),
+                                scalar_branch(ArrayOperation::Sin(SinOperation)),
+                            ],
+                            &[predicate, input.clone()],
+                        )?;
+                        Ok(outputs.remove(0))
+                    },
+                    Array::scalar(0.7),
+                )
+                .unwrap();
+            assert_eq!(value, Array::scalar(expected_value));
+            assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
+        }
+    }
+
+    #[test]
+    fn test_condition_jvp_preserves_zero_space_output_tangents() {
+        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
+        type TestTracer = DifferentiationTracer<TestContext>;
+
+        let (primal, tangent) = TestContext::new()
+            .jvp(
+                |input: TestTracer| {
+                    let predicate =
+                        input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                    let mut outputs = input.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![boolean_branch(), boolean_branch()],
+                        &[predicate, input.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                Array::scalar(2.0),
+                Array::scalar(3.0),
+            )
+            .unwrap();
+        assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
+        assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
     }
 }

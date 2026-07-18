@@ -37,10 +37,8 @@ pub use operations::collective::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
     forward_collective_to_parent,
 };
-pub use operations::control_flow::transpose_primal_condition;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
 pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};
-pub use operations::scan::transpose_primal_scan;
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
     NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,

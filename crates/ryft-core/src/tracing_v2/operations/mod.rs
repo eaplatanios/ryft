@@ -19,14 +19,10 @@ pub mod reduce;
 /// Recomputed primal operation payload used inside linear programs.
 pub mod recompute;
 
-/// Statically shaped scan loop differentiation and batching rules.
-pub mod scan;
-
 /// Per-element select / `where` primitive.
 pub mod select;
 
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
-pub use control_flow::transpose_primal_condition;
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation, CustomVjpResidual, custom_jvp, custom_vjp,
     transpose_primal_custom_vjp,
@@ -38,4 +34,3 @@ pub use dot::{
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
-pub use scan::transpose_primal_scan;

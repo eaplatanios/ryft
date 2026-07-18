@@ -733,7 +733,7 @@ where
 /// accumulates into its operand (`output = operand + scattered(updates)`, so the operand Jacobian is the identity), so
 /// the operand cotangent is the output cotangent unchanged; the update cotangent gathers the output cotangent at the
 /// scattered windows via the dual gather built by mirroring the scatter geometry. This reproduces the captured-index
-/// [`LinearScatterAddOperation`](crate::operations::manipulation::LinearScatterAddOperation) transpose rule, reading
+/// [`LinearScatterAddOperation`] transpose rule, reading
 /// the indices from the pullback through `operand_values` and staging a primal [`GatherOperation`] instead of folding
 /// the indices into a captured factor. The indices receive a structural zero, and a zero output cotangent stays a
 /// structural zero. Non-additive combiners are not linear and are

@@ -521,8 +521,8 @@ where
 }
 
 /// Partition-aware transpose rule for a *primal* tangent [`JitCallOperation`], the jitted-call counterpart of
-/// [`transpose_primal_condition`](ryft_core::tracing_v2::transpose_primal_condition),
-/// [`transpose_primal_scan`](ryft_core::tracing_v2::transpose_primal_scan), and
+/// [`transpose_primal_condition`](ryft_core::operations::control_flow::transpose_primal_condition),
+/// [`transpose_primal_scan`](ryft_core::operations::control_flow::transpose_primal_scan), and
 /// [`transpose_primal_custom_vjp`](ryft_core::tracing_v2::transpose_primal_custom_vjp). It is used when the
 /// direct reverse transposes a tangent program in the primal [`XlaOperation`] family rather than re-keying it
 /// into a linear operation family.

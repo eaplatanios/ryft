@@ -360,7 +360,7 @@ where
 /// with the input's data type. Padding requires static input extents: inputs with dynamic dimensions are rejected
 /// because the padded extent cannot be computed from an unknown extent.
 ///
-/// [`Pad`] is the transpose dual of strided [`Slice`](crate::operations::manipulation::Slice): slicing with stride
+/// [`Pad`] is the transpose dual of strided [`Slice`]: slicing with stride
 /// `s` keeps every `s`-th element, while padding with `interior_padding = s - 1` puts elements back at every `s`-th
 /// position.
 ///
