@@ -32,6 +32,7 @@ pub use linear::{
     jacfwd_holomorphic_with_aux, jacfwd_with_aux, jacrev, jacrev_holomorphic, jacrev_holomorphic_with_aux,
     jacrev_with_aux,
 };
+pub use operations::RecomputeOperation;
 pub use operations::collective::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
     forward_collective_to_parent,
@@ -41,7 +42,6 @@ pub use operations::custom_derivatives::transpose_primal_custom_vjp;
 pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::transpose_primal_scan;
-pub use operations::{ArrayOperation, RecomputeOperation};
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
     NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,

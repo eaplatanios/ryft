@@ -613,14 +613,18 @@ macro_rules! define_tracer_operator {
 ///   - `@scalar` / `@array`: Selects the value universe: `@scalar` checks a [`Scalar`](crate::Scalar)-valued function,
 ///     while `@array` checks an [`Array`](crate::Array)-valued function of any input shape whose output is a rank-0
 ///     real `f64` array (i.e., the only shape the plain [`gradient`](crate::gradient) entry point accepts).
-///   - `$function`: Closure literal (or generic function) to differentiate.
-///   - `$input`: Expression convertible into the selected universe's value, at which the gradient is checked.
+///   - `$function`: Closure literal (or generic function) to differentiate. The function may return its output value
+///     either directly or wrapped in a [`Result`] whose error type converts into the differentiation machinery's error
+///     types (which holds for the [`ProgramError`](crate::ProgramError) that the value capability traits return), so
+///     fallible capability calls like `x.sin()` need no `.unwrap()`. Refer to [`MaybeFallible`](crate::MaybeFallible)
+///     for the exact contract.
+///   - `at = $input`: Expression convertible into the selected universe's value, at which the gradient is checked.
 ///   - `step = $step`: Central finite-difference spacing `h`.
-///   - `tolerance = $tolerance`: Absolute tolerance for the comparison. Pick one compatible with the `O($step²)` truncation
-///     error of the central difference.
+///   - `tolerance = $tolerance`: Absolute tolerance for the comparison. Pick one compatible with the `O($step²)`
+///     truncation error of the central difference.
 #[macro_export]
 macro_rules! check_gradient {
-    (@scalar, $function:expr, $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
+    (@scalar, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
                 $crate::backends::scalars::Scalar,
@@ -631,7 +635,7 @@ macro_rules! check_gradient {
         )
     };
 
-    (@array, $function:expr, $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
+    (@array, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
                 $crate::backends::arrays::Array,
@@ -659,17 +663,28 @@ macro_rules! check_gradient {
         // input, but it pins the canonical eager reference context explicitly instead of leaving that choice to
         // inference through `Input::To<LinearizationTracer<V::ExecutionDomain>>`, and it keeps closure-shape errors
         // anchored to one concrete expected signature.
+        //
+        // Both pins leave the function's output type generic so that `$function` may return its value either directly
+        // or wrapped in a `Result` (refer to `MaybeFallible` for the exact contract). The traced copy's output is
+        // consumed by `gradient`, which accepts both shapes natively, while `pin_eager` normalizes the concrete copy's
+        // output by unwrapping through `MaybeFallible::into_result`, so that the assertion rules below always receive
+        // an infallible function.
 
         fn pin_traced<
             F: Fn(
                 $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
-            ) -> $crate::differentiation::LinearizationTracer<$crate::contexts::EagerContext<$value, $operation>>,
+            ) -> Output,
+            Output,
         >(function: F) -> F {
             function
         }
 
-        fn pin_eager<F: Fn($value) -> $value>(function: F) -> F {
-            function
+        fn pin_eager<F: Fn($value) -> Output, Output: $crate::MaybeFallible<$value, $crate::ProgramError>>(
+            function: F,
+        ) -> impl Fn($value) -> $value {
+            move |input| {
+                $crate::MaybeFallible::into_result(function(input)).unwrap_or_else(|error| panic!("{error}"))
+            }
         }
 
         let input: $value = ::core::convert::Into::into($input);

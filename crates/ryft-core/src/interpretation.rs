@@ -437,13 +437,14 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::types::TypeError;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::tests::{TestArray, TestRegionOperation};
+    use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -559,39 +560,39 @@ mod tests {
     #[test]
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
-            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
+            program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
             Err(ProgramError::Type(TypeError { message })) if message
                 == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
         ));
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap().values, vec![2.0, 4.0, 6.0]);
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0, 3.0])).unwrap().to_f64s(), vec![2.0, 4.0, 6.0]);
         assert!(matches!(
-            program.interpret(TestArray::scalar(1.0)),
+            program.interpret(Array::scalar(1.0)),
             Err(ProgramError::Type(TypeError { message })) if message
                 == "encountered input type f64[] which is incompatible with the program's declared type f64[*]",
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<Array, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(3))])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
+        let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
-            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
+            program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
             Err(ProgramError::Type(TypeError { message })) if message
                 == "encountered input type f64[3] which is incompatible with the program's declared type f64[<3]",
         ));

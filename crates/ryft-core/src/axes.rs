@@ -189,11 +189,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::BatchingError;
     use crate::contexts::EagerContext;
-    use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -228,7 +227,7 @@ mod tests {
         // Validate `name` against the seeded `NamedAxes` environment and stage a nullary `AxisIndexOperation`
         // producing a scalar `u64`, regardless of whether the axis is batch- or mesh-bound.
         let (output_type, program) =
-            DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::trace_with_named_axes(
+            DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
                 |input| input.context().axis_index("device"),
                 ArrayType::scalar(DataType::F64),
                 vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
@@ -248,7 +247,7 @@ mod tests {
     fn test_axis_index_rejects_an_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
         // `AxisError::UnboundAxisName` through the `BatchingError::Axis` channel riding `ProgramError`.
-        let error = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::trace_with_named_axes(
+        let error = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |input| input.context().axis_index("missing"),
             ArrayType::scalar(DataType::F64),
             vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],

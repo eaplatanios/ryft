@@ -1550,6 +1550,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::BooleanLike;
@@ -1558,9 +1559,7 @@ mod tests {
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
-    use crate::tests::TestArray;
     use crate::tracing::{NestedTracingContext, Trace};
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::DataType;
@@ -1607,12 +1606,12 @@ mod tests {
                 )?;
                 Ok(input + outputs.remove(0))
             },
-            TestArray::scalar(2.0),
-            TestArray::scalar(1.0),
+            Array::scalar(2.0),
+            Array::scalar(1.0),
         )
         .unwrap();
-        assert_eq!(primal.values, vec![4.0]);
-        assert_eq!(tangent.values, vec![1.0]);
+        assert_eq!(primal.to_f64s(), vec![4.0]);
+        assert_eq!(tangent.to_f64s(), vec![1.0]);
     }
 
     #[test]
@@ -1679,26 +1678,26 @@ mod tests {
 
     #[test]
     fn test_program_jvp_uses_the_primal_array_operation_family() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (_, program) = NestedTracingContext::trace(
             context,
             |inputs: Vec<_>| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
-            vec![TestArray::vector(vec![1.0, 2.0, 3.0]).r#type],
+            vec![Array::vector(vec![1.0, 2.0, 3.0]).r#type().into_owned()],
         )
         .unwrap();
         let program = program.into_simplified().unwrap().jvp().unwrap();
 
         // The fused JVP remains in the ordinary primal operation family instead of introducing a capture-keyed
         // linear operation family.
-        let _: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> = &program;
+        let _: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> = &program;
         assert_eq!(program.input_ids().len(), 2);
         assert_eq!(program.output_ids().len(), 2);
         assert_eq!(
             program.interpret_in_context(
                 &context,
-                vec![TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::vector(vec![1.0, 1.0, 1.0])],
+                vec![Array::vector(vec![1.0, 2.0, 3.0]), Array::vector(vec![1.0, 1.0, 1.0])],
             ),
-            Ok(vec![TestArray::scalar(14.0), TestArray::scalar(12.0)]),
+            Ok(vec![Array::scalar(14.0), Array::scalar(12.0)]),
         );
     }
 

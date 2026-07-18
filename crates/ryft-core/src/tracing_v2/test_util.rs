@@ -1,18 +1,17 @@
+use crate::backends::arrays::{Array, ArrayOperation};
 use crate::operations::math::MulOperation;
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
-use crate::tests::TestArray;
-use crate::tracing_v2::ArrayOperation;
 use crate::types::{ArrayType, DataType};
 
 /// Builds a single-input flat program that scales its scalar input by `factor`, multiplying the input by a captured
 /// constant carrying `factor`.
 pub(crate) fn scalar_scale_branch(
     factor: f64,
-) -> crate::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-    let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+) -> crate::programs::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+    let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
     let input = builder.add_input(ArrayType::scalar(DataType::F64));
-    let factor = builder.add_constant(TestArray::scalar(factor));
+    let factor = builder.add_constant(Array::scalar(factor));
     let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
     builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
 }
@@ -22,8 +21,10 @@ mod tests {
     use std::cell::Cell;
 
     use approx::assert_abs_diff_eq;
+    use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
@@ -50,14 +51,14 @@ mod tests {
         // batch axis through `lift_dot_dimensions`.
         use crate::tracing_v2::operations::dot::{DotDimensionNumbers, DotOperation};
         let lhs = {
-            let value = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+            let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let rhs = ArrayBatch::replicated(TestArray::vector(vec![10.0, 100.0, 1000.0]));
+        let rhs = ArrayBatch::replicated(Array::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
         let outputs = DotOperation::new(dimensions)
-            .batch(&BatchingContext::new(EagerContext::<TestArray>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])
+            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -69,14 +70,14 @@ mod tests {
     fn test_reduce_sum_jvp_linearizes_to_itself() {
         // Verify the linear reduce rule directly over a concrete tangent value.
         use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
-        let primal = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let tangent_value = TestArray::vector(vec![0.5, 0.5, 0.5, 0.5]);
+        let primal = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let tangent_value = Array::vector(vec![0.5, 0.5, 0.5, 0.5]);
 
         let operation = ReduceOperation::new(vec![0], ReductionKind::Sum);
 
-        // Primal: reduce(x, [0], Sum) on `TestArray` directly.
+        // Primal: reduce(x, [0], Sum) on `Array` directly.
         let primal_output = operation
-            .interpret(&EagerContext::<TestArray>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&primal))
+            .interpret(&EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&primal))
             .unwrap()
             .into_iter()
             .next()
@@ -86,11 +87,7 @@ mod tests {
         // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the
         // reduce of the tangent.
         let tangent_outputs = operation
-            .interpret(
-                &EagerContext::<TestArray>::new(),
-                &crate::EmptyRegionDriver,
-                std::slice::from_ref(&tangent_value),
-            )
+            .interpret(&EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&tangent_value))
             .unwrap();
         let tangent_output = tangent_outputs.into_iter().next().unwrap();
         assert_eq!(tangent_output.values(), &[2.0]);
@@ -105,12 +102,12 @@ mod tests {
         use crate::operations::compare::ComparisonDirection;
         use crate::operations::control_flow::WhileOperation;
         use crate::programs::Program;
-        type TestOp = ArrayOperation<TestArray>;
+        type TestOp = ArrayOperation<Array>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
 
         // Condition program: state -> (state > 0). Returns a scalar Boolean.
-        let mut condition_builder = ProgramBuilder::<TestArray, TestOp>::new();
+        let mut condition_builder = ProgramBuilder::<Array, TestOp>::new();
         let cond_input = condition_builder.add_input(scalar_f64.clone());
         let cond_zero = condition_builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![cond_input]).unwrap()[0];
         let cond_output = condition_builder
@@ -120,25 +117,25 @@ mod tests {
                 vec![cond_input, cond_zero],
             )
             .unwrap()[0];
-        let condition: Program<TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
+        let condition: Program<Array, TestOp, Vec<Array>, Vec<Array>> = condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![cond_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         // Body program: state -> state - 1.
-        let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestOp>::new();
         let body_input = body_builder.add_input(scalar_f64);
         let body_one = body_builder.add_instruction(OneLikeOperation, Vec::new(), vec![body_input]).unwrap()[0];
         let body_output =
             body_builder.add_instruction(SubOperation, Vec::new(), vec![body_input, body_one]).unwrap()[0];
-        let body: Program<TestArray, TestOp, Vec<TestArray>, Vec<TestArray>> = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+        let body: Program<Array, TestOp, Vec<Array>, Vec<Array>> = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let while_op = WhileOperation::new();
-        let context = BatchingContext::new(EagerContext::<TestArray, TestOp>::new(), 3);
+        let context = BatchingContext::new(EagerContext::<Array, TestOp>::new(), 3);
 
         let initial_state = {
-            let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
+            let value = Array::vector(vec![3.0, 1.0, 2.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -159,7 +156,7 @@ mod tests {
         // their own predicates first.
         let bounded_while_op = while_op.with_iteration_bound(2).unwrap();
         let initial_state = {
-            let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
+            let value = Array::vector(vec![3.0, 1.0, 2.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -173,7 +170,7 @@ mod tests {
         assert_eq!(outputs[0].value().values(), &[1.0, 0.0, 0.0]);
 
         // The replicated batched loop respects the bound as well: an unbatched initial state of 5.0 stops at 3.0.
-        let initial_state = ArrayBatch::replicated(TestArray::scalar(5.0));
+        let initial_state = ArrayBatch::replicated(Array::scalar(5.0));
         let inputs = [BatchingTracer::new(context.clone(), initial_state)];
         let outputs = context
             .bind(bounded_while_op, vec![condition, body], &inputs)
@@ -186,11 +183,8 @@ mod tests {
 
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
 
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -207,11 +201,9 @@ mod tests {
 
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
-        let jacobian = jacrev(
-            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
-            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-        )
-        .unwrap();
+        let jacobian =
+            jacrev(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
+                .unwrap();
 
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [block_00, block_01, block_10, block_11] = blocks.as_slice() else { unreachable!() };
@@ -224,30 +216,33 @@ mod tests {
 
     #[test]
     fn test_dense_differentiation_uses_widened_f8_differential_values() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let input = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
 
         let forward = context.jacfwd(|value| value.sin(), input.clone()).unwrap();
         let forward_block = forward.iter_blocks().next().unwrap();
         assert_eq!(forward_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(forward_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-9);
+        // The derivative payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
+        assert_abs_diff_eq!(forward_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         let reverse = context.jacrev(|value| value.sin(), input.clone()).unwrap();
         let reverse_block = reverse.iter_blocks().next().unwrap();
         assert_eq!(reverse_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(reverse_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-9);
+        // The derivative payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
+        assert_abs_diff_eq!(reverse_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         let hessian = context.hessian(|value| value.sin(), input).unwrap();
         let hessian_block = hessian.iter_blocks().next().unwrap();
         assert_eq!(hessian_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(hessian_block.value().values()[0], -2.0f64.sin(), epsilon = 1e-9);
+        // The derivative payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
+        assert_abs_diff_eq!(hessian_block.value().values()[0], -2.0f64.sin(), epsilon = 1e-6);
     }
 
     #[test]
     fn test_jacrev_converts_promoted_cotangents_to_each_input_type() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let f32 = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
-        let f64 = TestArray::new(ArrayType::scalar(DataType::F64), vec![3.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let f32 = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let f64 = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
 
         let add = context.jacrev(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap();
         let add_blocks = add.iter_blocks().collect::<Vec<_>>();
@@ -276,18 +271,18 @@ mod tests {
         let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, pullback) = context
             .vjp(
                 |(left, right)| Ok(left + right),
                 (
-                    TestArray::new(sharded_type.clone(), vec![1.0, 2.0]),
-                    TestArray::new(replicated_type.clone(), vec![3.0, 4.0]),
+                    Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
+                    Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]),
                 ),
             )
             .unwrap();
         assert!(pullback.program().to_string().contains("reshard"));
-        let (left, right) = pullback.apply(TestArray::new(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
+        let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
 
         assert_eq!(left.r#type().as_ref(), &sharded_type);
         assert_eq!(right.r#type().as_ref(), &replicated_type);
@@ -295,8 +290,8 @@ mod tests {
 
     #[test]
     fn test_dense_jacobians_unbroadcast_scalar_elementwise_inputs() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primals = (TestArray::scalar(2.0), TestArray::vector(vec![3.0, 4.0]));
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primals = (Array::scalar(2.0), Array::vector(vec![3.0, 4.0]));
         let forward = context.jacfwd(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals.clone()).unwrap();
         let reverse = context.jacrev(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals).unwrap();
 
@@ -320,7 +315,7 @@ mod tests {
                     .jacfwd(|value| Ok(value.clone() * value), input)
                     .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))
             },
-            TestArray::vector(vec![1.0, 2.0, 3.0]),
+            Array::vector(vec![1.0, 2.0, 3.0]),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
@@ -334,8 +329,8 @@ mod tests {
     #[test]
     fn test_dense_jacobians_keep_zero_sized_blocks_as_domain_values() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
-        let input = TestArray::new(r#type.clone(), Vec::new());
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let input = Array::from_f64s(r#type.clone(), Vec::new());
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         let forward = context.jacfwd(|x| Ok(x.clone() + x), input.clone()).unwrap();
         let forward_block = forward.iter_blocks().next().unwrap();
@@ -352,7 +347,7 @@ mod tests {
         assert_eq!(reverse_block.value().r#type(), forward_block.value().r#type());
         assert!(reverse_block.value().values().is_empty());
 
-        let input = TestArray::new(r#type, Vec::new());
+        let input = Array::from_f64s(r#type, Vec::new());
         let hessian = context.hessian(|x| Ok(x.clone() * x), input).unwrap();
         let hessian_block = hessian.iter_blocks().next().unwrap();
         assert_eq!(hessian_block.value().r#type().static_shape().unwrap().as_slice(), &[0, 0, 0]);
@@ -361,11 +356,8 @@ mod tests {
 
     #[test]
     fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
 
         let triples = jacobian
@@ -390,8 +382,8 @@ mod tests {
 
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
-        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .hessian(|(x, y)| Ok(x.clone() * y + x.sin()?), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
+        let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .hessian(|(x, y)| Ok(x.clone() * y + x.sin()?), (Array::scalar(2.0), Array::scalar(3.0)))
             .unwrap();
 
         let blocks = hessian.iter_blocks().collect::<Vec<_>>();
@@ -405,8 +397,8 @@ mod tests {
 
     #[test]
     fn test_hessian_materializes_all_structured_output_blocks() {
-        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .hessian(|x| Ok((x.clone() * x.clone(), x.clone() * x.clone() * x)), TestArray::scalar(2.0))
+        let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .hessian(|x| Ok((x.clone() * x.clone(), x.clone() * x.clone() * x)), Array::scalar(2.0))
             .unwrap();
 
         let blocks = hessian.iter_blocks().collect::<Vec<_>>();
@@ -421,11 +413,11 @@ mod tests {
 
     #[test]
     fn test_hessian_materializes_structured_mixed_rank_cartesian_product() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let hessian = context
             .hessian(
                 |(vector, scalar)| Ok((vector.clone() * vector, scalar.clone() * scalar)),
-                (TestArray::vector(vec![1.0, 2.0]), TestArray::scalar(3.0)),
+                (Array::vector(vec![1.0, 2.0]), Array::scalar(3.0)),
             )
             .unwrap();
         let blocks = hessian.iter_blocks().collect::<Vec<_>>();
@@ -457,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_dense_differentiation_can_differentiate_hessian_values() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let derivative = context
             .jacfwd(
                 |input| {
@@ -467,7 +459,7 @@ mod tests {
                         .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))?;
                     Ok(hessian.into_values().remove(0))
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
 
@@ -476,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_reverse_mode_composes_around_forward_jacobian() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let derivative = context
             .jacrev(
                 |input| {
@@ -486,7 +478,7 @@ mod tests {
                         .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))?;
                     Ok(jacobian.into_values().remove(0))
                 },
-                TestArray::scalar(3.0),
+                Array::scalar(3.0),
             )
             .unwrap();
 
@@ -495,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_dense_differentiation_with_aux_preserves_auxiliary_values() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         let forward_evaluations = Cell::new(0);
         let (forward, forward_auxiliary) = context
@@ -504,7 +496,7 @@ mod tests {
                     forward_evaluations.set(forward_evaluations.get() + 1);
                     Ok((x.clone() * x.clone(), x))
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
         assert_eq!(forward_evaluations.get(), 1);
@@ -518,7 +510,7 @@ mod tests {
                     reverse_evaluations.set(reverse_evaluations.get() + 1);
                     Ok((x.clone() * x.clone(), x))
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
         assert_eq!(reverse_evaluations.get(), 1);
@@ -532,7 +524,7 @@ mod tests {
                     hessian_evaluations.set(hessian_evaluations.get() + 1);
                     Ok((x.clone() * x.clone(), x))
                 },
-                TestArray::scalar(2.0),
+                Array::scalar(2.0),
             )
             .unwrap();
         assert_eq!(hessian_evaluations.get(), 1);
@@ -542,14 +534,14 @@ mod tests {
 
     #[test]
     fn test_dense_differentiation_validates_element_and_coordinate_types() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         assert_eq!(
-            crate::tracing_v2::jacfwd(|inputs| Ok(inputs), Vec::<TestArray>::new()).unwrap_err(),
+            crate::tracing_v2::jacfwd(|inputs| Ok(inputs), Vec::<Array>::new()).unwrap_err(),
             DifferentiationError::EmptyInput,
         );
 
-        let integer = TestArray::new(ArrayType::scalar(DataType::I32), vec![2.0]);
+        let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), integer).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {
@@ -560,7 +552,7 @@ mod tests {
             },
         );
 
-        let complex = TestArray::new(ArrayType::scalar(DataType::C64), vec![2.0]);
+        let complex = Array::from_f64s(ArrayType::scalar(DataType::C64), vec![2.0]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), complex.clone()).unwrap_err(),
             DifferentiationError::ComplexParameter {
@@ -571,10 +563,13 @@ mod tests {
             },
         );
         let holomorphic = context.jacfwd_holomorphic(|x| Ok(x), complex).unwrap();
-        assert_eq!(holomorphic.iter_blocks().next().unwrap().value().values(), &[1.0]);
+        assert_eq!(
+            holomorphic.iter_blocks().next().unwrap().value().values(),
+            &[Scalar::C64(ComplexNumber::new(1.0, 0.0))],
+        );
 
         assert_eq!(
-            context.jacrev_holomorphic(|x| Ok(x), TestArray::scalar(2.0)).unwrap_err(),
+            context.jacrev_holomorphic(|x| Ok(x), Array::scalar(2.0)).unwrap_err(),
             DifferentiationError::NonComplexParameter {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
@@ -585,8 +580,8 @@ mod tests {
 
         let complex_output_error = context
             .jacrev(
-                |input| Ok(input.context().lift(TestArray::new(ArrayType::scalar(DataType::C64), vec![1.0]))?),
-                TestArray::scalar(2.0),
+                |input| Ok(input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::C64), vec![1.0]))?),
+                Array::scalar(2.0),
             )
             .unwrap_err();
         assert_eq!(
@@ -600,7 +595,7 @@ mod tests {
         );
 
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
-        let dynamic = TestArray::new(dynamic_type, vec![1.0]);
+        let dynamic = Array::with_unchecked_type(dynamic_type, vec![Scalar::F64(1.0)]);
         assert_eq!(
             context.jacfwd(|x| Ok(x), dynamic).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
@@ -615,8 +610,10 @@ mod tests {
         assert_eq!(
             context
                 .jacfwd(
-                    |input| Ok(input.context().lift(TestArray::new(dynamic_type.clone(), vec![1.0]))?),
-                    TestArray::scalar(1.0),
+                    |input| Ok(input
+                        .context()
+                        .lift(Array::with_unchecked_type(dynamic_type.clone(), vec![Scalar::F64(1.0)]))?),
+                    Array::scalar(1.0),
                 )
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
@@ -627,9 +624,9 @@ mod tests {
             },
         );
 
-        let dynamic = TestArray::new(dynamic_type, vec![1.0]);
+        let dynamic = Array::with_unchecked_type(dynamic_type, vec![Scalar::F64(1.0)]);
         assert_eq!(
-            context.jacrev(|input| Ok(input.context().lift(TestArray::scalar(1.0))?), dynamic).unwrap_err(),
+            context.jacrev(|input| Ok(input.context().lift(Array::scalar(1.0))?), dynamic).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
@@ -642,10 +639,10 @@ mod tests {
     #[test]
     fn test_jacfwd_handles_function_with_independent_outputs() {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
             )
             .unwrap();
 
@@ -671,8 +668,8 @@ mod tests {
     }
 
     /// Builds a replicated scalar Boolean predicate batch with the provided truth value.
-    fn replicated_predicate(value: bool) -> ArrayBatch<TestArray> {
-        ArrayBatch::replicated(TestArray::new(
+    fn replicated_predicate(value: bool) -> ArrayBatch<Array> {
+        ArrayBatch::replicated(Array::from_f64s(
             ArrayType::scalar(DataType::Boolean),
             vec![if value { 1.0 } else { 0.0 }],
         ))
@@ -682,10 +679,10 @@ mod tests {
     fn vector_scale_branch(
         size: usize,
         factor: f64,
-    ) -> crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    ) -> crate::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)])));
-        let factor = builder.add_constant(TestArray::scalar(factor));
+        let factor = builder.add_constant(Array::scalar(factor));
         let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -693,24 +690,24 @@ mod tests {
     /// Builds a vector-input program that returns a replicated constant vector.
     fn constant_vector_branch(
         values: Vec<f64>,
-    ) -> crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+    ) -> crate::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())])));
-        let output = builder.add_constant(TestArray::vector(values));
+        let output = builder.add_constant(Array::vector(values));
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Batches a vector-valued condition whose true and false branches scale their input by two and three.
-    fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<TestArray> {
+    fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<Array> {
         let physical_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size), Size::Static(item_size)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
         let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
-        let predicate = TestArray::new(predicate_type.clone(), predicate_values);
+        let predicate = Array::from_f64s(predicate_type.clone(), predicate_values);
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
-        let operand = TestArray::new(physical_type.clone(), input_values);
+        let operand = Array::from_f64s(physical_type.clone(), input_values);
         let operand = ArrayBatch::new(physical_type, operand, Some(0)).unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
         let mut outputs = context
             .bind(
                 ArrayOperation::Condition(ConditionOperation::new()),
@@ -731,10 +728,10 @@ mod tests {
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
         let operation = ArrayOperation::Condition(condition);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
 
         let batched_input = {
-            let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
+            let value = Array::vector(vec![1.0, 4.0, 9.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -751,7 +748,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         let output_batch = outputs[0].batch();
         assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
-        assert_eq!(output_batch.value().values, vec![2.0, 8.0, 18.0]);
+        assert_eq!(output_batch.value().to_f64s(), vec![2.0, 8.0, 18.0]);
     }
 
     #[test]
@@ -761,10 +758,10 @@ mod tests {
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
         let operation = ArrayOperation::Condition(condition);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
 
         let batched_input = {
-            let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
+            let value = Array::vector(vec![1.0, 4.0, 9.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
@@ -781,7 +778,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         let output_batch = outputs[0].batch();
         assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
-        assert_eq!(output_batch.value().values, vec![3.0, 12.0, 27.0]);
+        assert_eq!(output_batch.value().to_f64s(), vec![3.0, 12.0, 27.0]);
     }
 
     #[test]
@@ -791,25 +788,25 @@ mod tests {
         // Batched matmul: [2, 2, 3] @ [2, 3, 2] -> [2, 2, 2] with axis 0 batched.
         let lhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let rhs_values: Vec<f64> = (1..=12).map(|value| value as f64).collect();
-        let lhs = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
-            values: lhs_values,
-        };
-        let rhs = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
-            values: rhs_values,
-        };
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
+            lhs_values,
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
+            rhs_values,
+        );
 
         let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
         let output = lhs.dot(&rhs, &dimensions);
 
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
         );
         // Batch 0: [[1,2,3],[4,5,6]] @ [[1,2],[3,4],[5,6]] = [[22,28],[49,64]]
         // Batch 1: [[7,8,9],[10,11,12]] @ [[7,8],[9,10],[11,12]] = [[220,244],[301,334]]
-        assert_eq!(output.values, vec![22.0, 28.0, 49.0, 64.0, 220.0, 244.0, 301.0, 334.0]);
+        assert_eq!(output.to_f64s(), vec![22.0, 28.0, 49.0, 64.0, 220.0, 244.0, 301.0, 334.0]);
     }
 
     #[test]
@@ -818,23 +815,23 @@ mod tests {
 
         // Rank-3 transpose with permutation [2, 0, 1]: [2, 3, 4] -> [4, 2, 3].
         let values: Vec<f64> = (0..24).map(|value| value as f64).collect();
-        let input = TestArray {
-            r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
+        let input = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
             values,
-        };
+        );
 
         let output = input.transpose(vec![2, 0, 1]).unwrap();
 
         assert_eq!(
-            output.r#type,
+            output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)])),
         );
         // Spot-check: input[0, 0, 0] (= 0) goes to output[0, 0, 0]; input[0, 0, 1] (= 1) -> output[1, 0, 0];
         // input[1, 2, 3] (= 23) -> output[3, 1, 2].
-        assert_eq!(output.values[0], 0.0);
-        assert_eq!(output.values[1 * 6], 1.0);
+        assert_eq!(output.to_f64s()[0], 0.0);
+        assert_eq!(output.to_f64s()[1 * 6], 1.0);
         let output_flat_for_23 = 3 * 6 + 1 * 3 + 2;
-        assert_eq!(output.values[output_flat_for_23], 23.0);
+        assert_eq!(output.to_f64s()[output_flat_for_23], 23.0);
     }
 
     #[test]
@@ -846,7 +843,7 @@ mod tests {
         // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
             |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
-            (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
+            (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0])),
         )
         .unwrap();
 
@@ -863,10 +860,10 @@ mod tests {
         // jacfwd linearizes the function once, then replays all input-coordinate basis tangents through the
         // pushforward in one batched pass. A dot-product scalar output exercises captured-factor (product-rule)
         // linear maps instead of only elementwise tangent arithmetic.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
-                (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
+                (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0])),
             )
             .unwrap();
 
@@ -888,13 +885,15 @@ mod tests {
 
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let predicate_batch =
-            ArrayBatch::new(predicate_type.clone(), TestArray::new(predicate_type, vec![1.0, 0.0, 1.0, 0.0]), Some(0))
-                .unwrap();
-        let operand_batch =
-            ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
+        let predicate_batch = ArrayBatch::new(
+            predicate_type.clone(),
+            Array::from_f64s(predicate_type, vec![1.0, 0.0, 1.0, 0.0]),
+            Some(0),
+        )
+        .unwrap();
+        let operand_batch = ArrayBatch::new(operand_type, Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let outputs = context
             .bind(
                 operation,
@@ -907,7 +906,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].batch().value().values, vec![2.0, 6.0, 6.0, 12.0]);
+        assert_eq!(outputs[0].batch().value().to_f64s(), vec![2.0, 6.0, 6.0, 12.0]);
     }
 
     #[test]
@@ -930,11 +929,11 @@ mod tests {
         let batch_size = 2;
         let item_size = 3;
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
-        let predicate = TestArray::new(predicate_type.clone(), vec![1.0, 0.0]);
+        let predicate = Array::from_f64s(predicate_type.clone(), vec![1.0, 0.0]);
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
-        let operand = TestArray::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
 
         let outputs = context
             .bind(
@@ -951,21 +950,21 @@ mod tests {
 
     #[test]
     fn test_batching_batch_varying_condition_rejects_effectful_branches_before_replay() {
-        let mut effectful_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut effectful_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
         let output =
             effectful_builder.add_instruction(PrintOperation::new("branch"), Vec::new(), vec![input]).unwrap()[0];
         let effectful_branch = effectful_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let batch_size = 2;
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
-        let predicate = TestArray::new(predicate_type.clone(), vec![1.0, 0.0]);
+        let predicate = Array::from_f64s(predicate_type.clone(), vec![1.0, 0.0]);
         let predicate = ArrayBatch::new(predicate_type, predicate, Some(0)).unwrap();
-        let operand = TestArray::vector(vec![1.0, 2.0]);
+        let operand = Array::vector(vec![1.0, 2.0]);
         let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, Some(0)).unwrap();
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), batch_size);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
 
         let error = context
             .bind(
@@ -989,10 +988,10 @@ mod tests {
 
         // A length-3 vector broadcast to shape [2, 3] with output_axes=[1]: the input
         // axis maps to output axis 1, so the value replicates across output axis 0.
-        let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output = input.broadcast(target, &[1]).unwrap();
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1001,10 +1000,13 @@ mod tests {
 
         // `t.broadcast_leading([2])` prepends a leading axis of size 2 and replicates the original
         // values across it. Matches `jax.lax.broadcast(t, [2])`.
-        let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
         let output = input.broadcast_leading(vec![2]).unwrap();
-        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
-        assert_eq!(output.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+        );
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1012,16 +1014,16 @@ mod tests {
         use crate::operations::manipulation::Broadcast;
 
         // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
-        let scalar = TestArray::scalar(7.0);
+        let scalar = Array::scalar(7.0);
         let output = scalar.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
-        assert_eq!(output.values, vec![7.0; 6]);
+        assert_eq!(output.to_f64s(), vec![7.0; 6]);
 
         // A rank-1 `[3]` vector broadcasts to `[2, 3]` by right-aligning: input axis 0 maps
         // to output axis 1, replicating across output axis 0 — matches NumPy's
         // `np.broadcast_to(x, (2, 3))`.
-        let vector = TestArray::vector(vec![10.0, 20.0, 30.0]);
+        let vector = Array::vector(vec![10.0, 20.0, 30.0]);
         let output = vector.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
-        assert_eq!(output.values, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+        assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
     }
 
     #[test]
@@ -1035,21 +1037,20 @@ mod tests {
 
         let pred_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let pred_batch = ArrayBatch::new(pred_type.clone(), TestArray::new(pred_type, vec![1.0]), None).unwrap();
-        let on_true_batch =
-            ArrayBatch::new(operand_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
-        let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
+        let pred_batch = ArrayBatch::new(pred_type.clone(), Array::from_f64s(pred_type, vec![1.0]), None).unwrap();
+        let on_true_batch = ArrayBatch::new(operand_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let on_false_batch = ArrayBatch::new(operand_type, Array::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
 
         let outputs = SelectOperation
             .batch(
-                &BatchingContext::new(EagerContext::<TestArray>::new(), 3),
+                &BatchingContext::new(EagerContext::<Array>::new(), 3),
                 &crate::EmptyRegionDriver,
                 &[pred_batch, on_true_batch, on_false_batch],
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -1060,10 +1061,10 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
 
-        let outputs: Vec<ArrayBatch<TestArray>> = operation
+        let outputs: Vec<ArrayBatch<Array>> = operation
             .batch(
                 &BatchingContext::new(
-                    EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
+                    EagerContext::<Array, crate::operations::constants::ConstantOperation<Array>>::new(),
                     2,
                 ),
                 &crate::EmptyRegionDriver,
@@ -1073,7 +1074,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
-        assert_eq!(outputs[0].value().values, vec![0.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0]);
     }
 
     #[test]
@@ -1082,10 +1083,10 @@ mod tests {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::OneOperation::new(scalar.clone());
 
-        let outputs: Vec<ArrayBatch<TestArray>> = operation
+        let outputs: Vec<ArrayBatch<Array>> = operation
             .batch(
                 &BatchingContext::new(
-                    EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
+                    EagerContext::<Array, crate::operations::constants::ConstantOperation<Array>>::new(),
                     2,
                 ),
                 &crate::EmptyRegionDriver,
@@ -1095,7 +1096,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
-        assert_eq!(outputs[0].value().values, vec![1.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0]);
     }
 
     #[test]
@@ -1105,22 +1106,22 @@ mod tests {
         // `Zero`/`Fill` instruction takes when `BatchingContext::interpret_program` dispatches it through the enum's
         // `batch` with no inputs.
         let scalar = ArrayType::scalar(DataType::F64);
-        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2);
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
 
-        let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
-        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
+        let zero = ArrayOperation::<Array>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
+        let outputs: Vec<ArrayBatch<Array>> = zero.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values, vec![0.0]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0]);
 
-        let fill = ArrayOperation::<TestArray>::Fill(crate::operations::constants::FillOperation::new(
+        let fill = ArrayOperation::<Array>::Fill(crate::operations::constants::FillOperation::new(
             scalar,
             crate::backends::scalars::Scalar::from(7.5),
         ));
-        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
+        let outputs: Vec<ArrayBatch<Array>> = fill.batch(&context, &crate::EmptyRegionDriver, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().values, vec![7.5]);
+        assert_eq!(outputs[0].value().to_f64s(), vec![7.5]);
     }
 
     #[test]
@@ -1128,7 +1129,7 @@ mod tests {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
         // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
         // that the constant-op rule composes cleanly with reverse-mode autodiff.
-        let jacobian = jacrev(|x| Ok(x.clone() + x.zero_like()), TestArray::scalar(2.0)).unwrap();
+        let jacobian = jacrev(|x| Ok(x.clone() + x.zero_like()), Array::scalar(2.0)).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 0) / dx = 1 at the scalar point.
         assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
@@ -1138,8 +1139,8 @@ mod tests {
     fn test_jacfwd_through_function_using_one_like() {
         // `f(x) = x + one_like(x)` shifts x by a constant; the Jacobian is still 1. Exercises
         // `OneLikeOperation` through jacfwd's internal batching.
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0))
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|x| Ok(x.clone() + x.one_like()), Array::scalar(2.0))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 1) / dx = 1.
@@ -1154,12 +1155,12 @@ mod tests {
     where
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain:
-            crate::contexts::Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
+            crate::contexts::Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
         let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
         let condition = ConditionOperation::new();
         let context = x.dispatch_domain();
-        let predicate = context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
+        let predicate = context.lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
         let mut outputs = context
             .bind(ArrayOperation::Condition(condition), condition_regions.clone(), &[predicate, x])
             .unwrap();
@@ -1172,10 +1173,10 @@ mod tests {
     where
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain:
-            crate::contexts::Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
+            crate::contexts::Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
         let context = x.dispatch_domain();
-        let zero = context.lift(TestArray::scalar(0.0))?;
+        let zero = context.lift(Array::scalar(0.0))?;
         let mut predicates = context.bind(
             ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
             Vec::new(),
@@ -1194,21 +1195,21 @@ mod tests {
     fn test_condition_composes_with_jacrev_and_jacfwd() {
         // The constant `true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
         // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
-        let jacobian = jacrev(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0)).unwrap();
+        let jacobian = jacrev(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0))
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
     }
 
     #[test]
     fn test_dense_jacobians_replay_runtime_condition_regions() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for (input, expected) in [(4.0, 2.0), (-4.0, 3.0)] {
-            let forward = context.jacfwd(stage_runtime_predicate_condition, TestArray::scalar(input)).unwrap();
-            let reverse = context.jacrev(stage_runtime_predicate_condition, TestArray::scalar(input)).unwrap();
+            let forward = context.jacfwd(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
+            let reverse = context.jacrev(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
             assert_abs_diff_eq!(forward.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
             assert_abs_diff_eq!(reverse.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
         }
@@ -1218,15 +1219,15 @@ mod tests {
     /// returning the payload-free operation together with its condition and body region programs (in region order).
     fn doubling_while_operation() -> (
         crate::operations::control_flow::WhileOperation,
-        Vec<crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>,
+        Vec<crate::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
     ) {
         use crate::operations::compare::ComparisonDirection;
-        type TestOp = ArrayOperation<TestArray>;
+        type TestOp = ArrayOperation<Array>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<TestArray, TestOp>::new();
+        let mut condition_builder = ProgramBuilder::<Array, TestOp>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
-        let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
+        let threshold = condition_builder.add_constant(Array::scalar(8.0));
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::LessThan),
@@ -1235,14 +1236,14 @@ mod tests {
             )
             .unwrap()[0];
         let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
+        let mut body_builder = ProgramBuilder::<Array, TestOp>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let doubled = body_builder.add_instruction(AddOperation, Vec::new(), vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         (crate::operations::control_flow::WhileOperation::new(), vec![condition, body])
@@ -1254,7 +1255,7 @@ mod tests {
         // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain:
         // the rule stages the doubled-state linear loop, which direct JVP execution interprets immediately.
         let (while_operation, while_regions) = doubling_while_operation();
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |x| {
                     let mut outputs = x.context().bind(
@@ -1264,12 +1265,12 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
-        assert_eq!(primal.values, vec![8.0]);
-        assert_eq!(tangent.values, vec![8.0]);
+        assert_eq!(primal.to_f64s(), vec![8.0]);
+        assert_eq!(tangent.to_f64s(), vec![8.0]);
     }
 
     #[test]
@@ -1279,7 +1280,7 @@ mod tests {
         // interpreted over the batching rules with concrete values, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let (while_operation, while_regions) = doubling_while_operation();
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacfwd(
                 move |x| {
                     let mut outputs = x.context().bind(
@@ -1289,7 +1290,7 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 8.0, epsilon = 1e-9);
@@ -1299,7 +1300,7 @@ mod tests {
     fn test_jacrev_through_bounded_while_batches_basis_cotangents() {
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
-        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jacrev(
                 move |x| {
                     let mut outputs = x.context().bind(
@@ -1309,7 +1310,7 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 8.0, epsilon = 1e-9);
@@ -1323,7 +1324,7 @@ mod tests {
         // the value is 8 and the gradient is 8.
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
@@ -1332,11 +1333,11 @@ mod tests {
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![8.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![8.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
 
     #[test]
@@ -1346,7 +1347,7 @@ mod tests {
         // `f(x) = 8 x`, so the value is 8 and the gradient is 8. JAX cannot do this even under eager execution,
         // because it always traces `while_loop`.
         let (while_operation, while_regions) = doubling_while_operation();
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |x| {
                     let mut outputs = x
@@ -1355,11 +1356,11 @@ mod tests {
                         .unwrap();
                     outputs.remove(0)
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
-        assert_eq!(value.values, vec![8.0]);
-        assert_eq!(gradient.values, vec![8.0]);
+        assert_eq!(value.to_f64s(), vec![8.0]);
+        assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
 
     #[test]
@@ -1370,7 +1371,7 @@ mod tests {
         // is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 move |x| {
                     let mut outputs = x.context().bind(
@@ -1380,27 +1381,23 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![8.0]);
+        assert_eq!(output.to_f64s(), vec![8.0]);
         assert!(!pullback.to_string().contains("while"), "{pullback}");
-        let pullback_inputs = |cotangent: TestArray| {
+        let pullback_inputs = |cotangent: Array| {
             let mut inputs = vec![cotangent];
             inputs.extend(residuals.iter().cloned());
             inputs
         };
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(1.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(1.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![8.0]),
         );
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(5.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(5.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![40.0]),
         );
     }
@@ -1410,7 +1407,7 @@ mod tests {
         // Eager `vjp` transposes the unrolled straight-line pushforward of an *unbounded* loop into a reusable
         // pullback: the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let (while_operation, while_regions) = doubling_while_operation();
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 move |x| {
                     let mut outputs = x.context().bind(
@@ -1420,26 +1417,22 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                TestArray::scalar(1.0),
+                Array::scalar(1.0),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![8.0]);
-        let pullback_inputs = |cotangent: TestArray| {
+        assert_eq!(output.to_f64s(), vec![8.0]);
+        let pullback_inputs = |cotangent: Array| {
             let mut inputs = vec![cotangent];
             inputs.extend(residuals.iter().cloned());
             inputs
         };
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(1.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(1.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![8.0]),
         );
         assert_eq!(
-            pullback
-                .interpret(pullback_inputs(TestArray::scalar(5.0)))
-                .map(|cotangents| cotangents[0].values.clone()),
+            pullback.interpret(pullback_inputs(Array::scalar(5.0))).map(|cotangents| cotangents[0].to_f64s()),
             Ok(vec![40.0]),
         );
     }
@@ -1449,22 +1442,22 @@ mod tests {
     fn product_scan_operation(
         reverse: bool,
     ) -> (
-        crate::operations::control_flow::ScanOperation<TestArray>,
-        crate::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        crate::operations::control_flow::ScanOperation<Array>,
+        crate::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) {
-        type TestOp = ArrayOperation<TestArray>;
-        let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
+        type TestOp = ArrayOperation<Array>;
+        let mut body_builder = ProgramBuilder::<Array, TestOp>::new();
         let carry = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let x = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let product = body_builder.add_instruction(MulOperation, Vec::new(), vec![carry, x]).unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![product, product],
                 vec![Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        (crate::operations::control_flow::ScanOperation::<TestArray>::new(1, 3).with_reverse(reverse), body)
+        (crate::operations::control_flow::ScanOperation::<Array>::new(1, 3).with_reverse(reverse), body)
     }
 
     #[test]
@@ -1475,7 +1468,7 @@ mod tests {
         // (same residual stacks, `reverse` flipped) — the static trip count is what makes this total, where the
         // staged linear `while` rejects transposition.
         let (scan, scan_body) = product_scan_operation(false);
-        let (value, (init_gradient, xs_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (value, (init_gradient, xs_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 move |(init, xs)| {
                     let mut outputs = init
@@ -1484,12 +1477,12 @@ mod tests {
                         .unwrap();
                     outputs.remove(0)
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
-        assert_eq!(value.values, vec![24.0]);
-        assert_eq!(init_gradient.values, vec![24.0]);
-        assert_eq!(xs_gradient.values, vec![12.0, 8.0, 6.0]);
+        assert_eq!(value.to_f64s(), vec![24.0]);
+        assert_eq!(init_gradient.to_f64s(), vec![24.0]);
+        assert_eq!(xs_gradient.to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     #[test]
@@ -1498,7 +1491,7 @@ mod tests {
         // scan: the same residual stacks with `reverse` flipped to `true`. Each cotangent seed scales the
         // hand-computed gradients `(24, [12, 8, 6])`.
         let (scan, scan_body) = product_scan_operation(false);
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1508,31 +1501,31 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![24.0]);
+        assert_eq!(output.to_f64s(), vec![24.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
-        let pullback_inputs = |cotangent: TestArray| {
+        let pullback_inputs = |cotangent: Array| {
             let mut inputs = vec![cotangent];
             inputs.extend(residuals.iter().cloned());
             inputs
         };
-        let cotangents = pullback.interpret(pullback_inputs(TestArray::scalar(1.0))).unwrap();
-        assert_eq!(cotangents[0].values, vec![24.0]);
-        assert_eq!(cotangents[1].values, vec![12.0, 8.0, 6.0]);
-        let cotangents = pullback.interpret(pullback_inputs(TestArray::scalar(2.0))).unwrap();
-        assert_eq!(cotangents[0].values, vec![48.0]);
-        assert_eq!(cotangents[1].values, vec![24.0, 16.0, 12.0]);
+        let cotangents = pullback.interpret(pullback_inputs(Array::scalar(1.0))).unwrap();
+        assert_eq!(cotangents[0].to_f64s(), vec![24.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![12.0, 8.0, 6.0]);
+        let cotangents = pullback.interpret(pullback_inputs(Array::scalar(2.0))).unwrap();
+        assert_eq!(cotangents[0].to_f64s(), vec![48.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![24.0, 16.0, 12.0]);
     }
 
     #[test]
     fn test_dense_jacobians_replay_scan_regions() {
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
         let (scan, body) = product_scan_operation(false);
         let forward = context
             .jacfwd(
@@ -1577,7 +1570,7 @@ mod tests {
         // and mixed derivatives between values are `initial` times the remaining value. This exercises nested
         // forward-over-reverse replay of the scan body rather than only first-order region replay.
         let (scan, body) = product_scan_operation(false);
-        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .hessian(
                 move |(initial, values)| {
                     let mut outputs = initial.context().bind(
@@ -1587,7 +1580,7 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
 
@@ -1614,7 +1607,7 @@ mod tests {
         // product has `ys = [x0 x1 x2, x1 x2, x2] = [24, 12, 4]`, so a unit tangent on `x1` gives
         // `dys = [x0 x2, x2, 0] = [8, 4, 0]`.
         let (scan, scan_body) = product_scan_operation(true);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1625,19 +1618,19 @@ mod tests {
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
-                (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 1.0, 0.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(0.0), Array::vector(vec![0.0, 1.0, 0.0])),
             )
             .unwrap();
-        assert_eq!(carry.values, vec![24.0]);
-        assert_eq!(ys.values, vec![24.0, 12.0, 4.0]);
-        assert_eq!(carry_tangent.values, vec![8.0]);
-        assert_eq!(ys_tangent.values, vec![8.0, 4.0, 0.0]);
+        assert_eq!(carry.to_f64s(), vec![24.0]);
+        assert_eq!(ys.to_f64s(), vec![24.0, 12.0, 4.0]);
+        assert_eq!(carry_tangent.to_f64s(), vec![8.0]);
+        assert_eq!(ys_tangent.to_f64s(), vec![8.0, 4.0, 0.0]);
 
         // Reverse mode through the reversed scan flips `reverse` back to `false` in the pullback and produces the
         // same product-rule gradients (multiplication commutes across the visit order).
         let (scan, scan_body) = product_scan_operation(true);
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs = init.context().bind(
@@ -1647,18 +1640,18 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![24.0]);
+        assert_eq!(output.to_f64s(), vec![24.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=false"), "{rendered_pullback}");
-        let mut pullback_inputs = vec![TestArray::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_eq!(cotangents[0].values, vec![24.0]);
-        assert_eq!(cotangents[1].values, vec![12.0, 8.0, 6.0]);
+        assert_eq!(cotangents[0].to_f64s(), vec![24.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     #[test]
@@ -1667,11 +1660,11 @@ mod tests {
         let condition = ConditionOperation::new();
         let operation = ArrayOperation::Condition(condition);
 
-        let predicate = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
+        let predicate = Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         assert_eq!(
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .bind(operation, condition_regions, &[predicate, TestArray::scalar(4.0)])
-                .map(|outputs| outputs[0].values[0]),
+            EagerContext::<Array, ArrayOperation<Array>>::new()
+                .bind(operation, condition_regions, &[predicate, Array::scalar(4.0)])
+                .map(|outputs| outputs[0].to_f64s()[0]),
             Ok(12.0),
         );
     }
@@ -1682,7 +1675,7 @@ mod tests {
         // transpose rule: the pullback runs the transposed branch program selected by the captured predicate, so
         // the operand cotangent is 2 * output cotangent at a TRUE-predicate primal point and 3 * output cotangent
         // at a FALSE one. The Boolean predicate has no tangent space, so its cotangent slot is always zero.
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
@@ -1694,18 +1687,18 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]), TestArray::scalar(4.0)),
+                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]), Array::scalar(4.0)),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![8.0]);
-        let mut pullback_inputs = vec![TestArray::scalar(5.0)];
+        assert_eq!(output.to_f64s(), vec![8.0]);
+        let mut pullback_inputs = vec![Array::scalar(5.0)];
         pullback_inputs.extend(residuals);
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_eq!(cotangents[1].values, vec![10.0]);
-        assert_eq!(cotangents[0].values, vec![0.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![10.0]);
+        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
 
-        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
@@ -1717,15 +1710,15 @@ mod tests {
                     )?;
                     Ok(outputs.remove(0))
                 },
-                (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]), TestArray::scalar(4.0)),
+                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]), Array::scalar(4.0)),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        assert_eq!(output.values, vec![12.0]);
-        let mut pullback_inputs = vec![TestArray::scalar(5.0)];
+        assert_eq!(output.to_f64s(), vec![12.0]);
+        let mut pullback_inputs = vec![Array::scalar(5.0)];
         pullback_inputs.extend(residuals);
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_eq!(cotangents[1].values, vec![15.0]);
-        assert_eq!(cotangents[0].values, vec![0.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![15.0]);
+        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
     }
 }

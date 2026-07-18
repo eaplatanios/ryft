@@ -419,12 +419,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::manipulation::ConvertElementType;
     use crate::operations::math::{AddOperation, SinOperation};
     use crate::programs::atoms::MaybeZero;
-    use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -442,18 +442,18 @@ mod tests {
 
     #[test]
     fn test_array_elementwise_derivative_alignment() {
-        let scalar = TestArray::new(ArrayType::scalar(DataType::F32), vec![2.0]);
+        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        assert_eq!(scalar.align_tangent(&target), Ok(TestArray::new(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0])),);
+        assert_eq!(scalar.align_tangent(&target), Ok(Array::from_f64s(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0])),);
 
-        let cotangent = TestArray::new(
+        let cotangent = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         let target = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(cotangent.unalign_cotangent(&target), Ok(TestArray::new(target, vec![5.0, 7.0, 9.0])),);
+        assert_eq!(cotangent.unalign_cotangent(&target), Ok(Array::from_f64s(target, vec![5.0, 7.0, 9.0])),);
 
-        let value = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         assert!(matches!(
             value.align_tangent(&target),
@@ -464,22 +464,25 @@ mod tests {
 
     #[test]
     fn test_broadcast_derivative_alignment() {
-        let cotangent = TestArray::new(
+        let cotangent = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 0]),
-            Ok(TestArray::new(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])),
+            Ok(Array::from_f64s(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])),
         );
 
-        let cotangent = TestArray::new(
+        let cotangent = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
             (1..=24).map(|value| value as f64).collect(),
         );
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
-        assert_eq!(cotangent.unalign_cotangent_along(&target, &[1, 2]), Ok(TestArray::new(target, vec![126.0, 174.0])));
+        assert_eq!(
+            cotangent.unalign_cotangent_along(&target, &[1, 2]),
+            Ok(Array::from_f64s(target, vec![126.0, 174.0]))
+        );
 
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         assert!(matches!(

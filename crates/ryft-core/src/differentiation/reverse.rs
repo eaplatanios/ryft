@@ -1637,6 +1637,7 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jvp;
@@ -1656,9 +1657,7 @@ mod tests {
     use crate::programs::regions::{Region, RegionId, RegionInterface};
     use crate::programs::types::{TypeError, Typed};
     use crate::programs::values::Value;
-    use crate::tests::TestArray;
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
-    use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
     use super::*;
@@ -1865,11 +1864,11 @@ mod tests {
     #[test]
     fn test_pullback_apply_preserves_non_copy_structured_cotangents() {
         let function = |(left, right): (
-            LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-            LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
         )| Ok(left * right);
-        let (_, pullback) = vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
-        assert_eq!(pullback.apply(TestArray::scalar(4.0)), Ok((TestArray::scalar(8.0), TestArray::scalar(12.0))),);
+        let (_, pullback) = vjp(function, (Array::scalar(3.0), Array::scalar(2.0))).unwrap();
+        assert_eq!(pullback.apply(Array::scalar(4.0)), Ok((Array::scalar(8.0), Array::scalar(12.0))),);
     }
 
     #[test]
@@ -2431,8 +2430,8 @@ mod tests {
 
     #[test]
     fn test_vjp_stages_non_copy_array_pullbacks_into_an_enclosing_trace() {
-        let vector_type = TestArray::vector(vec![0.0; 3]).r#type;
-        let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let vector_type = Array::vector(vec![0.0; 3]).r#type().into_owned();
+        let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(vector_type.clone());
         let cotangent = context.input(vector_type);
         let (_, pullback) =
@@ -2442,7 +2441,7 @@ mod tests {
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<TestArray>, Vec<TestArray>>(
+            .build::<Vec<Array>, Vec<Array>>(
                 vec![input_cotangents[0].atom_id().unwrap()],
                 vec![Placeholder; 2],
                 vec![Placeholder],
@@ -2452,7 +2451,7 @@ mod tests {
         let input = [0.7f64, -1.2, 2.0];
         let output_cotangent = [2.5f64, 1.0, -0.5];
         let outputs = program
-            .interpret(vec![TestArray::vector(input.to_vec()), TestArray::vector(output_cotangent.to_vec())])
+            .interpret(vec![Array::vector(input.to_vec()), Array::vector(output_cotangent.to_vec())])
             .unwrap();
         let expected = input
             .into_iter()
@@ -2460,7 +2459,7 @@ mod tests {
             .map(|(input, cotangent)| (input.sin() + input * input.cos()) * cotangent)
             .collect::<Vec<_>>();
         assert_eq!(outputs.len(), 1);
-        for (actual, expected) in outputs[0].values.iter().zip(expected) {
+        for (actual, expected) in outputs[0].to_f64s().iter().zip(expected) {
             assert_abs_diff_eq!(actual, &expected, epsilon = 1e-9);
         }
     }

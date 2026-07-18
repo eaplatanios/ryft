@@ -1970,39 +1970,39 @@ mod tests {
     use std::fmt::Debug;
     use std::rc::Rc;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{Cos, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Memory, Shape, Size};
 
-    /// Shorthand for the policy contract over the `TestArray` array domain used throughout these tests.
-    trait TestPolicy: RematerializationPolicy<ArrayType, ArrayOperation<TestArray>> + Clone + Debug {}
+    /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.
+    trait TestPolicy: RematerializationPolicy<ArrayType, ArrayOperation<Array>> + Clone + Debug {}
 
-    impl<P: RematerializationPolicy<ArrayType, ArrayOperation<TestArray>> + Clone + Debug> TestPolicy for P {}
+    impl<P: RematerializationPolicy<ArrayType, ArrayOperation<Array>> + Clone + Debug> TestPolicy for P {}
 
     /// One staged [`RematerializeOperation`] together with its materialized region programs (in
     /// `["primal", "forward", "backward", "tangent"]` region order), exposing the same accessors the payload-owned
     /// operation used to so the structural assertions below stay readable.
     struct StagedRematerialization {
-        regions: Vec<Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>>,
+        regions: Vec<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
     }
 
     impl StagedRematerialization {
-        fn forward(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        fn forward(&self) -> &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             &self.regions[1]
         }
 
-        fn backward(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        fn backward(&self) -> &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             &self.regions[2]
         }
 
-        fn tangent(&self) -> &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        fn tangent(&self) -> &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             &self.regions[3]
         }
     }
@@ -2011,22 +2011,22 @@ mod tests {
     /// together with its materialized region programs.
     fn staged_operation<B, P>(
         function: &Rematerialize<
-            EagerContext<TestArray, ArrayOperation<TestArray>>,
+            EagerContext<Array, ArrayOperation<Array>>,
             B,
-            DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-            DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             P,
         >,
         input_type: ArrayType,
     ) -> StagedRematerialization
     where
         B: Fn(
-            DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError>,
+            DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError>,
         P: TestPolicy,
     {
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), input_type).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), input_type).unwrap();
         assert_eq!(program.instructions().len(), 1);
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
@@ -2052,8 +2052,8 @@ mod tests {
 
     /// [`dot_sine`] in the closure shape consumed by [`rematerialization`].
     fn dot_sine_body(
-        input: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-    ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+    ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
         Ok(dot_sine(input))
     }
 
@@ -2069,22 +2069,22 @@ mod tests {
 
     #[test]
     fn test_rematerialization_matches_the_unrematerialized_gradient_under_every_policy() {
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (direct_value, direct_gradient) = domain.value_and_gradient(|x| dot_sine(x), input.clone()).unwrap();
-        fn check(policy: impl TestPolicy, input: &TestArray, direct_value: &TestArray, expected_gradient: &[f64]) {
-            let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
-                .with_policy(policy);
+        fn check(policy: impl TestPolicy, input: &Array, direct_value: &Array, expected_gradient: &[f64]) {
+            let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body).with_policy(policy);
             let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
-            assert_abs_diff_eq!(value.values[0], direct_value.values[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(value.to_f64s()[0], direct_value.to_f64s()[0], epsilon = 1e-9);
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
         }
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_abs_diff_eq!(direct_gradient.values[index], *expected, epsilon = 1e-9);
+            assert_abs_diff_eq!(direct_gradient.to_f64s()[index], *expected, epsilon = 1e-9);
         }
         check(NothingSaveable, &input, &direct_value, &expected_gradient);
         check(EverythingSaveable, &input, &direct_value, &expected_gradient);
@@ -2098,7 +2098,6 @@ mod tests {
     #[test]
     fn test_rematerialization_policies_classify_residuals_inside_scan_bodies() {
         use crate::operations::control_flow::ScanOperation;
-        use crate::tracing_v2::ArrayOperation;
         use crate::types::Shape;
 
         // Loop body `[c, x] -> [c * (x · x)]` over three two-element rows: `f(c0) = c0 * Π |xᵢ|²`.
@@ -2110,7 +2109,7 @@ mod tests {
             use crate::parameters::Placeholder;
             use crate::programs::ProgramBuilder;
 
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
             let row = builder.add_input(vector_type(2));
             let dot = builder
@@ -2124,14 +2123,14 @@ mod tests {
                 .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![carry, dot])
                 .unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
                 .unwrap()
         };
-        let stacked = TestArray::new(
+        let stacked = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
             rows.iter().flatten().copied().collect(),
         );
-        let scan_body = |carry: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        let scan_body = |carry: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let context = carry.context().clone();
             let xs = StagingContext::constant(&context, stacked.clone());
             let scan = ScanOperation::new(1, 3);
@@ -2144,21 +2143,21 @@ mod tests {
             policy: impl TestPolicy,
             scan_body: impl Clone
             + Fn(
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )
-                -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError>,
+                -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError>,
             expected_gradient: f64,
         ) -> usize {
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(scan_body)
-                .with_policy(policy);
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(scan_body).with_policy(policy);
             let operation = staged_operation(&function, ArrayType::scalar(DataType::F64));
             let forward_output_count = operation.forward().output_types().len();
 
-            let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .value_and_gradient(|carry| function.call(carry).unwrap(), TestArray::scalar(2.0))
+            let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+                .value_and_gradient(|carry| function.call(carry).unwrap(), Array::scalar(2.0))
                 .unwrap();
-            assert_abs_diff_eq!(value.values[0], 2.0 * expected_gradient, epsilon = 1e-9);
-            assert_abs_diff_eq!(gradient.values[0], expected_gradient, epsilon = 1e-9);
+            assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * expected_gradient, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[0], expected_gradient, epsilon = 1e-9);
             forward_output_count
         }
         let baseline = check(NothingSaveable, scan_body.clone(), expected_gradient);
@@ -2177,7 +2176,7 @@ mod tests {
 
         let vector_type = vector_type(2);
         let branch = |tag_output| {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let lhs = builder.add_input(vector_type.clone());
             let rhs = builder.add_input(vector_type.clone());
             let dot = builder
@@ -2195,10 +2194,10 @@ mod tests {
                 dot
             };
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let lhs = builder.add_input(vector_type.clone());
         let rhs = builder.add_input(vector_type.clone());
@@ -2212,7 +2211,7 @@ mod tests {
             .add_instruction(ArrayOperation::Condition(condition), regions, vec![predicate, lhs, rhs])
             .unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
         let candidate =
@@ -2232,7 +2231,7 @@ mod tests {
         let recorded_calls = policy_calls.clone();
         let recorded_producers = recorded_names.clone();
         let policy =
-            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
                 *recorded_calls.borrow_mut() += 1;
                 recorded_producers
                     .borrow_mut()
@@ -2252,7 +2251,7 @@ mod tests {
 
         // Reusing one attached region in both condition slots reaches the same program-local value twice. The
         // resolver retains its first semantic occurrence and does not expose duplicate producers to policies.
-        let mut shared_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut shared_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let shared_region = shared_builder.import_region(condition_regions[0].entry_region_ref());
         let shared_predicate = shared_builder.add_input(ArrayType::scalar(DataType::Boolean));
         let shared_lhs = shared_builder.add_input(vector_type.clone());
@@ -2265,7 +2264,7 @@ mod tests {
             )
             .unwrap()[0];
         let shared_program = shared_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![shared_output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![shared_output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let shared_candidate = RematerializationCandidate::from_program_residual(
             &shared_program,
@@ -2279,15 +2278,15 @@ mod tests {
         // A constant-producing branch contributes no instruction producer, while the other branch's dot remains
         // visible. The boundary is classifiable whenever at least one possible path has an instruction producer.
         let constant_branch = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(vector_type.clone());
             builder.add_input(vector_type.clone());
-            let output = builder.add_constant(TestArray::scalar(0.0));
+            let output = builder.add_constant(Array::scalar(0.0));
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut mixed_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut mixed_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let dot_region = mixed_builder.import_region(condition_regions[0].entry_region_ref());
         let constant_region = mixed_builder.import_region(constant_branch.entry_region_ref());
         let mixed_predicate = mixed_builder.add_input(ArrayType::scalar(DataType::Boolean));
@@ -2301,7 +2300,7 @@ mod tests {
             )
             .unwrap()[0];
         let mixed_program = mixed_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![mixed_output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![mixed_output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let mixed_candidate = RematerializationCandidate::from_program_residual(
             &mixed_program,
@@ -2322,8 +2321,8 @@ mod tests {
         use crate::programs::ProgramBuilder;
 
         /// Builds `x -> (x · x) * trig(x · x)` for one condition branch.
-        fn branch(cosine: bool) -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        fn branch(cosine: bool) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(vector_type(2));
             let dot = builder
                 .add_instruction(
@@ -2338,19 +2337,17 @@ mod tests {
                 builder.add_instruction(SinOperation, Vec::new(), vec![dot]).unwrap()[0]
             };
             let output = builder.add_instruction(MulOperation, Vec::new(), vec![dot, trigonometric]).unwrap()[0];
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 
         /// Derives and executes a rematerialized constant-predicate condition under `policy`.
         fn check(policy: impl TestPolicy, predicate: bool) -> (usize, f64, Vec<f64>) {
             let true_branch = branch(false);
             let false_branch = branch(true);
-            let body = move |input: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+            let body = move |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let context = input.dispatch_domain();
                 let predicate =
-                    context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]))?;
+                    context.lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![f64::from(predicate)]))?;
                 let mut outputs = context.bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
                     vec![true_branch.clone(), false_branch.clone()],
@@ -2359,15 +2356,15 @@ mod tests {
                 Ok(outputs.remove(0))
             };
             let function =
-                rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body).with_policy(policy);
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy);
             let forward_output_count = staged_operation(&function, vector_type(2)).forward().output_types().len();
-            let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
                 .value_and_gradient(
                     |input| function.call(input).unwrap(),
-                    TestArray::new(vector_type(2), vec![0.5, 1.5]),
+                    Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
                 )
                 .unwrap();
-            (forward_output_count, value.values[0], gradient.values)
+            (forward_output_count, value.to_f64s()[0], gradient.to_f64s())
         }
 
         let input = [0.5, 1.5];
@@ -2399,8 +2396,8 @@ mod tests {
         // 2 values under `NothingSaveable` (output + input), 3 under `DotsSaveable` (+`u`), and 5 under
         // `EverythingSaveable`; and the backward program shrinks as more residuals are saved instead of recomputed.
         fn counts(policy: impl TestPolicy) -> (usize, usize) {
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
-                .with_policy(policy);
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body).with_policy(policy);
             let operation = staged_operation(&function, vector_type(2));
             (operation.forward().output_types().len(), operation.backward().instructions().len())
         }
@@ -2438,18 +2435,18 @@ mod tests {
         // instruction-produced residuals (`u`, `sin(u)`, and the sine rule's `cos(u)` factor), so name-based
         // policies can select it (or its complement) by tag.
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
             Ok(u.clone() * u.sin()?)
         }
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         // Forward output counts: 2 base outputs (output + input), plus the residuals each policy saves.
-        fn check(policy: impl TestPolicy, expected_forward_outputs: usize, input: &TestArray, expected: &[f64]) {
-            let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body)
-                .with_policy(policy.clone());
+        fn check(policy: impl TestPolicy, expected_forward_outputs: usize, input: &Array, expected: &[f64]) {
+            let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy.clone());
             let operation = staged_operation(&function, vector_type(2));
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -2459,7 +2456,7 @@ mod tests {
             // Every policy preserves the gradient; only the save/recompute split changes.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected.iter().enumerate() {
-                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
         }
         check(SaveOnlyTheseNames::new(["u"]), 3, &input, &expected_gradient);
@@ -2493,18 +2490,18 @@ mod tests {
     fn test_jvp_through_rematerialization_uses_the_derived_tangent_program() {
         // Unlike user-authored custom VJPs (which reject forward mode, matching JAX), rematerialized calls carry a
         // derived tangent program, so `jvp` works through them — matching `jax.checkpoint`.
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body);
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body);
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x| function.call(x),
-                TestArray::new(vector_type(2), vec![0.5, 1.5]),
-                TestArray::new(vector_type(2), vec![1.0, 0.0]),
+                Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
+                Array::from_f64s(vector_type(2), vec![1.0, 0.0]),
             )
             .unwrap();
         // f(x) = u * sin(u) with u = x · x; the tangent against seed e_0 is the first gradient component.
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        assert_abs_diff_eq!(primal.values[0], u * u.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent.values[0], dot_sine_gradient(&[0.5, 1.5])[0], epsilon = 1e-9);
+        assert_abs_diff_eq!(primal.to_f64s()[0], u * u.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], dot_sine_gradient(&[0.5, 1.5])[0], epsilon = 1e-9);
     }
 
     #[test]
@@ -2514,23 +2511,22 @@ mod tests {
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
         // through the rematerialized region.
-        let custom = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.sin()?, x.cos()?)),
+        let custom = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
                 let product = residual * cotangent;
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            move |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| custom.call(x),
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            move |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| custom.call(x),
         )
         .with_policy(EverythingSaveable);
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let (value, gradient) =
-            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
-        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The custom-VJP boundary stays opaque to the policy: the rematerialized primal program preserves the
         // custom_vjp call intact, and even `EverythingSaveable` saves only the residual the user's forward rule
@@ -2538,7 +2534,7 @@ mod tests {
         // outputs exactly the body output, the region input, and that one residual.
         let scalar_type = ArrayType::new(DataType::F64, Shape::new(Vec::new()));
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), scalar_type).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), scalar_type).unwrap();
         assert_eq!(program.instructions().len(), 1);
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
@@ -2559,16 +2555,15 @@ mod tests {
         // `prevent_cse` defaults to enabled (JAX parity) and is carried on the staged operation as a backend
         // lowering hint; user-authored custom VJPs (constructed directly) leave it disabled.
         for (function, expected) in [
-            (rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body), true),
+            (rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body), true),
             (
-                rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body)
                     .with_prevent_cse(false),
                 false,
             ),
         ] {
             let (_, program) =
-                EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2))
-                    .unwrap();
+                EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
             let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
                 panic!("rematerialization should stage a rematerialize call");
             };
@@ -2579,10 +2574,9 @@ mod tests {
     #[test]
     fn test_rematerialize_remains_opaque_to_partial_evaluation() {
         let input_type = vector_type(2);
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body);
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body);
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), input_type.clone())
-                .unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), input_type.clone()).unwrap();
         let program = program.to_flat_program();
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(input_type)]).unwrap();
@@ -2608,20 +2602,20 @@ mod tests {
         use crate::tracing::TracingContext;
 
         let input_type = vector_type(2);
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |(a, x): (
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-                DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+                DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             )| { Ok((a * x.clone()).sin()?.dot(&x, &DotDimensionNumbers::inner_product())) },
         );
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs| function.call(inputs),
             (input_type.clone(), input_type.clone()),
         )
         .unwrap();
         let program = program.to_flat_program();
 
-        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
         let known = outer.input(input_type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(input_type)])
@@ -2644,40 +2638,40 @@ mod tests {
         // The analogue of JAX's sqrt-schedule idiom: rematerialized regions nest, with each level storing only its
         // own region inputs. Differentiating the outer call replays the inner call's backward program inside the
         // outer backward derivation, which interprets the inner (transposed) rematerialize call over tracers.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let inner = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let inner = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let outer = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
                 Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
             },
         );
         // f(x) = Σᵢ sin(xᵢ²) xᵢ, so ∂f/∂xⱼ = sin(xⱼ²) + 2 xⱼ² cos(xⱼ²).
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
         let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), input).unwrap();
-        assert_abs_diff_eq!(value.values[0], expected_value, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], expected_value, epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
         }
     }
 
     #[test]
     fn test_nested_rematerialization_preserves_the_nested_call_structure_and_residual_accounting() {
-        let inner = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let inner = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let outer = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
                 Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
             },
         );
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| outer.call(x), vector_type(2)).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| outer.call(x), vector_type(2)).unwrap();
         assert_eq!(program.instructions().len(), 1);
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
@@ -2701,20 +2695,20 @@ mod tests {
         // Forward mode through nested rematerialized calls exercises the un-transposed rematerialize call replay over
         // tracers: deriving the outer tangent program interprets the inner call's tangent program inside the outer
         // tangent trace.
-        let inner = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let inner = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let outer = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
                 Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
             },
         );
-        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
                 |x| outer.call(x),
-                TestArray::new(vector_type(2), vec![0.5, 1.5]),
-                TestArray::new(vector_type(2), vec![1.0, 0.0]),
+                Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
+                Array::from_f64s(vector_type(2), vec![1.0, 0.0]),
             )
             .unwrap();
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
@@ -2722,8 +2716,8 @@ mod tests {
             let x = 0.5f64;
             (x * x).sin() + 2.0 * x * x * (x * x).cos()
         };
-        assert_abs_diff_eq!(primal.values[0], expected_value, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent.values[0], expected_tangent, epsilon = 1e-9);
+        assert_abs_diff_eq!(primal.to_f64s()[0], expected_value, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], expected_tangent, epsilon = 1e-9);
     }
 
     #[test]
@@ -2754,9 +2748,9 @@ mod tests {
         // residuals — each now carrying the batch axis.
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, matrix_type: &ArrayType) {
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
+            let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body)
                 .with_policy(policy.clone());
-            let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+            let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
                 |x| {
                     let context = x.context().clone();
                     Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
@@ -2795,17 +2789,17 @@ mod tests {
         use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
-        // `grad(vmap(rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
+        // `grad(vmap(rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
         // backward program and matches the analytic per-item gradients.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (value, gradient) = domain
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| function.call(item),
                         x,
@@ -2816,13 +2810,13 @@ mod tests {
                     .unwrap();
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::new(vector_type(2), vec![0.5, 1.0]),
+                Array::from_f64s(vector_type(2), vec![0.5, 1.0]),
             )
             .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
-        assert_abs_diff_eq!(value.values[0], 0.25f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 2.0 * 0.5 * 0.25f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[1], 2.0 * 1.0 * 1.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.25f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.5 * 0.25f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 2.0 * 1.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2831,19 +2825,19 @@ mod tests {
 
         // The body closure runs only while deriving (the primal trace; the remaining passes replay the traced
         // program), so the closure invocation count equals the number of derivations.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let trace_count = Rc::new(Cell::new(0));
         let counter = trace_count.clone();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            move |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            move |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 counter.set(counter.get() + 1);
                 Ok((x.clone() * x).sin()?)
             },
         );
 
         // Two calls with equal input types derive once, both within one trace and across separate traces.
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let first = function.call(x.clone())?;
                 let second = function.call(x)?;
                 Ok(first + second)
@@ -2858,23 +2852,22 @@ mod tests {
             .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Rematerialize(_)))
             .count();
         assert_eq!(rematerialize_count, 2, "both calls should stage their own rematerialize instruction");
-        EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
+        EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
         assert_eq!(trace_count.get(), 1);
 
         // A different input type re-derives.
-        EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(3)).unwrap();
+        EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(3)).unwrap();
         assert_eq!(trace_count.get(), 2);
 
         // Cache hits still differentiate correctly: the second gradient call reuses the derivation staged by the
         // first one.
-        let (_, first_gradient) =
-            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
+        let (_, first_gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(0.7)).unwrap();
         let derivations_after_first_gradient = trace_count.get();
         let (_, second_gradient) =
-            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
+            domain.value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(0.7)).unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
-        assert_abs_diff_eq!(first_gradient.values[0], 2.0 * 0.7 * 0.49f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(second_gradient.values[0], first_gradient.values[0], epsilon = 1e-9);
+        assert_abs_diff_eq!(first_gradient.to_f64s()[0], 2.0 * 0.7 * 0.49f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(second_gradient.to_f64s()[0], first_gradient.to_f64s()[0], epsilon = 1e-9);
     }
 
     #[test]
@@ -2884,8 +2877,8 @@ mod tests {
         // `DotsWithNoBatchDimsSaveable` saves only the unbatched one, so the forward output counts differ by one
         // (2 base outputs = body output + region input).
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let batched = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
             let u = x.dot(&x, &batched);
             let v = u.dot(&u, &DotDimensionNumbers::inner_product());
@@ -2893,8 +2886,8 @@ mod tests {
         }
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, matrix_type: &ArrayType) {
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body)
-                .with_policy(policy.clone());
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy.clone());
             let operation = staged_operation(&function, matrix_type.clone());
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -2911,15 +2904,15 @@ mod tests {
         // The body produces one dot residual `u`, one named residual `s`, and one unnamed `cos` residual; the
         // combinator saves the union of what its two members save.
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product());
             let s = u.sin()?.tag("s");
             Ok(u * s)
         }
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize) {
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body)
-                .with_policy(policy.clone());
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy.clone());
             let operation = staged_operation(&function, vector_type(2));
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -2938,8 +2931,8 @@ mod tests {
         // `SaveFromBothPolicies` union from the test above through candidate queries; the second selects by
         // operation name; and both observe the residuals' staged types.
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product());
             let s = u.sin()?.tag("s");
             Ok(u * s)
@@ -2947,7 +2940,7 @@ mod tests {
         // Custom policies see the complete producing operation and match their operation family directly, without
         // any centrally selected fact list.
         let dot_or_named =
-            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
                 assert!(candidate.residual_type().shape().dimensions().is_empty());
                 let saves = candidate.producers().iter().any(|producer| match producer.operation() {
                     ArrayOperation::Dot(_) => true,
@@ -2960,7 +2953,7 @@ mod tests {
                 })
             });
         let cosines_only =
-            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
                 Ok::<_, RematerializationRejection>(
                     match candidate.producers().iter().any(|producer| producer.operation().name() == "cos") {
                         true => RematerializationDecision::<NoStorage>::Save,
@@ -2974,9 +2967,9 @@ mod tests {
             [0.5f64, 1.5].map(|value| (u.sin() + u * u.cos()) * 2.0 * value)
         };
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, expected_gradient: &[f64]) {
-            let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-            let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body)
-                .with_policy(policy.clone());
+            let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let function =
+                rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy.clone());
             let operation = staged_operation(&function, vector_type(2));
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -2984,10 +2977,10 @@ mod tests {
                 "unexpected forward output count for policy {policy:?}",
             );
             // Custom policies only change the save/recompute split, never the gradient.
-            let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+            let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
         }
         check(dot_or_named, 4, &expected_gradient);
@@ -3001,11 +2994,11 @@ mod tests {
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
         // the result. f(x) = sin(x²), so f''(x) = 2 cos(x²) - 4x² sin(x²).
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let hessian = domain.hessian(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let hessian = domain.hessian(|x| function.call(x), Array::scalar(0.7)).unwrap();
         let block = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(
@@ -3045,17 +3038,17 @@ mod tests {
         // cotangent at a unit output cotangent equals the tangent-map coefficient `f'(x)`, so seeding the
         // direct-transpose pullback at `[1.0 ++ residuals]` recovers the tangent map. f(x) = sin(x²), so the recovered
         // value is f'(0.7) = 2·0.7·cos(0.7²).
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (_, pullback) = domain.vjp(|x| function.call(x), Array::scalar(0.7)).unwrap();
         let (pullback, residuals) = pullback.into_parts();
-        let mut pullback_inputs = vec![TestArray::scalar(1.0)];
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();
         let x: f64 = 0.7;
-        assert_abs_diff_eq!(output[0].values[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(output[0].to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -3064,10 +3057,10 @@ mod tests {
 
         // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`; `jacrev` exercises
         // the batched replay of the derived backward program.
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let jacobian = jacrev(|x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
+        let jacobian = jacrev(|x| function.call(x), Array::from_f64s(vector_type(2), vec![0.5, 1.0])).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_abs_diff_eq!(block.value().values()[0], 0.25f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
@@ -3080,15 +3073,15 @@ mod tests {
 
     /// [`dot_sine`] with the dot output tagged `"u"`, so name-based offloading policies can select it.
     fn tagged_dot_sine_body(
-        x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-    ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+    ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
         let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
         Ok(u.clone() * u.sin()?)
     }
 
     /// Returns whether `program` stages any memory transfers.
     fn contains_memory_transfers(
-        program: &crate::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &crate::programs::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> bool {
         program
             .instructions()
@@ -3103,7 +3096,7 @@ mod tests {
         // `u`). Offloaded residuals are emitted behind a staged transfer — the saved forward output carries the
         // destination memory, and the backward and tangent programs transfer it back before consuming it — while
         // residuals saved in place stay in their own memory with no transfers anywhere.
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let offload_u = SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST);
         let save_u = SaveAndOffloadOnlyTheseNames::new(["u"], [] as [&str; 0], PINNED_HOST);
@@ -3111,11 +3104,10 @@ mod tests {
         // recompute-only first side defers to the offload side.
         let save_beats_offload = SaveFromBothPolicies::new(save_u.clone(), offload_u.clone());
         let offload_after_recompute = SaveFromBothPolicies::new(NothingSaveable, offload_u.clone());
-        fn check(policy: impl TestPolicy, expected_memory: Memory, input: &TestArray, expected_gradient: &[f64]) {
-            let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-            let function =
-                rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(tagged_dot_sine_body)
-                    .with_policy(policy.clone());
+        fn check(policy: impl TestPolicy, expected_memory: Memory, input: &Array, expected_gradient: &[f64]) {
+            let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(tagged_dot_sine_body)
+                .with_policy(policy.clone());
             let operation = staged_operation(&function, vector_type(2));
             let forward_output_types = operation.forward().output_types();
             assert_eq!(forward_output_types.len(), 3, "unexpected forward output count for policy {policy:?}");
@@ -3147,7 +3139,7 @@ mod tests {
             // Offloading changes placement, never values: gradients match the direct computation.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
         }
         check(offload_u, PINNED_HOST, &input, &expected_gradient);
@@ -3160,11 +3152,11 @@ mod tests {
     fn test_offload_dots_with_no_batch_dims_offloads_unbatched_contractions() {
         // `dot_sine_body`'s only dot residual is the unbatched inner product `u`, so the policy offloads exactly
         // that residual — `DotsSaveable`'s split, with the saved value parked in pinned host memory.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body)
             .with_policy(OffloadDotsWithNoBatchDims::new(PINNED_HOST));
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
         let forward = program.region_ref(instruction.regions()[1]).unwrap();
@@ -3172,13 +3164,13 @@ mod tests {
         assert_eq!(forward_output_types.len(), 3);
         assert_eq!(forward_output_types[2].memory(), PINNED_HOST);
 
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        assert_abs_diff_eq!(value.values[0], u * u.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], u * u.sin(), epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
         }
     }
 
@@ -3188,29 +3180,27 @@ mod tests {
         // the forward program emits four outputs whose final two are the device-resident `u` and the host-parked
         // `v`.
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
             let v = u.sin()?.tag("v");
             Ok(u * v)
         }
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let policy =
-            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                let key = match candidate.producers()[0].operation() {
-                    ArrayOperation::Tag(operation) => Some(operation.key()),
-                    _ => None,
-                };
-                Ok::<_, RematerializationRejection>(match key {
-                    Some("u") => RematerializationDecision::Save,
-                    Some("v") => RematerializationDecision::SaveWith(MemoryTransferStorage::new(PINNED_HOST)),
-                    _ => RematerializationDecision::Recompute,
-                })
-            });
-        let function =
-            rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body).with_policy(policy);
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let policy = PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
+            let key = match candidate.producers()[0].operation() {
+                ArrayOperation::Tag(operation) => Some(operation.key()),
+                _ => None,
+            };
+            Ok::<_, RematerializationRejection>(match key {
+                Some("u") => RematerializationDecision::Save,
+                Some("v") => RematerializationDecision::SaveWith(MemoryTransferStorage::new(PINNED_HOST)),
+                _ => RematerializationDecision::Recompute,
+            })
+        });
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy);
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
         let forward = program.region_ref(instruction.regions()[1]).unwrap();
@@ -3225,11 +3215,11 @@ mod tests {
         assert!(saved_memories.contains(&PINNED_HOST), "expected a host-parked saved residual");
 
         // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
-        let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
+        let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
         }
     }
 
@@ -3241,12 +3231,11 @@ mod tests {
 
         // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let function =
-            rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(tagged_dot_sine_body)
-                .with_policy(SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST));
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(tagged_dot_sine_body)
+            .with_policy(SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST));
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 let context = x.context().clone();
                 Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
@@ -3271,7 +3260,7 @@ mod tests {
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
                         |item| function.call(item),
                         x,
@@ -3282,13 +3271,13 @@ mod tests {
                     .unwrap();
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
-                TestArray::new(matrix_type, rows.as_flattened().to_vec()),
+                Array::from_f64s(matrix_type, rows.as_flattened().to_vec()),
             )
             .unwrap();
         for (row, values) in rows.iter().enumerate() {
             let expected_row_gradient = dot_sine_gradient(values);
             for (column, expected) in expected_row_gradient.iter().enumerate() {
-                assert_abs_diff_eq!(gradient.values[row * 3 + column], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(gradient.to_f64s()[row * 3 + column], *expected, epsilon = 1e-9);
             }
         }
     }
@@ -3298,20 +3287,20 @@ mod tests {
         // Any evaluated rejection aborts the whole transformation, and the engine enriches the policy-supplied
         // rejection with the producing operation's name and the rendered logical residual type.
         let policy =
-            PolicyFn::new(|candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
-                match candidate
+            PolicyFn::new(
+                |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| match candidate
                     .producers()
                     .iter()
                     .any(|producer| matches!(producer.operation(), ArrayOperation::Cos(_)))
                 {
                     true => Err(RematerializationRejection::other("cosines are not allowed here")),
                     false => Ok(RematerializationDecision::<NoStorage>::Recompute),
-                }
-            });
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
-            .with_policy(policy);
-        let error = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2))
-            .unwrap_err();
+                },
+            );
+        let function =
+            rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body).with_policy(policy);
+        let error =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap_err();
         let rematerialization = error.downcast_custom::<RematerializationError>().cloned();
         assert_eq!(
             rematerialization,
@@ -3336,7 +3325,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let row_type = vector_type(2);
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let carry = builder.add_input(scalar_type.clone());
             let row = builder.add_input(row_type.clone());
             let dot = builder
@@ -3350,12 +3339,12 @@ mod tests {
                 .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![carry, dot])
                 .unwrap()[0];
             builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let stacked_rows_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(scalar_type);
         let rows = builder.add_input(stacked_rows_type);
         let scan = ScanOperation::new(1, 3);
@@ -3365,7 +3354,7 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(scan_outputs.clone(), vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(scan_outputs.clone(), vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
         let candidate =
@@ -3415,17 +3404,17 @@ mod tests {
 
         // Primal program `x -> (a, b) = split(x)` with both outputs as residuals.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<TestArray, SplitOperation>::new();
+        let mut builder = ProgramBuilder::<Array, SplitOperation>::new();
         let input = builder.add_input(scalar_type.clone());
         let split_outputs = builder.add_instruction(SplitOperation, Vec::new(), vec![input]).unwrap().to_vec();
         let primal = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(split_outputs.clone(), vec![Placeholder], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(split_outputs.clone(), vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
 
         // Destination: `a` is a saved cut behind a fresh input; `b` resolves through a recompute slice. The slice
         // copies the split instruction exactly once (producing a replayed sibling for `a`), and resolving `a`
         // afterwards must keep returning the saved cut, never the replayed sibling.
-        let mut destination = ProgramBuilder::<TestArray, SplitOperation>::new();
+        let mut destination = ProgramBuilder::<Array, SplitOperation>::new();
         let region_input = destination.add_input(scalar_type.clone());
         let saved_input = destination.add_input(scalar_type);
         let mut resolver = PrimalSliceResolver::new(&primal, std::slice::from_ref(&region_input));
@@ -3491,12 +3480,12 @@ mod tests {
         }
 
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut body_builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, InvalidOriginOperation>::new();
         let body_input = body_builder.add_input(scalar_type.clone());
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![body_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
+        let mut builder = ProgramBuilder::<Array, InvalidOriginOperation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
         let output = builder
@@ -3508,9 +3497,8 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         assert!(matches!(
             RematerializationCandidate::from_program_residual(&program, output, scalar_type.clone()),
@@ -3518,7 +3506,7 @@ mod tests {
                 if message.contains("selecting output 1"),
         ));
 
-        let mut builder = ProgramBuilder::<TestArray, InvalidOriginOperation>::new();
+        let mut builder = ProgramBuilder::<Array, InvalidOriginOperation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
         let output = builder
@@ -3530,9 +3518,8 @@ mod tests {
                 vec![input],
             )
             .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert!(matches!(
             RematerializationCandidate::from_program_residual(&program, output, scalar_type),
             Err(RematerializationError::UnsupportedProvenance { message })
@@ -3585,18 +3572,17 @@ mod tests {
         }
 
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut body_builder = ProgramBuilder::<TestArray, PassThroughOriginOperation>::new();
+        let mut body_builder = ProgramBuilder::<Array, PassThroughOriginOperation>::new();
         let body_input = body_builder.add_input(scalar_type.clone());
         let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![body_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::<TestArray, PassThroughOriginOperation>::new();
+        let mut builder = ProgramBuilder::<Array, PassThroughOriginOperation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
         let output = builder.add_instruction(PassThroughOriginOperation, vec![body_region], vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         assert!(
             RematerializationCandidate::from_program_residual(&program, output, scalar_type).unwrap().is_none(),
@@ -3707,11 +3693,11 @@ mod tests {
     fn test_with_prevent_cse_invalidates_cached_derivations() {
         // Reconfiguring `prevent_cse` after a derivation was cached must not serve the stale cached operation, whose
         // staged flag was baked in at derivation time.
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body);
-        EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body);
+        EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
         let function = function.with_prevent_cse(false);
         let (_, program) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type(2)).unwrap();
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), vector_type(2)).unwrap();
         let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
             panic!("rematerialization should stage a rematerialize call");
         };
@@ -3720,7 +3706,7 @@ mod tests {
 
     /// Returns whether `program` stages any `print` instructions.
     fn contains_print(
-        program: &crate::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
+        program: &crate::programs::Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
     ) -> bool {
         program.instructions().iter().any(|instruction| instruction.operation().name() == "print")
     }
@@ -3736,12 +3722,12 @@ mod tests {
         // gradient is unchanged. Under the previous replay-based derivation the backward and tangent programs
         // retained a copy of the print and re-executed it per interpretation (behavioral fix).
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let printed = (x.clone() * x.clone()).print("u");
             Ok(printed * x)
         }
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body);
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body);
         let operation = staged_operation(&function, ArrayType::scalar(DataType::F64));
         assert!(contains_print(operation.forward()), "the forward program must retain the effectful instruction");
         assert!(!contains_print(operation.backward()), "the backward program must not replay the effect");
@@ -3751,11 +3737,11 @@ mod tests {
         assert_eq!(operation.forward().output_types().len(), 3);
 
         // f(x) = x² · x = x³, so f'(x) = 3x².
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(2.0))
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 8.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 12.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 12.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -3767,13 +3753,13 @@ mod tests {
         // recomputed — the producer-topological order makes later residuals see earlier upgrades. The forward
         // program therefore saves exactly one residual (`p`), and the backward program recomputes `y` from it.
         fn body(
-            x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-        ) -> Result<DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+            x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let printed = (x.clone() * x.clone()).print("p");
             let y = printed.clone() * printed;
             Ok(y * x)
         }
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(body);
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body);
         let operation = staged_operation(&function, ArrayType::scalar(DataType::F64));
         assert!(contains_print(operation.forward()));
         assert!(!contains_print(operation.backward()));
@@ -3782,11 +3768,11 @@ mod tests {
         assert_eq!(operation.forward().output_types().len(), 3);
 
         // f(x) = (x²)² · x = x⁵, so f'(x) = 5x⁴.
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(1.5))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(1.5))
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], 1.5f64.powi(5), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], 5.0 * 1.5f64.powi(4), epsilon = 1e-9);
+        assert_abs_diff_eq!(value.to_f64s()[0], 1.5f64.powi(5), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 5.0 * 1.5f64.powi(4), epsilon = 1e-9);
     }
 
     #[test]
@@ -3796,29 +3782,26 @@ mod tests {
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the
         // user-owned backward program contributes no candidates at all.
-        let custom = custom_vjp::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _, _, _, _>(
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.sin()?),
-            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.sin()?, x.cos()?)),
+        let custom = custom_vjp::<EagerContext<Array, ArrayOperation<Array>>, _, _, _, _, _, _>(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         );
         let names = Rc::new(RefCell::new(Vec::new()));
         let recorded = names.clone();
         let policy =
-            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
                 recorded
                     .borrow_mut()
                     .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
                 Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Recompute)
             });
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            move |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| custom.call(x),
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            move |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| custom.call(x),
         )
         .with_policy(policy);
-        EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x| function.call(x),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
+        EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), ArrayType::scalar(DataType::F64))
+            .unwrap();
         assert_eq!(names.borrow().clone(), vec!["cos".to_string()]);
     }
 
@@ -3834,9 +3817,9 @@ mod tests {
         // sees for them.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let condition = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
-            let bound = builder.add_constant(TestArray::scalar(8.0));
+            let bound = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
                 .add_instruction(
                     crate::operations::compare::CompareOperation::new(ComparisonDirection::LessThan),
@@ -3844,22 +3827,22 @@ mod tests {
                     vec![state, bound],
                 )
                 .unwrap()[0];
-            builder.build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
             let doubled = builder
                 .add_instruction(crate::operations::math::MulOperation, Vec::new(), vec![state, state])
                 .unwrap()[0];
-            builder.build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            builder.build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let names = Rc::new(RefCell::new(Vec::new()));
         let recorded = names.clone();
         let policy =
-            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<TestArray>>| {
+            PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayType, ArrayOperation<Array>>| {
                 recorded
                     .borrow_mut()
                     .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
@@ -3867,8 +3850,8 @@ mod tests {
             });
         let remat_condition = condition.clone();
         let remat_body = body.clone();
-        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
-            move |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
+            move |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let context = x.context().clone();
                 let operation = WhileOperation::new().with_iteration_bound(3)?;
                 let outputs = context.stage_operation(
@@ -3880,12 +3863,12 @@ mod tests {
             },
         )
         .with_policy(policy);
-        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(1.1))
+        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), Array::scalar(1.1))
             .unwrap();
         // x -> x^2 -> x^4 -> x^8 (three squarings before the predicate 1.1^8 > 8 stops the loop... the exact
         // iteration count is loop-driven; the assertions below only require derivative consistency).
-        let direct = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let direct = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
@@ -3895,16 +3878,14 @@ mod tests {
                         .unwrap();
                     outputs.into_iter().next().unwrap()
                 },
-                TestArray::scalar(1.1),
+                Array::scalar(1.1),
             )
             .unwrap();
-        assert_abs_diff_eq!(value.values[0], direct.0.values[0], epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.values[0], direct.1.values[0], epsilon = 1e-9);
-        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
-            |x| function.call(x),
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], direct.0.to_f64s()[0], epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], direct.1.to_f64s()[0], epsilon = 1e-9);
+        let (_, program) =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| function.call(x), ArrayType::scalar(DataType::F64))
+                .unwrap();
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
         let forward = program.region_ref(instruction.regions()[1]).unwrap();

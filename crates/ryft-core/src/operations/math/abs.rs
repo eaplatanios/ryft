@@ -240,16 +240,18 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
+    use crate::macros::check_gradient;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, check_gradient};
-    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
+    use crate::tracing_v2::ForwardModeDifferentiate;
+    use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -285,13 +287,13 @@ mod tests {
             Ok(vec![Scalar::from(5.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[TestArray::scalar(-2.0)],
+                &[Array::scalar(-2.0)],
             ),
-            Ok(vec![TestArray::scalar(2.0)]),
+            Ok(vec![Array::scalar(2.0)]),
         );
 
         // Array type inference preserves shape, layout, and sharding metadata for its single input.
@@ -333,7 +335,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
@@ -453,8 +455,8 @@ mod tests {
             0.0,
             epsilon = 1e-9,
         );
-        check_gradient!(|x| x.abs().unwrap(), 0.7, 1e-6, 1e-6);
-        check_gradient!(|x| x.abs().unwrap(), -2.5, 1e-6, 1e-6);
+        check_gradient!(@scalar, |x| x.abs(), at = 0.7, step = 1e-6, tolerance = 1e-6);
+        check_gradient!(@scalar, |x| x.abs(), at = -2.5, step = 1e-6, tolerance = 1e-6);
 
         // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
         // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
@@ -465,7 +467,17 @@ mod tests {
         let expected = z.conj() / z.norm();
         let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
         assert!((actual - expected).norm() < 1e-12, "expected {expected} but got {actual}");
-        check_gradient!(|z| z.abs().unwrap(), z, 1e-6, 1e-6);
+        check_gradient!(@scalar, |z| z.abs(), at = z, step = 1e-6, tolerance = 1e-6);
+
+        // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
+        // finite-difference oracle perturbs each element's real and imaginary parts independently.
+        check_gradient!(
+            @array,
+            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
+            at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
 
         // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
         // zero tangent and gradient at the origin.
@@ -495,19 +507,19 @@ mod tests {
         );
 
         // The coefficient and tangent are computed in the widened differential representation.
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let primal = TestArray::new(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let input_tangent = TestArray::new(ArrayType::scalar(DataType::F32), vec![3.0]);
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
 
         let (_, tangent) = context.jvp(|input| input.abs(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_eq!(tangent.values(), &[3.0]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
 
-        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(AbsOperation, Vec::new(), vec![input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
             .jvp()
             .unwrap();
