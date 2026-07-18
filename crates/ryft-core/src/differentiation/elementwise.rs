@@ -284,12 +284,13 @@ pub fn unary_elementwise_jvp<
     T: DifferentiableType,
     V: ElementwiseDerivativeAlignment<T>,
     O: Operation<T>,
-    F: Fn(&V) -> Result<V, ProgramError>,
+    PrimalFn: Fn(&V) -> Result<V, ProgramError>,
+    TangentFn: FnOnce(UnaryElementwiseJvpOperands<'_, T, V, PrimalFn>) -> Result<V, DifferentiationError>,
 >(
     operation: &O,
     inputs: &[DifferentiationDual<V>],
-    primal_fn: F,
-    tangent_fn: impl FnOnce(UnaryElementwiseJvpOperands<'_, T, V, F>) -> Result<V, DifferentiationError>,
+    primal_fn: PrimalFn,
+    tangent_fn: TangentFn,
 ) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError> {
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
@@ -343,38 +344,38 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Computes the Jacobian-Vector Product (JVP) for a binary elementwise [`Operation`]. This function computes the output
-/// primal via `primal_fn`, resolves the tangent target
-/// type, converts each live operand tangent into that representation, and delegates the mathematical content to
-/// the per-side terms, invoking each term only when that side's tangent is live so terms stay lazy in staged
-/// programs. Live contributions are summed; structural-zero operand tangents propagate as structural zeros —
-/// including through outputs without a tangent space (e.g., integer outputs), which only reject *live* tangents.
+/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts each live operand tangent into
+/// that representation, and delegates the mathematical content to the per-side terms, invoking each term only when that
+/// side's tangent is live so terms stay lazy in staged programs. Live contributions are summed, and structural-zero
+/// operand tangents propagate as structural zeros,including through outputs without a tangent space (e.g., integer
+/// outputs), which only reject *live* tangents.
 ///
 /// # Parameters
 ///
-///   - `operation`: Operation whose JVP rule is being evaluated.
-///   - `inputs`: The operand duals passed to the JVP rule.
-///   - `primal_fn`: Computes the primal output from the left and right operand primals.
-///   - `left_tangent_fn`: Computes the left operand's tangent contribution from the prepared
+///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
+///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
+///   - `primal_fn`: Function that computes the primal output from the left and right operand primals.
+///   - `left_tangent_term_fn`: Function that computes the left operand's tangent contribution from the prepared
 ///     [`BinaryElementwiseJvpOperands`] and the left operand's live tangent (already converted and broadcast to the
 ///     tangent target type).
-///   - `right_tangent_fn`: Computes the right operand's tangent contribution from the prepared
+///   - `right_tangent_term_fn`: Function that computes the right operand's tangent contribution from the prepared
 ///     [`BinaryElementwiseJvpOperands`] and the right operand's live tangent (already converted and broadcast to the
 ///     tangent target type).
-pub fn binary_elementwise_jvp<T, V, O>(
-    operation: &O,
-    inputs: &[DifferentiationDual<V>],
-    primal_fn: impl FnOnce(&V, &V) -> Result<V, ProgramError>,
-    left_tangent_fn: impl FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
-    right_tangent_fn: impl FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
-) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError>
-where
+pub fn binary_elementwise_jvp<
     T: DifferentiableType,
     V: std::ops::Add<Output = V> + ElementwiseDerivativeAlignment<T>,
     O: Operation<T>,
-{
+    PrimalFn: FnOnce(&V, &V) -> Result<V, ProgramError>,
+    LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    RightTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
+>(
+    operation: &O,
+    inputs: &[DifferentiationDual<V>],
+    primal_fn: PrimalFn,
+    left_tangent_term_fn: LeftTangentTermFn,
+    right_tangent_term_fn: RightTangentTermFn,
+) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError> {
     check_count!("input", inputs, 2, ProgramError);
     let left = &inputs[0];
     let right = &inputs[1];
@@ -397,12 +398,12 @@ where
     let left_contribution = left
         .tangent()
         .as_value()
-        .map(|tangent| left_tangent_fn(&operands, tangent.align_tangent(&target)?))
+        .map(|tangent| left_tangent_term_fn(&operands, tangent.align_tangent(&target)?))
         .transpose()?;
     let right_contribution = right
         .tangent()
         .as_value()
-        .map(|tangent| right_tangent_fn(&operands, tangent.align_tangent(&target)?))
+        .map(|tangent| right_tangent_term_fn(&operands, tangent.align_tangent(&target)?))
         .transpose()?;
     let output_tangent = match (left_contribution, right_contribution) {
         (Some(left), Some(right)) => MaybeZero::Value(left + right),
