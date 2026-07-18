@@ -61,7 +61,6 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
-    ConvertElementType(ConvertElementTypeOperation),
     Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),
@@ -74,21 +73,22 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Exp(ExpOperation),
     Log(LogOperation),
     Sqrt(SqrtOperation),
+    Not(NotOperation),
+    And(AndOperation),
+    Or(OrOperation),
+    Xor(XorOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),
     Real(RealOperation),
     Imaginary(ImaginaryOperation),
     Compare(CompareOperation),
-    And(AndOperation),
-    Or(OrOperation),
-    Xor(XorOperation),
-    Not(NotOperation),
     Select(SelectOperation),
     While(WhileOperation),
+    ConvertElementType(ConvertElementTypeOperation),
     StopGradient(StopGradientOperation),
-    Print(PrintOperation),
     Tag(TagOperation),
     Rematerialize(RematerializeOperation),
+    Print(PrintOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
     CustomVjpTangent(CustomVjpTangentOperation<DataType>),
@@ -604,61 +604,6 @@ impl AbsDiffEq for Scalar {
     }
 }
 
-impl BooleanLike for Scalar {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        match self.boolean() {
-            Ok(value) => Scalar::Bool(value),
-            Err(_) => *self,
-        }
-    }
-
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        if let Some((r#type, bits)) = self.low_precision_float_parts() {
-            return Ok(Self::decode_low_precision_float(r#type, bits) != 0.0);
-        }
-        Ok(match self {
-            Scalar::Token => {
-                return Err(TypeError { message: "cannot convert a token scalar to a Boolean".to_string() }.into());
-            }
-            Scalar::Zero => {
-                return Err(TypeError { message: "cannot convert a zero-space scalar to a Boolean".to_string() }.into());
-            }
-            Scalar::Bool(value) => *value,
-            Scalar::I8(value) => *value != 0,
-            Scalar::I16(value) => *value != 0,
-            Scalar::I32(value) => *value != 0,
-            Scalar::I64(value) => *value != 0,
-            Scalar::U8(value) => *value != 0,
-            Scalar::U16(value) => *value != 0,
-            Scalar::U32(value) => *value != 0,
-            Scalar::U64(value) => *value != 0,
-            // The low-precision variants were already handled through `low_precision_float_parts` before this
-            // match, which must nevertheless remain exhaustive.
-            Scalar::F4E2M1FN(_)
-            | Scalar::F8E3M4(_)
-            | Scalar::F8E4M3(_)
-            | Scalar::F8E4M3FN(_)
-            | Scalar::F8E4M3FNUZ(_)
-            | Scalar::F8E4M3B11FNUZ(_)
-            | Scalar::F8E5M2(_)
-            | Scalar::F8E5M2FNUZ(_)
-            | Scalar::F8E8M0FNU(_) => unreachable!("handled before the match"),
-            Scalar::BF16(value) => *value != bf16::ZERO,
-            Scalar::F16(value) => *value != f16::ZERO,
-            Scalar::F32(value) => *value != 0.0,
-            Scalar::F64(value) => *value != 0.0,
-            Scalar::C64(value) => value.re != 0.0 || value.im != 0.0,
-            Scalar::C128(value) => value.re != 0.0 || value.im != 0.0,
-        })
-    }
-}
-
-// A `Scalar` predicate is always rank-0 and so the scalar `WhilePredicate` defaults (its own truth value decides
-// continuation, and a true predicate takes the candidate wholesale) are exactly its semantics.
-impl WhilePredicate for Scalar {}
-
 impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
@@ -794,6 +739,36 @@ impl OneLike for Scalar {
             Scalar::C64(_) => Scalar::C64(Complex::new(1.0, 0.0)),
             Scalar::C128(_) => Scalar::C128(Complex::new(1.0, 0.0)),
         }
+    }
+}
+
+impl Abs for Scalar {
+    /// Computes the elementwise absolute value of this [`Scalar`]: the magnitude `|z|` (with a real result) for the
+    /// complex variants, and `|x|` for the signed-integer and floating-point variants. Any other variant returns a
+    /// [`TypeError`]. The minimum value of a signed-integer variant has no positive counterpart in the same type and
+    /// therefore wraps to itself, matching two's-complement integer absolute-value semantics without panicking.
+    fn abs(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).abs());
+        }
+        Ok(match self {
+            Scalar::I8(value) => Scalar::I8(value.wrapping_abs()),
+            Scalar::I16(value) => Scalar::I16(value.wrapping_abs()),
+            Scalar::I32(value) => Scalar::I32(value.wrapping_abs()),
+            Scalar::I64(value) => Scalar::I64(value.wrapping_abs()),
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().abs())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().abs())),
+            Scalar::F32(value) => Scalar::F32(value.abs()),
+            Scalar::F64(value) => Scalar::F64(value.abs()),
+            Scalar::C64(value) => Scalar::F32(value.norm()),
+            Scalar::C128(value) => Scalar::F64(value.norm()),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the absolute value of a scalar of data type {}", other.r#type(),),
+                }
+                .into());
+            }
+        })
     }
 }
 
@@ -1059,89 +1034,6 @@ impl std::ops::Div for Scalar {
     }
 }
 
-/// Implements a fallible binary logical capability (e.g., [`And`]) together with its panicking [`std::ops`]
-/// counterpart (e.g., [`std::ops::BitAnd`]) for [`Scalar`]. Boolean operands combine logically and same-variant
-/// integer operands combine bitwise (the two semantics that StableHLO's logical operations also serve); any other
-/// combination returns a [`TypeError`].
-macro_rules! impl_binary_logical_for_scalar {
-    ($trait:ident, $std_trait:ident, $method:ident, $std_method:ident, $operator:tt) => {
-        impl $trait for Scalar {
-            #[inline]
-            fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
-                Ok(match (*self, *rhs) {
-                    (Scalar::Bool(left), Scalar::Bool(right)) => Scalar::Bool(left $operator right),
-                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
-                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
-                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
-                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left $operator right),
-                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left $operator right),
-                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left $operator right),
-                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
-                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
-                    (left, right) => {
-                        return Err(TypeError {
-                            message: format!(
-                                "cannot apply `{}` to scalars of data types {} and {}",
-                                stringify!($method),
-                                left.r#type(),
-                                right.r#type(),
-                            ),
-                        }
-                        .into());
-                    }
-                })
-            }
-        }
-
-        impl std::ops::$std_trait for Scalar {
-            type Output = Scalar;
-
-            #[inline]
-            fn $std_method(self, rhs: Scalar) -> Scalar {
-                $trait::$method(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-            }
-        }
-    };
-}
-
-impl_binary_logical_for_scalar!(And, BitAnd, and, bitand, &);
-impl_binary_logical_for_scalar!(Or, BitOr, or, bitor, |);
-impl_binary_logical_for_scalar!(Xor, BitXor, xor, bitxor, ^);
-
-impl Not for Scalar {
-    /// Computes the elementwise negation of this [`Scalar`]. A Boolean scalar negates logically and an integer scalar
-    /// negates bitwise (the two semantics that StableHLO's `not` operation also serves); any other variant returns a
-    /// [`TypeError`].
-    fn not(&self) -> Result<Self, ProgramError> {
-        Ok(match self {
-            Scalar::Bool(value) => Scalar::Bool(!value),
-            Scalar::I8(value) => Scalar::I8(!value),
-            Scalar::I16(value) => Scalar::I16(!value),
-            Scalar::I32(value) => Scalar::I32(!value),
-            Scalar::I64(value) => Scalar::I64(!value),
-            Scalar::U8(value) => Scalar::U8(!value),
-            Scalar::U16(value) => Scalar::U16(!value),
-            Scalar::U32(value) => Scalar::U32(!value),
-            Scalar::U64(value) => Scalar::U64(!value),
-            other => {
-                return Err(TypeError {
-                    message: format!("cannot apply `not` to a scalar of data type {}", other.r#type()),
-                }
-                .into());
-            }
-        })
-    }
-}
-
-impl std::ops::Not for Scalar {
-    type Output = Scalar;
-
-    #[inline]
-    fn not(self) -> Scalar {
-        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
 impl Sin for Scalar {
     /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point and complex variants support sine
     /// (the complex sine being the analytic continuation `sin(z)`); any other variant returns a [`TypeError`].
@@ -1224,73 +1116,44 @@ impl Cos for Scalar {
     }
 }
 
-// The `Complex` construction capability is implemented with a path-qualified trait name because this module already
-// uses `num_complex::Complex` pervasively as the complex payload type.
-impl crate::operations::complex::Complex for Scalar {
-    /// Constructs a complex [`Scalar`] from this value as the real part and `imaginary` as the imaginary part. Only
-    /// same-precision `f32` and `f64` part pairs are supported; any other combination returns a [`TypeError`].
-    fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
-        Ok(match (*self, *imaginary) {
-            (Scalar::F32(real), Scalar::F32(imaginary)) => Scalar::C64(Complex::new(real, imaginary)),
-            (Scalar::F64(real), Scalar::F64(imaginary)) => Scalar::C128(Complex::new(real, imaginary)),
-            (real, imaginary) => {
+impl Atan2 for Scalar {
+    /// Computes the elementwise two-argument arc tangent `atan2(self, x)` for this [`Scalar`]. Floating-point and
+    /// complex operands are promoted to a common data type; any other combination returns a [`TypeError`]. Complex
+    /// results use the principal value `-i · log((x + i · self) / sqrt(x² + self²))`.
+    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+        validate_floating_or_complex_input_types(&[self.r#type().into_owned(), x.r#type().into_owned()], "atan2")?;
+        let (y, x) = promote_scalar_arithmetic_operands(self, x, "atan2")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (y.low_precision_float_parts(), x.low_precision_float_parts())
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                Self::decode_low_precision_float(left_type, left_bits)
+                    .atan2(Self::decode_low_precision_float(right_type, right_bits)),
+            );
+        }
+        Ok(match (y, x) {
+            (Scalar::BF16(y), Scalar::BF16(x)) => Scalar::BF16(bf16::from_f32(y.to_f32().atan2(x.to_f32()))),
+            (Scalar::F16(y), Scalar::F16(x)) => Scalar::F16(f16::from_f32(y.to_f32().atan2(x.to_f32()))),
+            (Scalar::F32(y), Scalar::F32(x)) => Scalar::F32(y.atan2(x)),
+            (Scalar::F64(y), Scalar::F64(x)) => Scalar::F64(y.atan2(x)),
+            (Scalar::C64(y), Scalar::C64(x)) => {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + y * y).sqrt();
+                Scalar::C64(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
+            }
+            (Scalar::C128(y), Scalar::C128(x)) => {
+                let imaginary_unit = Complex::new(0.0, 1.0);
+                let radius = (x * x + y * y).sqrt();
+                Scalar::C128(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
+            }
+            (y, x) => {
                 return Err(TypeError {
                     message: format!(
-                        "cannot construct a complex scalar from parts of data types {} and {}",
-                        real.r#type(),
-                        imaginary.r#type(),
+                        "cannot compute the arc tangent of scalars of data types {} and {}",
+                        y.r#type(),
+                        x.r#type(),
                     ),
-                }
-                .into());
-            }
-        })
-    }
-}
-
-impl Conjugate for Scalar {
-    /// Computes the complex conjugate of this [`Scalar`]. Only the complex variants support conjugation; any other
-    /// variant returns a [`TypeError`].
-    fn conjugate(&self) -> Result<Self, ProgramError> {
-        Ok(match self {
-            Scalar::C64(value) => Scalar::C64(value.conj()),
-            Scalar::C128(value) => Scalar::C128(value.conj()),
-            other => {
-                return Err(TypeError {
-                    message: format!("cannot conjugate a scalar of data type {}", other.r#type()),
-                }
-                .into());
-            }
-        })
-    }
-}
-
-impl Real for Scalar {
-    /// Extracts the real part of this complex [`Scalar`]. Only the complex variants support the extraction; any other
-    /// variant returns a [`TypeError`].
-    fn real(&self) -> Result<Self, ProgramError> {
-        Ok(match self {
-            Scalar::C64(value) => Scalar::F32(value.re),
-            Scalar::C128(value) => Scalar::F64(value.re),
-            other => {
-                return Err(TypeError {
-                    message: format!("cannot extract the real part of a scalar of data type {}", other.r#type()),
-                }
-                .into());
-            }
-        })
-    }
-}
-
-impl Imaginary for Scalar {
-    /// Extracts the imaginary part of this complex [`Scalar`]. Only the complex variants support the extraction; any
-    /// other variant returns a [`TypeError`].
-    fn imaginary(&self) -> Result<Self, ProgramError> {
-        Ok(match self {
-            Scalar::C64(value) => Scalar::F32(value.im),
-            Scalar::C128(value) => Scalar::F64(value.im),
-            other => {
-                return Err(TypeError {
-                    message: format!("cannot extract the imaginary part of a scalar of data type {}", other.r#type()),
                 }
                 .into());
             }
@@ -1373,43 +1236,104 @@ impl Sqrt for Scalar {
     }
 }
 
-impl Atan2 for Scalar {
-    /// Computes the elementwise two-argument arc tangent `atan2(self, x)` for this [`Scalar`]. Floating-point and
-    /// complex operands are promoted to a common data type; any other combination returns a [`TypeError`]. Complex
-    /// results use the principal value `-i · log((x + i · self) / sqrt(x² + self²))`.
-    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        validate_floating_or_complex_input_types(&[self.r#type().into_owned(), x.r#type().into_owned()], "atan2")?;
-        let (y, x) = promote_scalar_arithmetic_operands(self, x, "atan2")?;
-        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
-            (y.low_precision_float_parts(), x.low_precision_float_parts())
-        {
-            return Self::encode_low_precision_float(
-                left_type,
-                Self::decode_low_precision_float(left_type, left_bits)
-                    .atan2(Self::decode_low_precision_float(right_type, right_bits)),
-            );
+impl Not for Scalar {
+    /// Computes the elementwise negation of this [`Scalar`]. A Boolean scalar negates logically and an integer scalar
+    /// negates bitwise (the two semantics that StableHLO's `not` operation also serves); any other variant returns a
+    /// [`TypeError`].
+    fn not(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
+            Scalar::Bool(value) => Scalar::Bool(!value),
+            Scalar::I8(value) => Scalar::I8(!value),
+            Scalar::I16(value) => Scalar::I16(!value),
+            Scalar::I32(value) => Scalar::I32(!value),
+            Scalar::I64(value) => Scalar::I64(!value),
+            Scalar::U8(value) => Scalar::U8(!value),
+            Scalar::U16(value) => Scalar::U16(!value),
+            Scalar::U32(value) => Scalar::U32(!value),
+            Scalar::U64(value) => Scalar::U64(!value),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot apply `not` to a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl std::ops::Not for Scalar {
+    type Output = Scalar;
+
+    #[inline]
+    fn not(self) -> Scalar {
+        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+/// Implements a fallible binary logical capability (e.g., [`And`]) together with its panicking [`std::ops`]
+/// counterpart (e.g., [`std::ops::BitAnd`]) for [`Scalar`]. Boolean operands combine logically and same-variant
+/// integer operands combine bitwise (the two semantics that StableHLO's logical operations also serve); any other
+/// combination returns a [`TypeError`].
+macro_rules! impl_binary_logical_for_scalar {
+    ($trait:ident, $std_trait:ident, $method:ident, $std_method:ident, $operator:tt) => {
+        impl $trait for Scalar {
+            #[inline]
+            fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+                Ok(match (*self, *rhs) {
+                    (Scalar::Bool(left), Scalar::Bool(right)) => Scalar::Bool(left $operator right),
+                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
+                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
+                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
+                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left $operator right),
+                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left $operator right),
+                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left $operator right),
+                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
+                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
+                    (left, right) => {
+                        return Err(TypeError {
+                            message: format!(
+                                "cannot apply `{}` to scalars of data types {} and {}",
+                                stringify!($method),
+                                left.r#type(),
+                                right.r#type(),
+                            ),
+                        }
+                        .into());
+                    }
+                })
+            }
         }
-        Ok(match (y, x) {
-            (Scalar::BF16(y), Scalar::BF16(x)) => Scalar::BF16(bf16::from_f32(y.to_f32().atan2(x.to_f32()))),
-            (Scalar::F16(y), Scalar::F16(x)) => Scalar::F16(f16::from_f32(y.to_f32().atan2(x.to_f32()))),
-            (Scalar::F32(y), Scalar::F32(x)) => Scalar::F32(y.atan2(x)),
-            (Scalar::F64(y), Scalar::F64(x)) => Scalar::F64(y.atan2(x)),
-            (Scalar::C64(y), Scalar::C64(x)) => {
-                let imaginary_unit = Complex::new(0.0, 1.0);
-                let radius = (x * x + y * y).sqrt();
-                Scalar::C64(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
+
+        impl std::ops::$std_trait for Scalar {
+            type Output = Scalar;
+
+            #[inline]
+            fn $std_method(self, rhs: Scalar) -> Scalar {
+                $trait::$method(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
             }
-            (Scalar::C128(y), Scalar::C128(x)) => {
-                let imaginary_unit = Complex::new(0.0, 1.0);
-                let radius = (x * x + y * y).sqrt();
-                Scalar::C128(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
-            }
-            (y, x) => {
+        }
+    };
+}
+
+impl_binary_logical_for_scalar!(And, BitAnd, and, bitand, &);
+impl_binary_logical_for_scalar!(Or, BitOr, or, bitor, |);
+impl_binary_logical_for_scalar!(Xor, BitXor, xor, bitxor, ^);
+
+// The `Complex` construction capability is implemented with a path-qualified trait name because this module already
+// uses `num_complex::Complex` pervasively as the complex payload type.
+impl crate::operations::complex::Complex for Scalar {
+    /// Constructs a complex [`Scalar`] from this value as the real part and `imaginary` as the imaginary part. Only
+    /// same-precision `f32` and `f64` part pairs are supported; any other combination returns a [`TypeError`].
+    fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
+        Ok(match (*self, *imaginary) {
+            (Scalar::F32(real), Scalar::F32(imaginary)) => Scalar::C64(Complex::new(real, imaginary)),
+            (Scalar::F64(real), Scalar::F64(imaginary)) => Scalar::C128(Complex::new(real, imaginary)),
+            (real, imaginary) => {
                 return Err(TypeError {
                     message: format!(
-                        "cannot compute the arc tangent of scalars of data types {} and {}",
-                        y.r#type(),
-                        x.r#type(),
+                        "cannot construct a complex scalar from parts of data types {} and {}",
+                        real.r#type(),
+                        imaginary.r#type(),
                     ),
                 }
                 .into());
@@ -1418,29 +1342,16 @@ impl Atan2 for Scalar {
     }
 }
 
-impl Abs for Scalar {
-    /// Computes the elementwise absolute value of this [`Scalar`]: the magnitude `|z|` (with a real result) for the
-    /// complex variants, and `|x|` for the signed-integer and floating-point variants. Any other variant returns a
-    /// [`TypeError`]. The minimum value of a signed-integer variant has no positive counterpart in the same type and
-    /// therefore wraps to itself, matching two's-complement integer absolute-value semantics without panicking.
-    fn abs(&self) -> Result<Self, ProgramError> {
-        if let Some((r#type, bits)) = self.low_precision_float_parts() {
-            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).abs());
-        }
+impl Conjugate for Scalar {
+    /// Computes the complex conjugate of this [`Scalar`]. Only the complex variants support conjugation; any other
+    /// variant returns a [`TypeError`].
+    fn conjugate(&self) -> Result<Self, ProgramError> {
         Ok(match self {
-            Scalar::I8(value) => Scalar::I8(value.wrapping_abs()),
-            Scalar::I16(value) => Scalar::I16(value.wrapping_abs()),
-            Scalar::I32(value) => Scalar::I32(value.wrapping_abs()),
-            Scalar::I64(value) => Scalar::I64(value.wrapping_abs()),
-            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().abs())),
-            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().abs())),
-            Scalar::F32(value) => Scalar::F32(value.abs()),
-            Scalar::F64(value) => Scalar::F64(value.abs()),
-            Scalar::C64(value) => Scalar::F32(value.norm()),
-            Scalar::C128(value) => Scalar::F64(value.norm()),
+            Scalar::C64(value) => Scalar::C64(value.conj()),
+            Scalar::C128(value) => Scalar::C128(value.conj()),
             other => {
                 return Err(TypeError {
-                    message: format!("cannot compute the absolute value of a scalar of data type {}", other.r#type(),),
+                    message: format!("cannot conjugate a scalar of data type {}", other.r#type()),
                 }
                 .into());
             }
@@ -1448,20 +1359,37 @@ impl Abs for Scalar {
     }
 }
 
-impl StopGradient for Scalar {
-    /// Returns this [`Scalar`] unchanged while marking it as a constant for differentiation purposes.
-    #[inline]
-    fn stop_gradient(&self) -> Self {
-        *self
+impl Real for Scalar {
+    /// Extracts the real part of this complex [`Scalar`]. Only the complex variants support the extraction; any other
+    /// variant returns a [`TypeError`].
+    fn real(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
+            Scalar::C64(value) => Scalar::F32(value.re),
+            Scalar::C128(value) => Scalar::F64(value.re),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot extract the real part of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
     }
 }
 
-impl Tag for Scalar {
-    /// Returns this [`Scalar`] unchanged. Tagging is the identity on concrete values; the tag only matters when staging
-    /// through a [`Tracer`](crate::tracing::Tracer).
-    #[inline]
-    fn tag(self, _key: &str) -> Self {
-        self
+impl Imaginary for Scalar {
+    /// Extracts the imaginary part of this complex [`Scalar`]. Only the complex variants support the extraction; any
+    /// other variant returns a [`TypeError`].
+    fn imaginary(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
+            Scalar::C64(value) => Scalar::F32(value.im),
+            Scalar::C128(value) => Scalar::F64(value.im),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot extract the imaginary part of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
     }
 }
 
@@ -1540,6 +1468,89 @@ impl Compare for Scalar {
         Ok(Scalar::Bool(evaluate(ordering, direction)))
     }
 }
+
+impl Select for Scalar {
+    type Condition = bool;
+
+    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the broadcasting
+    /// [`SelectOperation`] type-inference contract: the selected
+    /// branch is promoted to the promotion of the two branch data types, so `select(condition, f32, f64)` yields an
+    /// `f64` like `jnp.where`. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before
+    /// reaching here, so this only needs the resolved `bool`.
+    #[inline]
+    fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        let selected = if *condition { on_true } else { on_false };
+        selected.convert_element_type(target)
+    }
+}
+
+impl SelectCondition for Scalar {
+    type Condition = bool;
+
+    /// Extracts the selection condition carried by this [`Scalar`], decoding its in-band Boolean payload through
+    /// [`BooleanLike::boolean`].
+    #[inline]
+    fn select_condition(&self) -> Result<bool, ProgramError> {
+        self.boolean()
+    }
+}
+
+impl BooleanLike for Scalar {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        match self.boolean() {
+            Ok(value) => Scalar::Bool(value),
+            Err(_) => *self,
+        }
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Ok(Self::decode_low_precision_float(r#type, bits) != 0.0);
+        }
+        Ok(match self {
+            Scalar::Token => {
+                return Err(TypeError { message: "cannot convert a token scalar to a Boolean".to_string() }.into());
+            }
+            Scalar::Zero => {
+                return Err(TypeError { message: "cannot convert a zero-space scalar to a Boolean".to_string() }.into());
+            }
+            Scalar::Bool(value) => *value,
+            Scalar::I8(value) => *value != 0,
+            Scalar::I16(value) => *value != 0,
+            Scalar::I32(value) => *value != 0,
+            Scalar::I64(value) => *value != 0,
+            Scalar::U8(value) => *value != 0,
+            Scalar::U16(value) => *value != 0,
+            Scalar::U32(value) => *value != 0,
+            Scalar::U64(value) => *value != 0,
+            // The low-precision variants were already handled through `low_precision_float_parts` before this
+            // match, which must nevertheless remain exhaustive.
+            Scalar::F4E2M1FN(_)
+            | Scalar::F8E3M4(_)
+            | Scalar::F8E4M3(_)
+            | Scalar::F8E4M3FN(_)
+            | Scalar::F8E4M3FNUZ(_)
+            | Scalar::F8E4M3B11FNUZ(_)
+            | Scalar::F8E5M2(_)
+            | Scalar::F8E5M2FNUZ(_)
+            | Scalar::F8E8M0FNU(_) => unreachable!("handled before the match"),
+            Scalar::BF16(value) => *value != bf16::ZERO,
+            Scalar::F16(value) => *value != f16::ZERO,
+            Scalar::F32(value) => *value != 0.0,
+            Scalar::F64(value) => *value != 0.0,
+            Scalar::C64(value) => value.re != 0.0 || value.im != 0.0,
+            Scalar::C128(value) => value.re != 0.0 || value.im != 0.0,
+        })
+    }
+}
+
+// A `Scalar` predicate is always rank-0 and so the scalar `WhilePredicate` defaults (its own truth value decides
+// continuation, and a true predicate takes the candidate wholesale) are exactly its semantics.
+impl WhilePredicate for Scalar {}
 
 impl ConvertElementType for Scalar {
     fn convert_element_type(&self, target: DataType) -> Result<Self, ProgramError> {
@@ -1643,31 +1654,20 @@ impl ConvertElementType for Scalar {
     }
 }
 
-impl Select for Scalar {
-    type Condition = bool;
-
-    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the broadcasting
-    /// [`SelectOperation`] type-inference contract: the selected
-    /// branch is promoted to the promotion of the two branch data types, so `select(condition, f32, f64)` yields an
-    /// `f64` like `jnp.where`. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before
-    /// reaching here, so this only needs the resolved `bool`.
+impl StopGradient for Scalar {
+    /// Returns this [`Scalar`] unchanged while marking it as a constant for differentiation purposes.
     #[inline]
-    fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
-            .map_err(|error| TypeError { message: error.to_string() })?;
-        let selected = if *condition { on_true } else { on_false };
-        selected.convert_element_type(target)
+    fn stop_gradient(&self) -> Self {
+        *self
     }
 }
 
-impl SelectCondition for Scalar {
-    type Condition = bool;
-
-    /// Extracts the selection condition carried by this [`Scalar`], decoding its in-band Boolean payload through
-    /// [`BooleanLike::boolean`].
+impl Tag for Scalar {
+    /// Returns this [`Scalar`] unchanged. Tagging is the identity on concrete values; the tag only matters when staging
+    /// through a [`Tracer`](crate::tracing::Tracer).
     #[inline]
-    fn select_condition(&self) -> Result<bool, ProgramError> {
-        self.boolean()
+    fn tag(self, _key: &str) -> Self {
+        self
     }
 }
 

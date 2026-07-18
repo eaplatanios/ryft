@@ -6,9 +6,9 @@
 //! array programs eagerly. [`Array`] stores a flat row-major [`Scalar`] payload, so that every per-element concern
 //! (e.g., the exact `f4`/`f8` bit encodings, complex arithmetic, integer wrapping semantics, and fallible arithmetic)
 //! delegates to the scalar reference backend and [`Array`] adds only the shape logic.
-//! 
+//!
 //! # Warning
-//! 
+//!
 //! This backend prioritizes transparency over performance: payloads are contiguous [`Scalar`] vectors with no strides,
 //! views, or vectorization, and every operation is implemented with straightforward index arithmetic. Do not use it
 //! outside of tests, documentation examples, and reference-semantics checks.
@@ -27,7 +27,7 @@ use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
-use crate::operations::compare::CompareOperation;
+use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
@@ -40,7 +40,7 @@ use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::{
-    BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
+    Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
     DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation,
     GatherScatterMode, Pad, PadOperation, Reshape, ReshapeOperation, Scatter, ScatterOperation, ScatterReductionKind,
     Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
@@ -67,7 +67,7 @@ use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOp
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind, reduce_evaluate};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
-use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
+use crate::{Select, SelectCondition};
 
 /// Reusable [`Operation`] enum for ordinary staged array programs.
 ///
@@ -86,10 +86,10 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
-    ConvertElementType(ConvertElementTypeOperation),
     Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     CoordinateBasis(CoordinateBasisOperation<ArrayType>),
+    Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -101,45 +101,45 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Exp(ExpOperation),
     Log(LogOperation),
     Sqrt(SqrtOperation),
-    Abs(AbsOperation),
-    Complex(ComplexOperation),
-    Conjugate(ConjugateOperation),
-    Real(RealOperation),
-    Imaginary(ImaginaryOperation),
-    StopGradient(StopGradientOperation),
-    Tag(TagOperation),
-    Print(PrintOperation),
-    TransferToMemory(TransferToMemoryOperation),
-    Dot(DotOperation),
-    Transpose(TransposeOperation),
-    Reshape(ReshapeOperation),
-    Reshard(ReshardOperation),
-    ShardingConstraint(ShardingConstraintOperation),
-    Broadcast(BroadcastOperation),
-    Slice(SliceOperation),
-    UpdateSlice(UpdateSliceOperation),
-    DynamicSlice(DynamicSliceOperation),
-    DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    Pad(PadOperation),
-    Concatenate(ConcatenateOperation),
-    Gather(GatherOperation),
-    Scatter(ScatterOperation),
-    Reduce(ReduceOperation),
-    Compare(CompareOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
     Xor(XorOperation),
+    Complex(ComplexOperation),
+    Conjugate(ConjugateOperation),
+    Real(RealOperation),
+    Imaginary(ImaginaryOperation),
+    Dot(DotOperation),
+    Reduce(ReduceOperation),
     Collective(CollectiveOperation),
     AxisIndex(AxisIndexOperation),
+    Transpose(TransposeOperation),
+    Reshape(ReshapeOperation),
+    Broadcast(BroadcastOperation),
+    Pad(PadOperation),
+    Concatenate(ConcatenateOperation),
+    Gather(GatherOperation),
+    Scatter(ScatterOperation),
+    Slice(SliceOperation),
+    UpdateSlice(UpdateSliceOperation),
+    DynamicSlice(DynamicSliceOperation),
+    DynamicUpdateSlice(DynamicUpdateSliceOperation),
+    Compare(CompareOperation),
     Select(SelectOperation),
     Condition(ConditionOperation<V>),
     While(WhileOperation),
     Scan(ScanOperation<V>),
+    ConvertElementType(ConvertElementTypeOperation),
+    TransferToMemory(TransferToMemoryOperation),
+    Reshard(ReshardOperation),
+    ShardingConstraint(ShardingConstraintOperation),
+    StopGradient(StopGradientOperation),
+    Tag(TagOperation),
+    Rematerialize(RematerializeOperation),
+    Print(PrintOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
     CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
-    Rematerialize(RematerializeOperation),
 }
 
 /// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
@@ -422,93 +422,6 @@ impl AbsDiffEq for Array {
     }
 }
 
-impl Tag for Array {
-    #[inline]
-    fn tag(self, _key: &str) -> Self {
-        self
-    }
-}
-
-impl TransferToMemory for Array {
-    /// Re-places this [`Array`] in `destination` by updating the [`Memory`](crate::types::Memory) carried by its
-    /// type. The payload is host-resident either way, but the carried type must reflect the transfer so that staged
-    /// programs whose declared types park values in other memories (e.g., offloaded residuals) accept the
-    /// interpreted value.
-    #[inline]
-    fn transfer_to_memory(&self, destination: crate::types::Memory) -> Self {
-        Self { r#type: self.r#type.clone().with_memory(destination), values: self.values.clone() }
-    }
-}
-
-impl BooleanLike for Array {
-    /// Returns an [`Array`] with a Boolean-typed counterpart of this array's type and with every element
-    /// reinterpreted as Boolean through the elementwise [`Scalar`] conversion (i.e., zero maps to `false` and any
-    /// nonzero element maps to `true`).
-    fn as_boolean(&self) -> Self {
-        Self { r#type: self.r#type.as_boolean(), values: self.values.iter().map(|value| value.as_boolean()).collect() }
-    }
-
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
-        // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
-        if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
-            return self.values[0].boolean();
-        }
-        Err(ProgramError::Concretization {
-            message: format!(
-                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
-                self.r#type()
-            ),
-        })
-    }
-}
-
-/// Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
-/// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
-/// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
-impl crate::operations::control_flow::WhilePredicate for Array {
-    fn any_true(&self) -> Result<bool, ProgramError> {
-        if self.r#type.data_type() != DataType::Boolean {
-            return Err(ProgramError::Concretization {
-                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
-            });
-        }
-        for value in &self.values {
-            if value.boolean()? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() != DataType::Boolean
-            || on_true.r#type != on_false.r#type
-            || self.values.is_empty()
-            || !on_true.values.len().is_multiple_of(self.values.len())
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "mask_select requires a Boolean predicate whose element count divides congruent operands, but \
-                     got predicate {} with operands {} and {}",
-                    self.r#type, on_true.r#type, on_false.r#type,
-                ),
-            });
-        }
-        let block = on_true.values.len() / self.values.len();
-        let values = on_true
-            .values
-            .iter()
-            .zip(on_false.values.iter())
-            .enumerate()
-            .map(|(index, (on_true, on_false))| {
-                Ok(if self.values[index / block].boolean()? { *on_true } else { *on_false })
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        Ok(Self { r#type: on_true.r#type.clone(), values })
-    }
-}
-
 impl<O: Operation<ArrayType>> Zero<Array> for EagerContext<Array, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = Array::zero_element(r#type.data_type())?;
@@ -516,10 +429,22 @@ impl<O: Operation<ArrayType>> Zero<Array> for EagerContext<Array, O> {
     }
 }
 
+impl ZeroLike for Array {
+    fn zero_like(&self) -> Self {
+        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value.zero_like()).collect() }
+    }
+}
+
 impl<O: Operation<ArrayType>> One<Array> for EagerContext<Array, O> {
     fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
         let element = EagerContext::<Scalar>::new().one(&r#type.data_type())?;
         Ok(Array { r#type: r#type.clone(), values: vec![element; Array::materialized_element_count(r#type)?] })
+    }
+}
+
+impl OneLike for Array {
+    fn one_like(&self) -> Self {
+        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value.one_like()).collect() }
     }
 }
 
@@ -564,15 +489,17 @@ impl<O: Operation<ArrayType>> crate::operations::constants::Iota<Array> for Eage
     }
 }
 
-impl ZeroLike for Array {
-    fn zero_like(&self) -> Self {
-        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value.zero_like()).collect() }
-    }
-}
-
-impl OneLike for Array {
-    fn one_like(&self) -> Self {
-        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value.one_like()).collect() }
+impl Abs for Array {
+    fn abs(&self) -> Result<Self, ProgramError> {
+        // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
+        // real part data type, mirroring the `AbsOperation` type-inference contract.
+        let data_type = match self.r#type.data_type() {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => other,
+        };
+        let values = self.values.iter().map(|value| value.abs()).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { r#type: self.r#type.clone().with_data_type(data_type), values })
     }
 }
 
@@ -660,6 +587,48 @@ impl std::ops::Div for Array {
     }
 }
 
+impl Sin for Array {
+    fn sin(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.sin())
+    }
+}
+
+impl Cos for Array {
+    fn cos(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.cos())
+    }
+}
+
+impl Atan2 for Array {
+    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+        self.binary(x, |y, x| y.atan2(x))
+    }
+}
+
+impl Exp for Array {
+    fn exp(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.exp())
+    }
+}
+
+impl Log for Array {
+    fn log(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.log())
+    }
+}
+
+impl Sqrt for Array {
+    fn sqrt(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.sqrt())
+    }
+}
+
+impl Not for Array {
+    fn not(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.not())
+    }
+}
+
 impl And for Array {
     fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
         self.binary(rhs, |left, right| left.and(right))
@@ -678,9 +647,11 @@ impl Xor for Array {
     }
 }
 
-impl Not for Array {
-    fn not(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.not())
+impl std::ops::Not for Array {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -705,64 +676,6 @@ impl std::ops::BitXor for Array {
 
     fn bitxor(self, rhs: Self) -> Self::Output {
         Xor::xor(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl std::ops::Not for Array {
-    type Output = Self;
-
-    fn not(self) -> Self::Output {
-        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-impl Sin for Array {
-    fn sin(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.sin())
-    }
-}
-
-impl Cos for Array {
-    fn cos(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.cos())
-    }
-}
-
-impl Exp for Array {
-    fn exp(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.exp())
-    }
-}
-
-impl Log for Array {
-    fn log(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.log())
-    }
-}
-
-impl Sqrt for Array {
-    fn sqrt(&self) -> Result<Self, ProgramError> {
-        self.unary(|value| value.sqrt())
-    }
-}
-
-impl Atan2 for Array {
-    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        self.binary(x, |y, x| y.atan2(x))
-    }
-}
-
-impl Abs for Array {
-    fn abs(&self) -> Result<Self, ProgramError> {
-        // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
-        // real part data type, mirroring the `AbsOperation` type-inference contract.
-        let data_type = match self.r#type.data_type() {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other,
-        };
-        let values = self.values.iter().map(|value| value.abs()).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { r#type: self.r#type.clone().with_data_type(data_type), values })
     }
 }
 
@@ -833,122 +746,6 @@ impl Imaginary for Array {
     }
 }
 
-impl Compare for Array {
-    type Output = Self;
-
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
-        // Broadcast the operand types together (including element-type promotion) so mixed-precision comparisons
-        // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
-        // output type is the Boolean-typed counterpart of the broadcast type.
-        let broadcast_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
-            .map_err(|error| TypeError { message: error.to_string() })?;
-        let target = broadcast_type.data_type();
-        let output_len = Self::element_count(&broadcast_type);
-        let left = self.broadcast_values(output_len);
-        let right = rhs.broadcast_values(output_len);
-        let values = left
-            .iter()
-            .zip(right.iter())
-            .map(|(left, right)| {
-                left.convert_element_type(target)?.compare(&right.convert_element_type(target)?, direction)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { r#type: broadcast_type.as_boolean(), values })
-    }
-}
-
-impl ConvertElementType for Array {
-    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() == DataType::Token || data_type == DataType::Token {
-            return Err(
-                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
-            );
-        }
-        let values = self
-            .values
-            .iter()
-            .map(|value| value.convert_element_type(data_type))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { r#type: self.r#type.clone().with_data_type(data_type), values })
-    }
-}
-
-impl Select for Array {
-    type Condition = Self;
-
-    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
-        // the three operand shapes broadcast together, and the two branch data types promote together to the output
-        // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
-        // acts as a mask rather than promoting into the output.
-        assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
-        let output_type = Broadcastable::broadcast(
-            &Broadcastable::broadcast(
-                &condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
-                &on_true.r#type,
-            )
-            .map_err(|error| TypeError { message: error.to_string() })?,
-            &on_false.r#type,
-        )
-        .map_err(|error| TypeError { message: error.to_string() })?;
-        let output_len = Self::element_count(&output_type);
-        let condition = condition.broadcast_values(output_len);
-        let on_true = on_true.broadcast_values(output_len);
-        let on_false = on_false.broadcast_values(output_len);
-        let values = condition
-            .iter()
-            .zip(on_true.iter())
-            .zip(on_false.iter())
-            .map(|((condition, on_true), on_false)| Scalar::select(&condition.boolean()?, on_true, on_false))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { r#type: output_type, values })
-    }
-}
-
-impl SelectCondition for Array {
-    type Condition = Self;
-
-    fn select_condition(&self) -> Result<Self, ProgramError> {
-        Ok(self.clone())
-    }
-}
-
-impl Broadcast for Array {
-    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
-        let input_shape = self.r#type.static_shape().unwrap();
-        let Some(target_shape) = r#type.static_shape() else {
-            return Err(TypeError {
-                message: format!("cannot materialize a value of dynamically sized type {}", r#type),
-            }
-            .into());
-        };
-        let input_rank = input_shape.rank();
-        let target_rank = target_shape.rank();
-        let input_strides = input_shape.row_major_strides();
-        let output_count: usize = target_shape.dimensions().iter().product();
-        let mut values = Vec::with_capacity(output_count);
-        let mut target_index = vec![0usize; target_rank];
-        while values.len() < output_count {
-            let mut input_flat = 0usize;
-            for input_axis in 0..input_rank {
-                let target_axis = output_axes[input_axis];
-                let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
-                input_flat += coordinate * input_strides[input_axis];
-            }
-            values.push(self.values[input_flat]);
-            for position in (0..target_rank).rev() {
-                target_index[position] += 1;
-                if target_index[position] < target_shape[position] {
-                    break;
-                }
-                target_index[position] = 0;
-            }
-        }
-        Ok(Self { r#type, values })
-    }
-}
-
 impl Dot for Array {
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         let lhs_shape = self.r#type.static_shape().unwrap();
@@ -966,6 +763,86 @@ impl Dot for Array {
         let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
         Self { r#type: output_type, values }
     }
+}
+
+impl Reduce for Array {
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
+        if axes.is_empty() {
+            return self.clone();
+        }
+        let data_type = self.r#type.data_type();
+        let shape = self.r#type.static_shape().unwrap();
+        let (mut values, reduced_shape) = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => {
+                let zero = Self::zero_element(data_type).unwrap_or_else(|error| panic!("{error}"));
+                reduce_evaluate(self.values.as_slice(), &shape, axes, || zero, |accumulator, value| accumulator + value)
+            }
+            ReductionKind::Max => reduce_extremum(&self.values, &shape, axes, ComparisonDirection::GreaterThan),
+            ReductionKind::Min => reduce_extremum(&self.values, &shape, axes, ComparisonDirection::LessThan),
+            ReductionKind::Any => reduce_evaluate(
+                self.values.as_slice(),
+                &shape,
+                axes,
+                || Scalar::Bool(false),
+                |accumulator, value| accumulator | value,
+            ),
+            ReductionKind::All => reduce_evaluate(
+                self.values.as_slice(),
+                &shape,
+                axes,
+                || Scalar::Bool(true),
+                |accumulator, value| accumulator & value,
+            ),
+        };
+        if matches!(kind, ReductionKind::Mean) {
+            let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
+            let divisor = Scalar::from(reduced_count.max(1) as f64)
+                .convert_element_type(data_type)
+                .unwrap_or_else(|error| panic!("{error}"));
+            for value in values.iter_mut() {
+                *value = *value / divisor;
+            }
+        }
+        let output_type = ArrayType::new(data_type, Shape::from(&reduced_shape));
+        Self { r#type: output_type, values }
+    }
+}
+
+/// Reduces `values` along `axes` keeping the extremum in the provided `direction` (the maximum for
+/// [`ComparisonDirection::GreaterThan`] and the minimum for [`ComparisonDirection::LessThan`]). The accumulator is an
+/// `Option` because max/min have no identity element that is representable for every element data type (e.g.,
+/// integers have no infinities), so reducing an empty axis panics instead of materializing a synthetic identity.
+fn reduce_extremum(
+    values: &[Scalar],
+    shape: &StaticShape,
+    axes: &[usize],
+    direction: ComparisonDirection,
+) -> (Vec<Scalar>, StaticShape) {
+    let wrapped: Vec<Option<Scalar>> = values.iter().map(|value| Some(*value)).collect();
+    let (reduced, reduced_shape) = reduce_evaluate(
+        wrapped.as_slice(),
+        shape,
+        axes,
+        || None,
+        |accumulator, value| match (accumulator, value) {
+            (None, value) => value,
+            (accumulator, None) => accumulator,
+            (Some(accumulator), Some(value)) => Some(extremum(accumulator, value, direction)),
+        },
+    );
+    let values = reduced
+        .into_iter()
+        .map(|value| value.expect("cannot reduce an empty axis with a max or min reduction"))
+        .collect();
+    (values, reduced_shape)
+}
+
+/// Returns the extremum of two same-data-type scalars in the provided `direction` (the maximum for
+/// [`ComparisonDirection::GreaterThan`] and the minimum for [`ComparisonDirection::LessThan`]), panicking for
+/// unordered element data types such as the complex ones.
+fn extremum(left: Scalar, right: Scalar, direction: ComparisonDirection) -> Scalar {
+    let keep_left = left.compare(&right, direction).unwrap_or_else(|error| panic!("{error}"));
+    if matches!(keep_left, Scalar::Bool(true)) { left } else { right }
 }
 
 impl Transpose for Array {
@@ -1011,17 +888,41 @@ impl Reshape for Array {
     }
 }
 
-// An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
-// requested distribution metadata so interpreted programs preserve their declared boundaries exactly.
-impl crate::operations::sharding::Reshard for Array {
-    fn reshard(&self, sharding: &crate::Sharding) -> Self {
-        let mut output = self.clone();
-        output.r#type.sharding = Some(sharding.clone());
-        output
+impl Broadcast for Array {
+    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let r#type = Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let Some(target_shape) = r#type.static_shape() else {
+            return Err(TypeError {
+                message: format!("cannot materialize a value of dynamically sized type {}", r#type),
+            }
+            .into());
+        };
+        let input_rank = input_shape.rank();
+        let target_rank = target_shape.rank();
+        let input_strides = input_shape.row_major_strides();
+        let output_count: usize = target_shape.dimensions().iter().product();
+        let mut values = Vec::with_capacity(output_count);
+        let mut target_index = vec![0usize; target_rank];
+        while values.len() < output_count {
+            let mut input_flat = 0usize;
+            for input_axis in 0..input_rank {
+                let target_axis = output_axes[input_axis];
+                let coordinate = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
+                input_flat += coordinate * input_strides[input_axis];
+            }
+            values.push(self.values[input_flat]);
+            for position in (0..target_rank).rev() {
+                target_index[position] += 1;
+                if target_index[position] < target_shape[position] {
+                    break;
+                }
+                target_index[position] = 0;
+            }
+        }
+        Ok(Self { r#type, values })
     }
 }
-
-impl crate::operations::sharding::ConstrainSharding for Array {}
 
 impl Array {
     /// Copies the row-major block of shape `sizes` out of this array's payload, reading the element at index
@@ -1091,50 +992,6 @@ impl Array {
                 raw.clamp(0, maximum) as usize
             })
             .collect()
-    }
-}
-
-impl Slice for Array {
-    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
-        let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
-        let sizes: Vec<usize> = start_indices
-            .iter()
-            .zip(limit_indices.iter())
-            .zip(strides.iter())
-            .map(|((start, limit), stride)| (limit - start).div_ceil(*stride))
-            .collect();
-        let values = self.copy_block(start_indices, strides, sizes.as_slice());
-        Ok(Self { r#type: output_type, values })
-    }
-}
-
-impl UpdateSlice for Array {
-    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        self.r#type.update_slice(&update.r#type, start_indices)?;
-        Ok(self.clone().replace_block(update, start_indices))
-    }
-}
-
-impl DynamicSlice for Array {
-    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
-        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
-        let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
-        let input_shape = self.r#type.static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
-        let unit_strides = vec![1; sizes.len()];
-        let values = self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes);
-        Ok(Self { r#type: output_type, values })
-    }
-}
-
-impl DynamicUpdateSlice for Array {
-    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
-        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
-        self.r#type.dynamic_update_slice(&update.r#type, &index_types)?;
-        let input_shape = self.r#type.static_shape().unwrap();
-        let update_shape = update.r#type.static_shape().unwrap();
-        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
-        Ok(self.clone().replace_block(update, starts.as_slice()))
     }
 }
 
@@ -1383,121 +1240,236 @@ fn combine_scatter(kind: ScatterReductionKind, current: Scalar, update: Scalar) 
     }
 }
 
-/// Returns the extremum of two same-data-type scalars in the provided `direction` (the maximum for
-/// [`ComparisonDirection::GreaterThan`] and the minimum for [`ComparisonDirection::LessThan`]), panicking for
-/// unordered element data types such as the complex ones.
-fn extremum(left: Scalar, right: Scalar, direction: ComparisonDirection) -> Scalar {
-    let keep_left = left.compare(&right, direction).unwrap_or_else(|error| panic!("{error}"));
-    if matches!(keep_left, Scalar::Bool(true)) { left } else { right }
+impl Slice for Array {
+    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
+        let sizes: Vec<usize> = start_indices
+            .iter()
+            .zip(limit_indices.iter())
+            .zip(strides.iter())
+            .map(|((start, limit), stride)| (limit - start).div_ceil(*stride))
+            .collect();
+        let values = self.copy_block(start_indices, strides, sizes.as_slice());
+        Ok(Self { r#type: output_type, values })
+    }
 }
 
-impl Reduce for Array {
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
-        if axes.is_empty() {
-            return self.clone();
+impl UpdateSlice for Array {
+    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
+        self.r#type.update_slice(&update.r#type, start_indices)?;
+        Ok(self.clone().replace_block(update, start_indices))
+    }
+}
+
+impl DynamicSlice for Array {
+    fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
+        let unit_strides = vec![1; sizes.len()];
+        let values = self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes);
+        Ok(Self { r#type: output_type, values })
+    }
+}
+
+impl DynamicUpdateSlice for Array {
+    fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
+        self.r#type.dynamic_update_slice(&update.r#type, &index_types)?;
+        let input_shape = self.r#type.static_shape().unwrap();
+        let update_shape = update.r#type.static_shape().unwrap();
+        let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
+        Ok(self.clone().replace_block(update, starts.as_slice()))
+    }
+}
+
+impl Compare for Array {
+    type Output = Self;
+
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
+        // Broadcast the operand types together (including element-type promotion) so mixed-precision comparisons
+        // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
+        // output type is the Boolean-typed counterpart of the broadcast type.
+        let broadcast_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        let target = broadcast_type.data_type();
+        let output_len = Self::element_count(&broadcast_type);
+        let left = self.broadcast_values(output_len);
+        let right = rhs.broadcast_values(output_len);
+        let values = left
+            .iter()
+            .zip(right.iter())
+            .map(|(left, right)| {
+                left.convert_element_type(target)?.compare(&right.convert_element_type(target)?, direction)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { r#type: broadcast_type.as_boolean(), values })
+    }
+}
+
+impl Select for Array {
+    type Condition = Self;
+
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
+        // the three operand shapes broadcast together, and the two branch data types promote together to the output
+        // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
+        // acts as a mask rather than promoting into the output.
+        assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
+        let output_type = Broadcastable::broadcast(
+            &Broadcastable::broadcast(
+                &condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
+                &on_true.r#type,
+            )
+            .map_err(|error| TypeError { message: error.to_string() })?,
+            &on_false.r#type,
+        )
+        .map_err(|error| TypeError { message: error.to_string() })?;
+        let output_len = Self::element_count(&output_type);
+        let condition = condition.broadcast_values(output_len);
+        let on_true = on_true.broadcast_values(output_len);
+        let on_false = on_false.broadcast_values(output_len);
+        let values = condition
+            .iter()
+            .zip(on_true.iter())
+            .zip(on_false.iter())
+            .map(|((condition, on_true), on_false)| Scalar::select(&condition.boolean()?, on_true, on_false))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { r#type: output_type, values })
+    }
+}
+
+impl SelectCondition for Array {
+    type Condition = Self;
+
+    fn select_condition(&self) -> Result<Self, ProgramError> {
+        Ok(self.clone())
+    }
+}
+
+impl BooleanLike for Array {
+    /// Returns an [`Array`] with a Boolean-typed counterpart of this array's type and with every element
+    /// reinterpreted as Boolean through the elementwise [`Scalar`] conversion (i.e., zero maps to `false` and any
+    /// nonzero element maps to `true`).
+    fn as_boolean(&self) -> Self {
+        Self { r#type: self.r#type.as_boolean(), values: self.values.iter().map(|value| value.as_boolean()).collect() }
+    }
+
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
+        // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
+        if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
+            return self.values[0].boolean();
         }
-        let data_type = self.r#type.data_type();
-        let shape = self.r#type.static_shape().unwrap();
-        let (mut values, reduced_shape) = match kind {
-            ReductionKind::Sum | ReductionKind::Mean => {
-                let zero = Self::zero_element(data_type).unwrap_or_else(|error| panic!("{error}"));
-                reduce_evaluate(self.values.as_slice(), &shape, axes, || zero, |accumulator, value| accumulator + value)
-            }
-            ReductionKind::Max => reduce_extremum(&self.values, &shape, axes, ComparisonDirection::GreaterThan),
-            ReductionKind::Min => reduce_extremum(&self.values, &shape, axes, ComparisonDirection::LessThan),
-            ReductionKind::Any => reduce_evaluate(
-                self.values.as_slice(),
-                &shape,
-                axes,
-                || Scalar::Bool(false),
-                |accumulator, value| accumulator | value,
+        Err(ProgramError::Concretization {
+            message: format!(
+                "cannot extract a concrete boolean from a value of type {}; expected bool[]",
+                self.r#type()
             ),
-            ReductionKind::All => reduce_evaluate(
-                self.values.as_slice(),
-                &shape,
-                axes,
-                || Scalar::Bool(true),
-                |accumulator, value| accumulator & value,
-            ),
-        };
-        if matches!(kind, ReductionKind::Mean) {
-            let reduced_count: usize = axes.iter().map(|axis| shape[*axis]).product();
-            let divisor = Scalar::from(reduced_count.max(1) as f64)
-                .convert_element_type(data_type)
-                .unwrap_or_else(|error| panic!("{error}"));
-            for value in values.iter_mut() {
-                *value = *value / divisor;
+        })
+    }
+}
+
+/// Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
+/// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
+/// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+impl crate::operations::control_flow::WhilePredicate for Array {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        if self.r#type.data_type() != DataType::Boolean {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
+            });
+        }
+        for value in &self.values {
+            if value.boolean()? {
+                return Ok(true);
             }
         }
-        let output_type = ArrayType::new(data_type, Shape::from(&reduced_shape));
-        Self { r#type: output_type, values }
+        Ok(false)
+    }
+
+    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() != DataType::Boolean
+            || on_true.r#type != on_false.r#type
+            || self.values.is_empty()
+            || !on_true.values.len().is_multiple_of(self.values.len())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "mask_select requires a Boolean predicate whose element count divides congruent operands, but \
+                     got predicate {} with operands {} and {}",
+                    self.r#type, on_true.r#type, on_false.r#type,
+                ),
+            });
+        }
+        let block = on_true.values.len() / self.values.len();
+        let values = on_true
+            .values
+            .iter()
+            .zip(on_false.values.iter())
+            .enumerate()
+            .map(|(index, (on_true, on_false))| {
+                Ok(if self.values[index / block].boolean()? { *on_true } else { *on_false })
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Ok(Self { r#type: on_true.r#type.clone(), values })
     }
 }
 
-/// Reduces `values` along `axes` keeping the extremum in the provided `direction` (the maximum for
-/// [`ComparisonDirection::GreaterThan`] and the minimum for [`ComparisonDirection::LessThan`]). The accumulator is an
-/// `Option` because max/min have no identity element that is representable for every element data type (e.g.,
-/// integers have no infinities), so reducing an empty axis panics instead of materializing a synthetic identity.
-fn reduce_extremum(
-    values: &[Scalar],
-    shape: &StaticShape,
-    axes: &[usize],
-    direction: ComparisonDirection,
-) -> (Vec<Scalar>, StaticShape) {
-    let wrapped: Vec<Option<Scalar>> = values.iter().map(|value| Some(*value)).collect();
-    let (reduced, reduced_shape) = reduce_evaluate(
-        wrapped.as_slice(),
-        shape,
-        axes,
-        || None,
-        |accumulator, value| match (accumulator, value) {
-            (None, value) => value,
-            (accumulator, None) => accumulator,
-            (Some(accumulator), Some(value)) => Some(extremum(accumulator, value, direction)),
-        },
-    );
-    let values = reduced
-        .into_iter()
-        .map(|value| value.expect("cannot reduce an empty axis with a max or min reduction"))
-        .collect();
-    (values, reduced_shape)
-}
-
-// `ArrayType` describes itself. This fixed point (rather than a dummy unit-like type) is deliberate and load-bearing
-// for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the same
-// type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<ArrayType>` type inference,
-// lowering bounds such as `MlirLowerableValue: Value<Type = ArrayType>` in `ryft-xla`, and tracing and staging code
-// pinned on `V: Value<Type = ArrayType>`) accepts it anywhere a concrete array value would slot in. A dummy `Type`
-// would place the carrier in a fresh operation universe with no operations or inference rules and an opaque unit type
-// would additionally discard the shape, element-type, and sharding payload that `r#type()` feeds to type inference
-// during a metadata trace. This is the standard abstract-interpretation move (e.g., JAX's `eval_shape` traces with
-// `ShapeDtypeStruct` standing in for arrays, and an abstract value's abstract value is itself).
-impl Typed for ArrayType {
-    type Type = ArrayType;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(self)
+impl ConvertElementType for Array {
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() == DataType::Token || data_type == DataType::Token {
+            return Err(
+                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
+            );
+        }
+        let values = self
+            .values
+            .iter()
+            .map(|value| value.convert_element_type(data_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { r#type: self.r#type.clone().with_data_type(data_type), values })
     }
 }
 
-// Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
-// because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
-// self-describing: its type is itself. This is not a type-theoretic universe claim (i.e., `ArrayType : ArrayType`).
-// It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program storage, lowering, and
-// transformation. Refer to the comment above the `Typed` implementation for `ArrayType` for more information.
-impl Value for ArrayType {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
-
+impl TransferToMemory for Array {
+    /// Re-places this [`Array`] in `destination` by updating the [`Memory`](crate::types::Memory) carried by its
+    /// type. The payload is host-resident either way, but the carried type must reflect the transfer so that staged
+    /// programs whose declared types park values in other memories (e.g., offloaded residuals) accept the
+    /// interpreted value.
     #[inline]
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
+    fn transfer_to_memory(&self, destination: crate::types::Memory) -> Self {
+        Self { r#type: self.r#type.clone().with_memory(destination), values: self.values.clone() }
     }
+}
 
+// An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
+// requested distribution metadata — mirroring the `ReshardOperation` type-inference rule, which carries the input's
+// varying manual axes over to the target sharding — so interpreted programs preserve their declared boundaries
+// exactly. The infallible capability signature makes an invalid target sharding a panic rather than an error, which
+// the type-level validation performed before interpretation rules out for staged programs.
+impl crate::operations::sharding::Reshard for Array {
+    fn reshard(&self, sharding: &crate::Sharding) -> Self {
+        let varying_manual_axes =
+            self.r#type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
+        let sharding = sharding
+            .clone()
+            .with_varying_manual_axes(varying_manual_axes)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let r#type = self.r#type.clone().with_sharding(sharding).unwrap_or_else(|error| panic!("{error}"));
+        Self { r#type, values: self.values.clone() }
+    }
+}
+
+// The sharding-constraint hint is untracked: the output type (sharding included) is identical to the input, so the
+// identity default is exactly the `ShardingConstraintOperation` interpretation contract for a concrete value.
+impl crate::operations::sharding::ConstrainSharding for Array {}
+
+impl Tag for Array {
     #[inline]
-    fn execution_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
+    fn tag(self, _key: &str) -> Self {
+        self
     }
 }
 
@@ -1510,6 +1482,9 @@ mod tests {
     use crate::operations::complex::Complex;
     use crate::operations::constants::Iota;
     use crate::operations::manipulation::{GatherDimensionNumbers, ScatterDimensionNumbers};
+    use crate::operations::sharding::{ConstrainSharding, Reshard};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::types::Memory;
 
     use super::*;
 
@@ -2012,5 +1987,36 @@ mod tests {
         assert_eq!(converted.to_f64s(), vec![2.0, 0.5]);
         let round_trip = converted.convert_element_type(DataType::F8E8M0FNU).unwrap();
         assert_eq!(round_trip, array);
+    }
+
+    #[test]
+    fn test_array_type_metadata_operations() {
+        // The sharding, memory, and tagging operations alter only the carried type (or nothing at all): the payload
+        // of a concrete single-device array is host-resident metadata-free storage either way.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+
+        // Memory transfers re-place the array by updating the memory carried by its type.
+        let array = Array::vector(vec![1.0, 2.0]);
+        let transferred = array.transfer_to_memory(Memory::Host { pinned: true });
+        assert_eq!(transferred.r#type().memory(), Memory::Host { pinned: true });
+        assert_eq!(transferred.r#type().into_owned().with_memory(Memory::Device), array.r#type().into_owned());
+        assert_eq!(transferred.values(), array.values());
+
+        // Resharding records the requested distribution metadata on the type, carrying the input's varying manual
+        // axes over to the target sharding exactly like the `ReshardOperation` type-inference rule.
+        let input_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let input =
+            Array::from_f64s(array_type(DataType::F64, &[2]).with_sharding(input_sharding).unwrap(), vec![1.0, 2.0]);
+        let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let resharded = input.reshard(&target);
+        assert_eq!(resharded.r#type().sharding(), Some(&target.clone().with_varying_manual_axes(["m"]).unwrap()),);
+        assert_eq!(resharded.values(), input.values());
+
+        // The sharding-constraint hint is untracked, so constraining leaves the value (type included) unchanged.
+        assert_eq!(input.constrain_sharding(&target), input);
     }
 }
