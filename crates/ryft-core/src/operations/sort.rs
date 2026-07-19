@@ -480,7 +480,8 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::macros::{
-        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -661,9 +662,23 @@ mod tests {
     #[test]
     fn test_sort_partial_evaluation() {
         check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
             operation = SortOperation::new(0, SortDirection::Ascending),
-            inputs = [Array::vector(vec![3.0, 1.0, 2.0])],
-            expected = Array::vector(vec![1.0, 2.0, 3.0]),
+            cases = [
+                {
+                    inputs = [(@known, Array::vector(vec![3.0, 1.0, 2.0]))],
+                    outputs = [(@known, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(
+                        type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),
+                        replay = Array::vector(vec![3.0, 1.0, 2.0])
+                    ))],
+                    outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    residual_instructions = 1,
+                },
+            ],
         );
     }
 

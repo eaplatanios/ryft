@@ -435,6 +435,7 @@ where
 /// Canonical operation name for [`AxisIndexOperation`].
 pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 
+// TODO(eaplatanios): Include code examples in the docstrings similar to the JAX documentation.
 /// Nullary primitive that produces the current batch item's or device shard's index along a named axis as a scalar
 /// [`DataType::U64`] value — the ryft analogue of JAX's
 /// [`axis_index`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.axis_index.html).

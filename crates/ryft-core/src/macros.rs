@@ -570,8 +570,8 @@ macro_rules! define_elementwise_operation {
             @infer_data_types [$($infer_data_types)?] @$arity $input_data_types $(, $name)?
         )?;
         $crate::check_count!("output", output_data_types, 1, TypeError);
-        let mut output_type = $crate::ElementwiseOperation::broadcast_output_type($operation, $input_types)?;
-        output_type.data_type = output_data_types[0];
+        let output_type = $crate::ElementwiseOperation::broadcast_output_type($operation, $input_types)?
+            .with_data_type(output_data_types[0]);
         Ok(vec![output_type])
     }};
 }
