@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::{BooleanLike, ElementwiseOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
@@ -135,9 +135,7 @@ where
 
 impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation {}
 
-impl_non_differentiable_operation!(CompareOperation);
-
-impl_non_transposable_operation!(CompareOperation);
+impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation);
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing

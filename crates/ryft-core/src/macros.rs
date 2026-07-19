@@ -208,6 +208,44 @@ macro_rules! check_builders {
 /// [`ElementwiseOperation`](crate::ElementwiseOperation), [`InterpretableOperation`](crate::InterpretableOperation),
 /// and [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations.
 ///
+/// # Examples
+///
+/// An ordinary unary operation declares its type constraints and uses the default type-preserving inference:
+///
+/// ```rust,ignore
+/// define_elementwise_operation!(
+///     @unary
+///     /// Elementwise sine operation.
+///     SinOperation, SIN_OPERATION_NAME,
+///     Sin, sin,
+///     check_data_types = [@floating_or_complex],
+///     check_array_types = [@no_unreduced],
+/// );
+/// ```
+///
+/// An operation whose result element type differs from its input can provide a named data-type inference function.
+/// The generated array inference broadcasts the array structure and applies that same function to its element data
+/// types. Operations with genuinely custom array metadata semantics can additionally provide `infer_array_types`:
+///
+/// ```rust,ignore
+/// fn infer_abs_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+///     Ok(vec![match input_types[0] {
+///         DataType::C64 => DataType::F32,
+///         DataType::C128 => DataType::F64,
+///         input_type => input_type,
+///     }])
+/// }
+///
+/// define_elementwise_operation!(
+///     @unary
+///     /// Elementwise absolute-value operation.
+///     AbsOperation, ABS_OPERATION_NAME,
+///     Abs, abs,
+///     infer_data_types = infer_abs_output_data_types,
+///     check_array_types = [@no_unreduced],
+/// );
+/// ```
+///
 /// # Parameters
 ///
 ///   - `@unary` / `@binary`: Selects the operation arity.
@@ -217,6 +255,14 @@ macro_rules! check_builders {
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
 ///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
+///   - `infer_data_types`: Optional path to a function with signature `fn(&[DataType]) -> Result<Vec<DataType>,
+///     TypeError>`. It receives the operation's validated input data types and returns its single output data type.
+///     When omitted, unary operations preserve their input data type and binary operations use ordinary data-type
+///     broadcasting.
+///   - `infer_array_types`: Optional path to a function that accepts the operation's input
+///     [`ArrayType`](crate::ArrayType) slice with signature `fn(&[ArrayType]) -> Result<Vec<ArrayType>, TypeError>`.
+///     It receives the validated input array types and returns the single output array type. When omitted, the macro
+///     broadcasts the input array structure and applies `infer_data_types` to the input element data types.
 ///   - `check_data_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to scalar
 ///     input types and array element types before type inference.
 ///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to array
@@ -228,6 +274,8 @@ macro_rules! define_elementwise_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
+        $(, infer_data_types = $infer_data_types:path)?
+        $(, infer_array_types = $infer_array_types:path)?
         $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
@@ -256,7 +304,11 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
-                Ok(vec![input_types[0]])
+                let output_types = $crate::define_elementwise_operation!(
+                    @infer_data_types [$($infer_data_types)?] @unary input_types
+                )?;
+                $crate::check_count!("output", output_types, 1, TypeError);
+                Ok(output_types)
             }
         }
 
@@ -272,9 +324,6 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
-                $crate::check_count!("input", input_types, 1, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type()]);)*)?
-                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -283,6 +332,21 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn input_count(&self) -> usize {
                 1
+            }
+
+            #[inline]
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::ArrayType],
+            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                $crate::check_count!("input", input_types, 1, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type()]);)*)?
+                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
+                let output_types = $crate::define_elementwise_operation!(
+                    @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self, input_types
+                )?;
+                $crate::check_count!("output", output_types, 1, TypeError);
+                Ok(output_types)
             }
         }
 
@@ -307,11 +371,14 @@ macro_rules! define_elementwise_operation {
         {
         }
     };
+
     (
         @binary
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
+        $(, infer_data_types = $infer_data_types:path)?
+        $(, infer_array_types = $infer_array_types:path)?
         $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
@@ -340,11 +407,11 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
-                $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
-                    .map(|output| vec![output])
-                    .map_err(|_| $crate::TypeError {
-                        message: format!("'{}' input types are not broadcast-compatible", $name),
-                    })
+                let output_types = $crate::define_elementwise_operation!(
+                    @infer_data_types [$($infer_data_types)?] @binary input_types, $name
+                )?;
+                $crate::check_count!("output", output_types, 1, TypeError);
+                Ok(output_types)
             }
         }
 
@@ -360,9 +427,6 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
                 _region_interfaces: &[$crate::RegionInterface<$crate::ArrayType>],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
-                $crate::check_count!("input", input_types, 2, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type(), input_types[1].data_type()]);)*)?
-                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
         }
@@ -371,6 +435,21 @@ macro_rules! define_elementwise_operation {
             #[inline]
             fn input_count(&self) -> usize {
                 2
+            }
+
+            #[inline]
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::ArrayType],
+            ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
+                $crate::check_count!("input", input_types, 2, TypeError);
+                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type(), input_types[1].data_type()]);)*)?
+                $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
+                let output_types = $crate::define_elementwise_operation!(
+                    @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self, input_types, $name
+                )?;
+                $crate::check_count!("output", output_types, 1, TypeError);
+                Ok(output_types)
             }
         }
 
@@ -395,27 +474,126 @@ macro_rules! define_elementwise_operation {
         {
         }
     };
+
+    // Internal branch used for this macro's implementation.
+    (@infer_data_types [$infer_data_types:path] @$arity:ident $input_types:expr $(, $name:ident)?) => {
+        $infer_data_types($input_types)
+    };
+
+    // Internal branch used for this macro's implementation.
+    (@infer_data_types [] @unary $input_types:expr) => {
+        Ok(vec![$input_types[0]])
+    };
+
+    // Internal branch used for this macro's implementation.
+    (@infer_data_types [] @binary $input_types:expr, $name:ident) => {
+        $crate::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
+            .map(|output| vec![output])
+            .map_err(|_| $crate::TypeError {
+                message: format!("'{}' input types are not broadcast-compatible", $name),
+            })
+    };
+
+    // Internal branch used for this macro's implementation.
+    (
+        @infer_array_types [$infer_array_types:path] [$($infer_data_types:path)?] @$arity:ident
+        $operation:expr, $input_types:expr $(, $name:ident)?
+    ) => {
+        $infer_array_types($input_types)
+    };
+
+    // Internal branch used for this macro's implementation.
+    (
+        @infer_array_types [] [$($infer_data_types:path)?] @unary
+        $operation:expr, $input_types:expr
+    ) => {{
+        let input_data_types = [$input_types[0].data_type()];
+        $crate::define_elementwise_operation!(
+            @infer_default_array_types [$($infer_data_types)?] @unary
+            $operation, $input_types, input_data_types.as_slice()
+        )
+    }};
+
+    // Internal branch used for this macro's implementation.
+    (
+        @infer_array_types [] [$($infer_data_types:path)?] @binary
+        $operation:expr, $input_types:expr, $name:ident
+    ) => {{
+        let input_data_types = [$input_types[0].data_type(), $input_types[1].data_type()];
+        $crate::define_elementwise_operation!(
+            @infer_default_array_types [$($infer_data_types)?] @binary
+            $operation, $input_types, input_data_types.as_slice(), $name
+        )
+    }};
+
+    // Internal branch used for this macro's implementation.
+    (
+        @infer_default_array_types [$($infer_data_types:path)?] @$arity:ident
+        $operation:expr, $input_types:expr, $input_data_types:expr $(, $name:ident)?
+    ) => {{
+        let output_data_types = $crate::define_elementwise_operation!(
+            @infer_data_types [$($infer_data_types)?] @$arity $input_data_types $(, $name)?
+        )?;
+        $crate::check_count!("output", output_data_types, 1, TypeError);
+        let mut output_type = $crate::ElementwiseOperation::broadcast_output_type($operation, $input_types)?;
+        output_type.data_type = output_data_types[0];
+        Ok(vec![output_type])
+    }};
 }
 
 /// Defines a value-level capability trait paired with an elementwise operation and its dispatch-domain implementation.
 ///
+/// # Examples
+///
+/// Unary capabilities document their receiver-only method directly:
+///
+/// ```rust,ignore
+/// define_elementwise_capability!(
+///     @unary
+///     /// Value-level sine capability.
+///     Sin,
+///     /// Computes the elementwise sine of this value.
+///     sin,
+///     SinOperation,
+/// );
+/// ```
+///
+/// Binary capabilities must name their non-receiver argument. That name is used in both the generated trait method and
+/// its blanket implementation, allowing operation-specific terminology such as the `x` coordinate of `atan2(y, x)`:
+///
+/// ```rust,ignore
+/// define_elementwise_capability!(
+///     @binary
+///     /// Value-level two-argument arc-tangent capability.
+///     Atan2,
+///     /// Computes `atan2(self, x)`, with `self` representing the `y` coordinate.
+///     atan2(x),
+///     Atan2Operation,
+/// );
+/// ```
+///
 /// # Parameters
 ///
-///   - `@unary` / `@binary`: Selects whether the capability consumes only `self` or also a right-hand-side value.
-///   - `$(#[$documentation])*`: Documentation attributes attached to the generated capability trait.
+///   - `@unary` / `@binary`: Selects whether the capability consumes only `self` or also one named argument.
+///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
+///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
 ///   - `$method`: Identifier of the generated capability method (e.g., `sin`).
+///   - `$argument`: Required name for the binary capability's non-receiver argument (e.g., `x` in `atan2(x)`).
 ///   - `$operation`: Unit-struct operation bound through the value's dispatch domain (e.g., `SinOperation`).
 #[macro_export]
 macro_rules! define_elementwise_capability {
     (
         @unary
-        $(#[$documentation:meta])*
-        $capability:ident, $method:ident, $operation:ident $(,)?
+        $(#[$capability_documentation:meta])*
+        $capability:ident,
+        $(#[$method_documentation:meta])+
+        $method:ident,
+        $operation:ident $(,)?
     ) => {
-        $(#[$documentation])*
+        $(#[$capability_documentation])*
         pub trait $capability: Sized {
-            #[doc = concat!("Computes [`", stringify!($operation), "`] elementwise for this value.")]
+            $(#[$method_documentation])+
             fn $method(&self) -> Result<Self, $crate::ProgramError>;
         }
 
@@ -434,27 +612,31 @@ macro_rules! define_elementwise_capability {
             }
         }
     };
+
     (
         @binary
-        $(#[$documentation:meta])*
-        $capability:ident, $method:ident, $operation:ident $(,)?
+        $(#[$capability_documentation:meta])*
+        $capability:ident,
+        $(#[$method_documentation:meta])+
+        $method:ident($argument:ident),
+        $operation:ident $(,)?
     ) => {
-        $(#[$documentation])*
+        $(#[$capability_documentation])*
         pub trait $capability: Sized {
-            #[doc = concat!("Computes [`", stringify!($operation), "`] elementwise for this value and `right`.")]
-            fn $method(&self, right: &Self) -> Result<Self, $crate::ProgramError>;
+            $(#[$method_documentation])+
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
         impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
             $capability for V
         {
             #[inline]
-            fn $method(&self, right: &Self) -> Result<Self, $crate::ProgramError> {
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
                     $operation,
                     Vec::new(),
-                    &[self.clone(), right.clone()],
+                    &[self.clone(), $argument.clone()],
                 )?
                 .remove(0))
             }
@@ -501,21 +683,92 @@ macro_rules! define_elementwise_capability {
 /// [`TransposableOperation`](crate::TransposableOperation) implementations that do not themselves impose elementwise
 /// structure on the provided bodies (the form exists so that elementwise operation modules keep a single entry point).
 ///
-/// # Example
+/// # Examples
+///
+/// Signed-linear operations need only declare the sign with which each input contributes.
+/// The macro generates both the JVP and the transposition rules:
+///
+/// ```rust,ignore
+/// impl_differentiable_elementwise_operation! {
+///     @signed_linear
+///     impl<C> AddOperation {
+///         rule = [@positive, @positive];
+///     }
+/// }
+/// ```
+///
+/// A nonlinear unary rule expresses its one tangent contribution directly. This example uses `-> output` to bind
+/// the primal output at the tangent type, reusing the original output when its type already matches and otherwise
+/// re-evaluating it only when the input tangent is live:
 ///
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
 ///     @unary
-///     impl<C> SinOperation
-///     where {
-///         C::Value: Sin + Cos + std::ops::Mul<Output = C::Value>,
-///     }
+///     impl<C> ExpOperation where C::Value: std::ops::Mul<Output = C::Value>,
 ///     {
-///         jvp = |(input, input_tangent)| input.cos()? * input_tangent;
-///
+///         jvp = |(_, input_tangent) -> output| output * input_tangent;
 ///         transpose = @nonlinear;
 ///     }
 /// }
+/// ```
+///
+/// A binary rule provides one independently lazy contribution per input tangent. It can additionally describe the
+/// supported primitive-transposition knownness cases and their operation-specific diagnostics:
+///
+/// ```rust,ignore
+/// impl_differentiable_elementwise_operation! {
+///     @binary
+///     impl<C> MulOperation where C::Value: std::ops::Mul<Output = C::Value>,
+///     {
+///         jvp {
+///             |(_, left_tangent), (right, _)| right * left_tangent;
+///             |(left, _), (_, right_tangent)| left * right_tangent;
+///         }
+///
+///         transpose<V, O>
+///         where
+///             V::Type: DifferentiableType,
+///             O: From<MulOperation>,
+///             Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+///         {
+///             [left = @linear, right = @known] =>
+///                 |output_cotangent| right.binary(output_cotangent, MulOperation);
+///             [left = @known, right = @linear] =>
+///                 |output_cotangent| left.binary(output_cotangent, MulOperation);
+///
+///             errors {
+///                 no_cotangent = "'mul' linear input has no cotangent space";
+///                 both_linear = "bilinear 'mul' with two linear operands cannot be transposed";
+///                 no_linear = "'mul' with no linear operand cannot be transposed";
+///             }
+///         }
+///     }
+/// }
+/// ```
+///
+/// The custom form accepts complete rule bodies when independent contribution expressions cannot represent the
+/// operation efficiently or correctly. The helpers in this example stand in for arbitrary caller-defined logic:
+///
+/// ```rust,ignore
+/// impl_differentiable_elementwise_operation! {
+///     @custom
+///     impl<C> SelectOperation where C::Type: DifferentiableType, C::Operation: From<SelectOperation>
+///     jvp |operation, context, driver, inputs| {
+///         custom_select_jvp(operation, context, driver, inputs)
+///     }
+///     transpose<V, O> where V::Type: DifferentiableType, O: From<SelectOperation>
+///     |operation, context, driver, inputs, outputs| {
+///         custom_select_transpose(operation, context, driver, inputs, outputs)
+///     }
+/// }
+/// ```
+///
+/// Finally, operations with no differential dependence use the compact selectors. `@non_differentiable` gives every
+/// output a structural-zero tangent, while `@constant_like` also gives its exemplar input a structural-zero cotangent:
+///
+/// ```rust,ignore
+/// impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation);
+/// impl_differentiable_elementwise_operation!(@constant_like ZeroLikeOperation);
 /// ```
 ///
 /// # Parameters
@@ -529,7 +782,8 @@ macro_rules! define_elementwise_capability {
 ///   - `@nonlinear`: Selects the standard unsupported primitive transposition rule.
 ///   - `$context`: Generic parameter used for the generated differentiation context.
 ///   - `$operation`: Elementwise operation type for which the rules are generated.
-///   - `$bounds`: Additional bounds required by the operation-specific formulas.
+///   - `$bounds`: Additional bounds required by the operation-specific formulas, written directly after `where` using
+///     ordinary Rust `where`-predicate syntax without an additional delimiter.
 ///   - `$input_primal`: Name bound to an aligned input primal. `_` omits that value without evaluating it.
 ///   - `$input_tangent`: Name bound to the live, aligned tangent whose contribution is being evaluated.
 ///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
@@ -573,6 +827,97 @@ macro_rules! impl_differentiable_elementwise_operation {
                     $crate::Typed::r#type(&inputs[0]).as_ref(),
                 ))])
             }
+        }
+    };
+
+    // `macro_rules!` has no fragment specifier for a complete `where` clause. These entry arms therefore collect
+    // predicates one token tree at a time until the final rule body, allowing the public syntax to remain Rust-like
+    // without constraining which predicates callers may write.
+    (
+        @unary
+        impl<$context:ident> $operation:ty
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_outer_where [unary] [$context] [$operation] [] $($tail)*
+        }
+    };
+
+    (
+        @binary
+        impl<$context:ident> $operation:ty
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_outer_where [binary] [$context] [$operation] [] $($tail)*
+        }
+    };
+
+    (
+        @collect_outer_where [unary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        { $($body:tt)* }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @unary_with_bounds
+            impl<$context> $operation
+            where { $($bounds)* }
+            { $($body)* }
+        }
+    };
+
+    (
+        @collect_outer_where [binary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        { $($body:tt)* }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_with_bounds
+            impl<$context> $operation
+            where { $($bounds)* }
+            { $($body)* }
+        }
+    };
+
+    (
+        @collect_outer_where [$kind:ident] [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_outer_where [$kind] [$context] [$operation] [$($bounds)* $next] $($rest)*
+        }
+    };
+
+    // Custom rules have no enclosing rule-body braces, so their outer predicates end at `jvp`.
+    (
+        @custom
+        impl<$context:ident> $operation:ty
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_custom_where [$context] [$operation] [] $($tail)*
+        }
+    };
+
+    (
+        @collect_custom_where [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $(#[$documentation:meta])* jvp $($body:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_with_bounds
+            impl<$context> $operation
+            where { $($bounds)* }
+            $(#[$documentation])* jvp $($body)*
+        }
+    };
+
+    (
+        @collect_custom_where [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_custom_where [$context] [$operation] [$($bounds)* $next] $($rest)*
         }
     };
 
@@ -917,7 +1262,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     }};
 
     (
-        @unary
+        @unary_with_bounds
         impl<$context:ident> $operation:ty
         where { $($bounds:tt)* }
         {
@@ -974,8 +1319,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
+    // Binary transposition has its own generic parameters and `where` clause inside the outer rule body. Collect its
+    // predicates until either the knownness-case body or the custom transposition closure.
     (
-        @binary
+        @binary_with_bounds
         impl<$context:ident> $operation:ty
         where { $($bounds:tt)* }
         {
@@ -995,7 +1342,83 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @binary
+        @binary_with_bounds
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        {
+            jvp { $($jvp:tt)* }
+
+            $(#[$transpose_documentation:meta])*
+            transpose<$value:ident, $operations:ident>
+            where
+            $($tail:tt)*
+        }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_binary_transpose_where
+            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
+        }
+    };
+
+    (
+        @collect_binary_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        { $($transpose_body:tt)* }
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_ready
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            {
+                jvp { $($jvp)* }
+
+                $($transpose_documentation)*
+                transpose<$value, $operations>
+                where { $($transpose_bounds)* }
+                { $($transpose_body)* }
+            }
+        }
+    };
+
+    (
+        @collect_binary_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_ready
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            {
+                jvp { $($jvp)* }
+
+                $($transpose_documentation)*
+                transpose<$value, $operations>
+                where { $($transpose_bounds)* }
+                |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+            }
+        }
+    };
+
+    (
+        @collect_binary_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_binary_transpose_where
+            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
+            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+        }
+    };
+
+    (
+        @binary_ready
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
@@ -1118,7 +1541,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @binary
+        @binary_ready
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
@@ -1198,7 +1621,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @binary
+        @binary_ready
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
@@ -1315,7 +1738,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @custom
+        @custom_with_bounds
         impl<$context:ident> $operation:ty
         where { $($bounds:tt)* }
         $(#[$jvp_documentation:meta])*
@@ -1334,7 +1757,64 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @custom
+        @custom_with_bounds
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        $(#[$jvp_documentation:meta])*
+        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_custom_transpose_where
+            [$context] [$operation] [$($jvp_bounds)*]
+            [$(#[$jvp_documentation])*] [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
+        }
+    };
+
+    (
+        @collect_custom_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        [$($jvp_documentation:tt)*] [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident]
+        [$jvp_body:block] [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident]
+        [$($transpose_bounds:tt)*]
+        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_ready
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            $($jvp_documentation)*
+            jvp |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            $($transpose_documentation)*
+            transpose<$value, $operations>
+            where { $($transpose_bounds)* }
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    (
+        @collect_custom_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
+        [$($jvp_documentation:tt)*] [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident]
+        [$jvp_body:block] [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident]
+        [$($transpose_bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_custom_transpose_where
+            [$context] [$operation] [$($jvp_bounds)*]
+            [$($jvp_documentation)*] [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+        }
+    };
+
+    (
+        @custom_ready
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         $(#[$jvp_documentation:meta])*
@@ -2983,16 +3463,59 @@ mod tests {
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
+    const TEST_MAGNITUDE_OPERATION_NAME: &str = "test_magnitude";
+    const TEST_STRICT_ADD_OPERATION_NAME: &str = "test_strict_add";
+
+    /// Infers the test magnitude operation's complex-to-real output data type.
+    fn infer_test_magnitude_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        Ok(vec![match input_types[0] {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            input_type => input_type,
+        }])
+    }
+
+    /// Infers the test strict-add operation's output array type.
+    fn infer_test_strict_add_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        if input_types[0] != input_types[1] {
+            return Err(TypeError { message: "test strict-add inputs must have identical array types".to_string() });
+        }
+        Ok(vec![input_types[0].clone()])
+    }
+
+    define_elementwise_operation!(
+        @unary
+        /// Unary operation used to test custom data-type inference.
+        TestMagnitudeOperation, TEST_MAGNITUDE_OPERATION_NAME,
+        Abs, abs,
+        infer_data_types = infer_test_magnitude_data_types,
+    );
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation used to test custom array-type inference.
+        TestStrictAddOperation, TEST_STRICT_ADD_OPERATION_NAME,
+        Add, add,
+        infer_array_types = infer_test_strict_add_array_types,
+        check_data_types = [@numeric],
+    );
+
     define_elementwise_capability!(
         @unary
         /// Unary capability used to test [`define_elementwise_capability!`].
-        TestUnary, test_unary, TestUnaryOperation,
+        TestUnary,
+        /// Applies the test unary operation.
+        test_unary,
+        TestUnaryOperation,
     );
 
     define_elementwise_capability!(
         @binary
         /// Binary capability used to test [`define_elementwise_capability!`].
-        TestBinary, test_binary, TestBinaryOperation,
+        TestBinary,
+        /// Applies the test binary operation to this value and `other`.
+        test_binary(other),
+        TestBinaryOperation,
     );
 
     const TEST_REVERSED_SUB_OPERATION_NAME: &str = "test_reversed_sub";
@@ -3884,6 +4407,43 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&Scalar::from(5.0f32)));
+    }
+
+    #[test]
+    fn test_define_elementwise_operation_custom_inference() {
+        let magnitude = TestMagnitudeOperation;
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&magnitude, &[DataType::C64], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        let complex_vector = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]));
+        let real_vector = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&magnitude, std::slice::from_ref(&complex_vector), &[],),
+            Ok(vec![real_vector.clone()]),
+        );
+        assert_eq!(
+            ElementwiseOperation::infer_output_types(&magnitude, std::slice::from_ref(&complex_vector)),
+            Ok(vec![real_vector]),
+        );
+
+        let strict_add = TestStrictAddOperation;
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&strict_add, &[DataType::F32, DataType::F64], &[]),
+            Ok(vec![DataType::F64]),
+        );
+        let scalar = ArrayType::scalar(DataType::F32);
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), scalar.clone()], &[]),
+            Ok(vec![scalar.clone()]),
+        );
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let expected = Err(TypeError { message: "test strict-add inputs must have identical array types".to_string() });
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), vector.clone()], &[]),
+            expected.clone(),
+        );
+        assert_eq!(ElementwiseOperation::infer_output_types(&strict_add, &[scalar, vector]), expected);
     }
 
     #[test]

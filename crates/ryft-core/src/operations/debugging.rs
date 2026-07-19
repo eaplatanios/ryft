@@ -1,23 +1,16 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::ZeroOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
@@ -146,43 +139,10 @@ where
     }
 }
 
-impl<C: Context> DifferentiableOperation<C> for PrintOperation
-where
-    C::Type: DifferentiableType,
-    C::Operation: From<ZeroOperation<C::Type>> + From<PrintOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // We re-print the input primal so the effect survives differentiation, while letting the input tangent pass
-        // through unchanged (printing tangents would change the observable output of the differentiated program).
-        // The print binds through the context so the rule works uniformly under staging and eager contexts.
-        check_count!("input", inputs, 1, ProgramError);
-        let mut primal =
-            context.bind(PrintOperation::new(self.label()), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
-        check_count!("output", primal, 1, ProgramError);
-        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())?])
-    }
-}
-
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOperation {
-    #[inline]
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // `PrintOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
-        // function: the single output cotangent passes straight through to the single input without staging another
-        // print. The `DifferentiableOperation` implementation keeps the effect on the primal side, so the reverse
-        // pass never re-executes it.
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![outputs[0].clone()])
+impl_differentiable_elementwise_operation! {
+    @signed_linear
+    impl<C> PrintOperation {
+        rule = [@positive];
     }
 }
 

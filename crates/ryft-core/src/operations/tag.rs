@@ -1,22 +1,15 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::ZeroOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`TagOperation`].
 pub const TAG_OPERATION_NAME: &str = "tag";
@@ -114,46 +107,10 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
     }
 }
 
-impl<C: Context> DifferentiableOperation<C> for TagOperation
-where
-    C::Type: DifferentiableType,
-    C::Operation: From<ZeroOperation<C::Type>> + From<TagOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // We re-tag the input primal for downstream classification while letting the input tangent pass through
-        // unchanged, matching the identity tangent of the tag. The tag binds through the context so the rule works
-        // uniformly under staging and eager contexts.
-        check_count!("input", inputs, 1, ProgramError);
-        let mut primal =
-            context.bind(TagOperation::new(self.key()), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
-        check_count!("output", primal, 1, ProgramError);
-        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())?])
-    }
-}
-
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for TagOperation {
-    #[inline]
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // `TagOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
-        // function. The single output cotangent passes straight through to the single input, staging nothing and
-        // leaving the cotangent untagged. That is because the tag is meant to mark forward residuals and not adjoints.
-        // Based on the `DifferentiableOperation` implementation for `TagOperation`, the tag rides only the primal
-        // value and so a tag should never reach a transposed program, in practice. This implementation exists mainly
-        // for completeness and so that owning closed operation families (i.e., operation enums) can implement
-        // `TransposableOperation` themselves if one of their variants holds a `TagOperation` payload.
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![outputs[0].clone()])
+impl_differentiable_elementwise_operation! {
+    @signed_linear
+    impl<C> TagOperation {
+        rule = [@positive];
     }
 }
 
