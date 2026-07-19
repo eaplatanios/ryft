@@ -363,7 +363,7 @@ mod tests {
         let constraint_1 = IntegerSetConstraint { expression: (dimension_0 + constant_1).as_ref(), is_equality: false };
         let set = context.integer_set(1, 0, &[&constraint_0, &constraint_1]);
 
-        // We are just checking that [`IntegerSet::dump`] runs successfully without crashing.
+        // We are just checking that `IntegerSet::dump` runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
         set.dump();
     }

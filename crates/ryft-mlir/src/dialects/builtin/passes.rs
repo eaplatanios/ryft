@@ -6,7 +6,7 @@ use crate::{GLOBAL_REGISTRATION_MUTEX, mlir_pass};
 
 /// Registers the MLIR conversion passes with the global registry.
 pub fn register_conversions_passes() {
-    // Use [`OnceLock`] to ensure that [`register_conversions_passes`] is called at most once.
+    // Use `OnceLock` to ensure that `register_conversions_passes` is called at most once.
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| unsafe {
         let _guard = GLOBAL_REGISTRATION_MUTEX.lock();
@@ -100,7 +100,7 @@ mlir_pass!(conversion_ub_to_spirv_pass, ConversionUBToSPIRVConversionPass);
 
 /// Registers the MLIR transformation passes with the global registry.
 pub fn register_transforms_passes() {
-    // Use [`OnceLock`] to ensure that [`register_transforms_passes`] is called at most once.
+    // Use `OnceLock` to ensure that `register_transforms_passes` is called at most once.
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| unsafe {
         let _guard = GLOBAL_REGISTRATION_MUTEX.lock();

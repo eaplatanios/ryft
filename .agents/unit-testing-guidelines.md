@@ -22,6 +22,20 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Run scoped verification for the crate or module touched, using a 300-second timeout for local test commands unless the
   user asks for a longer run.
 
+## Reference Backends
+
+- Use `ryft_core::backends::scalars::Scalar` as the concrete eager value for scalar-universe coverage (i.e., programs 
+  typed by `DataType`) and `ryft_core::backends::arrays::Array` for array-universe coverage (i.e., programs typed by
+  `ArrayType`). Both store honestly typed payloads (`Array` is a row-major `Vec<Scalar>`), so value-level tests can and
+  should assert exact element data types, complex values, and exact low-precision floating-point encodings, and not
+  `f64` approximations of them.
+- In `ryft-xla`, import the reference array value as `use ryft_core::backends::arrays::Array as TestArray;` so that it
+  does not collide with the XLA buffer-backed `Array`. When both backends implement an operation, keep them value-level
+  consistent.
+- Use the `check_gradient!` macro from `ryft_core::macros` as the finite-difference oracle for gradient rules. You
+  must use `check_gradient!(@scalar, ...)` for `Scalar`-valued functions and `check_gradient!(@array, ...)` for
+  `Array`-valued functions, and `TestRegionOperation` for testing region-carrying program machinery.
+
 ## Structure
 
 - Keep setup local and explicit. A single test may cover a normal path plus nearby edge cases when they share the same
@@ -78,6 +92,17 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   with `indoc!` and `pretty_assertions::assert_eq`.
 - Test operations individually where possible. Prefer full-string equality assertions over partial `.contains(...)`
   checks for rendered IR.
+- Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
+  `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
+  and `check_operation_transposition!`.
+- Use `check_operation_type_inference!` for exact regionless operation type-inference cases. Keep explicit assertions
+  for field-level metadata projections and operations whose inference contract depends on attached region interfaces.
+- Use the `@elementwise @unary` and `@elementwise @binary` selectors of `check_operation_type_inference!` for
+  operation-owned element-data-type cases. Keep shared broadcasting, layout, and metadata behavior in the central
+  `ElementwiseOperation` tests, and keep specialized reduction-state behavior beside the operation that owns it.
+- Keep per-operation tests focused on semantics selected or implemented by that operation. Test shared declarative
+  macro rendering, arity validation, and generated formatting centrally rather than repeating those checks for every
+  macro-generated operation.
 - When testing operation accessors, assert operands, results, attributes, properties, and collection lengths before
   inserting the operation into a final block if detached-operation behavior matters.
 - For wrapper hierarchies, cover construction, context ownership, accessor values, equality within one context,

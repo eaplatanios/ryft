@@ -91,12 +91,12 @@ impl UrlWithChecksum {
             bail!("encountered HTTP error ({}) while downloading '{}'", response.status(), self.url);
         }
 
-        // Create the parent directory of the destination [`Path`], if it does not exist already.
+        // Create the parent directory of the destination `Path` if it does not exist already.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // Write the downloaded content into a [`File`] at the destination [`Path`].
+        // Write the downloaded content into a `File` at the destination `Path`.
         let content = response.bytes()?;
         let mut file = File::create(path)?;
         file.write_all(&content)?;
@@ -946,6 +946,9 @@ impl Display for BuildConfiguration {
 }
 
 fn main() {
+    println!("cargo::rustc-env=RYFT_XLA_COMMIT={}", *XLA_COMMIT);
+    println!("cargo::rustc-env=RYFT_JAX_COMMIT={}", *JAX_COMMIT);
+
     // Skip linking to our XLA dependencies if this is executed from within a `docs.rs` pipeline.
     if env::var("DOCS_RS").is_ok() {
         return;

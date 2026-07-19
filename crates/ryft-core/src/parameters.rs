@@ -1567,8 +1567,8 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     }
 }
 
-// Use declarative macros to provide implementations for tuples of [`Parameterized`] items. Note that if a tuple
-// contains a mix of [`Parameterized`] and non-[`Parameterized`] items, then the generated implementations here
+// Use declarative macros to provide implementations for tuples of `Parameterized` items. Note that if a tuple
+// contains a mix of `Parameterized` and non-`Parameterized` items, then the generated implementations here
 // will not cover it. Instead, such tuples are supported when nested within `struct`s or `enum`s by using our
 // `#[derive(Parameterized)]` macro as it provides special treatment for them.
 
@@ -1970,7 +1970,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
         structure: Self::ParameterStructure,
         parameters: &mut I,
     ) -> Result<Self, ParameterError> {
-        // TODO(eaplatanios): Make this more efficient by using [`std::array::try_from_fn`] once it becomes stable.
+        // TODO(eaplatanios): Make this more efficient by using `std::array::try_from_fn` once it becomes stable.
         //  Tracking issue: https://github.com/rust-lang/rust/issues/89379.
         Ok(unsafe {
             structure
@@ -2126,9 +2126,9 @@ impl<
 }
 
 // TODO(eaplatanios): Find a simple way to avoid the need for sorting.
-// The [`Parameterized`] implementation for [`HashMap`] is quite inefficient. That is because for most operations that
-// require traversal of the [`HashMap`] we end up having to perform a sort of the results that we obtain (by key) to
-// comply with the requirements of the [`Parameterized`].
+// The `Parameterized` implementation for `HashMap` is quite inefficient. That is because for most operations that
+// require traversal of the `HashMap` we end up having to perform a sort of the results that we obtain (by key) to
+// comply with the requirements of the `Parameterized`.
 impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: Clone + BuildHasher> Parameterized<P>
     for HashMap<K, V, S>
 {
@@ -2537,10 +2537,10 @@ mod tests {
             "$.heads[1].gain".to_string(),
         ];
 
-        // Test [`Parameterized::parameter_count`].
+        // Test `Parameterized::parameter_count`.
         assert_eq!(value.parameter_count(), 10);
 
-        // Test [`Parameterized::parameter_structure`].
+        // Test `Parameterized::parameter_structure`.
         let structure = value.parameter_structure();
         assert_eq!(
             structure,
@@ -2558,10 +2558,10 @@ mod tests {
             },
         );
 
-        // Test [`Parameterized::parameters`].
+        // Test `Parameterized::parameters`.
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
-        // Test [`Parameterized::parameters_mut`].
+        // Test `Parameterized::parameters_mut`.
         let mut value_clone = value.clone();
         for parameter in value_clone.parameters_mut() {
             *parameter += 100;
@@ -2571,10 +2571,10 @@ mod tests {
             vec![101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
         );
 
-        // Test [`Parameterized::into_parameters`].
+        // Test `Parameterized::into_parameters`.
         assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
-        // Test [`Parameterized::named_parameters`].
+        // Test `Parameterized::named_parameters`.
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
             expected_parameter_paths
@@ -2584,7 +2584,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        // Test [`Parameterized::named_parameters_mut`].
+        // Test `Parameterized::named_parameters_mut`.
         let mut value_clone = value.clone();
         let mut seen_parameter_paths = Vec::new();
         for (path, parameter) in value_clone.named_parameters_mut() {
@@ -2594,7 +2594,7 @@ mod tests {
         assert_eq!(seen_parameter_paths, expected_parameter_paths);
         assert_eq!(value_clone.parameters().copied().collect::<Vec<_>>(), vec![4, 5, 5, 7, 10, 10, 11, 11, 13, 13]);
 
-        // Test [`Parameterized::into_named_parameters`].
+        // Test `Parameterized::into_named_parameters`.
         assert_eq!(
             value
                 .clone()
@@ -2615,10 +2615,10 @@ mod tests {
             ]
         );
 
-        // Test [`Parameterized::parameter_paths`].
+        // Test `Parameterized::parameter_paths`.
         assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_parameter_paths);
 
-        // Test [`Parameterized::from_parameters_with_remainder`].
+        // Test `Parameterized::from_parameters_with_remainder`.
         let mut parameters = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 500].into_iter();
         assert_eq!(
             Network::from_parameters_with_remainder(structure.clone(), &mut parameters),
@@ -2634,7 +2634,7 @@ mod tests {
         );
         assert_eq!(parameters.collect::<Vec<_>>(), vec![500]);
 
-        // Test [`Parameterized::from_parameters`].
+        // Test `Parameterized::from_parameters`.
         assert_eq!(
             Network::from_parameters(structure.clone(), vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]),
             Ok(Network {
@@ -2652,12 +2652,12 @@ mod tests {
             Err(ParameterError::UnusedParameters { paths: None })
         );
 
-        // Test [`Parameterized::from_named_parameters`].
+        // Test `Parameterized::from_named_parameters`.
         let mut parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
         parameters.reverse();
         assert_eq!(Network::from_named_parameters(structure.clone(), parameters), Ok(value.clone()));
 
-        // Test [`Parameterized::from_broadcasted_named_parameters`].
+        // Test `Parameterized::from_broadcasted_named_parameters`.
         assert_eq!(
             Network::from_broadcasted_named_parameters(
                 structure.clone(),
@@ -2680,7 +2680,7 @@ mod tests {
             })
         );
 
-        // Test [`Parameterized::broadcast_to_parameter_structure`].
+        // Test `Parameterized::broadcast_to_parameter_structure`.
         assert_eq!(
             42_i32.broadcast_to_parameter_structure::<(i32, (i32, i32))>((Placeholder, (Placeholder, Placeholder))),
             Ok((42, (42, 42))),
@@ -2690,7 +2690,7 @@ mod tests {
             Err(ParameterError::MissingParameters { .. }),
         ));
 
-        // Test [`Parameterized::try_map_parameters`].
+        // Test `Parameterized::try_map_parameters`.
         assert_eq!(
             value
                 .clone()
@@ -2711,7 +2711,7 @@ mod tests {
             Err(TestMappingError::RejectedParameter(5)),
         );
 
-        // Test [`Parameterized::map_parameters`].
+        // Test `Parameterized::map_parameters`.
         assert_eq!(
             value.clone().map_parameters(|parameter| i64::from(parameter) * 10),
             Ok(Network {
@@ -2728,7 +2728,7 @@ mod tests {
             })
         );
 
-        // Test [`Parameterized::try_map_named_parameters`].
+        // Test `Parameterized::try_map_named_parameters`.
         assert_eq!(
             value
                 .clone()
@@ -2754,7 +2754,7 @@ mod tests {
             }),
         );
 
-        // Test [`Parameterized::map_named_parameters`].
+        // Test `Parameterized::map_named_parameters`.
         assert_eq!(
             value
                 .clone()
@@ -2765,7 +2765,7 @@ mod tests {
             vec![4i64, 5i64, 5i64, 7i64, 10i64, 10i64, 11i64, 11i64, 13i64, 13i64],
         );
 
-        // Test [`Parameterized::filter_parameters`].
+        // Test `Parameterized::filter_parameters`.
         assert_eq!(
             value
                 .clone()
@@ -2776,7 +2776,7 @@ mod tests {
             vec![None, None, Some(3), None, None, Some(6), None, Some(8), None, Some(10)],
         );
 
-        // Test [`Parameterized::partition_parameters`].
+        // Test `Parameterized::partition_parameters`.
         let (partition_0, partition_1) =
             value.clone().partition_parameters(|path, _| path.to_string().starts_with("$.heads[1]")).unwrap();
         assert_eq!(
@@ -2788,10 +2788,10 @@ mod tests {
             vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), None, None],
         );
 
-        // Test [`Parameterized::combine_parameters`].
+        // Test `Parameterized::combine_parameters`.
         assert_eq!(Network::combine_parameters(structure.clone(), vec![partition_0, partition_1]), Ok(value.clone()));
 
-        // Test [`Parameterized::replace_parameters`].
+        // Test `Parameterized::replace_parameters`.
         assert_eq!(
             value
                 .clone()

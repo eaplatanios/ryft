@@ -133,7 +133,7 @@ impl<O> Future for Event<O> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // It is safe to force unwrap the output option when ready because it is always going to be `Some`
-        // unless this [`Future`] has already returned [`Poll::Ready`] in an earlier call to [`Future::poll`],
+        // unless this `Future` has already returned `Poll::Ready` in an earlier call to `Future::poll`,
         // in which case this function should not have been called and a potential panic is expected.
         match self.ready() {
             Ok(true) => match self.error() {

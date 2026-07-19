@@ -46,7 +46,10 @@ When asked to implement a change or add a new feature, you must always follow th
    mutates unrelated working-tree files) to work around a build broken by concurrent edits in another crate. Those
    uncommitted changes may belong to a concurrently running agent and a partial `stash pop` can silently drop them. If
    a crate you depend on is transiently broken by such edits, verify your own change in isolation instead (e.g., a
-   throwaway crate outside the workspace that depends only on the crates you changed).
+   throwaway crate outside the workspace that depends only on the crates you changed). More generally, never run
+   `git checkout <path>`, `git restore <path>`, or `git reset` on tracked files during a session. Large refactors live
+   uncommitted in the working tree for hours, and such commands silently destroy that work. To inspect the committed
+   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead.
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.

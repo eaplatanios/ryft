@@ -34,7 +34,7 @@ use crate::{Context, Dialect, Error, Identifier, StringRef, Type, TypeId, TypeRe
 /// using the [`Attribute::is`] and [`Attribute::cast`] functions.
 ///
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/LangRef/#attributes) for more information.
-pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + Debug {
+pub trait Attribute<'c, 't: 'c>: Sized + Copy + Eq + Display + Debug {
     /// Constructs a new attribute of this type from the provided handle that came from a function in the MLIR C API.
     ///
     /// This function is marked as unsafe because handling the MLIR C API representations in Rust is generally not
@@ -245,7 +245,7 @@ pub(crate) mod tests {
     ) {
         assert_eq!(format!("{}", attribute), expected);
 
-        // Extract the type name for `A` to check the [`Debug`] implementation.
+        // Extract the type name for `A` to check the `Debug` implementation.
         let type_name = std::any::type_name::<A>().rsplit("::").next().unwrap_or("").split("<").next().unwrap_or("");
         assert_eq!(format!("{:?}", attribute), format!("{type_name}[{expected}]"));
     }
@@ -323,7 +323,7 @@ pub(crate) mod tests {
         let context = Context::new();
         let attribute = context.unit_attribute();
 
-        // We are just checking that [`AttributeRef::dump`] runs successfully without crashing.
+        // We are just checking that `AttributeRef::dump` runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
         attribute.dump();
     }

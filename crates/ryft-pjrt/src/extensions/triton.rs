@@ -323,7 +323,7 @@ mod tests {
                     let device = client.addressable_devices().unwrap().remove(0);
 
                     // Test using a minimal Triton TTIR vector-add module (same as the one used by XLA's own
-                    // [`triton_test.cc`](https://github.com/openxla/xla/blob/main/xla/pjrt/triton_test.cc) suite).
+                    // `triton_test.cc` suite).
                     let module = indoc! {"
                         module {
                             tt.func public @add_kernel(

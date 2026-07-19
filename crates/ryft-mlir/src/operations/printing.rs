@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(BytecodeWriterConfiguration::new().version, None);
         assert_eq!(BytecodeWriterConfiguration { version: Some(5) }.version, Some(5));
 
-        // Check that we can construct a C API handle for a [`BytecodeWriterConfiguration`] without crashing.
+        // Check that we can construct a C API handle for a `BytecodeWriterConfiguration` without crashing.
         let configuration = BytecodeWriterConfiguration { version: Some(42) };
         let handle = unsafe { configuration.handle() };
         let _ = unsafe { handle.to_c_api() };
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(flags.assume_verified_operations, false);
         assert_eq!(flags.skip_regions, false);
 
-        // Check that we can construct a C API handle for an [`OperationPrintingFlags`] without crashing.
+        // Check that we can construct a C API handle for an `OperationPrintingFlags` without crashing.
         let flags = OperationPrintingFlags {
             elements_attribute_size_threshold: None,
             resource_string_size_threshold: None,
@@ -310,11 +310,11 @@ mod tests {
         let region = context.region();
         let operation = OperationBuilder::new("test.op", location).add_region(region).build().unwrap();
 
-        // Check that we can create [`AsmState`] instances without crashing.
+        // Check that we can create `AsmState` instances without crashing.
         let _ = AsmState::for_operation(&operation, OperationPrintingFlags::default());
         let _ = AsmState::for_value(block.argument(0).unwrap(), OperationPrintingFlags::default());
 
-        // Check that we can construct a C API handle for an [`AsmState`] without crashing.
+        // Check that we can construct a C API handle for an `AsmState` without crashing.
         let state = AsmState::for_operation(&operation, OperationPrintingFlags::default());
         let _ = unsafe { state.to_c_api() };
     }

@@ -171,7 +171,7 @@ impl<'t> Context<'t> {
             user_data: *mut std::ffi::c_void,
         ) {
             if !user_data.is_null() {
-                // When this new [`Box`] goes out of scope, it will be dropped automatically.
+                // When this new `Box` goes out of scope, it will be dropped automatically.
                 let _ = unsafe { Box::from_raw(user_data as *mut (F, &'c Context<'t>)) };
             }
         }

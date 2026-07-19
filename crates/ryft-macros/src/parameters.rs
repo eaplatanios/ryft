@@ -19,6 +19,7 @@ const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_MACRO_PARAMETER_LIFETIME: Symbol = Symbol::new("'__p");
 const DEFAULT_MACRO_PARAMETER_TYPE: Symbol = Symbol::new("__P");
+const DEFAULT_MACRO_ITERATOR_TYPE: Symbol = Symbol::new("__I");
 const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Parameter");
 
 const FIELD_ATTRIBUTE_ERROR: &str = "\
@@ -46,6 +47,11 @@ pub(crate) struct CodeGenerator {
     /// arguments). This should not conflict with any identifiers that already appear in the scope in which the
     /// corresponding code will be generated. It defaults to [`DEFAULT_MACRO_PARAMETER_TYPE`].
     macro_parameter_type: syn::Ident,
+
+    /// [`syn::Ident`] that represents the macro-internal iterator type parameter used by generated reconstruction
+    /// methods. This should not conflict with any identifiers that already appear in the scope in which the
+    /// corresponding code will be generated. It defaults to [`DEFAULT_MACRO_ITERATOR_TYPE`].
+    macro_iterator_type: syn::Ident,
 
     /// [`syn::Ident`] that represents the parameter type in the container on which our macros operate. This must match
     /// one of the generic type parameters of that container. This [`syn::Ident`] is always inferred from the
@@ -126,9 +132,9 @@ impl CodeGenerator {
     ///         fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> { ... }
     ///         fn into_parameters(self) -> Self::ParameterIntoIterator<P> { ... }
     ///
-    ///         fn from_parameters_with_remainder<I: Iterator<Item = P>>(
+    ///         fn from_parameters_with_remainder<__I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
-    ///             parameters: &mut I,
+    ///             parameters: &mut __I,
     ///         ) -> Result<Self, ryft::ParameterError> {
     ///             let expected_count = structure.parameter_count();
     ///             Ok(...)
@@ -159,25 +165,26 @@ impl CodeGenerator {
     pub(crate) fn generate_parameterized_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
 
-        // Replace any instances of [`Self`] with its fully-qualified path. This is necessary in order to be able to
-        // handle recursive types when deriving our [`Parameterized`] implementation.
+        // Replace any instances of `Self` with its fully-qualified path. This is necessary in order to be able to
+        // handle recursive types when deriving our `Parameterized` implementation.
         replace_self_type(&mut input);
 
-        // Construct a new [`CodeGenerator`] using inconsequential default values for fields whose values need to be
+        // Construct a new `CodeGenerator` using inconsequential default values for fields whose values need to be
         // extracted from the provided input. These values are inconsequential because if we fail to extract them from
-        // the provided input, then we will accumulate all relevant [`syn::Error`]s in [`CodeGenerator::errors`] and
-        // return a compiler error before we get to use them.
+        // the provided input, then we will accumulate all relevant `syn::Error`s in `CodeGenerator::errors` and return
+        // a compiler error before we get to use them.
         let mut generator = CodeGenerator {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
             errors: Vec::new(),
         };
 
-        // Extracts all the necessary information from our [`syn::DeriveInput`].
+        // Extracts all the necessary information from our `syn::DeriveInput`.
         generator.extract_attributes(&input);
         generator.extract_parameter_type(&input);
         generator.extract_data(&input);
@@ -275,7 +282,7 @@ impl CodeGenerator {
     fn extract_parameter_type(&mut self, input: &syn::DeriveInput) {
         let generics = &input.generics;
 
-        // Helper that checks if the provided [`syn::TypeParamBound`] is a [`ryft::Parameter`] bound. Given that
+        // Helper that checks if the provided `syn::TypeParamBound` is a `ryft::Parameter` bound. Given that
         // procedural macros are executed before type checking and inference is performed by the Rust compiler,
         // we cannot consider all possible ways of specifying this bound (e.g., using aliases) and therefore
         // this function simply checks for a match to either `Parameter` or `ryft::Parameter`, with `ryft`
@@ -293,7 +300,7 @@ impl CodeGenerator {
             bounds.into_iter().any(|bound| check_bound(ryft_crate, bound))
         };
 
-        // Collect all parameters that are bounded by [`ryft::Parameter`].
+        // Collect all parameters that are bounded by `ryft::Parameter`.
         let where_predicates = generics.where_clause.iter().flat_map(|clause| clause.predicates.iter());
         let parameter_types: HashSet<&syn::Ident> = generics
             .type_params()
@@ -305,7 +312,7 @@ impl CodeGenerator {
             }))
             .collect();
 
-        // Check that there is only a single unique type parameter bounded by [`ryft::Parameter`].
+        // Check that there is only a single unique type parameter bounded by `ryft::Parameter`.
         if parameter_types.len() > 1 {
             self.add_error(
                 generics,
@@ -395,7 +402,7 @@ impl CodeGenerator {
                 _ => {}
             }
 
-            // Construct a [`Field`] from the provided information.
+            // Construct a `Field` from the provided information.
             Field {
                 is_parameter,
                 index: field_index,
@@ -442,7 +449,7 @@ impl CodeGenerator {
                 .filter(|f| f.attrs.iter().any(|attr| attr.path() == &RYFT_ATTRIBUTE))
                 .for_each(|f| generator.add_error(f, FIELD_ATTRIBUTE_ERROR));
 
-            // Construct a [`Variant`] from the provided information.
+            // Construct a `Variant` from the provided information.
             let fields = variant
                 .fields
                 .iter()
@@ -496,7 +503,7 @@ impl CodeGenerator {
             // and maybe even impossible to eliminate these redundancies in a robust manner here because procedural
             // macros are executed before type checking/inference and that makes dealing with things like type aliases
             // correctly practically impossible (as we would need information that is not necessarily part of the
-            // [`syn::DeriveInput`] that this code is operating over).
+            // `syn::DeriveInput` that this code is operating over).
             let mut bounds = syn::punctuated::Punctuated::new();
             bounds.push(syn::TypeParamBound::Trait(syn::TraitBound {
                 paren_token: None,
@@ -515,8 +522,8 @@ impl CodeGenerator {
         /// Adds [`Parameterized`] bounds for the provided [`Field`]'s [`syn::Type`], if it references the
         /// [`CodeGenerator::parameter_type`]. If it does not, then this function will not do anything.
         fn add_parameterized_bounds(generator: &CodeGenerator, generics: &mut syn::Generics, field: &Field) {
-            // We do not add [`Parameterized`] bounds for types that do not reference the
-            // [`CodeGenerator::parameter_type`].
+            // We do not add `Parameterized` bounds for types that do not reference the
+            // `CodeGenerator::parameter_type`.
             if field.is_parameter {
                 if let Some(fields) = &field.fields {
                     match fields {
@@ -542,7 +549,7 @@ impl CodeGenerator {
                     let mut ty_using_parameter_placeholder = field.ty.clone();
                     ty_using_parameter_placeholder.replace_ident(&generator.parameter_type, &ryft_placeholder);
 
-                    // We need to construct the full [`ryft::Parameterized`] bound and to do that, we first construct
+                    // We need to construct the full `ryft::Parameterized` bound and to do that, we first construct
                     // its arguments `<P, ParameterStructure = FieldType<ryft::Placeholder>>`.
                     let mut args = syn::punctuated::Punctuated::new();
 
@@ -559,7 +566,7 @@ impl CodeGenerator {
                         ty: ty_using_parameter_placeholder.clone(),
                     }));
 
-                    // Then, we construct the full bound [`syn::Path`].
+                    // Then, we construct the full bound `syn::Path`.
                     let bound = generator.ryft_crate.with_segment(syn::PathSegment {
                         ident: syn::Ident::new("Parameterized", Span::call_site()),
                         arguments: syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
@@ -585,7 +592,7 @@ impl CodeGenerator {
             }
         }
 
-        // Go over all [`Fields`] in the underlying [`Data`] (including fields that may be nested inside [`Variant`]s),
+        // Go over all `Fields` in the underlying `Data` (including fields that may be nested inside `Variant`s),
         // and add any necessary trait bounds for them.
         match &self.data {
             Data::Struct(data) => data.fields.iter().for_each(|f| add_field_bounds(self, &mut generics, f)),
@@ -599,9 +606,8 @@ impl CodeGenerator {
         self.generics = generics;
     }
 
-    /// Checks whether there are any name conflicts in the provided [`syn::DeriveInput`]. Specifically, this function
-    /// will check for whether the reserved [`MACRO_PARAMETER_LIFETIME`] and [`MACRO_PARAMETER_TYPE`] identifiers appear
-    /// anywhere in the provided [`syn::DeriveInput`] and will report corresponding errors if they do.
+    /// Checks whether any macro-reserved identifiers appear in the generic parameters of the provided
+    /// [`syn::DeriveInput`] and reports corresponding errors if they do.
     fn check_for_name_conflicts(&mut self, input: &syn::DeriveInput) {
         input.generics.params.iter().for_each(|parameter| match parameter {
             syn::GenericParam::Lifetime(parameter) if parameter.lifetime == self.macro_parameter_lifetime => {
@@ -620,6 +626,18 @@ impl CodeGenerator {
                 self.add_error(
                     parameter,
                     format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                );
+            }
+            syn::GenericParam::Type(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
+                );
+            }
+            syn::GenericParam::Const(parameter) if parameter.matches_ident(&self.macro_iterator_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_iterator_type.clone()),
                 );
             }
             _ => {}
@@ -812,8 +830,8 @@ impl CodeGenerator {
                 Data::Enum(EnumData { ident, variants }) => {
                     let iterator_ident = format_ident!("{}{}", &ident, iter_type.parameters_assoc_type_name());
 
-                    // Refer to the implementation of [`generate_type_and_impl`] for more information on why the
-                    // [`syn::Generics`] here are constructed this way.
+                    // Refer to the implementation of `generate_type_and_impl` for more information on why the
+                    // `syn::Generics` here are constructed this way.
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
                     let generics = generics.with_renamed_param(&generator.parameter_type, macro_parameter_type);
@@ -1116,7 +1134,7 @@ impl CodeGenerator {
         let parameter_type = &self.parameter_type;
         let ident = self.data.ident();
 
-        // For generated `To` associated types we need to rename the parameter type in our [`syn::Generics`].
+        // For generated `To` associated types we need to rename the parameter type in our `syn::Generics`.
         // That is because if we do not rename it, we will end up with something like this:
         // ```
         // impl<P: Parameter> ParameterizedFamily<P> for SomeType<Placeholder> {
@@ -1134,12 +1152,12 @@ impl CodeGenerator {
         // ```
         // where `__P` is a fresh and unique identifier. This generic parameter replacement is what
         // takes place in the following line (the uniqueness check for the name is performed in
-        // [`CodeGenerator::check_for_name_conflicts`]).
+        // `CodeGenerator::check_for_name_conflicts`).
         let to_assoc_ty_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
         let to_assoc_parameter = quote!(#macro_parameter_type: #ryft::Parameter);
 
-        // Generate the [`ParameterizedFamily`] implementation block first.
+        // Generate the `ParameterizedFamily` implementation block first.
         let mut family_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
         self.add_parameter_structure_clone_bound(&mut family_generics);
         let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
@@ -1153,7 +1171,7 @@ impl CodeGenerator {
             }
         };
 
-        // Generate the [`Parameterized`] associated type declarations.
+        // Generate the `Parameterized` associated type declarations.
         let family_assoc_ty = quote!(type Family = #family_type;);
         let to_assoc_ty = quote!(
             type To<#to_assoc_parameter>
@@ -1549,9 +1567,9 @@ impl CodeGenerator {
     /// as well):
     ///
     /// ```ignore
-    /// fn from_parameters_with_remainder<I: Iterator<Item = P>>(
+    /// fn from_parameters_with_remainder<__I: Iterator<Item = P>>(
     ///     structure: Self::To<ryft::Placeholder>,
-    ///     parameters: &mut I,
+    ///     parameters: &mut __I,
     /// ) -> Result<Self, ryft::ParameterError> {
     ///     let expected_count = structure.parameter_count();
     ///     Ok(...)
@@ -1577,7 +1595,7 @@ impl CodeGenerator {
             let parameter_type = &generator.parameter_type;
 
             // Note that `expected_count`, which is referenced by the generated code here is defined in the beginning
-            // of the implementation of the generated [`Parameterized::from_parameters_with_remainder`] function body.
+            // of the implementation of the generated `Parameterized::from_parameters_with_remainder` function body.
             let missing_parameters_error = quote!(#ryft::ParameterError::MissingParameters { expected_count, paths });
 
             fields
@@ -1641,11 +1659,12 @@ impl CodeGenerator {
 
         let ryft = &self.ryft_crate;
         let parameter_type = &self.parameter_type;
+        let macro_iterator_type = &self.macro_iterator_type;
         let self_to_as_parameterized = quote!(<Self::ParameterStructure as #ryft::Parameterized<#ryft::Placeholder>>);
         quote! {
-            fn from_parameters_with_remainder<I: Iterator<Item = #parameter_type>>(
+            fn from_parameters_with_remainder<#macro_iterator_type: Iterator<Item = #parameter_type>>(
                 structure: Self::To<#ryft::Placeholder>,
-                parameters: &mut I,
+                parameters: &mut #macro_iterator_type,
             ) -> Result<Self, #ryft::ParameterError> {
                 let expected_count = #self_to_as_parameterized::parameter_count(&structure);
                 Ok(#body)
@@ -1871,6 +1890,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -1890,6 +1910,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -1928,6 +1949,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2001,6 +2023,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2135,6 +2158,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2187,14 +2211,15 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
             errors: Vec::new(),
         };
         let input = syn::parse2(quote! {
-            struct Container<'__p, __P: Parameter, P: Parameter> {
-                marker: std::marker::PhantomData<(&'__p (), __P, P)>,
+            struct Container<'__p, __P: Parameter, __I, P: Parameter> {
+                marker: std::marker::PhantomData<(&'__p (), __P, __I, P)>,
             }
         })
         .expect("failed to parse derive input");
@@ -2203,6 +2228,7 @@ mod tests {
         assert!(errors.contains("reserved"));
         assert!(errors.contains("'__p"));
         assert!(errors.contains("__P"));
+        assert!(errors.contains("__I"));
     }
 
     #[test]
@@ -2211,6 +2237,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2316,6 +2343,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2351,6 +2379,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2387,6 +2416,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2464,6 +2494,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
@@ -2483,8 +2514,8 @@ mod tests {
         assert_eq!(
             generated,
             indoc! {"
-                fn from_parameters_with_remainder < I : Iterator < Item = P >> \
-                    (structure : Self :: To < ryft :: Placeholder > , parameters : & mut I ,) \
+                fn from_parameters_with_remainder < __I : Iterator < Item = P >> \
+                    (structure : Self :: To < ryft :: Placeholder > , parameters : & mut __I ,) \
                     -> Result < Self , ryft :: ParameterError > { \
                     let expected_count = < \
                         Self :: ParameterStructure as ryft :: Parameterized < ryft :: Placeholder >\
@@ -2522,6 +2553,7 @@ mod tests {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
             macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            macro_iterator_type: DEFAULT_MACRO_ITERATOR_TYPE.into(),
             parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::parse2::<syn::DeriveInput>(quote!(
                 struct Dummy<P, U, V>

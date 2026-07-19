@@ -444,7 +444,7 @@ impl TypeIdAllocator {
 
 impl Drop for TypeIdAllocator {
     fn drop(&mut self) {
-        // Deallocates both the type ID allocator and also all of its allocated [`TypeId`]s.
+        // Deallocates both the type ID allocator and also all of its allocated `TypeId`s.
         unsafe { mlirTypeIDAllocatorDestroy(self.handle) }
     }
 }

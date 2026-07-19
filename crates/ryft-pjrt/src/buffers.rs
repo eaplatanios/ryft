@@ -491,7 +491,7 @@ impl TileDimension {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
+// Our `Display` implementation attempts to match the corresponding XLA rendering.
 impl Display for TileDimension {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
@@ -523,7 +523,7 @@ impl Tile {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
+// Our `Display` implementation attempts to match the corresponding XLA rendering.
 impl Display for Tile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("(")?;
@@ -644,7 +644,7 @@ impl TiledLayout {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
+// Our `Display` implementation attempts to match the corresponding XLA rendering.
 impl Display for TiledLayout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("{")?;
@@ -712,7 +712,7 @@ impl StridedLayout {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
+// Our `Display` implementation attempts to match the corresponding XLA rendering.
 impl Display for StridedLayout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("strides(")?;
@@ -910,7 +910,7 @@ impl Layout {
                         }
                     }
                     'L' | 'E' | 'M' => {
-                        // XLA layout properties are ignored since they are not supported by [`Layout`].
+                        // XLA layout properties are ignored since they are not supported by `Layout`.
                         parse_parenthesized(&mut characters, "layout property")?;
                     }
                     'S' => {
@@ -1254,7 +1254,7 @@ impl Buffer<'_> {
     #[deprecated(note = "use [`Client::layouts_extension`] instead")]
     pub fn layout(&self) -> Result<Layout, Error> {
         // We cannot use our `invoke_pjrt_api_error_fn!` macro here because we need to construct some uninitialized
-        // memory that will be initialized by a C API function call. We use [`MaybeUninit`] for this purpose.
+        // memory that will be initialized by a C API function call. We use `MaybeUninit` for this purpose.
         unsafe {
             let api_handle = self.api().to_c_api();
             let api_fn_offset = std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Buffer_GetMemoryLayout);
@@ -1692,7 +1692,7 @@ impl Drop for Buffer<'_> {
     }
 }
 
-// This [`PartialEq`] implementation is expensive and should generally be avoided unless absolutely necessary.
+// This `PartialEq` implementation is expensive and should generally be avoided unless absolutely necessary.
 impl PartialEq for Buffer<'_> {
     fn eq(&self, other: &Self) -> bool {
         let self_specification = self.specification();
@@ -1832,7 +1832,7 @@ impl<D: AsRef<[u64]>> BufferSpecification<D> {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
+// Our `Display` implementation attempts to match the corresponding XLA rendering.
 impl<D: AsRef<[u64]>> Display for BufferSpecification<D> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}[", self.element_type)?;
@@ -2066,22 +2066,22 @@ impl<'c> DmaMappedBuffer<'c> {
             }
         }
 
-        // Create a temporary, non-owning [`Client`] wrapper to call [`Client::buffer`].
-        // [`ManuallyDrop`] prevents the [`Client::drop`] from destroying the underlying PJRT client.
+        // Create a temporary, non-owning `Client` wrapper to call `Client::buffer`.
+        // `ManuallyDrop` prevents the `Client::drop` from destroying the underlying PJRT client.
         let client = std::mem::ManuallyDrop::new(unsafe { Client::from_c_api(self.client, self.api, None) }?);
 
-        // Extract the underlying data pointer before calling [`std::mem::transmute`] on `self`.
+        // Extract the underlying data pointer before calling `std::mem::transmute` on `self`.
         let ptr = self.ptr as *const std::ffi::c_void;
 
-        // Erase the phantom lifetime so that the [`DmaMappedBuffer`] can be moved into a [`Box<dyn FnOnce()>`] which
+        // Erase the phantom lifetime so that the `DmaMappedBuffer` can be moved into a `Box<dyn FnOnce()>` which
         // requires a `'static` lifetime. This is not generally safe but the requirements are outlined in the
-        // documentation of [`DmaMappedBuffer::into_buffer`] which is also marked as unsafe.
+        // documentation of `DmaMappedBuffer::into_buffer` which is also marked as unsafe.
         let dma: DmaMappedBuffer<'static> = unsafe { std::mem::transmute(self) };
 
-        // [`Client::buffer`] takes a [`DmaHostBuffer`] by value. On success, that [`DmaHostBuffer`]'s drop function
-        // will be invoked when PJRT fires the "done" event. On failure, it will be invoked when that [`DmaHostBuffer`]
-        // itself is dropped. Note that the [`std::mem::transmute`] that follows is safe as we are guaranteed that
-        // the client will outlive the buffer due to the `'c` lifetime of [`DmaMappedBuffer`].
+        // `Client::buffer` takes a `DmaHostBuffer` by value. On success, that `DmaHostBuffer`'s drop function
+        // will be invoked when PJRT fires the "done" event. On failure, it will be invoked when that `DmaHostBuffer`
+        // itself is dropped. Note that the `std::mem::transmute` that follows is safe as we are guaranteed that
+        // the client will outlive the buffer due to the `'c` lifetime of `DmaMappedBuffer`.
         client
             .buffer(
                 DmaHostBuffer { ptr, dma: UnsafeCell::new(Some(dma)) },
@@ -2214,7 +2214,7 @@ impl<'s> Client<'s> {
         {
             done_event.on_ready(move |_| {
                 // We ignore the error because there is nothing we can do with it here,
-                // and if something goes wrong, it should be reflected in [`Buffer::ready`].
+                // and if something goes wrong, it should be reflected in `Buffer::ready`.
                 ManuallyDrop::into_inner(drop_fn)();
             })?;
         }
@@ -3839,7 +3839,7 @@ mod tests {
 
     #[test]
     fn test_layout() {
-        // Test round-tripping a [`TiledLayout`] through the C API.
+        // Test round-tripping a `TiledLayout` through the C API.
         let layout = Layout::Tiled(TiledLayout::new(
             vec![1, 0],
             vec![Tile { dimensions: vec![TileDimension::sized(4), TileDimension::combined()] }],
@@ -3850,7 +3850,7 @@ mod tests {
         assert_eq!(format!("{layout}"), "{1,0:T(4,*)}");
         assert_eq!(format!("{layout:?}"), "Layout[{1,0:T(4,*)}]");
 
-        // Test creating and round-tripping a dense major-to-minor [`Layout`].
+        // Test creating and round-tripping a dense major-to-minor `Layout`.
         let layout = Layout::dense_major_to_minor(3);
         assert_eq!(layout, Layout::Tiled(TiledLayout::new(vec![2, 1, 0], Vec::new())));
         assert_eq!(unsafe { Layout::from_c_api(&layout.to_c_api() as *const _) }, Ok(layout.clone()));
@@ -3859,7 +3859,7 @@ mod tests {
         assert_eq!(format!("{layout}"), "{2,1,0}");
         assert_eq!(format!("{layout:?}"), "Layout[{2,1,0}]");
 
-        // Test round-tripping a [`StridedLayout`] through the C API.
+        // Test round-tripping a `StridedLayout` through the C API.
         let layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
         assert_eq!(unsafe { Layout::from_c_api(&layout.to_c_api() as *const _) }, Ok(layout.clone()));
         assert_eq!(Layout::from_str(layout.clone().to_string()), Ok(layout.clone()));
@@ -3891,7 +3891,7 @@ mod tests {
                 if message == "invalid dimension index '-1': expected non-negative value",
         ));
 
-        // Test creating an invalid [`Layout`].
+        // Test creating an invalid `Layout`.
         let invalid_layout = ffi::PJRT_Buffer_MemoryLayout::new(
             ffi::PJRT_Buffer_MemoryLayout_Value {
                 strides: ffi::PJRT_Buffer_MemoryLayout_Strides::new(std::ptr::null(), 0),
@@ -3903,7 +3903,7 @@ mod tests {
             Err(Error::InvalidArgument { message, .. }) if message == "unknown PJRT buffer memory layout type",
         ));
 
-        // Test creating a [`Layout`] from a null pointer.
+        // Test creating a `Layout` from a null pointer.
         assert!(matches!(
             unsafe { Layout::from_c_api(std::ptr::null()) },
             Err(Error::InvalidArgument { message, .. })
@@ -3919,14 +3919,14 @@ mod tests {
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
 
-        // Test constructing an invalid [`Buffer`].
+        // Test constructing an invalid `Buffer`.
         assert!(matches!(
             unsafe { Buffer::from_c_api(std::ptr::null_mut(), client.api(), client.to_c_api()) },
             Err(Error::InvalidArgument { message, .. })
                 if message == "the provided PJRT buffer handle is a null pointer",
         ));
 
-        // Test constructing a valid [`Buffer`].
+        // Test constructing a valid `Buffer`.
         let buffer = client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4u64], None, device.clone(), None).unwrap();
         assert!(!unsafe { buffer.to_c_api() }.is_null());
         assert_eq!(buffer.element_type(), Ok(BufferType::U8));
@@ -4260,13 +4260,13 @@ mod tests {
 
     #[test]
     fn test_host_buffer_data() {
-        // Test [`HostBufferData::from_host_buffer`].
+        // Test `HostBufferData::from_host_buffer`.
         let data = [1u8, 2u8, 3u8, 4u8];
         let host_buffer_data = HostBufferData::from_host_buffer(data.as_slice());
         assert_eq!(host_buffer_data.ptr, data.as_ptr() as *const std::ffi::c_void);
         assert!(host_buffer_data.drop_fn.is_none());
 
-        // Test [`HostBufferData::from_host_buffer_arc`].
+        // Test `HostBufferData::from_host_buffer_arc`.
         let data = Arc::new([7u8, 8u8, 9u8, 10u8]);
         assert_eq!(Arc::strong_count(&data), 1);
         let mut host_buffer_data = HostBufferData::from_host_buffer_arc(&data);

@@ -571,7 +571,7 @@ mod tests {
         let expression_1 = (dimension_0 * constant_0).as_ref();
         let map = context.affine_map(2, 1, &[expression_0, expression_1]);
 
-        // We are just checking that [`AffineMap::dump`] runs successfully without crashing.
+        // We are just checking that `AffineMap::dump` runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
         map.dump();
     }

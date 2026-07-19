@@ -31,10 +31,9 @@ mlir_subtype_trait_impls!(
     SymbolVisibilityAttributeRef<'c, 't> as Attribute,
     mlir_type = Attribute,
     // Note that this function will not actually check whether the underlying string value corresponds to a valid
-    // [`SymbolVisibility`] string rendering. That is because [`SymbolVisibilityAttributeRef`] is just a convenient
-    // helper for working with [`StringAttributeRef`](crate::StringAttributeRef) that are used to store
-    // [`SymbolVisibility`] values, but it is the responsibility of the caller to make sure that this helper
-    // is used correctly.
+    // `SymbolVisibility` string rendering. That is because `SymbolVisibilityAttributeRef` is just a convenient helper
+    // for working with `StringAttributeRef` that are used to store `SymbolVisibility` values, but it is the
+    // responsibility of the caller to make sure that this helper is used correctly.
     mlir_subtype = String,
 );
 

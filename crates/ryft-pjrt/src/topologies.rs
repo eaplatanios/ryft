@@ -195,10 +195,10 @@ impl Topology<'_> {
 
     /// Serializes this [`Topology`] to a Protobuf message.
     pub fn proto(&self) -> Result<TopologyProto, Error> {
-        // It would be nice to be able to get this directly without having to go through [`Topology::serialize`] first,
+        // It would be nice to be able to get this directly without having to go through `Topology::serialize` first,
         // but unfortunately, the PJRT C API does not provide the necessary hooks for doing that. Also, ideally this
-        // would return a [`Topology`](crate::protos::Topology), but unfortunately, the PJRT C API does not provide the
-        // necessary hooks for doing that either.
+        // would return a `Topology`, but unfortunately, the PJRT C API does not provide the necessary hooks for doing
+        // that either.
         self.serialize()?.proto()
     }
 
@@ -801,7 +801,7 @@ mod tests {
                 }
             }
 
-            // Test creating a [`Topology`] from a null pointer.
+            // Test creating a `Topology` from a null pointer.
             assert!(matches!(
                 unsafe { Topology::from_c_api(std::ptr::null_mut(), plugin.api(), false) },
                 Err(Error::InvalidArgument { message, .. })

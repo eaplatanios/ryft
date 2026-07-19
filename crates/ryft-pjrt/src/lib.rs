@@ -216,7 +216,7 @@ pub(crate) mod ffi {
     pub struct PJRT_Api {
         // For backwards compatibility, callers must use this value to guard accesses to fields
         // that may have been added after the plugin version they are interacting with was released.
-        // The macros in [`crate::macros`] take care of this automatically.
+        // The macros in `crate::macros` take care of this automatically.
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
         pub pjrt_api_version: PJRT_Api_Version,
@@ -572,13 +572,13 @@ mod tests {
 
     #[test]
     fn test_api() {
-        // Test creating an [`Api`] from a null pointer.
+        // Test creating an `Api` from a null pointer.
         assert!(matches!(
             unsafe { Api::from_c_api(std::ptr::null()) },
             Err(Error::InvalidArgument { message, .. }) if message == "the provided PJRT API handle is a null pointer",
         ));
 
-        // Test constructing valid [`Api`]s across all supported platforms.
+        // Test constructing valid `Api`s across all supported platforms.
         test_for_each_platform!(|plugin, client, platform| {
             match platform {
                 TestPlatform::Metal => {
@@ -645,7 +645,7 @@ mod tests {
         // Test using a null pointer.
         assert!(hash_map_from_c_api(std::ptr::null(), 0).is_empty());
 
-        // Test using a non-empty list of [`NamedValue`]s.
+        // Test using a non-empty list of `NamedValue`s.
         let values = vec![
             NamedValue::new("boolean", true),
             NamedValue::new("integer", 42_i64),

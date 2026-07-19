@@ -566,13 +566,13 @@ mod tests {
                 )
                 .unwrap();
 
-                // Check that the `function` accessor of [`CallOperation`] works as expected.
+                // Check that the `function` accessor of `CallOperation` works as expected.
                 assert_eq!(op.function().unwrap().as_str().unwrap(), "identity");
 
-                // Check that the `arguments` accessor of [`CallOperation`] works as expected.
+                // Check that the `arguments` accessor of `CallOperation` works as expected.
                 assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
-                // Check that the `results` accessor of [`CallOperation`] works as expected.
+                // Check that the `results` accessor of `CallOperation` works as expected.
                 assert_eq!(
                     op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(),
                     1
@@ -635,7 +635,7 @@ mod tests {
                 )
                 .unwrap();
 
-                // Check that the `function` accessor of [`CallOperation`] works as expected.
+                // Check that the `function` accessor of `CallOperation` works as expected.
                 assert_eq!(op.function().unwrap().as_str().unwrap(), "foo");
 
                 let op = block.append_operation(op).unwrap();
@@ -726,20 +726,20 @@ mod tests {
             assert_eq!(map.get(&op_ref), Some(&"op"));
             assert_eq!(map.get(&dummy_op_ref), Some(&"dummy_op"));
 
-            // Check that the `callee` and `function` accessors of [`CallOperation`] work as expected.
+            // Check that the `callee` and `function` accessors of `CallOperation` work as expected.
             assert!(matches!(op.callee().unwrap(), Callee::Symbol(_)));
             assert_eq!(op.function().unwrap().as_str().unwrap(), "identity");
 
             let op_ref = unsafe { op.as_ref().cast::<CallOperationRef>() }.unwrap();
             assert!(matches!(op_ref.callee().unwrap(), Callee::Symbol(_)));
 
-            // Check that the `no_inline` accessor of [`CallOperation`] works as expected.
+            // Check that the `no_inline` accessor of `CallOperation` works as expected.
             assert!(op.no_inline());
 
-            // Check that the `arguments` accessor of [`CallOperation`] works as expected.
+            // Check that the `arguments` accessor of `CallOperation` works as expected.
             assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
-            // Check that the `results` accessor of [`CallOperation`] works as expected.
+            // Check that the `results` accessor of `CallOperation` works as expected.
             assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
             let op = block.append_operation(op).unwrap();
@@ -869,16 +869,16 @@ mod tests {
                     0
                 );
 
-                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                // Check that the `arguments` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                // Check that the `results` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                // Check that the `no_inline` accessor of `FuncOperation` works as expected.
                 assert!(!func_op.no_inline());
 
-                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                // Check that the `llvm_emit_c_interface` accessor of `FuncOperation` works as expected.
                 assert!(!func_op.llvm_emit_c_interface());
 
                 func_op
@@ -1041,16 +1041,16 @@ mod tests {
                 )
                 .unwrap();
 
-                // Check that the `callee` accessor of [`CallOperation`] works as expected.
+                // Check that the `callee` accessor of `CallOperation` works as expected.
                 assert!(matches!(op.callee().unwrap(), Callee::Value(_)));
 
                 let op_ref = unsafe { op.as_ref().cast::<CallIndirectOperationRef>() }.unwrap();
                 assert!(matches!(op_ref.callee().unwrap(), Callee::Value(_)));
 
-                // Check that the `function` accessor of [`CallIndirectOperation`] works as expected.
+                // Check that the `function` accessor of `CallIndirectOperation` works as expected.
                 assert_eq!(op.function().unwrap(), identity.result(0).unwrap());
 
-                // Check that the `arguments` accessor of [`CallIndirectOperation`] works as expected.
+                // Check that the `arguments` accessor of `CallIndirectOperation` works as expected.
                 assert_eq!(op.arguments().unwrap().into_iter().collect::<Vec<_>>().len(), 1);
 
                 block.append_operation(op).unwrap();
@@ -1126,16 +1126,16 @@ mod tests {
                     0
                 );
 
-                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                // Check that the `arguments` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                // Check that the `results` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                // Check that the `no_inline` accessor of `FuncOperation` works as expected.
                 assert!(func_op.no_inline());
 
-                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                // Check that the `llvm_emit_c_interface` accessor of `FuncOperation` works as expected.
                 assert!(!func_op.llvm_emit_c_interface());
 
                 func_op
@@ -1191,16 +1191,16 @@ mod tests {
                     0
                 );
 
-                // Check that the `arguments` accessor of [`FuncOperation`] works as expected.
+                // Check that the `arguments` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_argument_types().unwrap().len(), 3);
 
-                // Check that the `results` accessor of [`FuncOperation`] works as expected.
+                // Check that the `results` accessor of `FuncOperation` works as expected.
                 assert_eq!(func_op.function_result_types().unwrap().len(), 1);
 
-                // Check that the `no_inline` accessor of [`FuncOperation`] works as expected.
+                // Check that the `no_inline` accessor of `FuncOperation` works as expected.
                 assert!(!func_op.no_inline());
 
-                // Check that the `llvm_emit_c_interface` accessor of [`FuncOperation`] works as expected.
+                // Check that the `llvm_emit_c_interface` accessor of `FuncOperation` works as expected.
                 assert!(func_op.llvm_emit_c_interface());
 
                 func_op
