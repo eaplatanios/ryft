@@ -13,6 +13,8 @@ use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 use crate::types::ArrayType;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`CompareOperation`].
 pub const COMPARE_OPERATION_NAME: &str = "compare";
 
@@ -214,12 +216,10 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{DifferentiationTracer, ForwardModeDifferentiate};
-    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -234,104 +234,8 @@ mod tests {
 
     #[test]
     fn test_compare() {
-        // Test using `ArrayType`s.
-        let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let outputs = Operation::<ArrayType>::infer_output_types(
-            &CompareOperation::new(ComparisonDirection::LessThan),
-            &[lhs, rhs],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            outputs,
-            vec![ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2), Size::Static(3)]))]
-        );
-
-        // Type inference broadcasts the two operand shapes together (a size-1 operand broadcasts up to the other) and
-        // always produces a Boolean-typed output at the broadcast shape.
-        let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
-        let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let outputs = Operation::<ArrayType>::infer_output_types(
-            &CompareOperation::new(ComparisonDirection::LessThan),
-            &[lhs, rhs],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            outputs,
-            vec![ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2), Size::Static(3)]))]
-        );
-
-        // Test using `DataType`s: broadcast-compatible (promotable) input data types infer a Boolean output and
-        // non-promotable ones error.
-        let operation = CompareOperation::new(ComparisonDirection::LessThan);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64], &[]),
-            Ok(vec![DataType::Boolean]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::Boolean]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: "comparison input types are not broadcast-compatible".to_string() }),
-        );
-
-        // Complex operands are unordered: ordered directions are rejected while the equality directions stay
-        // supported (at both the data-type and array-type levels).
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
-            Err(TypeError {
-                message: "cannot apply an ordered comparison to unordered complex operands of types c64 and c64"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(
-                &CompareOperation::new(ComparisonDirection::Equal),
-                &[DataType::C64, DataType::C64],
-                &[],
-            ),
-            Ok(vec![DataType::Boolean]),
-        );
-        let complex_array = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]));
-        assert!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex_array.clone(), complex_array], &[])
-                .is_err(),
-        );
-
-        // Test that `as_boolean` on type metadata produces Boolean counterparts while `boolean` errors because
-        // type metadata carries no concrete payload to decode.
-        assert_eq!(DataType::F64.as_boolean(), DataType::Boolean);
-        assert!(DataType::F64.boolean().is_err());
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        assert_eq!(array_type.as_boolean(), ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])));
-        assert!(array_type.boolean().is_err());
-
-        // Test that scalar values produce an honestly Boolean-typed `Scalar::Bool` result.
         assert_eq!(Scalar::from(2.0).less_than(&Scalar::from(3.0)).unwrap(), Scalar::from(true));
         assert_eq!(Scalar::from(2.0f32).greater_than(&Scalar::from(3.0f32)).unwrap(), Scalar::from(false));
-        assert_eq!(
-            <CompareOperation as InterpretableOperation<EagerContext<Scalar>>>::interpret(
-                &operation,
-                &EagerContext::<Scalar>::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.0), Scalar::from(3.0)],
-            ),
-            Ok(vec![Scalar::from(true)])
-        );
-
-        // Test using `Array`s.
-        let lhs = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let rhs = Array::vector(vec![2.0, 2.0, 2.0, 2.0]);
-        let outputs = CompareOperation::new(ComparisonDirection::LessThan)
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[lhs, rhs])
-            .unwrap();
-        assert_eq!(outputs[0].values(), &[true, false, false, false]);
-
-        // Test the convenience functions provided by `Compare`.
         let left = || Array::vector(vec![1.0, 2.0, 3.0]);
         let right = || Array::vector(vec![2.0, 2.0, 2.0]);
         assert_eq!(left().equal(&right()).unwrap().values(), &[false, true, false]);
@@ -340,6 +244,45 @@ mod tests {
         assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[true, true, false]);
         assert_eq!(left().greater_than(&right()).unwrap().values(), &[false, false, true]);
         assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[false, true, true]);
+    }
+
+    #[test]
+    fn test_compare_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = CompareOperation::new(ComparisonDirection::LessThan),
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::Boolean],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = "comparison input types are not broadcast-compatible",
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "cannot apply an ordered comparison to unordered complex operands of types c64 and c64",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = CompareOperation::new(ComparisonDirection::Equal),
+            cases = [{
+                input_data_types = [DataType::C64, DataType::C64],
+                output_data_types = [DataType::Boolean],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_boolean_type_conversion() {
+        assert_eq!(DataType::F64.as_boolean(), DataType::Boolean);
+        assert!(DataType::F64.boolean().is_err());
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        assert_eq!(array_type.as_boolean(), ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])));
+        assert!(array_type.boolean().is_err());
     }
 
     #[test]

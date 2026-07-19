@@ -37,74 +37,29 @@ define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operatio
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
-    use crate::interpretation::InterpretableOperation;
-    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::types::DataType;
 
     use super::*;
 
     #[test]
     fn test_not() {
-        let operation = NotOperation;
-
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<ArrayType>::name(&operation), NOT_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "NotOperation");
-        assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
-        let input = Array::vector(vec![true, false, true]);
-        let outputs = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input]).unwrap();
-        assert_eq!(outputs[0].values(), &[false, true, false]);
-
-        // The `!` operator implementation matches the interpretation.
         assert_eq!((!Array::vector(vec![true, false, true])).values(), &[false, true, false]);
+    }
 
-        // Array type inference preserves the Boolean input type.
-        let input_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&input_type), &[]),
-            Ok(vec![input_type.clone()]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Array, NotOperation>::new();
-        let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:bool[3] .
-                let %1:bool[3] = not %0
-                in (%1)
-            "}
-            .trim_end(),
+    #[test]
+    fn test_not_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NotOperation,
+            cases = [{
+                input_data_types = [DataType::Boolean],
+                output_data_types = [DataType::Boolean],
+            }],
         );
     }
 

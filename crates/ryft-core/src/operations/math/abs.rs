@@ -19,39 +19,6 @@ use crate::types::DataType;
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
-/// Infers the result [`DataType`]s of an absolute-value operation from its input element data types.
-fn infer_abs_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-    let output_type = match input_types[0] {
-        DataType::I2
-        | DataType::I4
-        | DataType::I8
-        | DataType::I16
-        | DataType::I32
-        | DataType::I64
-        | DataType::F4E2M1FN
-        | DataType::F6E2M3FN
-        | DataType::F6E3M2FN
-        | DataType::F8E3M4
-        | DataType::F8E4M3
-        | DataType::F8E4M3FN
-        | DataType::F8E4M3FNUZ
-        | DataType::F8E4M3B11FNUZ
-        | DataType::F8E5M2
-        | DataType::F8E5M2FNUZ
-        | DataType::F8E8M0FNU
-        | DataType::BF16
-        | DataType::F16
-        | DataType::F32
-        | DataType::F64 => input_types[0],
-        DataType::C64 => DataType::F32,
-        DataType::C128 => DataType::F64,
-        input_type => Err(TypeError {
-            message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-        })?,
-    };
-    Ok(vec![output_type])
-}
-
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|`
@@ -64,7 +31,40 @@ define_elementwise_operation!(
     /// `-1` has no representable absolute value) are rejected.
     AbsOperation, ABS_OPERATION_NAME,
     Abs, abs,
-    infer_data_types = infer_abs_output_data_types,
+    infer_data_types = |input_types: &[DataType]| {
+        let input_type = input_types[0];
+        let output_type = match input_type {
+            DataType::I2
+            | DataType::I4
+            | DataType::I8
+            | DataType::I16
+            | DataType::I32
+            | DataType::I64
+            | DataType::F4E2M1FN
+            | DataType::F6E2M3FN
+            | DataType::F6E3M2FN
+            | DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E4M3FN
+            | DataType::F8E4M3FNUZ
+            | DataType::F8E4M3B11FNUZ
+            | DataType::F8E5M2
+            | DataType::F8E5M2FNUZ
+            | DataType::F8E8M0FNU
+            | DataType::BF16
+            | DataType::F16
+            | DataType::F32
+            | DataType::F64 => input_type,
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            input_type => {
+                return Err(TypeError {
+                    message: format!("cannot compute the absolute value of a value of data type {input_type}"),
+                });
+            }
+        };
+        Ok(vec![output_type])
+    },
     check_array_types = [@no_unreduced],
 );
 

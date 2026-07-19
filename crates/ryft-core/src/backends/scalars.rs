@@ -34,9 +34,11 @@ use crate::operations::differentiation::{StopGradient, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::math::{
-    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Exp,
-    ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub,
-    SubOperation,
+    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
+    DivOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation, Logistic, LogisticOperation, Maximum,
+    MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation, Pow, PowOperation, Remainder,
+    RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign, SignOperation, Sin, SinOperation, Sqrt,
+    SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -74,6 +76,17 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Exp(ExpOperation),
     Log(LogOperation),
     Sqrt(SqrtOperation),
+    Rsqrt(RsqrtOperation),
+    Tanh(TanhOperation),
+    Logistic(LogisticOperation),
+    Pow(PowOperation),
+    Sign(SignOperation),
+    Floor(FloorOperation),
+    Ceil(CeilOperation),
+    Round(RoundOperation),
+    Maximum(MaximumOperation),
+    Minimum(MinimumOperation),
+    Remainder(RemainderOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
@@ -242,6 +255,40 @@ impl Scalar {
             Scalar::F8E5M2(bits) => (DataType::F8E5M2, *bits),
             Scalar::F8E5M2FNUZ(bits) => (DataType::F8E5M2FNUZ, *bits),
             Scalar::F8E8M0FNU(bits) => (DataType::F8E8M0FNU, *bits),
+            _ => return None,
+        })
+    }
+
+    /// Returns an order-preserving `u64` rank for this scalar within its own data type, or `None` for data types
+    /// with no total order (complex, token, and structural-zero scalars). Integer ranks are sign-biased two's
+    /// complement, and floating-point ranks follow the IEEE 754 total order
+    /// (`-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < NaN`), which is what stable ranking sorts (see
+    /// [`SortOperation`](crate::operations::sort::SortOperation)) compare by. Distinct NaN payloads of one sign may
+    /// share a rank, which stable sorts resolve by original position.
+    pub(crate) fn total_order_rank(&self) -> Option<u64> {
+        /// Maps an `f64` to its IEEE 754 total-order rank.
+        fn float_rank(value: f64) -> u64 {
+            let bits = value.to_bits();
+            if bits >> 63 == 1 { !bits } else { bits | (1 << 63) }
+        }
+
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Some(float_rank(Self::decode_low_precision_float(r#type, bits)));
+        }
+        Some(match self {
+            Scalar::Bool(value) => u64::from(*value),
+            Scalar::I8(value) => (*value as u64) ^ (1 << 63),
+            Scalar::I16(value) => (*value as u64) ^ (1 << 63),
+            Scalar::I32(value) => (*value as u64) ^ (1 << 63),
+            Scalar::I64(value) => (*value as u64) ^ (1 << 63),
+            Scalar::U8(value) => u64::from(*value),
+            Scalar::U16(value) => u64::from(*value),
+            Scalar::U32(value) => u64::from(*value),
+            Scalar::U64(value) => *value,
+            Scalar::BF16(value) => float_rank(value.to_f64()),
+            Scalar::F16(value) => float_rank(value.to_f64()),
+            Scalar::F32(value) => float_rank(f64::from(*value)),
+            Scalar::F64(value) => float_rank(*value),
             _ => return None,
         })
     }
@@ -1122,7 +1169,7 @@ impl Atan2 for Scalar {
     /// complex operands are promoted to a common data type; any other combination returns a [`TypeError`]. Complex
     /// results use the principal value `-i · log((x + i · self) / sqrt(x² + self²))`.
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        check_types!(@floating_or_complex, "atan2", [self.r#type().into_owned(), x.r#type().into_owned()]);
+        check_types!(@float, "atan2", [self.r#type().into_owned(), x.r#type().into_owned()]);
         let (y, x) = promote_scalar_arithmetic_operands(self, x, "atan2")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (y.low_precision_float_parts(), x.low_precision_float_parts())
@@ -1230,6 +1277,437 @@ impl Sqrt for Scalar {
             other => {
                 return Err(TypeError {
                     message: format!("cannot compute the square root of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Rsqrt for Scalar {
+    /// Computes the elementwise reciprocal square root of this [`Scalar`]. Only the floating-point and complex
+    /// variants support the reciprocal square root (the complex form being the reciprocal of the principal branch
+    /// `1/√z`); any other variant returns a [`TypeError`].
+    fn rsqrt(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(
+                r#type,
+                Self::decode_low_precision_float(r#type, bits).sqrt().recip(),
+            );
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sqrt().recip())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sqrt().recip())),
+            Scalar::F32(value) => Scalar::F32(value.sqrt().recip()),
+            Scalar::F64(value) => Scalar::F64(value.sqrt().recip()),
+            Scalar::C64(value) => Scalar::C64(value.sqrt().inv()),
+            Scalar::C128(value) => Scalar::C128(value.sqrt().inv()),
+            other => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the reciprocal square root of a scalar of data type {}",
+                        other.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Tanh for Scalar {
+    /// Computes the elementwise hyperbolic tangent of this [`Scalar`]. Only the floating-point and complex variants
+    /// support the hyperbolic tangent (the complex form being the analytic continuation `tanh(z)`); any other variant
+    /// returns a [`TypeError`].
+    fn tanh(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).tanh());
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().tanh())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().tanh())),
+            Scalar::F32(value) => Scalar::F32(value.tanh()),
+            Scalar::F64(value) => Scalar::F64(value.tanh()),
+            Scalar::C64(value) => Scalar::C64(value.tanh()),
+            Scalar::C128(value) => Scalar::C128(value.tanh()),
+            other => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the hyperbolic tangent of a scalar of data type {}",
+                        other.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Logistic for Scalar {
+    /// Computes the elementwise logistic sigmoid `1 / (1 + e^{-x})` of this [`Scalar`]. Only the floating-point and
+    /// complex variants support the logistic function (the complex form being the analytic continuation); any other
+    /// variant returns a [`TypeError`].
+    fn logistic(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            let value = Self::decode_low_precision_float(r#type, bits);
+            return Self::encode_low_precision_float(r#type, ((-value).exp() + 1.0).recip());
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(((-value.to_f32()).exp() + 1.0).recip())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(((-value.to_f32()).exp() + 1.0).recip())),
+            Scalar::F32(value) => Scalar::F32(((-value).exp() + 1.0).recip()),
+            Scalar::F64(value) => Scalar::F64(((-value).exp() + 1.0).recip()),
+            Scalar::C64(value) => Scalar::C64(((-value).exp() + 1.0).inv()),
+            Scalar::C128(value) => Scalar::C128(((-value).exp() + 1.0).inv()),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the logistic of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Pow for Scalar {
+    /// Computes the elementwise power `self^exponent` for this [`Scalar`]. Floating-point and complex operands are
+    /// promoted to a common data type (the complex power being the principal value `exp(y · log(x))`); any other
+    /// combination returns a [`TypeError`].
+    fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
+        check_types!(@float, "pow", [self.r#type().into_owned(), exponent.r#type().into_owned()]);
+        let (base, exponent) = promote_scalar_arithmetic_operands(self, exponent, "pow")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (base.low_precision_float_parts(), exponent.low_precision_float_parts())
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                Self::decode_low_precision_float(left_type, left_bits)
+                    .powf(Self::decode_low_precision_float(right_type, right_bits)),
+            );
+        }
+        Ok(match (base, exponent) {
+            (Scalar::BF16(base), Scalar::BF16(exponent)) => {
+                Scalar::BF16(bf16::from_f32(base.to_f32().powf(exponent.to_f32())))
+            }
+            (Scalar::F16(base), Scalar::F16(exponent)) => {
+                Scalar::F16(f16::from_f32(base.to_f32().powf(exponent.to_f32())))
+            }
+            (Scalar::F32(base), Scalar::F32(exponent)) => Scalar::F32(base.powf(exponent)),
+            (Scalar::F64(base), Scalar::F64(exponent)) => Scalar::F64(base.powf(exponent)),
+            (Scalar::C64(base), Scalar::C64(exponent)) => Scalar::C64(base.powc(exponent)),
+            (Scalar::C128(base), Scalar::C128(exponent)) => Scalar::C128(base.powc(exponent)),
+            (base, exponent) => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the power of scalars of data types {} and {}",
+                        base.r#type(),
+                        exponent.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Sign for Scalar {
+    /// Computes the elementwise sign of this [`Scalar`]: `-1`, `0`, or `1` for the signed-integer variants; `-1.0`
+    /// or `1.0` for floating-point values away from zero, with signed zeros and NaNs passing through unchanged; and
+    /// `z / |z|` for the complex variants, with `0` mapping to itself. Unsigned-integer, Boolean, and other variants
+    /// return a [`TypeError`].
+    fn sign(&self) -> Result<Self, ProgramError> {
+        /// Computes the floating-point sign, preserving signed zeros and NaNs.
+        fn float_sign(value: f64) -> f64 {
+            if value.is_nan() || value == 0.0 { value } else { value.signum() }
+        }
+
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(
+                r#type,
+                float_sign(Self::decode_low_precision_float(r#type, bits)),
+            );
+        }
+        Ok(match self {
+            Scalar::I8(value) => Scalar::I8(value.signum()),
+            Scalar::I16(value) => Scalar::I16(value.signum()),
+            Scalar::I32(value) => Scalar::I32(value.signum()),
+            Scalar::I64(value) => Scalar::I64(value.signum()),
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(float_sign(value.to_f64()) as f32)),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(float_sign(value.to_f64()) as f32)),
+            Scalar::F32(value) => Scalar::F32(float_sign(f64::from(*value)) as f32),
+            Scalar::F64(value) => Scalar::F64(float_sign(*value)),
+            Scalar::C64(value) => {
+                let norm = value.norm();
+                Scalar::C64(if norm == 0.0 { *value } else { value / norm })
+            }
+            Scalar::C128(value) => {
+                let norm = value.norm();
+                Scalar::C128(if norm == 0.0 { *value } else { value / norm })
+            }
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the sign of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Floor for Scalar {
+    /// Computes the elementwise floor of this [`Scalar`], rounding toward negative infinity. Only the real
+    /// floating-point variants support the floor; any other variant returns a [`TypeError`].
+    fn floor(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).floor());
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().floor())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().floor())),
+            Scalar::F32(value) => Scalar::F32(value.floor()),
+            Scalar::F64(value) => Scalar::F64(value.floor()),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the floor of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Ceil for Scalar {
+    /// Computes the elementwise ceiling of this [`Scalar`], rounding toward positive infinity. Only the real
+    /// floating-point variants support the ceiling; any other variant returns a [`TypeError`].
+    fn ceil(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).ceil());
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().ceil())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().ceil())),
+            Scalar::F32(value) => Scalar::F32(value.ceil()),
+            Scalar::F64(value) => Scalar::F64(value.ceil()),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the ceiling of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Round for Scalar {
+    /// Computes the elementwise rounding of this [`Scalar`] to the nearest integer, resolving ties toward the
+    /// nearest even integer. Only the real floating-point variants support rounding; any other variant returns a
+    /// [`TypeError`].
+    fn round(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(
+                r#type,
+                Self::decode_low_precision_float(r#type, bits).round_ties_even(),
+            );
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().round_ties_even())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().round_ties_even())),
+            Scalar::F32(value) => Scalar::F32(value.round_ties_even()),
+            Scalar::F64(value) => Scalar::F64(value.round_ties_even()),
+            other => {
+                return Err(
+                    TypeError { message: format!("cannot round a scalar of data type {}", other.r#type()) }.into()
+                );
+            }
+        })
+    }
+}
+
+/// Selects the maximum of two floating-point values with NaN propagation and `-0.0` ordering below `+0.0`, resolving
+/// exact ties toward `left`.
+fn maximum_float(left: f64, right: f64) -> f64 {
+    if left.is_nan() {
+        left
+    } else if right.is_nan() {
+        right
+    } else {
+        match left.total_cmp(&right) {
+            Ordering::Less => right,
+            _ => left,
+        }
+    }
+}
+
+/// Selects the minimum of two floating-point values with NaN propagation and `-0.0` ordering below `+0.0`, resolving
+/// exact ties toward `left`.
+fn minimum_float(left: f64, right: f64) -> f64 {
+    if left.is_nan() {
+        left
+    } else if right.is_nan() {
+        right
+    } else {
+        match left.total_cmp(&right) {
+            Ordering::Greater => right,
+            _ => left,
+        }
+    }
+}
+
+impl Maximum for Scalar {
+    /// Computes the elementwise maximum of two [`Scalar`]s, promoting them to a common data type. Only the real
+    /// (non-complex) numeric variants are supported. For floating-point operands, NaNs propagate and `-0.0` orders
+    /// below `+0.0`; any other combination returns a [`TypeError`].
+    fn maximum(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "maximum", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "maximum")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (left.low_precision_float_parts(), right.low_precision_float_parts())
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                maximum_float(
+                    Self::decode_low_precision_float(left_type, left_bits),
+                    Self::decode_low_precision_float(right_type, right_bits),
+                ),
+            );
+        }
+        Ok(match (left, right) {
+            (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left.max(right)),
+            (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left.max(right)),
+            (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left.max(right)),
+            (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left.max(right)),
+            (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left.max(right)),
+            (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left.max(right)),
+            (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left.max(right)),
+            (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left.max(right)),
+            (Scalar::BF16(left), Scalar::BF16(right)) => {
+                Scalar::BF16(bf16::from_f64(maximum_float(left.to_f64(), right.to_f64())))
+            }
+            (Scalar::F16(left), Scalar::F16(right)) => {
+                Scalar::F16(f16::from_f64(maximum_float(left.to_f64(), right.to_f64())))
+            }
+            (Scalar::F32(left), Scalar::F32(right)) => {
+                Scalar::F32(maximum_float(f64::from(left), f64::from(right)) as f32)
+            }
+            (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(maximum_float(left, right)),
+            (left, right) => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the maximum of scalars of data types {} and {}",
+                        left.r#type(),
+                        right.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Minimum for Scalar {
+    /// Computes the elementwise minimum of two [`Scalar`]s, promoting them to a common data type. Only the real
+    /// (non-complex) numeric variants are supported. For floating-point operands, NaNs propagate and `-0.0` orders
+    /// below `+0.0`; any other combination returns a [`TypeError`].
+    fn minimum(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "minimum", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "minimum")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (left.low_precision_float_parts(), right.low_precision_float_parts())
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                minimum_float(
+                    Self::decode_low_precision_float(left_type, left_bits),
+                    Self::decode_low_precision_float(right_type, right_bits),
+                ),
+            );
+        }
+        Ok(match (left, right) {
+            (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left.min(right)),
+            (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left.min(right)),
+            (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left.min(right)),
+            (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left.min(right)),
+            (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left.min(right)),
+            (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left.min(right)),
+            (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left.min(right)),
+            (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left.min(right)),
+            (Scalar::BF16(left), Scalar::BF16(right)) => {
+                Scalar::BF16(bf16::from_f64(minimum_float(left.to_f64(), right.to_f64())))
+            }
+            (Scalar::F16(left), Scalar::F16(right)) => {
+                Scalar::F16(f16::from_f64(minimum_float(left.to_f64(), right.to_f64())))
+            }
+            (Scalar::F32(left), Scalar::F32(right)) => {
+                Scalar::F32(minimum_float(f64::from(left), f64::from(right)) as f32)
+            }
+            (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(minimum_float(left, right)),
+            (left, right) => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the minimum of scalars of data types {} and {}",
+                        left.r#type(),
+                        right.r#type(),
+                    ),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl Remainder for Scalar {
+    /// Computes the elementwise remainder of this [`Scalar`] (the dividend) and `right` (the divisor), with the
+    /// result taking the sign of the dividend (truncation semantics). Integer and floating-point operands are
+    /// promoted to a common data type; integer remainders with a zero divisor return a [`TypeError`], the minimum
+    /// signed-integer dividend with a `-1` divisor wraps to `0`, and any other combination returns a [`TypeError`].
+    fn remainder(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "remainder", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "remainder")?;
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (left.low_precision_float_parts(), right.low_precision_float_parts())
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                Self::decode_low_precision_float(left_type, left_bits)
+                    % Self::decode_low_precision_float(right_type, right_bits),
+            );
+        }
+
+        macro_rules! integer_remainder {
+            ($left:expr, $right:expr, $variant:ident, $data_type:ident) => {{
+                if $right == 0 {
+                    return Err(TypeError {
+                        message: format!(
+                            "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
+                            DataType::$data_type,
+                        ),
+                    }
+                    .into());
+                }
+                Scalar::$variant($left.wrapping_rem($right))
+            }};
+        }
+
+        Ok(match (left, right) {
+            (Scalar::I8(left), Scalar::I8(right)) => integer_remainder!(left, right, I8, I8),
+            (Scalar::I16(left), Scalar::I16(right)) => integer_remainder!(left, right, I16, I16),
+            (Scalar::I32(left), Scalar::I32(right)) => integer_remainder!(left, right, I32, I32),
+            (Scalar::I64(left), Scalar::I64(right)) => integer_remainder!(left, right, I64, I64),
+            (Scalar::U8(left), Scalar::U8(right)) => integer_remainder!(left, right, U8, U8),
+            (Scalar::U16(left), Scalar::U16(right)) => integer_remainder!(left, right, U16, U16),
+            (Scalar::U32(left), Scalar::U32(right)) => integer_remainder!(left, right, U32, U32),
+            (Scalar::U64(left), Scalar::U64(right)) => integer_remainder!(left, right, U64, U64),
+            (Scalar::BF16(left), Scalar::BF16(right)) => Scalar::BF16(bf16::from_f32(left.to_f32() % right.to_f32())),
+            (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(f16::from_f32(left.to_f32() % right.to_f32())),
+            (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left % right),
+            (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left % right),
+            (left, right) => {
+                return Err(TypeError {
+                    message: format!(
+                        "cannot compute the remainder of scalars of data types {} and {}",
+                        left.r#type(),
+                        right.r#type(),
+                    ),
                 }
                 .into());
             }

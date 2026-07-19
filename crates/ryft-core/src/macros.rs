@@ -254,25 +254,24 @@ macro_rules! check_builders {
 /// );
 /// ```
 ///
-/// An operation whose result element type differs from its input can provide a named data-type inference function.
-/// The generated array inference broadcasts the array structure and applies that same function to its element data
-/// types. Operations with genuinely custom array metadata semantics can additionally provide `infer_array_types`:
+/// An operation whose result element type differs from its input can provide a data-type inference closure. The
+/// generated array inference broadcasts the array structure and applies that same closure to its element data types.
+/// Named functions remain supported because function paths are expressions. Operations with genuinely custom array
+/// metadata semantics can additionally provide `infer_array_types`:
 ///
 /// ```rust,ignore
-/// fn infer_abs_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-///     Ok(vec![match input_types[0] {
-///         DataType::C64 => DataType::F32,
-///         DataType::C128 => DataType::F64,
-///         input_type => input_type,
-///     }])
-/// }
-///
 /// define_elementwise_operation!(
 ///     @unary
 ///     /// Elementwise absolute-value operation.
 ///     AbsOperation, ABS_OPERATION_NAME,
 ///     Abs, abs,
-///     infer_data_types = infer_abs_output_data_types,
+///     infer_data_types = |input_types: &[DataType]| {
+///         Ok(vec![match input_types[0] {
+///             DataType::C64 => DataType::F32,
+///             DataType::C128 => DataType::F64,
+///             input_type => input_type,
+///         }])
+///     },
 ///     check_array_types = [@no_unreduced],
 /// );
 /// ```
@@ -286,14 +285,14 @@ macro_rules! check_builders {
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
 ///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
-///   - `infer_data_types`: Optional path to a function with signature `fn(&[DataType]) -> Result<Vec<DataType>,
+///   - `infer_data_types`: Optional callable expression with signature `Fn(&[DataType]) -> Result<Vec<DataType>,
 ///     TypeError>`. It receives the operation's validated input data types and returns its single output data type.
-///     When omitted, unary operations preserve their input data type and binary operations use ordinary data-type
-///     broadcasting.
-///   - `infer_array_types`: Optional path to a function that accepts the operation's input
-///     [`ArrayType`](crate::ArrayType) slice with signature `fn(&[ArrayType]) -> Result<Vec<ArrayType>, TypeError>`.
-///     It receives the validated input array types and returns the single output array type. When omitted, the macro
-///     broadcasts the input array structure and applies `infer_data_types` to the input element data types.
+///     Both closures and function paths are accepted. When omitted, unary operations preserve their input data type
+///     and binary operations use ordinary data-type broadcasting.
+///   - `infer_array_types`: Optional callable expression with signature `Fn(&[ArrayType]) -> Result<Vec<ArrayType>,
+///     TypeError>`. It receives the validated input array types and returns the single output array type. Both closures
+///     and function paths are accepted. When omitted, the macro broadcasts the input array structure and applies
+///     `infer_data_types` to the input element data types.
 ///   - `check_data_types = [@selector ..., ...]`: Optional ordered list of [`check_types!`] data-type contracts applied
 ///     to scalar input types and array element types before type inference. Space-separated selectors compose one
 ///     contract, while commas separate independently checked contracts.
@@ -306,8 +305,8 @@ macro_rules! define_elementwise_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
-        $(, infer_data_types = $infer_data_types:path)?
-        $(, infer_array_types = $infer_array_types:path)?
+        $(, infer_data_types = $infer_data_types:expr)?
+        $(, infer_array_types = $infer_array_types:expr)?
         $(, check_data_types = [$($(@$data_type_check:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
@@ -409,8 +408,8 @@ macro_rules! define_elementwise_operation {
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
-        $(, infer_data_types = $infer_data_types:path)?
-        $(, infer_array_types = $infer_array_types:path)?
+        $(, infer_data_types = $infer_data_types:expr)?
+        $(, infer_array_types = $infer_array_types:expr)?
         $(, check_data_types = [$($(@$data_type_selector:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
@@ -512,8 +511,8 @@ macro_rules! define_elementwise_operation {
     };
 
     // Internal branch used for this macro's implementation.
-    (@infer_data_types [$infer_data_types:path] @$arity:ident $input_types:expr $(, $name:ident)?) => {
-        $infer_data_types($input_types)
+    (@infer_data_types [$infer_data_types:expr] @$arity:ident $input_types:expr $(, $name:ident)?) => {
+        ($infer_data_types)($input_types)
     };
 
     // Internal branch used for this macro's implementation.
@@ -532,15 +531,15 @@ macro_rules! define_elementwise_operation {
 
     // Internal branch used for this macro's implementation.
     (
-        @infer_array_types [$infer_array_types:path] [$($infer_data_types:path)?] @$arity:ident
+        @infer_array_types [$infer_array_types:expr] [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr $(, $name:ident)?
     ) => {
-        $infer_array_types($input_types)
+        ($infer_array_types)($input_types)
     };
 
     // Internal branch used for this macro's implementation.
     (
-        @infer_array_types [] [$($infer_data_types:path)?] @unary
+        @infer_array_types [] [$($infer_data_types:expr)?] @unary
         $operation:expr, $input_types:expr
     ) => {{
         let input_data_types = [$input_types[0].data_type()];
@@ -552,7 +551,7 @@ macro_rules! define_elementwise_operation {
 
     // Internal branch used for this macro's implementation.
     (
-        @infer_array_types [] [$($infer_data_types:path)?] @binary
+        @infer_array_types [] [$($infer_data_types:expr)?] @binary
         $operation:expr, $input_types:expr, $name:ident
     ) => {{
         let input_data_types = [$input_types[0].data_type(), $input_types[1].data_type()];
@@ -564,7 +563,7 @@ macro_rules! define_elementwise_operation {
 
     // Internal branch used for this macro's implementation.
     (
-        @infer_default_array_types [$($infer_data_types:path)?] @$arity:ident
+        @infer_default_array_types [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr, $input_data_types:expr $(, $name:ident)?
     ) => {{
         let output_data_types = $crate::define_elementwise_operation!(
@@ -3774,29 +3773,18 @@ mod tests {
     const TEST_MAGNITUDE_OPERATION_NAME: &str = "test_magnitude";
     const TEST_STRICT_ADD_OPERATION_NAME: &str = "test_strict_add";
 
-    /// Infers the test magnitude operation's complex-to-real output data type.
-    fn infer_test_magnitude_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        Ok(vec![match input_types[0] {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            input_type => input_type,
-        }])
-    }
-
-    /// Infers the test strict-add operation's output array type.
-    fn infer_test_strict_add_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types[0] != input_types[1] {
-            return Err(TypeError { message: "test strict-add inputs must have identical array types".to_string() });
-        }
-        Ok(vec![input_types[0].clone()])
-    }
-
     define_elementwise_operation!(
         @unary
         /// Unary operation used to test custom data-type inference.
         TestMagnitudeOperation, TEST_MAGNITUDE_OPERATION_NAME,
         Abs, abs,
-        infer_data_types = infer_test_magnitude_data_types,
+        infer_data_types = |input_types: &[DataType]| {
+            Ok(vec![match input_types[0] {
+                DataType::C64 => DataType::F32,
+                DataType::C128 => DataType::F64,
+                input_type => input_type,
+            }])
+        },
     );
 
     define_elementwise_operation!(
@@ -3804,7 +3792,14 @@ mod tests {
         /// Binary operation used to test custom array-type inference.
         TestStrictAddOperation, TEST_STRICT_ADD_OPERATION_NAME,
         Add, add,
-        infer_array_types = infer_test_strict_add_array_types,
+        infer_array_types = |input_types: &[ArrayType]| {
+            if input_types[0] != input_types[1] {
+                return Err(TypeError {
+                    message: "test strict-add inputs must have identical array types".to_string(),
+                });
+            }
+            Ok(vec![input_types[0].clone()])
+        },
         check_data_types = [@numeric],
     );
 

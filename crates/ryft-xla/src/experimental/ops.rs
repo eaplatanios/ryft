@@ -22,6 +22,7 @@ use ryft_core::operations::constants::{
     ZeroOperation,
 };
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
+use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
@@ -30,10 +31,14 @@ use ryft_core::operations::manipulation::{
     SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, DotOperation, ExpOperation, LogOperation,
-    MulOperation, NegOperation, ReduceOperation, SinOperation, SqrtOperation, SubOperation,
+    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ExpOperation,
+    FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation, NegOperation,
+    PowOperation, ReduceOperation, RemainderOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
+use ryft_core::operations::random::RngBitGeneratorOperation;
+use ryft_core::operations::sort::SortOperation;
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -46,7 +51,10 @@ use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
-use ryft_core::operations::collectives::{AxisIndexOperation, CollectiveOperation};
+use ryft_core::operations::collectives::{
+    AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveOperation, PSumScatterOperation,
+    PpermuteOperation,
+};
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
@@ -92,6 +100,17 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Exp(ExpOperation),
     Log(LogOperation),
     Sqrt(SqrtOperation),
+    Rsqrt(RsqrtOperation),
+    Tanh(TanhOperation),
+    Logistic(LogisticOperation),
+    Pow(PowOperation),
+    Sign(SignOperation),
+    Floor(FloorOperation),
+    Ceil(CeilOperation),
+    Round(RoundOperation),
+    Maximum(MaximumOperation),
+    Minimum(MinimumOperation),
+    Remainder(RemainderOperation),
     Abs(AbsOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),
@@ -100,8 +119,10 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     StopGradient(StopGradientOperation),
     Tag(TagOperation),
     Print(PrintOperation),
+    CustomCall(CustomCallOperation),
     TransferToMemory(TransferToMemoryOperation),
     Dot(DotOperation),
+    ScaledDot(ScaledDotOperation),
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
     Reshard(ReshardOperation),
@@ -116,12 +137,18 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Gather(GatherOperation),
     Scatter(ScatterOperation),
     Reduce(ReduceOperation),
+    Sort(SortOperation),
+    RngBitGenerator(RngBitGeneratorOperation),
     Compare(CompareOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
     Xor(XorOperation),
     Collective(CollectiveOperation),
+    AllGather(AllGatherOperation),
+    PSumScatter(PSumScatterOperation),
+    Ppermute(PpermuteOperation),
+    AllToAll(AllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
@@ -179,6 +206,17 @@ where
             ArrayOperation::Exp(operation) => Self::Exp(operation),
             ArrayOperation::Log(operation) => Self::Log(operation),
             ArrayOperation::Sqrt(operation) => Self::Sqrt(operation),
+            ArrayOperation::Rsqrt(operation) => Self::Rsqrt(operation),
+            ArrayOperation::Tanh(operation) => Self::Tanh(operation),
+            ArrayOperation::Logistic(operation) => Self::Logistic(operation),
+            ArrayOperation::Pow(operation) => Self::Pow(operation),
+            ArrayOperation::Sign(operation) => Self::Sign(operation),
+            ArrayOperation::Floor(operation) => Self::Floor(operation),
+            ArrayOperation::Ceil(operation) => Self::Ceil(operation),
+            ArrayOperation::Round(operation) => Self::Round(operation),
+            ArrayOperation::Maximum(operation) => Self::Maximum(operation),
+            ArrayOperation::Minimum(operation) => Self::Minimum(operation),
+            ArrayOperation::Remainder(operation) => Self::Remainder(operation),
             ArrayOperation::Abs(operation) => Self::Abs(operation),
             ArrayOperation::Complex(operation) => Self::Complex(operation),
             ArrayOperation::Conjugate(operation) => Self::Conjugate(operation),
@@ -187,8 +225,10 @@ where
             ArrayOperation::StopGradient(operation) => Self::StopGradient(operation),
             ArrayOperation::Tag(operation) => Self::Tag(operation),
             ArrayOperation::Print(operation) => Self::Print(operation),
+            ArrayOperation::CustomCall(operation) => Self::CustomCall(operation),
             ArrayOperation::TransferToMemory(operation) => Self::TransferToMemory(operation),
             ArrayOperation::Dot(operation) => Self::Dot(operation),
+            ArrayOperation::ScaledDot(operation) => Self::ScaledDot(operation),
             ArrayOperation::Transpose(operation) => Self::Transpose(operation),
             ArrayOperation::Reshape(operation) => Self::Reshape(operation),
             ArrayOperation::Reshard(operation) => Self::Reshard(operation),
@@ -203,12 +243,18 @@ where
             ArrayOperation::Gather(operation) => Self::Gather(operation),
             ArrayOperation::Scatter(operation) => Self::Scatter(operation),
             ArrayOperation::Reduce(operation) => Self::Reduce(operation),
+            ArrayOperation::Sort(operation) => Self::Sort(operation),
+            ArrayOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
             ArrayOperation::Compare(operation) => Self::Compare(operation),
             ArrayOperation::Not(operation) => Self::Not(operation),
             ArrayOperation::And(operation) => Self::And(operation),
             ArrayOperation::Or(operation) => Self::Or(operation),
             ArrayOperation::Xor(operation) => Self::Xor(operation),
             ArrayOperation::Collective(operation) => Self::Collective(operation),
+            ArrayOperation::AllGather(operation) => Self::AllGather(operation),
+            ArrayOperation::PSumScatter(operation) => Self::PSumScatter(operation),
+            ArrayOperation::Ppermute(operation) => Self::Ppermute(operation),
+            ArrayOperation::AllToAll(operation) => Self::AllToAll(operation),
             ArrayOperation::AxisIndex(operation) => Self::AxisIndex(operation),
             ArrayOperation::Select(operation) => Self::Select(operation),
             ArrayOperation::Condition(operation) => XlaOperation::from(operation),

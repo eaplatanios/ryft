@@ -237,14 +237,19 @@ mod tests {
     use ryft_core::operations::manipulation::{
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
     };
-    use ryft_core::operations::math::{Abs, Atan2, Cos, Exp, Log, Reduce, ReductionKind, Sin, Sqrt};
+    use ryft_core::operations::math::{
+        Abs, Atan2, Ceil, Cos, Dot, Exp, Floor, Log, Logistic, Maximum, Minimum, Pow, Reduce, ReductionKind, Remainder,
+        Round, Rsqrt, Sign, Sin, Sqrt, Tanh,
+    };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, values_from_bytes, values_to_bytes,
+    };
     use crate::{Array, FromPjrt};
 
     use super::*;
@@ -303,6 +308,12 @@ mod tests {
         let shard = array.addressable_shards().next().unwrap();
         let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
         values_from_bytes::<f32>(bytes.as_slice())
+    }
+
+    fn read_i32s(array: &Array<'_>) -> Vec<i32> {
+        let shard = array.addressable_shards().next().unwrap();
+        let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+        values_from_bytes::<i32>(bytes.as_slice())
     }
 
     /// Copies an array to a dense row-major host vector for assertions only. Production dense differential assembly
@@ -405,7 +416,7 @@ mod tests {
     }
 
     /// Asserts elementwise value agreement between the XLA-backed eager array backend and the `ryft-core`
-    /// reference array backend ([`CpuArray`]) over a scoped operation list: the twelve math operations,
+    /// reference array backend ([`CpuArray`]) over a scoped operation list: the elementwise math operations,
     /// element-type conversion, selection, and reduction — including one complex and one `f8` case. This is the
     /// value-level counterpart of the reference-backend parity rule: the reference backend must agree with the
     /// pinned XLA semantics wherever both implement an operation.
@@ -451,6 +462,19 @@ mod tests {
         assert_parity(&left.exp().unwrap(), &reference_left.exp().unwrap());
         assert_parity(&left.log().unwrap(), &reference_left.log().unwrap());
         assert_parity(&left.sqrt().unwrap(), &reference_left.sqrt().unwrap());
+        assert_parity(&left.rsqrt().unwrap(), &reference_left.rsqrt().unwrap());
+        assert_parity(&left.tanh().unwrap(), &reference_left.tanh().unwrap());
+        assert_parity(&left.logistic().unwrap(), &reference_left.logistic().unwrap());
+        assert_parity(&left.pow(&right).unwrap(), &reference_left.pow(&reference_right).unwrap());
+        assert_parity(&right.sign().unwrap(), &reference_right.sign().unwrap());
+        assert_parity(&right.floor().unwrap(), &reference_right.floor().unwrap());
+        assert_parity(&right.ceil().unwrap(), &reference_right.ceil().unwrap());
+        // The `right` vector contains the exact ties `-1.5` and `2.5`, checking the round-to-nearest-even policy
+        // against the reference backend.
+        assert_parity(&right.round().unwrap(), &reference_right.round().unwrap());
+        assert_parity(&left.maximum(&right).unwrap(), &reference_left.maximum(&reference_right).unwrap());
+        assert_parity(&left.minimum(&right).unwrap(), &reference_left.minimum(&reference_right).unwrap());
+        assert_parity(&left.remainder(&right).unwrap(), &reference_left.remainder(&reference_right).unwrap());
 
         // Element-type conversion agrees, including the exact `f8e4m3fn` encodings: the device payload bytes match
         // the reference backend's encoded bits bit for bit.
@@ -489,6 +513,366 @@ mod tests {
             panic!("expected a c64 reference product");
         };
         assert!((device_product - reference_product).norm() < 1e-5);
+    }
+
+    /// The traced custom-call operation executes a registered XLA FFI handler through the eager capability path:
+    /// dispatch compiles a cached single-operation program whose `stablehlo.custom_call` resolves to the
+    /// `ryft.test.add_one` handler at execution time.
+    #[test]
+    fn test_eager_custom_call_executes_registered_ffi_handler() {
+        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+
+        let operation =
+            CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_type(&mesh, DataType::F32, &[2])]);
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5]);
+
+        // A typed `f64` attribute reaches the handler through the `backend_config` dictionary.
+        let operation = operation.with_attribute("increment", 2.5);
+        let outputs = CustomCall::custom_call(&operation, std::slice::from_ref(&input)).unwrap();
+        assert_eq!(read_f32s(&outputs[0]), vec![4.0, 5.0]);
+    }
+
+    /// A custom call wrapped with `custom_vjp` differentiates through the user-provided rule while the primal
+    /// executes the registered FFI handler, which is the documented pairing for differentiable foreign kernels
+    /// (the bare operation rejects differentiation).
+    #[test]
+    fn test_eager_custom_call_differentiates_through_custom_vjp() {
+        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+        use ryft_core::tracing::DomainTracer;
+        use ryft_core::tracing_v2::operations::custom_vjp;
+
+        use crate::XlaDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let output_type = replicated_type(&mesh, DataType::F32, &[2]);
+        let domain = input.execution_domain();
+
+        let add_one = move |x: &DomainTracer<XlaDomain<'_>>| {
+            let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type.clone()]);
+            Ok(CustomCall::custom_call(&operation, std::slice::from_ref(x))?.remove(0))
+        };
+        let function = custom_vjp::<XlaDomain<'_>, _, _, _, _, _, _>(
+            {
+                let add_one = add_one.clone();
+                move |x: DomainTracer<XlaDomain<'_>>| add_one(&x)
+            },
+            move |x: DomainTracer<XlaDomain<'_>>| Ok((add_one(&x)?, ())),
+            // d(x + 1)/dx is the identity, so the backward rule passes the cotangent through.
+            |(), cotangent| Ok(cotangent),
+        );
+        let (value, gradient) = domain
+            .value_and_gradient(|x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum), input)
+            .unwrap();
+        assert_eq!(read_f32s(&value), vec![6.0]);
+        assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
+    }
+
+    /// Sorting, top-k, and argmax agree between the XLA-backed eager array backend and the reference array backend,
+    /// including stable-tie routing (equal keys keep their original order, so ranking ties select the lowest
+    /// index) and NaN placement (NaNs order above `+∞` in the total order, so `argmax` reports a NaN's index).
+    #[test]
+    fn test_eager_sort_and_ranking_parity_with_reference_backend() {
+        use ryft_core::operations::sort::{ArgMax, ArgMin, Sort, SortDirection, TopK};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let key_values = [3.0f32, 1.0, 3.0, -0.0, 0.0, 2.0];
+        let payload_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let keys = f32_vector(&client, &mesh, &key_values);
+        let payloads = f32_vector(&client, &mesh, &payload_values);
+        let reference_keys = CpuArray::vector(key_values.to_vec());
+        let reference_payloads = CpuArray::vector(payload_values.to_vec());
+
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            let sorted = Sort::sort(&[keys.clone(), payloads.clone()], 0, direction).unwrap();
+            let reference_sorted =
+                Sort::sort(&[reference_keys.clone(), reference_payloads.clone()], 0, direction).unwrap();
+            for (device, reference) in sorted.iter().zip(reference_sorted.iter()) {
+                // Bit-level comparison keeps the `-0.0` versus `+0.0` total-order placement observable.
+                let device_bits = read_f32s(device).into_iter().map(f32::to_bits).collect::<Vec<_>>();
+                let reference_bits =
+                    reference.to_f64s().into_iter().map(|value| (value as f32).to_bits()).collect::<Vec<_>>();
+                assert_eq!(device_bits, reference_bits);
+            }
+        }
+
+        let (device_values, device_indices) = keys.top_k(3, 0).unwrap();
+        let (reference_values, reference_indices) = reference_keys.top_k(3, 0).unwrap();
+        let device_value_f64s = read_f32s(&device_values).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+        assert_eq!(device_value_f64s, reference_values.to_f64s());
+        let device_index_f64s = read_i32s(&device_indices).iter().map(|index| f64::from(*index)).collect::<Vec<_>>();
+        assert_eq!(device_index_f64s, reference_indices.to_f64s());
+        // Ties select the lowest index: both threes appear before the two, and index 0 precedes index 2.
+        assert_eq!(read_i32s(&device_indices), vec![0, 2, 5]);
+
+        let nan_values = [1.0f32, f32::NAN, 3.0];
+        let nan_keys = f32_vector(&client, &mesh, &nan_values);
+        let reference_nan_keys = CpuArray::vector(nan_values.to_vec());
+        assert_eq!(read_i32s(&nan_keys.argmax(0).unwrap()), vec![1]);
+        assert_eq!(reference_nan_keys.argmax(0).unwrap().to_f64s(), vec![1.0]);
+        assert_eq!(read_i32s(&nan_keys.argmin(0).unwrap()), vec![0]);
+        assert_eq!(reference_nan_keys.argmin(0).unwrap().to_f64s(), vec![0.0]);
+    }
+
+    /// The reference backend's ThreeFry implementation is bit-exact with XLA's `rng_bit_generator` expansion:
+    /// the same `[key, counter]` state produces identical `u32` and `u64` bits and identical advanced states on
+    /// both backends.
+    #[test]
+    fn test_eager_rng_bit_generator_matches_reference_backend() {
+        use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let state_values = [42u64, 7u64];
+        let state_type = replicated_type(&mesh, DataType::U64, &[2]);
+        let state = Array::from_host_buffer(
+            &client,
+            state_type,
+            mesh.clone(),
+            values_to_bytes::<u64>(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state =
+            CpuArray::new(
+                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
+                state_values.iter().copied().map(Scalar::U64).collect(),
+            )
+            .unwrap();
+
+        // An odd `u32` element count exercises the padded counter pair and the truncated word layout.
+        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
+        let (device_state, device_bits) =
+            state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
+        let (reference_new_state, reference_bits) =
+            reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
+        let device_words = values_from_bytes::<u32>(
+            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        let reference_words = reference_bits
+            .values()
+            .iter()
+            .map(|value| match value {
+                Scalar::U32(word) => *word,
+                _ => panic!("expected u32 reference bits"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(device_words, reference_words);
+        // Generating five `u32` words runs three cipher invocations, and the counter advances by that invocation
+        // count (`7 + 3 = 10`).
+        let device_state_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        assert_eq!(device_state_words, vec![42u64, 10u64]);
+        assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(10)]);
+
+        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
+        let (reference_new_state, reference_bits) =
+            reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
+        let device_state_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        assert_eq!(
+            device_state_words,
+            reference_new_state
+                .values()
+                .iter()
+                .map(|value| match value {
+                    Scalar::U64(word) => *word,
+                    _ => panic!("expected a u64 reference state"),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let device_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        let reference_words = reference_bits
+            .values()
+            .iter()
+            .map(|value| match value {
+                Scalar::U64(word) => *word,
+                _ => panic!("expected u64 reference bits"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(device_words, reference_words);
+    }
+
+    /// The composed random distributions agree between the XLA-backed eager array backend and the reference
+    /// array backend: uniform `f32` samples are bit-identical (every step of the composition is exact arithmetic
+    /// over bit-identical ThreeFry draws), normal samples agree within floating-point tolerance (the Box–Muller
+    /// transform routes through transcendental functions), and categorical samples with well-separated logits
+    /// select identical indices.
+    #[test]
+    fn test_eager_random_distributions_parity_with_reference_backend() {
+        use ryft_core::operations::random::Random;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let state_values = [11u64, 3u64];
+        let state = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[2]),
+            mesh.clone(),
+            values_to_bytes::<u64>(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state = CpuArray::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
+            state_values.iter().copied().map(Scalar::U64).collect(),
+        )
+        .unwrap();
+
+        let shape = Shape::new(vec![Size::Static(8)]);
+        let (_, device_uniform) = state.uniform(shape.clone(), DataType::F32).unwrap();
+        let (_, reference_uniform) = reference_state.uniform(shape.clone(), DataType::F32).unwrap();
+        let device_bits = read_f32s(&device_uniform).into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let reference_bits =
+            reference_uniform.to_f64s().into_iter().map(|value| (value as f32).to_bits()).collect::<Vec<_>>();
+        assert_eq!(device_bits, reference_bits);
+        for value in reference_uniform.to_f64s() {
+            assert!((0.0..1.0).contains(&value), "uniform sample {value} escapes [0, 1)");
+        }
+
+        let (_, device_normal) = state.normal(shape.clone(), DataType::F32).unwrap();
+        let (_, reference_normal) = reference_state.normal(shape, DataType::F32).unwrap();
+        for (device_value, reference_value) in read_f32s(&device_normal).iter().zip(reference_normal.to_f64s()) {
+            assert!(
+                (f64::from(*device_value) - reference_value).abs() < 1e-5,
+                "normal samples disagree: XLA computed {device_value} but the reference backend computed \
+                 {reference_value}",
+            );
+        }
+
+        let logit_values = [0.0f32, 10.0, -3.0, 2.0];
+        let device_logits = f32_vector(&client, &mesh, &logit_values);
+        let reference_logits = CpuArray::vector(logit_values.iter().map(|value| f64::from(*value)).collect())
+            .convert_element_type(DataType::F32)
+            .unwrap();
+        let (_, device_samples) = state.categorical(&device_logits, 0).unwrap();
+        let (_, reference_samples) = reference_state.categorical(&reference_logits, 0).unwrap();
+        assert_eq!(read_i32s(&device_samples), vec![1]);
+        assert_eq!(reference_samples.values(), &[Scalar::I32(1)]);
+
+        let (_, device_keys) = state.split_key(2).unwrap();
+        let (_, reference_keys) = reference_state.split_key(2).unwrap();
+        for (device_key, reference_key) in device_keys.iter().zip(reference_keys.iter()) {
+            let device_words = values_from_bytes::<u64>(
+                shard_host_bytes(&device_key.addressable_shards().next().unwrap()).unwrap().as_slice(),
+            );
+            let reference_words = reference_key
+                .values()
+                .iter()
+                .map(|value| match value {
+                    Scalar::U64(word) => *word,
+                    _ => panic!("expected u64 key words"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(device_words, reference_words);
+        }
+    }
+
+    /// An accumulation-typed dot (`f8e4m3fn × f8e4m3fn → f32`) agrees between the XLA-backed eager array backend
+    /// and the reference array backend: the operands stay at the narrow element type on device and the contraction
+    /// accumulates at `f32`. Every value used is exactly representable in `f8e4m3fn`, so both backends are exact.
+    #[test]
+    fn test_eager_accumulation_typed_dot_parity_with_reference_backend() {
+        use ryft_core::operations::math::DotDimensionNumbers;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let operand_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let lhs_values = [0.5f64, 1.0, 1.5, 2.0];
+        let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
+        let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec());
+        let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec());
+        let lhs_bytes =
+            reference_lhs.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<_>>();
+        let rhs_bytes =
+            reference_rhs.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<_>>();
+        let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
+        let lhs = Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
+        let rhs = Array::from_host_buffer(&client, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
+
+        let device_product =
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32);
+        let reference_product =
+            reference_lhs.dot_with_accumulation_type(&reference_rhs, &DotDimensionNumbers::matmul(), DataType::F32);
+        assert_eq!(device_product.r#type().data_type(), DataType::F32);
+        let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+        assert_eq!(device_value_f64s, reference_product.to_f64s());
+        assert_eq!(reference_product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
+    }
+
+    /// A block-scaled (NVFP4-style) dot agrees between the XLA-backed eager array backend and the reference array
+    /// backend on CPU, where the operation lowers to the portable dequantization composition (the CUDA fast path
+    /// emits the `__op$block_scaled_dot` custom call instead). Every element and scale is exactly representable,
+    /// so both backends are exact.
+    #[test]
+    fn test_eager_scaled_dot_parity_with_reference_backend() {
+        use ryft_core::operations::math::ScaledDot;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(16)]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        const F4_CANDIDATES: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
+        let element_values =
+            |seed: usize| (0..32).map(|index| F4_CANDIDATES[(index * 5 + seed) % 8]).collect::<Vec<_>>();
+        let reference_lhs = CpuArray::from_f64s(element_type.clone(), element_values(0));
+        let reference_rhs = CpuArray::from_f64s(element_type.clone(), element_values(3));
+        let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]);
+        let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]);
+        let bits = |reference: &CpuArray| {
+            reference.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<u8>>()
+        };
+        let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
+        let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
+        let lhs =
+            Array::from_host_buffer(&client, device_element_type.clone(), mesh.clone(), bits(&reference_lhs).as_slice())
+                .unwrap();
+        let rhs =
+            Array::from_host_buffer(&client, device_element_type, mesh.clone(), bits(&reference_rhs).as_slice())
+                .unwrap();
+        let lhs_scales = Array::from_host_buffer(
+            &client,
+            device_scale_type.clone(),
+            mesh.clone(),
+            bits(&reference_lhs_scales).as_slice(),
+        )
+        .unwrap();
+        let rhs_scales =
+            Array::from_host_buffer(&client, device_scale_type, mesh.clone(), bits(&reference_rhs_scales).as_slice())
+                .unwrap();
+
+        let device_product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 16, DataType::F32).unwrap();
+        let reference_product = reference_lhs
+            .scaled_dot(&reference_lhs_scales, &reference_rhs, &reference_rhs_scales, 16, DataType::F32)
+            .unwrap();
+        assert_eq!(device_product.r#type().data_type(), DataType::F32);
+        let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+        assert_eq!(device_value_f64s, reference_product.to_f64s());
     }
 
     #[test]

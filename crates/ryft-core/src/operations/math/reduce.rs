@@ -27,6 +27,8 @@ use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Shape, StaticShape};
 
+// TODO(eaplatanios): Review this module.
+
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
 /// Reductions collapse one or more axes of an input array by combining their elements with a

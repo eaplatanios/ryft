@@ -27,7 +27,10 @@ use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
-use crate::operations::collectives::{AxisIndexOperation, CollectiveOperation};
+use crate::operations::collectives::{
+    AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveOperation, PSumScatterOperation,
+    PpermuteOperation,
+};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -37,6 +40,7 @@ use crate::operations::constants::{
     ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
+use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
@@ -49,12 +53,22 @@ use crate::operations::manipulation::{
 use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::reduce_evaluate;
 use crate::operations::math::{
-    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Dot,
-    DotDimensionNumbers, DotOperation, Exp, ExpOperation, Log, LogOperation, Mul, MulOperation, Neg, NegOperation,
-    Reduce, ReduceOperation, ReductionKind, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation,
+    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
+    DivOperation, Dot, DotDimensionNumbers, DotOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation,
+    Logistic, LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg,
+    NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Remainder, RemainderOperation, Round,
+    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign, SignOperation, Sin, SinOperation,
+    Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation, scaled_dot_composition,
 };
 use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
+use crate::operations::random::{
+    RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, threefry_u32_words, threefry_u64_words,
+};
+use crate::operations::sort::{
+    ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_evaluate,
+    top_k_from_index_passenger,
+};
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
@@ -101,6 +115,17 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Exp(ExpOperation),
     Log(LogOperation),
     Sqrt(SqrtOperation),
+    Rsqrt(RsqrtOperation),
+    Tanh(TanhOperation),
+    Logistic(LogisticOperation),
+    Pow(PowOperation),
+    Sign(SignOperation),
+    Floor(FloorOperation),
+    Ceil(CeilOperation),
+    Round(RoundOperation),
+    Maximum(MaximumOperation),
+    Minimum(MinimumOperation),
+    Remainder(RemainderOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
@@ -110,8 +135,15 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Real(RealOperation),
     Imaginary(ImaginaryOperation),
     Dot(DotOperation),
+    ScaledDot(ScaledDotOperation),
     Reduce(ReduceOperation),
+    Sort(SortOperation),
+    RngBitGenerator(RngBitGeneratorOperation),
     Collective(CollectiveOperation),
+    AllGather(AllGatherOperation),
+    PSumScatter(PSumScatterOperation),
+    Ppermute(PpermuteOperation),
+    AllToAll(AllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
@@ -137,6 +169,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Tag(TagOperation),
     Rematerialize(RematerializeOperation),
     Print(PrintOperation),
+    CustomCall(CustomCallOperation),
     CustomJvp(CustomJvpOperation),
     CustomVjp(CustomVjpOperation),
     CustomVjpTangent(CustomVjpTangentOperation<ArrayType>),
@@ -623,6 +656,238 @@ impl Sqrt for Array {
     }
 }
 
+impl Rsqrt for Array {
+    fn rsqrt(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.rsqrt())
+    }
+}
+
+impl Tanh for Array {
+    fn tanh(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.tanh())
+    }
+}
+
+impl Logistic for Array {
+    fn logistic(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.logistic())
+    }
+}
+
+impl Pow for Array {
+    fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
+        self.binary(exponent, |base, exponent| base.pow(exponent))
+    }
+}
+
+impl Sign for Array {
+    fn sign(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.sign())
+    }
+}
+
+impl Floor for Array {
+    fn floor(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.floor())
+    }
+}
+
+impl Ceil for Array {
+    fn ceil(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.ceil())
+    }
+}
+
+impl Round for Array {
+    fn round(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.round())
+    }
+}
+
+impl Maximum for Array {
+    fn maximum(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.maximum(right))
+    }
+}
+
+impl Minimum for Array {
+    fn minimum(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.minimum(right))
+    }
+}
+
+impl Remainder for Array {
+    fn remainder(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.remainder(right))
+    }
+}
+
+impl Sort for Array {
+    fn sort(operands: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
+        let Some(key) = operands.first() else {
+            return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() });
+        };
+        let shape = key.r#type.static_shape().unwrap();
+        if axis >= shape.rank() {
+            return Err(TypeError {
+                message: format!("'sort' axis {axis} is out of bounds for rank {}", shape.rank()),
+            }
+            .into());
+        }
+        for operand in operands {
+            if operand.r#type.shape() != key.r#type.shape() {
+                return Err(TypeError {
+                    message: format!(
+                        "'sort' operands must agree on shape but got {} and {}",
+                        key.r#type.shape(),
+                        operand.r#type.shape(),
+                    ),
+                }
+                .into());
+            }
+        }
+        let key_ranks = key
+            .values
+            .iter()
+            .map(|value| {
+                value.total_order_rank().ok_or_else(|| {
+                    ProgramError::from(TypeError {
+                        message: format!("'sort' does not support key data type {}", key.r#type.data_type()),
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let operand_values = operands.iter().map(|operand| operand.values()).collect::<Vec<_>>();
+        let outputs = sort_evaluate(key_ranks.as_slice(), operand_values.as_slice(), shape.dimensions(), axis, direction);
+        operands.iter().zip(outputs).map(|(operand, values)| Array::new(operand.r#type.clone(), values)).collect()
+    }
+}
+
+/// Materializes the `i32` index passenger that rides a ranking sort for the concrete eager [`Array`] backend
+/// (the transform tracers stage it as an [`IotaOperation`](crate::operations::constants::IotaOperation) instead),
+/// returning it together with the operand's static dimensions.
+fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize>), ProgramError> {
+    let shape = value.r#type.static_shape().unwrap();
+    let dimensions = shape.dimensions().to_vec();
+    if axis >= dimensions.len() {
+        return Err(TypeError {
+            message: format!("'sort' axis {axis} is out of bounds for rank {}", dimensions.len()),
+        }
+        .into());
+    }
+    let inner_stride: usize = dimensions[axis + 1..].iter().product();
+    let axis_size = dimensions[axis];
+    let count: usize = dimensions.iter().product();
+    let values = (0..count)
+        .map(|index| Scalar::I32(((index / inner_stride) % axis_size) as i32))
+        .collect::<Vec<_>>();
+    let indices = Array::new(ArrayType::new(DataType::I32, value.r#type.shape().clone()), values)?;
+    Ok((indices, dimensions))
+}
+
+impl TopK for Array {
+    fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError> {
+        let (indices, dimensions) = eager_index_passenger(self, axis)?;
+        top_k_from_index_passenger(self, indices, dimensions.as_slice(), k, axis)
+    }
+}
+
+impl ArgMax for Array {
+    fn argmax(&self, axis: usize) -> Result<Self, ProgramError> {
+        let (indices, dimensions) = eager_index_passenger(self, axis)?;
+        extremal_index_from_index_passenger(self, indices, dimensions.as_slice(), axis, SortDirection::Descending)
+    }
+}
+
+impl ArgMin for Array {
+    fn argmin(&self, axis: usize) -> Result<Self, ProgramError> {
+        let (indices, dimensions) = eager_index_passenger(self, axis)?;
+        extremal_index_from_index_passenger(self, indices, dimensions.as_slice(), axis, SortDirection::Ascending)
+    }
+}
+
+impl ScaledDot for Array {
+    fn scaled_dot(
+        &self,
+        lhs_scales: &Self,
+        rhs: &Self,
+        rhs_scales: &Self,
+        block_size: usize,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, block_size, accumulation_type)
+    }
+}
+
+impl RngBitGenerator for Array {
+    fn rng_bit_generator(
+        &self,
+        algorithm: RandomAlgorithm,
+        output_type: &ArrayType,
+    ) -> Result<(Self, Self), ProgramError> {
+        if algorithm != RandomAlgorithm::ThreeFry {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("the reference array backend does not implement the {algorithm} algorithm"),
+            });
+        }
+        let [Scalar::U64(key), Scalar::U64(counter)] = self.values() else {
+            return Err(TypeError {
+                message: format!(
+                    "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[2] state but got {}",
+                    self.r#type,
+                ),
+            }
+            .into());
+        };
+        let Some(output_shape) = output_type.static_shape() else {
+            return Err(TypeError {
+                message: "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
+            }
+            .into());
+        };
+        let count = output_shape.dimensions().iter().product::<usize>();
+        let (values, new_counter) = match output_type.data_type() {
+            DataType::U64 => {
+                let (words, new_counter) = threefry_u64_words(*key, *counter, count);
+                (words.into_iter().map(Scalar::U64).collect::<Vec<_>>(), new_counter)
+            }
+            DataType::U32 => {
+                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
+                (words.into_iter().map(Scalar::U32).collect::<Vec<_>>(), new_counter)
+            }
+            DataType::U16 => {
+                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
+                (words.into_iter().map(|word| Scalar::U16(word as u16)).collect::<Vec<_>>(), new_counter)
+            }
+            DataType::U8 => {
+                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
+                (words.into_iter().map(|word| Scalar::U8(word as u8)).collect::<Vec<_>>(), new_counter)
+            }
+            data_type => {
+                return Err(TypeError {
+                    message: format!("'rng_bit_generator' does not support output data type {data_type}"),
+                }
+                .into());
+            }
+        };
+        let state = Array::new(self.r#type.clone(), vec![Scalar::U64(*key), Scalar::U64(new_counter)])?;
+        Ok((state, Array::new(output_type.clone(), values)?))
+    }
+}
+
+impl CustomCall for Array {
+    /// The reference array backend has no foreign-kernel registry, so custom calls always report an
+    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+    fn custom_call(operation: &CustomCallOperation, _inputs: &[Self]) -> Result<Vec<Self>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "the reference array backend cannot execute the foreign kernel '{}'",
+                operation.target_name(),
+            ),
+        })
+    }
+}
+
 impl Not for Array {
     fn not(&self) -> Result<Self, ProgramError> {
         self.unary(|value| value.not())
@@ -747,6 +1012,20 @@ impl Imaginary for Array {
 }
 
 impl Dot for Array {
+    /// Computes an accumulation-typed dot by upcasting both operands to `accumulation_type` and delegating to the
+    /// ordinary evaluator, which is exactly the upcast-then-accumulate contract of
+    /// [`DotOperation::with_accumulation_type`].
+    fn dot_with_accumulation_type(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: DataType,
+    ) -> Self {
+        let lhs = self.convert_element_type(accumulation_type).unwrap_or_else(|error| panic!("{error}"));
+        let rhs = rhs.convert_element_type(accumulation_type).unwrap_or_else(|error| panic!("{error}"));
+        lhs.dot(&rhs, dimensions)
+    }
+
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         let lhs_shape = self.r#type.static_shape().unwrap();
         let rhs_shape = rhs.r#type.static_shape().unwrap();

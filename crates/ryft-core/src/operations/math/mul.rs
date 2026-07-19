@@ -149,7 +149,6 @@ define_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operati
 mod tests {
     use std::collections::BTreeSet;
 
-    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
@@ -157,21 +156,16 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
-        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_transposition,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::math::{Reduce, ReductionKind};
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
@@ -179,14 +173,6 @@ mod tests {
     fn test_mul() {
         let operation = MulOperation;
 
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), MUL_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "MulOperation");
-        assert_eq!(format!("{operation}"), MUL_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::F64]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -214,138 +200,23 @@ mod tests {
             ),
             Ok(vec![Scalar::from(Complex::new(1.0f64, 2.0) * Complex::new(0.5f64, -1.0))]),
         );
-
-        // Array type inference broadcasts shapes and promotes data types.
-        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::scalar(DataType::F32),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))]);
-
-        // Array type inference drops layout metadata when inputs disagree.
-        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::new(DataType::F32, Shape::scalar()).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
-                ArrayType::scalar(DataType::F32),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
-
-        // Array type inference tolerates compatible inputs that only disagree on varying manual axes.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let left = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let right = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["y"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let output =
-            <MulOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().as_ref().unwrap().varying_manual_axes(),
-            &BTreeSet::from(["x".to_string(), "y".to_string()]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.0)],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0)]
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        );
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Scalar, MulOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = mul %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_mul_type_inference() {
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&MulOperation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
-        );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
-            let expected =
-                TypeError { message: format!("'{MUL_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&MulOperation, &[input_type, input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(
-                    &MulOperation,
-                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
-                    &[],
-                ),
-                Err(expected),
-            );
-        }
-        assert_eq!(
-            <MulOperation as Operation<ArrayType>>::infer_output_types(
-                &MulOperation,
-                &[
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-                ],
-                &[],
-            ),
-            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = MulOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
+                },
+            ],
         );
 
         let mesh = LogicalMesh::new(vec![
@@ -387,30 +258,24 @@ mod tests {
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
 
         // Two operands both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
-        assert_eq!(
-            <MulOperation as Operation<ArrayType>>::infer_output_types(
-                &MulOperation,
-                &[unreduced("x"), unreduced("x")],
-                &[],
-            ),
-            Err(TypeError {
-                message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced")
-            }),
+        check_operation_type_inference!(
+            operation = MulOperation,
+            cases = [{
+                input_types = [unreduced("x"), unreduced("x")],
+                error = format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
+            }],
         );
 
         // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
-        assert_eq!(
-            <MulOperation as Operation<ArrayType>>::infer_output_types(
-                &MulOperation,
-                &[unreduced("x"), reduced("y")],
-                &[]
-            ),
-            Err(TypeError {
-                message: format!(
+        check_operation_type_inference!(
+            operation = MulOperation,
+            cases = [{
+                input_types = [unreduced("x"), reduced("y")],
+                error = format!(
                     "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes the first is \
                      unreduced over",
                 ),
-            }),
+            }],
         );
 
         // Two operands reduced over the same axis multiply to a value reduced over that axis.
@@ -425,13 +290,12 @@ mod tests {
 
         // A reduced operand cannot be multiplied by an otherwise replicated operand because the result would inherit
         // a reduction marker that does not describe both inputs.
-        assert_eq!(
-            <MulOperation as Operation<ArrayType>>::infer_output_types(
-                &MulOperation,
-                &[reduced("x"), vector_type()],
-                &[],
-            ),
-            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes") }),
+        check_operation_type_inference!(
+            operation = MulOperation,
+            cases = [{
+                input_types = [reduced("x"), vector_type()],
+                error = format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
+            }],
         );
     }
 
@@ -471,29 +335,10 @@ mod tests {
                 "},
             }],
         );
-        fn square<V: Clone + std::ops::Mul<Output = V>>(input: V) -> V {
-            input.clone() * input
-        }
-        check_gradient!(@scalar, square, at = 0.7, step = 1e-6, tolerance = 1e-6);
-        // The array universe agrees: the gradient of `sum(x ⊙ x)` is `2x`, and the finite-difference oracle perturbs
-        // each input element independently.
-        check_gradient!(
-            @array,
-            |x| square(x).reduce(&[0], ReductionKind::Sum),
-            at = Array::vector(vec![0.7, -1.3, 2.1]),
-            step = 1e-6,
-            tolerance = 1e-6,
-        );
-        let input = Complex::new(0.7f64, -0.3);
-        assert_eq!(gradient_holomorphic(square, Scalar::from(input)), Ok(Scalar::from(input * 2.0)));
+    }
 
-        // Second-order differentiation recovers d²(x²)/dx² = 2.
-        assert_abs_diff_eq!(
-            gradient(|x| gradient(square, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
-            2.0,
-            epsilon = 1e-9,
-        );
-
+    #[test]
+    fn test_mul_complex_differentiation() {
         // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
         // `c128` payloads, and the reverse-mode pullback applies the bilinear (conjugation-free) transpose pairing.
         let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();

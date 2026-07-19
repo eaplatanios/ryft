@@ -1,0 +1,226 @@
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+};
+use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::constants::ZeroLike;
+use crate::operations::control_flow::{Select, SelectCondition};
+
+// TODO(eaplatanios): Review this module.
+
+/// Canonical operation name for [`MinimumOperation`].
+pub const MINIMUM_OPERATION_NAME: &str = "minimum";
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that computes the elementwise minimum of two numeric values, promoting their element types and
+    /// broadcasting their shapes. Matching the operand constraints of
+    /// [StableHLO's `minimum`](https://openxla.org/stablehlo/spec#minimum), only real (non-complex) numeric operands
+    /// are supported because complex numbers are unordered (Boolean minima are spelled [`And`](crate::And)). For
+    /// floating-point operands, NaNs propagate (the minimum is NaN when either operand is NaN) and `-0.0` orders
+    /// below `+0.0` (so `minimum(-0.0, +0.0)` is `-0.0`). Array operands that still carry partial sums are rejected,
+    /// and their reduced-axis markers must agree.
+    MinimumOperation, MINIMUM_OPERATION_NAME,
+    Minimum, minimum,
+    check_data_types = [@numeric @real],
+    check_array_types = [@no_unreduced, @same_reduced_axes],
+);
+
+impl_differentiable_elementwise_operation! {
+    @binary
+    MinimumOperation,
+    jvp<C>
+    where
+        C::Value: Compare<Output = C::Value>
+            + Select<Condition = <C::Value as SelectCondition>::Condition>
+            + SelectCondition
+            + ZeroLike,
+    {
+        // The tangent follows the winning operand, with ties routing to the left operand: each contribution masks
+        // its own tangent by the same `left <= right` predicate, so the combined tangent is
+        // `select(left <= right, left_tangent, right_tangent)`.
+        |(left, left_tangent), (right, _)| {
+            let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?.select_condition()?;
+            C::Value::select(&left_wins, &left_tangent, &left_tangent.zero_like())?
+        };
+        |(left, _), (right, right_tangent)| {
+            let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?.select_condition()?;
+            C::Value::select(&left_wins, &right_tangent.zero_like(), &right_tangent)?
+        };
+    },
+    transpose = @nonlinear,
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value-level elementwise minimum capability. [`Minimum`] fills the same role for
+    /// [`MinimumOperation`] that [`Atan2`](crate::Atan2) fills for [`Atan2Operation`](crate::Atan2Operation).
+    Minimum,
+    /// Computes the elementwise minimum of this value and `right`, promoting both operands to a common numeric
+    /// element type and returning a [`ProgramError`](crate::ProgramError) if something goes wrong.
+    minimum(right),
+    MinimumOperation,
+);
+
+#[cfg(test)]
+mod tests {
+    use half::{bf16, f16};
+    use pretty_assertions::assert_eq;
+
+    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::scalars::Scalar;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
+    use crate::parameters::Placeholder;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::types::{ArrayType, DataType};
+
+    use super::*;
+
+    #[test]
+    fn test_minimum() {
+        assert_eq!(Scalar::from(2i32).minimum(&Scalar::from(5i32)).unwrap(), Scalar::from(2i32));
+        assert_eq!(Scalar::from(-2i64).minimum(&Scalar::from(-5i64)).unwrap(), Scalar::from(-5i64));
+        assert_eq!(Scalar::from(3u32).minimum(&Scalar::from(7u32)).unwrap(), Scalar::from(3u32));
+        assert_eq!(Scalar::from(2.5f32).minimum(&Scalar::from(1.5f32)).unwrap(), Scalar::from(1.5f32));
+        // Mixed-precision operands promote before comparing.
+        assert_eq!(Scalar::from(2.5f32).minimum(&Scalar::from(3.5f64)).unwrap(), Scalar::from(2.5f64));
+        assert_eq!(
+            Scalar::from(bf16::from_f32(2.0)).minimum(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
+            Scalar::from(bf16::from_f32(2.0)),
+        );
+        assert_eq!(
+            Scalar::from(f16::from_f32(2.0)).minimum(&Scalar::from(f16::from_f32(3.0))).unwrap(),
+            Scalar::from(f16::from_f32(2.0)),
+        );
+        // NaNs propagate and `-0.0` orders below `+0.0`.
+        assert!(match Scalar::from(f64::NAN).minimum(&Scalar::from(1.0f64)).unwrap() {
+            Scalar::F64(value) => value.is_nan(),
+            _ => false,
+        });
+        assert!(match Scalar::from(1.0f64).minimum(&Scalar::from(f64::NAN)).unwrap() {
+            Scalar::F64(value) => value.is_nan(),
+            _ => false,
+        });
+        assert!(match Scalar::from(-0.0f64).minimum(&Scalar::from(0.0f64)).unwrap() {
+            Scalar::F64(value) => value == 0.0 && value.is_sign_negative(),
+            _ => false,
+        });
+        assert_eq!(
+            Array::vector(vec![0.7, -1.0]).minimum(&Array::vector(vec![0.3, 2.0])).unwrap(),
+            Array::vector(vec![0.3, -1.0]),
+        );
+    }
+
+    #[test]
+    fn test_minimum_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = MinimumOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32, DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "'minimum' does not support input data type c64",
+                },
+                {
+                    input_data_types = [DataType::Boolean, DataType::Boolean],
+                    error = "'minimum' does not support input data type bool",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = MinimumOperation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_minimum_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = MinimumOperation,
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
+                        (@mapped(axis = 0), Array::vector(vec![0.3, 2.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![0.3, -1.0]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(0.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![0.0, -2.0]))],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_minimum_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = MinimumOperation,
+            cases = [
+                {
+                    primals = [Array::scalar(2.0), Array::scalar(1.0)],
+                    tangents = [Array::scalar(3.0), Array::scalar(5.0)],
+                    primal_outputs = [Array::scalar(1.0)],
+                    tangent_outputs = [Array::scalar(5.0)],
+                },
+                {
+                    primals = [Array::scalar(1.0), Array::scalar(2.0)],
+                    tangents = [Array::scalar(3.0), Array::scalar(5.0)],
+                    primal_outputs = [Array::scalar(1.0)],
+                    tangent_outputs = [Array::scalar(3.0)],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_minimum_differentiation_at_ties() {
+        // Ties route the tangent to the left operand. The finite-difference oracle cannot check the
+        // non-differentiable tie point, so the tie policy is asserted on the staged jvp program directly.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(MinimumOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let jvp_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let outputs = jvp_program
+            .interpret(vec![Array::scalar(2.0), Array::scalar(2.0), Array::scalar(3.0), Array::scalar(5.0)])
+            .unwrap();
+        assert_eq!(outputs, vec![Array::scalar(2.0), Array::scalar(3.0)]);
+    }
+
+    #[test]
+    fn test_minimum_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = MinimumOperation,
+            inputs = [Scalar::from(0.7), Scalar::from(0.3)],
+            expected = Scalar::from(0.3),
+        );
+    }
+
+    #[test]
+    fn test_minimum_transposition() {
+        check_operation_transposition!(
+            @rejected,
+            operation = MinimumOperation,
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+}

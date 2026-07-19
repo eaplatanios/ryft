@@ -263,6 +263,7 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::check_operation_type_inference;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::types::DataType::{Boolean, F8E8M0FNU, F32, I32};
@@ -274,9 +275,13 @@ mod tests {
     fn test_coordinate_basis_operation_infers_packed_type() {
         let leaf_type = ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let operation = CoordinateBasisOperation::new(leaf_type.clone(), 4, 10);
-        assert_eq!(
-            operation.infer_output_types(&[], &[]).unwrap(),
-            vec![leaf_type.with_inserted_dimension(0, Size::Static(10)).unwrap()],
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [{
+                type = ArrayType,
+                input_types = [],
+                output_types = [leaf_type.with_inserted_dimension(0, Size::Static(10)).unwrap()],
+            }],
         );
     }
 

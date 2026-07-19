@@ -1,15 +1,19 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
-use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation};
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
+};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::operations::manipulation::{Broadcast, ConvertElementType, Transpose};
+use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::operations::manipulation::{Broadcast, ConvertElementType, Reshape, Transpose};
+use crate::operations::math::Mul;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -17,7 +21,9 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Shape, Size, StaticShape};
+use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
+
+// TODO(eaplatanios): Review this module.
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
@@ -182,14 +188,91 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 ///     operand is allowed and its sharding is dropped from the output.
 ///   - Result dimension entries are copied from the owning operand, and auto mesh axes are stripped from the final
 ///     sharding.
+/// Returns whether operands of `operand` element type may accumulate at `accumulation`: the identical type is
+/// always valid, floating-point operands of any precision (including the sub-byte and 8-bit types that live outside
+/// the standard promotion lattice) accumulate at `f32` or `f64` (the accumulator widths XLA's low-precision matrix
+/// units expose), and integer operands accumulate at a same-signedness integer type at least as wide.
+fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) -> bool {
+    /// Returns the signedness and bit width of an integer data type, or `None` for any other type.
+    fn integer_parts(data_type: DataType) -> Option<(bool, usize)> {
+        Some(match data_type {
+            DataType::I1 => (true, 1),
+            DataType::I2 => (true, 2),
+            DataType::I4 => (true, 4),
+            DataType::I8 => (true, 8),
+            DataType::I16 => (true, 16),
+            DataType::I32 => (true, 32),
+            DataType::I64 => (true, 64),
+            DataType::U1 => (false, 1),
+            DataType::U2 => (false, 2),
+            DataType::U4 => (false, 4),
+            DataType::U8 => (false, 8),
+            DataType::U16 => (false, 16),
+            DataType::U32 => (false, 32),
+            DataType::U64 => (false, 64),
+            _ => return None,
+        })
+    }
+
+    if operand == accumulation {
+        return true;
+    }
+    let operand_is_float = matches!(
+        operand,
+        DataType::F4E2M1FN
+            | DataType::F6E2M3FN
+            | DataType::F6E3M2FN
+            | DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E4M3FN
+            | DataType::F8E4M3FNUZ
+            | DataType::F8E4M3B11FNUZ
+            | DataType::F8E5M2
+            | DataType::F8E5M2FNUZ
+            | DataType::F8E8M0FNU
+            | DataType::BF16
+            | DataType::F16
+            | DataType::F32
+            | DataType::F64
+    );
+    if operand_is_float {
+        return matches!(accumulation, DataType::F32 | DataType::F64);
+    }
+    match (integer_parts(operand), integer_parts(accumulation)) {
+        (Some((operand_signed, operand_width)), Some((accumulation_signed, accumulation_width))) => {
+            operand_signed == accumulation_signed && accumulation_width >= operand_width
+        }
+        _ => false,
+    }
+}
+
 fn dot_abstract(
     lhs: &ArrayType,
     rhs: &ArrayType,
     dimensions: &DotDimensionNumbers,
+    accumulation_type: Option<DataType>,
     output_sharding: Option<&Sharding>,
 ) -> Result<ArrayType, TypeError> {
     if lhs.data_type() != rhs.data_type() {
         return Err(TypeError { message: format!("'{DOT_OPERATION_NAME}' input element types are incompatible") });
+    }
+    if let Some(accumulation_type) = accumulation_type {
+        if output_sharding.is_some() {
+            return Err(TypeError {
+                message: format!(
+                    "'{DOT_OPERATION_NAME}' does not support combining an accumulation type with a requested \
+                     output sharding yet"
+                ),
+            });
+        }
+        if !accumulation_type_is_compatible(lhs.data_type(), accumulation_type) {
+            return Err(TypeError {
+                message: format!(
+                    "'{DOT_OPERATION_NAME}' operand data type {} cannot accumulate at data type {accumulation_type}",
+                    lhs.data_type(),
+                ),
+            });
+        }
     }
     let lhs_rank = lhs.rank();
     let rhs_rank = rhs.rank();
@@ -432,7 +515,7 @@ fn dot_abstract(
         None
     };
 
-    ArrayType::new(lhs.data_type(), Shape::new(output_dimensions))
+    ArrayType::new(accumulation_type.unwrap_or(lhs.data_type()), Shape::new(output_dimensions))
         .with_sharding(sharding)
         .map_err(|error| TypeError { message: error.to_string() })
 }
@@ -447,6 +530,9 @@ pub struct DotOperation {
     /// Contracting and batching dimension specification.
     dimensions: DotDimensionNumbers,
 
+    /// Optional accumulation data type. Refer to the documentation of [`Self::with_accumulation_type`].
+    accumulation_type: Option<DataType>,
+
     /// Optional requested output [`Sharding`]. Refer to the documentation of [`Self::with_output_sharding`].
     output_sharding: Option<Sharding>,
 }
@@ -455,7 +541,7 @@ impl DotOperation {
     /// Creates a new [`DotOperation`] with the supplied dimension numbers.
     #[inline]
     pub fn new(dimensions: DotDimensionNumbers) -> Self {
-        Self { dimensions, output_sharding: None }
+        Self { dimensions, accumulation_type: None, output_sharding: None }
     }
 
     /// Returns a [`DotOperation`] configured for standard rank-2 matrix multiplication.
@@ -473,6 +559,25 @@ impl DotOperation {
     pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
         self.output_sharding = output_sharding.into();
         self
+    }
+
+    /// Returns a copy of this [`DotOperation`] with the provided accumulation data type. The operand element types
+    /// must still match each other and must promote to the accumulation type, which becomes the output element
+    /// type: the backend upcasts the operands and accumulates the contraction at the wider type (XLA's
+    /// `preferred_element_type` contract, which is what its low-precision matrix units implement natively — e.g.,
+    /// `f8 × f8 → f32` and `bf16 × bf16 → f32`). Accumulation-typed dots reject differentiation (differentiate a
+    /// full-precision dot instead) and cannot yet be combined with a requested output sharding.
+    #[inline]
+    pub fn with_accumulation_type(mut self, accumulation_type: impl Into<Option<DataType>>) -> Self {
+        self.accumulation_type = accumulation_type.into();
+        self
+    }
+
+    /// Returns the optional accumulation data type. Refer to the documentation of
+    /// [`Self::with_accumulation_type`].
+    #[inline]
+    pub fn accumulation_type(&self) -> Option<DataType> {
+        self.accumulation_type
     }
 
     /// Returns the contracting and batching dimension specification.
@@ -506,12 +611,21 @@ impl Operation<ArrayType> for DotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        Ok(vec![dot_abstract(&input_types[0], &input_types[1], &self.dimensions, self.output_sharding.as_ref())?])
+        Ok(vec![dot_abstract(
+            &input_types[0],
+            &input_types[1],
+            &self.dimensions,
+            self.accumulation_type,
+            self.output_sharding.as_ref(),
+        )?])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("dimensions", &self.dimensions)?;
+            if let Some(accumulation_type) = self.accumulation_type {
+                operation.field("accumulation_type", &accumulation_type)?;
+            }
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
             }
@@ -528,11 +642,17 @@ impl<C: Domain<Type = ArrayType, Value: Dot>> InterpretableOperation<C> for DotO
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        // The requested output sharding flows through the capability method so that interpretation over staging
-        // values (e.g., during program batching) preserves it; concrete values ignore it.
-        Ok(vec![match &self.output_sharding {
-            Some(output_sharding) => inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding),
-            None => inputs[0].dot(&inputs[1], &self.dimensions),
+        // The requested output sharding and accumulation type flow through the capability methods so that
+        // interpretation over staging values (e.g., during program batching) preserves them; concrete values
+        // ignore the sharding and upcast for the accumulation type. Type inference rejects combining the two.
+        Ok(vec![match (&self.accumulation_type, &self.output_sharding) {
+            (Some(accumulation_type), _) => {
+                inputs[0].dot_with_accumulation_type(&inputs[1], &self.dimensions, *accumulation_type)
+            }
+            (None, Some(output_sharding)) => {
+                inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding)
+            }
+            (None, None) => inputs[0].dot(&inputs[1], &self.dimensions),
         }])
     }
 }
@@ -578,11 +698,9 @@ where
                 message: "'dot' batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
             })?;
         let axis_sharding = crate::batching::ArrayBatch::sharding_for_inputs(inputs)?;
-        let lifted_op = DotOperation::new(lifted_dimensions).with_output_sharding(lift_output_sharding(
-            self.output_sharding.as_ref(),
-            output_axis,
-            axis_sharding,
-        )?);
+        let lifted_op = DotOperation::new(lifted_dimensions)
+            .with_accumulation_type(self.accumulation_type)
+            .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, axis_sharding)?);
         lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
 }
@@ -603,6 +721,15 @@ where
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
+        if self.accumulation_type.is_some() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_OPERATION_NAME}' with an accumulation type does not support differentiation; \
+                     differentiate a full-precision dot instead"
+                ),
+            }
+            .into());
+        }
         let left = &inputs[0];
         let right = &inputs[1];
         let stage_dot = |left: &C::Value, right: &C::Value| match self.output_sharding() {
@@ -675,6 +802,15 @@ impl<
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
+        if self.accumulation_type.is_some() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_OPERATION_NAME}' with an accumulation type does not support differentiation; \
+                     differentiate a full-precision dot instead"
+                ),
+            }
+            .into());
+        }
         check_count!("output", outputs, 1, ProgramError);
         match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
             // Both operands linear is a bilinear product, which is not a linear map in both operands jointly and so
@@ -859,6 +995,336 @@ pub fn adjoint_dimensions_for_right_dot(
 /// performs the contraction described by `dimensions`, supporting standard matrix
 /// multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor
 /// contractions.
+
+/// Canonical operation name for [`ScaledDotOperation`].
+pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
+
+/// Primitive representing a block-scaled ("microscaling") matrix product — the analogue of
+/// [JAX's `jax.nn.scaled_matmul`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_matmul.html). Each
+/// operand pairs a narrow element tensor with a tensor of per-block scales along the contracting dimension,
+/// covering the [OCP MX formats](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+/// (e.g., MXFP8: `f8e4m3fn` elements with `f8e8m0fnu` scales over blocks of 32) and NVIDIA's NVFP4 (`f4e2m1fn`
+/// elements with `f8e4m3fn` scales over blocks of 16; fold any additional per-tensor scale into one scale tensor
+/// or the result). The contracting dimension is the last dimension of *both* element operands, matching the
+/// hardware block-scaled gemm convention: the operands are `lhs [m, k]` with scales `[m, k / block_size]` and
+/// `rhs [n, k]` with scales `[n, k / block_size]`, and the result is `[m, n]` at the accumulation type.
+///
+/// Semantically the operation dequantizes both operands (upcasting elements and scales to the accumulation type
+/// and expanding each scale across its block) and contracts them — which is exactly how the reference array
+/// backend and the portable XLA lowering evaluate it (see [`scaled_dot_composition`]). On CUDA targets, the XLA
+/// lowering instead emits the `__op$block_scaled_dot` custom call for the standard MXFP8/NVFP4 format and block
+/// combinations, which XLA's GPU block-scaling rewriter lowers to cuDNN's native block-scaled tensor-core dot
+/// (cuDNN 9.10+) or to expanded reference HLO.
+///
+/// Because quantized operands are inference-oriented, the operation rejects differentiation and batching with
+/// errors directing users to differentiate or batch an explicit dequantization composition instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScaledDotOperation {
+    /// Number of contracting-dimension elements sharing one scale.
+    block_size: usize,
+
+    /// Element type at which the operands are dequantized and the contraction accumulates.
+    accumulation_type: DataType,
+}
+
+impl ScaledDotOperation {
+    /// Creates a new [`ScaledDotOperation`] with the provided block size and accumulation type.
+    #[inline]
+    pub fn new(block_size: usize, accumulation_type: DataType) -> Self {
+        Self { block_size, accumulation_type }
+    }
+
+    /// Returns the number of contracting-dimension elements sharing one scale.
+    #[inline]
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Returns the element type at which the operands are dequantized and the contraction accumulates.
+    #[inline]
+    pub fn accumulation_type(&self) -> DataType {
+        self.accumulation_type
+    }
+}
+
+impl Display for ScaledDotOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Operation::<ArrayType>::render(self, formatter, 0)
+    }
+}
+
+impl Operation<ArrayType> for ScaledDotOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        SCALED_DOT_OPERATION_NAME
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, SCALED_DOT_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("block_size", &self.block_size)?;
+            operation.field("accumulation_type", &self.accumulation_type)
+        })
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 4, TypeError);
+        let lhs = static_rank_2_dimensions("'scaled_dot' left operand", &input_types[0])?;
+        let lhs_scales = static_rank_2_dimensions("'scaled_dot' left scales", &input_types[1])?;
+        let rhs = static_rank_2_dimensions("'scaled_dot' right operand", &input_types[2])?;
+        let rhs_scales = static_rank_2_dimensions("'scaled_dot' right scales", &input_types[3])?;
+        if lhs[1] != rhs[1] {
+            return Err(TypeError {
+                message: format!(
+                    "'scaled_dot' contracting dimension sizes do not match: {} versus {}",
+                    lhs[1], rhs[1],
+                ),
+            });
+        }
+        if self.block_size == 0 || lhs[1] % self.block_size != 0 {
+            return Err(TypeError {
+                message: format!(
+                    "'scaled_dot' contracting dimension size {} is not divisible by block size {}",
+                    lhs[1], self.block_size,
+                ),
+            });
+        }
+        for (descriptor, elements, scales) in
+            [("left", lhs, lhs_scales), ("right", rhs, rhs_scales)]
+        {
+            if scales != [elements[0], elements[1] / self.block_size] {
+                return Err(TypeError {
+                    message: format!(
+                        "'scaled_dot' {descriptor} scales must have shape [{}, {}] but got [{}, {}]",
+                        elements[0],
+                        elements[1] / self.block_size,
+                        scales[0],
+                        scales[1],
+                    ),
+                });
+            }
+        }
+        for input_type in input_types {
+            if !accumulation_type_is_compatible(input_type.data_type(), self.accumulation_type) {
+                return Err(TypeError {
+                    message: format!(
+                        "'scaled_dot' operand data type {} cannot accumulate at data type {}",
+                        input_type.data_type(),
+                        self.accumulation_type,
+                    ),
+                });
+            }
+            if !input_type.unreduced_axes().is_empty() {
+                return Err(TypeError { message: "'scaled_dot' does not support unreduced operands".to_string() });
+            }
+        }
+        Ok(vec![ArrayType::new(
+            self.accumulation_type,
+            Shape::new(vec![Size::Static(lhs[0]), Size::Static(rhs[0])]),
+        )])
+    }
+}
+
+impl<C: Domain<Type = ArrayType, Value: ScaledDot>> InterpretableOperation<C> for ScaledDotOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 4, ProgramError);
+        Ok(vec![inputs[0].scaled_dot(
+            &inputs[1],
+            &inputs[2],
+            &inputs[3],
+            self.block_size,
+            self.accumulation_type,
+        )?])
+    }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDotOperation where
+    C::Operation: From<ScaledDotOperation>
+{
+}
+
+/// Quantized operands are inference-oriented, so there is no differentiation rule: differentiating reports an
+/// error directing users to differentiate an explicit dequantization composition instead.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
+where
+    C::Operation: From<ScaledDotOperation>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "'{SCALED_DOT_OPERATION_NAME}' does not support differentiation; differentiate an explicit \
+                 dequantization composition instead"
+            ),
+        }
+        .into())
+    }
+}
+
+impl_non_transposable_operation!(ScaledDotOperation);
+
+/// Quantized operands are inference-oriented, so there is no batching rule: batching reports an error directing
+/// users to batch an explicit dequantization composition instead.
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ScaledDotOperation {
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        _context: &BatchingContext<C>,
+        _driver: &D,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "'{SCALED_DOT_OPERATION_NAME}' does not support batching; batch an explicit dequantization \
+                 composition instead"
+            ),
+        })
+    }
+}
+
+/// Value-level block-scaled ("microscaling") dot capability. Refer to the documentation of [`ScaledDotOperation`]
+/// for the operand convention (the contracting dimension is last on *both* element operands), the supported
+/// formats, and the transform rules.
+pub trait ScaledDot: Sized {
+    /// Computes the block-scaled matrix product of `self` (shape `[m, k]`, scaled by `lhs_scales` of shape
+    /// `[m, k / block_size]`) and `rhs` (shape `[n, k]`, scaled by `rhs_scales` of shape `[n, k / block_size]`),
+    /// dequantizing both operands to `accumulation_type` and returning the `[m, n]` product at that type, and a
+    /// [`ProgramError`] if something goes wrong.
+    fn scaled_dot(
+        &self,
+        lhs_scales: &Self,
+        rhs: &Self,
+        rhs_scales: &Self,
+        block_size: usize,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError>;
+}
+
+/// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
+/// context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
+/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
+/// transform tracers and backend-owned values without conflicting with concrete implementations.
+impl<V: Value<Type = ArrayType>> ScaledDot for V
+where
+    V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
+{
+    fn scaled_dot(
+        &self,
+        lhs_scales: &Self,
+        rhs: &Self,
+        rhs_scales: &Self,
+        block_size: usize,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            ScaledDotOperation::new(block_size, accumulation_type),
+            Vec::new(),
+            &[self.clone(), lhs_scales.clone(), rhs.clone(), rhs_scales.clone()],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+/// Evaluates a block-scaled dot as the portable dequantization composition: both operands (whose contracting
+/// dimension is last) are upcast to the accumulation type, their scales are expanded across the blocks (a
+/// broadcast inserting the block axis, merged back by a reshape), multiplied in, and contracted over the last
+/// dimension of both sides. This is the shared semantics behind the concrete [`ScaledDot`] implementations and
+/// the portable XLA lowering.
+pub(crate) fn scaled_dot_composition<V>(
+    lhs: &V,
+    lhs_scales: &V,
+    rhs: &V,
+    rhs_scales: &V,
+    block_size: usize,
+    accumulation_type: DataType,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Dot + Mul + Reshape,
+{
+    let lhs = dequantize_block_scaled(lhs, lhs_scales, block_size, accumulation_type)?;
+    let rhs = dequantize_block_scaled(rhs, rhs_scales, block_size, accumulation_type)?;
+    Ok(lhs.dot(&rhs, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new())))
+}
+
+/// Dequantizes one block-scaled rank-2 operand whose contracting dimension is last: converts the elements and
+/// scales to `accumulation_type`, expands each scale across its block of `block_size` contracting elements (a
+/// broadcast appending the block axis, merged back by a reshape), and multiplies.
+fn dequantize_block_scaled<V>(
+    elements: &V,
+    scales: &V,
+    block_size: usize,
+    accumulation_type: DataType,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape,
+{
+    let element_type = elements.r#type().into_owned();
+    let element_dimensions = static_rank_2_dimensions("'scaled_dot' operand", &element_type)?;
+    let scale_dimensions = static_rank_2_dimensions("'scaled_dot' scales", &scales.r#type())?;
+    if block_size == 0 || element_dimensions[1] % block_size != 0 {
+        return Err(TypeError {
+            message: format!(
+                "'scaled_dot' contracting dimension size {} is not divisible by block size {block_size}",
+                element_dimensions[1],
+            ),
+        }
+        .into());
+    }
+    if scale_dimensions != [element_dimensions[0], element_dimensions[1] / block_size] {
+        return Err(TypeError {
+            message: format!(
+                "'scaled_dot' scales must have shape [{}, {}] but got [{}, {}]",
+                element_dimensions[0],
+                element_dimensions[1] / block_size,
+                scale_dimensions[0],
+                scale_dimensions[1],
+            ),
+        }
+        .into());
+    }
+    let expanded_type = ArrayType::new(
+        accumulation_type,
+        Shape::new(vec![
+            Size::Static(scale_dimensions[0]),
+            Size::Static(scale_dimensions[1]),
+            Size::Static(block_size),
+        ]),
+    );
+    let element_sizes = element_dimensions.iter().map(|&size| Size::Static(size)).collect::<Vec<_>>();
+    let expanded_scales = scales
+        .convert_element_type(accumulation_type)?
+        .broadcast(expanded_type, &[0, 1])?
+        .reshape(Shape::new(element_sizes))?;
+    elements.convert_element_type(accumulation_type)?.mul(&expanded_scales)
+}
+
+/// Returns the static rank-2 dimensions of a [`ScaledDot`] operand type, rejecting other ranks and dynamic shapes.
+fn static_rank_2_dimensions(descriptor: &str, value_type: &ArrayType) -> Result<[usize; 2], TypeError> {
+    let Some(shape) = value_type.static_shape() else {
+        return Err(TypeError { message: format!("{descriptor} must have a static shape") });
+    };
+    match shape.dimensions() {
+        &[rows, columns] => Ok([rows, columns]),
+        dimensions => Err(TypeError {
+            message: format!("{descriptor} must have rank 2 but got rank {}", dimensions.len()),
+        }),
+    }
+}
+
 pub trait Dot<Rhs = Self>: Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
     fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
@@ -878,6 +1344,16 @@ pub trait Dot<Rhs = Self>: Sized {
         let _ = output_sharding;
         self.dot(rhs, dimensions)
     }
+
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the operands to
+    /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
+    /// Refer to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
+    fn dot_with_accumulation_type(
+        &self,
+        rhs: &Rhs,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: DataType,
+    ) -> Self;
 }
 
 /// Any context-carrying value takes a dot product by binding a [`DotOperation`] through its own context. The
@@ -891,6 +1367,22 @@ where
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         self.dispatch_domain()
             .bind(DotOperation::new(dimensions.clone()), Vec::new(), &[self.clone(), rhs.clone()])
+            .expect("`dot` operation failed")
+            .remove(0)
+    }
+
+    fn dot_with_accumulation_type(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: DataType,
+    ) -> Self {
+        self.dispatch_domain()
+            .bind(
+                DotOperation::new(dimensions.clone()).with_accumulation_type(accumulation_type),
+                Vec::new(),
+                &[self.clone(), rhs.clone()],
+            )
             .expect("`dot` operation failed")
             .remove(0)
     }
@@ -1078,6 +1570,204 @@ mod tests {
 
     fn sharded_array(mesh: &LogicalMesh, sizes: &[usize], dimensions: Vec<ShardingDimension>) -> ArrayType {
         plain_array(sizes).with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_scaled_dot() {
+        // NVFP4-flavored case (with a compact block size of 2 instead of 16): `f4e2m1fn` elements with `f8e4m3fn`
+        // per-block scales along the trailing contracting dimension of BOTH operands (`lhs [m, k]`, `rhs [n, k]`).
+        // Every element, scale, product, and partial sum below is exactly representable, so the `f32` result is
+        // exact.
+        let lhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
+        let rhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let lhs = Array::from_f64s(lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
+        let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
+        let rhs = Array::from_f64s(rhs_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
+        let rhs_scales = Array::from_f64s(scale_type.clone(), vec![2.0, 0.5, 1.0, 2.0]);
+        let product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 2, DataType::F32).unwrap();
+        assert_eq!(
+            product.r#type().as_ref(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
+
+        // MXFP8-flavored case: `f8e4m3fn` elements with power-of-two `f8e8m0fnu` scales.
+        let f8_lhs_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
+        let mx_scale_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let f8_lhs = Array::from_f64s(f8_lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
+        let f8_lhs_scales = Array::from_f64s(mx_scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
+        let f8_rhs = Array::from_f64s(f8_lhs_type, vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
+        let f8_rhs_scales = Array::from_f64s(mx_scale_type, vec![2.0, 0.5, 1.0, 2.0]);
+        let product = f8_lhs.scaled_dot(&f8_lhs_scales, &f8_rhs, &f8_rhs_scales, 2, DataType::F32).unwrap();
+        assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
+
+        // The staged operation renders its payload.
+        let operation = ScaledDotOperation::new(2, DataType::F32);
+        assert_eq!(operation.block_size(), 2);
+        assert_eq!(operation.accumulation_type(), DataType::F32);
+        assert_eq!(operation.name(), SCALED_DOT_OPERATION_NAME);
+        assert_eq!(operation.to_string(), "scaled_dot [block_size=2, accumulation_type=f32]");
+        assert_eq!(
+            operation.infer_output_types(
+                &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
+                &[],
+            ),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+        );
+
+        // Contract violations report clear errors through type inference.
+        assert_eq!(
+            ScaledDotOperation::new(3, DataType::F32).infer_output_types(
+                &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
+                &[],
+            ),
+            Err(TypeError {
+                message: "'scaled_dot' contracting dimension size 4 is not divisible by block size 3".to_string(),
+            }),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[lhs_type.clone(), rhs_type.clone(), rhs_type, scale_type.clone()], &[]),
+            Err(TypeError {
+                message: "'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string(),
+            }),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    lhs_type.clone(),
+                    scale_type.clone(),
+                    ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(4)])),
+                    scale_type.clone(),
+                ],
+                &[],
+            ),
+            Err(TypeError {
+                message: "'scaled_dot' right operand must have rank 2 but got rank 1".to_string(),
+            }),
+        );
+
+        // Differentiation and batching are rejected with errors directing to explicit dequantization.
+        let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = vec![
+            builder.add_input(lhs_type),
+            builder.add_input(scale_type.clone()),
+            builder.add_input(ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]))),
+            builder.add_input(scale_type),
+        ];
+        let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![output],
+                vec![crate::parameters::Placeholder; 4],
+                vec![crate::parameters::Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(error) if error.to_string().contains("'scaled_dot' does not support differentiation"),
+        ));
+        assert!(matches!(
+            program.batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0); 4],
+                crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(error) if error.to_string().contains("'scaled_dot' does not support batching"),
+        ));
+    }
+
+    #[test]
+    fn test_dot_accumulation_type() {
+        // Type inference widens the output to the accumulation type for promotable operand types and rejects
+        // non-promotable ones, combining with a requested output sharding, and differentiation.
+        let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
+        assert_eq!(operation.accumulation_type(), Some(DataType::F32));
+        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let rhs = lhs.clone();
+        assert_eq!(
+            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+        );
+        let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        assert_eq!(
+            operation.infer_output_types(&[bf16_operand.clone(), bf16_operand.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+        );
+        let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
+        let f32_operand = plain_array(&[2, 2]);
+        assert_eq!(
+            narrowing.infer_output_types(&[f32_operand.clone(), f32_operand.clone()], &[]),
+            Err(TypeError { message: "'dot' operand data type f32 cannot accumulate at data type f16".to_string() }),
+        );
+        let mesh = test_mesh();
+        let sharded = DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(
+            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]).unwrap(),
+        );
+        assert_eq!(
+            sharded.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
+            Err(TypeError {
+                message: "'dot' does not support combining an accumulation type with a requested output sharding \
+                          yet"
+                .to_string(),
+            }),
+        );
+
+        // The eager reference backend upcasts the operands and accumulates at the accumulation type: every value
+        // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+        let lhs_values = Array::from_f64s(lhs.clone(), vec![0.5, 1.0, 1.5, 2.0]);
+        let rhs_values = Array::from_f64s(rhs.clone(), vec![1.0, 0.5, 0.5, 1.0]);
+        let product = lhs_values.dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32);
+        assert_eq!(
+            product.r#type().as_ref(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))
+        );
+        assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
+
+        // Differentiating an accumulation-typed dot is rejected with a message directing to full precision.
+        let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs);
+        let rhs_input = builder.add_input(rhs);
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul().with_accumulation_type(DataType::F32),
+                Vec::new(),
+                vec![lhs_input, rhs_input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![output],
+                vec![crate::parameters::Placeholder; 2],
+                vec![crate::parameters::Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(error) if error.to_string().contains("does not support differentiation"),
+        ));
+
+        // Batching lifts the dimension numbers while carrying the accumulation type, so per-item products still
+        // accumulate at the widened type.
+        let lifted = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .0;
+        let batched_lhs_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let batched_lhs = Array::from_f64s(batched_lhs_type.clone(), vec![0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0]);
+        let batched_rhs = Array::from_f64s(batched_lhs_type, vec![1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0]);
+        let outputs = lifted.interpret(vec![batched_lhs, batched_rhs]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().data_type(), DataType::F32);
+        // Both batch items repeat the unbatched case, whose exact product is [[1, 1.25], [2.5, 2.75]].
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75]);
     }
 
     #[test]

@@ -52,21 +52,16 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, gradient_holomorphic};
-    use crate::interpretation::InterpretableOperation;
+    use crate::differentiation::gradient_holomorphic;
     use crate::macros::{
-        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::{TypeError, Typed};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::programs::types::Typed;
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -82,104 +77,24 @@ mod tests {
         assert!(extreme.re.is_infinite() && extreme.re.is_sign_positive());
         assert_eq!(extreme.im, 0.0);
 
-        let operation = CosOperation;
-
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), COS_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "CosOperation");
-        assert_eq!(format!("{operation}"), COS_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
-            Ok(vec![DataType::F32]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(0.5)],
-            ),
-            Ok(vec![Scalar::from(0.5f64.cos())]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(0.5)],
-            ),
-            Ok(vec![Array::scalar(0.5f64.cos())]),
-        );
-
-        // Array type inference preserves shape, layout, and sharding metadata for its single input.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            <CosOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
-            Ok(vec![input]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Scalar, CosOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = cos %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
+        assert_eq!(Array::scalar(0.5).cos().unwrap(), Array::scalar(0.5f64.cos()),);
     }
 
     #[test]
     fn test_cos_type_inference() {
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&CosOperation, &[DataType::I32], &[]),
-            Err(TypeError { message: "'cos' does not support input data type i32".to_string() }),
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = CosOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::I32],
+                    error = "'cos' does not support input data type i32",
+                },
+            ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
@@ -221,20 +136,19 @@ mod tests {
                 "},
             }],
         );
-        check_gradient!(@scalar, |input| input.cos(), at = 0.7, step = 1e-6, tolerance = 1e-6);
+    }
+
+    #[test]
+    fn test_cos_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
             gradient_holomorphic(|input| input.cos().unwrap(), Scalar::from(input)),
             Ok(Scalar::from(-input.sin())),
         );
+    }
 
-        // Second-order differentiation recovers d²(cos(x))/dx² = -cos(x).
-        assert_abs_diff_eq!(
-            gradient(|x| gradient(|x| x.cos().unwrap(), x).unwrap(), Scalar::from(0.7f64)).unwrap(),
-            -0.7f64.cos(),
-            epsilon = 1e-9,
-        );
-
+    #[test]
+    fn test_cos_low_precision_differentiation_uses_widened_tangents() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![4.0]);
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);

@@ -25,7 +25,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @linear
     AddOperation,
-    rule = [@positive, @positive]
+    rule = [@positive, @positive],
 }
 
 define_elementwise_capability!(
@@ -44,8 +44,6 @@ define_tracer_operator!(@binary std::ops::Add, add, AddOperation, "`add` operati
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
@@ -58,10 +56,9 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
@@ -99,70 +96,18 @@ mod tests {
     #[test]
     fn test_add_type_inference() {
         check_operation_type_inference!(
+            @elementwise @binary,
             operation = AddOperation,
             cases = [
                 {
-                    input_types = [DataType::F32, DataType::F64],
-                    output_types = [DataType::F64],
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
                 },
                 {
-                    input_types = [
-                        ArrayType::scalar(DataType::F32),
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-                    ],
-                    output_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-                    ],
-                },
-                {
-                    input_types = [
-                        ArrayType::new(DataType::F32, Shape::scalar())
-                            .with_layout(Layout::Strided(StridedLayout::new(vec![]))),
-                        ArrayType::scalar(DataType::F32),
-                    ],
-                    output_types = [ArrayType::scalar(DataType::F32)],
-                },
-                {
-                    input_types = [DataType::F8E3M4, DataType::F32],
-                    error = format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible"),
-                },
-                {
-                    input_types = [
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-                    ],
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
                     error = format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible"),
                 },
             ],
-        );
-
-        // Compatible inputs merge their varying manual axes into the inferred output sharding.
-        let manual_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let left = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let right = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["y"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let output =
-            <AddOperation as Operation<ArrayType>>::infer_output_types(&AddOperation, &[left, right], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().as_ref().unwrap().varying_manual_axes(),
-            &BTreeSet::from(["x".to_string(), "y".to_string()]),
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();

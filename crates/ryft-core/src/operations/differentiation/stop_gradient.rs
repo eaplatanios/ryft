@@ -136,12 +136,15 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_transposition};
+    use crate::macros::{
+        check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
+        check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{Layout, Shape, Size, StridedLayout};
+    use crate::types::{Shape, Size};
 
     use super::*;
 
@@ -149,14 +152,6 @@ mod tests {
     fn test_stop_gradient() {
         let operation = StopGradientOperation;
 
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), STOP_GRADIENT_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "StopGradientOperation");
-        assert_eq!(format!("{operation}"), STOP_GRADIENT_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
-            Ok(vec![DataType::F32]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -184,78 +179,19 @@ mod tests {
             ),
             Ok(vec![Array::scalar(2.0)]),
         );
-
-        // Array type inference preserves shape, layout, and sharding metadata for its single input.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
-            Ok(vec![input]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Scalar, StopGradientOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = stop_gradient %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_stop_gradient_type_inference() {
         // Gradient stopping is the identity on every data type, including types the numeric operations reject.
         for input_type in [DataType::Token, DataType::Boolean, DataType::I32, DataType::C64] {
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&StopGradientOperation, &[input_type], &[]),
-                Ok(vec![input_type]),
+            check_operation_type_inference!(
+                @elementwise @unary,
+                operation = StopGradientOperation,
+                cases = [{
+                    input_data_types = [input_type],
+                    output_data_types = [input_type],
+                }],
             );
         }
 
@@ -269,9 +205,12 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&StopGradientOperation, std::slice::from_ref(&unreduced), &[]),
-            Ok(vec![unreduced]),
+        check_operation_type_inference!(
+            operation = StopGradientOperation,
+            cases = [{
+                input_types = [unreduced.clone()],
+                output_types = [unreduced],
+            }],
         );
         let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
@@ -281,9 +220,12 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&StopGradientOperation, std::slice::from_ref(&reduced), &[]),
-            Ok(vec![reduced]),
+        check_operation_type_inference!(
+            operation = StopGradientOperation,
+            cases = [{
+                input_types = [reduced.clone()],
+                output_types = [reduced],
+            }],
         );
     }
 
@@ -298,7 +240,10 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
             }],
         );
+    }
 
+    #[test]
+    fn test_stop_gradient_composes_with_batching() {
         // Gradient stopping composes with batching: `x * stop_gradient(x)` batches like `x * x`.
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
             .batch(

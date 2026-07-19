@@ -1,29 +1,57 @@
 pub mod abs;
 pub mod add;
 pub mod atan2;
+pub mod ceil;
+pub mod clamp;
 pub mod cos;
 pub mod div;
 pub mod dot;
 pub mod exp;
+pub mod floor;
 pub mod log;
+pub mod logistic;
+pub mod maximum;
+pub mod minimum;
 pub mod mul;
 pub mod neg;
+pub mod pow;
 pub mod reduce;
+pub mod remainder;
+pub mod round;
+pub mod rsqrt;
+pub mod sign;
 pub mod sin;
 pub mod sqrt;
 pub mod sub;
+pub mod tanh;
 
 pub use abs::{ABS_OPERATION_NAME, Abs, AbsOperation};
 pub use add::{ADD_OPERATION_NAME, Add, AddOperation};
 pub use atan2::{ATAN2_OPERATION_NAME, Atan2, Atan2Operation};
+pub use ceil::{CEIL_OPERATION_NAME, Ceil, CeilOperation};
+pub use clamp::Clamp;
 pub use cos::{COS_OPERATION_NAME, Cos, CosOperation};
 pub use div::{DIV_OPERATION_NAME, Div, DivOperation};
-pub use dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps};
+pub use dot::{
+    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, SCALED_DOT_OPERATION_NAME, ScaledDot,
+    ScaledDotOperation,
+};
+pub(crate) use dot::scaled_dot_composition;
 pub use exp::{EXP_OPERATION_NAME, Exp, ExpOperation};
+pub use floor::{FLOOR_OPERATION_NAME, Floor, FloorOperation};
 pub use log::{LOG_OPERATION_NAME, Log, LogOperation};
+pub use logistic::{LOGISTIC_OPERATION_NAME, Logistic, LogisticOperation};
+pub use maximum::{MAXIMUM_OPERATION_NAME, Maximum, MaximumOperation};
+pub use minimum::{MINIMUM_OPERATION_NAME, Minimum, MinimumOperation};
 pub use mul::{MUL_OPERATION_NAME, Mul, MulOperation};
 pub use neg::{NEG_OPERATION_NAME, Neg, NegOperation};
+pub use pow::{POW_OPERATION_NAME, Pow, PowOperation};
 pub use reduce::{Reduce, ReduceOperation, ReductionKind};
+pub use remainder::{REMAINDER_OPERATION_NAME, Remainder, RemainderOperation};
+pub use round::{ROUND_OPERATION_NAME, Round, RoundOperation};
+pub use rsqrt::{RSQRT_OPERATION_NAME, Rsqrt, RsqrtOperation};
+pub use sign::{SIGN_OPERATION_NAME, Sign, SignOperation};
 pub use sin::{SIN_OPERATION_NAME, Sin, SinOperation};
 pub use sqrt::{SQRT_OPERATION_NAME, Sqrt, SqrtOperation};
 pub use sub::{SUB_OPERATION_NAME, Sub, SubOperation};
+pub use tanh::{TANH_OPERATION_NAME, Tanh, TanhOperation};

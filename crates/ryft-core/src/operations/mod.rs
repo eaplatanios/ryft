@@ -30,6 +30,9 @@ pub mod constants;
 /// Higher-order control-flow operations and capability traits.
 pub mod control_flow;
 
+/// Foreign-kernel call operation (declared output types, backend-registered handlers) and capability trait.
+pub mod custom_call;
+
 /// Debugging operations with observable effects (e.g., printing values from inside programs).
 pub mod debugging;
 
@@ -51,8 +54,14 @@ pub mod memory;
 /// Shared marker types for operations with payload-dependent interpretation.
 pub mod payloads;
 
+/// Deterministic counter-based random bit generation and the distributions composed from it.
+pub mod random;
+
 /// Sharding-related operations (e.g., resharding and propagation hints) and capability traits.
 pub mod sharding;
+
+/// Stable key-value sorting along one axis and the ranking capabilities composed from it (top-k, argmax, argmin).
+pub mod sort;
 
 /// Value tagging — attaching a string key to a value in a program (consumed by, e.g., rematerialization policies).
 pub mod tag;
@@ -303,12 +312,12 @@ mod tests {
 
     use crate::programs::regions::RegionInterface;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 
     #[test]
-    fn elementwise_array_operation() {
+    fn test_elementwise_operation_type_inference() {
         #[derive(Clone, Debug)]
         struct TestElementwiseArrayOperation {
             input_count: usize,
@@ -346,6 +355,30 @@ mod tests {
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+        );
+
+        let operation = TestElementwiseArrayOperation { input_count: 2 };
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(
+                &operation,
+                &[
+                    ArrayType::scalar(DataType::F32).with_layout(Layout::Strided(StridedLayout::new(Vec::new()))),
+                    ArrayType::scalar(DataType::F32),
+                ],
+                &[],
+            ),
+            Ok(vec![ArrayType::scalar(DataType::F32)]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(
+                &operation,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                ],
+                &[],
+            ),
+            Err(TypeError { message: "'elementwise_test' input types are not broadcast-compatible".to_string() }),
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 3 };

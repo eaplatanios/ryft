@@ -42,49 +42,6 @@ fn complex_to_part_data_type(complex: DataType, op: &'static str) -> Result<Data
     }
 }
 
-/// Infers complex-construction output data types from its real and imaginary part data types.
-fn infer_complex_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-    if input_types[0] != input_types[1] {
-        return Err(TypeError {
-            message: format!(
-                "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
-                input_types[0], input_types[1],
-            ),
-        });
-    }
-    Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
-}
-
-/// Infers complex-construction output array types while requiring structurally identical part types.
-fn infer_complex_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-    if input_types[0] != input_types[1] {
-        return Err(TypeError {
-            message: format!(
-                "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
-                input_types[0], input_types[1],
-            ),
-        });
-    }
-    let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
-    Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
-}
-
-/// Infers complex-conjugation output data types.
-fn infer_conjugate_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-    complex_to_part_data_type(input_types[0], CONJUGATE_OPERATION_NAME)?;
-    Ok(vec![input_types[0]])
-}
-
-/// Infers real-part extraction output data types.
-fn infer_real_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-    Ok(vec![complex_to_part_data_type(input_types[0], REAL_OPERATION_NAME)?])
-}
-
-/// Infers imaginary-part extraction output data types.
-fn infer_imaginary_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-    Ok(vec![complex_to_part_data_type(input_types[0], IMAGINARY_OPERATION_NAME)?])
-}
-
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that constructs a complex value from its real and imaginary parts (i.e., `(re, im) ↦ re + im·i`,
@@ -97,8 +54,29 @@ define_elementwise_operation!(
     /// transposition uses over complex types.
     ComplexOperation, COMPLEX_OPERATION_NAME,
     Complex, complex,
-    infer_data_types = infer_complex_output_data_types,
-    infer_array_types = infer_complex_output_array_types,
+    infer_data_types = |input_types: &[DataType]| {
+        if input_types[0] != input_types[1] {
+            return Err(TypeError {
+                message: format!(
+                    "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
+                    input_types[0], input_types[1],
+                ),
+            });
+        }
+        Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
+    },
+    infer_array_types = |input_types: &[ArrayType]| {
+        if input_types[0] != input_types[1] {
+            return Err(TypeError {
+                message: format!(
+                    "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
+                    input_types[0], input_types[1],
+                ),
+            });
+        }
+        let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
+        Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
+    },
 );
 
 impl_differentiable_elementwise_operation! {
@@ -180,7 +158,10 @@ define_elementwise_operation!(
     /// transposition uses over complex types, it is self-adjoint: the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
     ConjugateOperation, CONJUGATE_OPERATION_NAME,
     Conjugate, conjugate,
-    infer_data_types = infer_conjugate_output_data_types,
+    infer_data_types = |input_types: &[DataType]| {
+        complex_to_part_data_type(input_types[0], CONJUGATE_OPERATION_NAME)?;
+        Ok(vec![input_types[0]])
+    },
 );
 
 impl_differentiable_elementwise_operation! {
@@ -246,7 +227,9 @@ define_elementwise_operation!(
     /// over complex types, the transpose of `z ↦ Re(z)` is `ȳ ↦ complex(ȳ, 0)`.
     RealOperation, REAL_OPERATION_NAME,
     Real, real,
-    infer_data_types = infer_real_output_data_types,
+    infer_data_types = |input_types: &[DataType]| {
+        Ok(vec![complex_to_part_data_type(input_types[0], REAL_OPERATION_NAME)?])
+    },
 );
 
 impl_differentiable_elementwise_operation! {
@@ -314,7 +297,9 @@ define_elementwise_operation!(
     /// over complex types, the transpose of `z ↦ Im(z)` is `ȳ ↦ complex(0, -ȳ)`.
     ImaginaryOperation, IMAGINARY_OPERATION_NAME,
     Imaginary, imaginary,
-    infer_data_types = infer_imaginary_output_data_types,
+    infer_data_types = |input_types: &[DataType]| {
+        Ok(vec![complex_to_part_data_type(input_types[0], IMAGINARY_OPERATION_NAME)?])
+    },
 );
 
 impl_differentiable_elementwise_operation! {
@@ -378,50 +363,18 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use super::*;
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::programs::operations::Operation;
+    use crate::macros::check_operation_type_inference;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::types::{Shape, Size};
-
-    use super::*;
 
     #[test]
     fn test_complex() {
         let operation = ComplexOperation;
-
-        // Operation identity and type inference: identical `f32`/`f64` parts construct the matching complex type, and
-        // mismatched or non-float parts are rejected.
-        assert_eq!(Operation::<DataType>::name(&operation), COMPLEX_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), COMPLEX_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32], &[]),
-            Ok(vec![DataType::C64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64], &[]),
-            Ok(vec![DataType::C128]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
-            Err(TypeError { message: "'complex' requires identical part types but got f32 and f64".to_string() }),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::I32, DataType::I32], &[]),
-            Err(TypeError { message: "'complex' requires f32 or f64 parts but got i32".to_string() }),
-        );
-
-        // Array type inference swaps the element data type and keeps the shape.
-        let part = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[part.clone(), part], &[]),
-            Ok(vec![ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]))]),
-        );
-
-        // Concrete interpretation constructs the complex value in both the scalar and the array universes.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -443,21 +396,34 @@ mod tests {
     }
 
     #[test]
+    fn test_complex_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = ComplexOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F32],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::F64, DataType::F64],
+                    output_data_types = [DataType::C128],
+                },
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    error = "'complex' requires identical part types but got f32 and f64",
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::I32],
+                    error = "'complex' requires f32 or f64 parts but got i32",
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_conjugate() {
         let operation = ConjugateOperation;
-
-        // Type inference preserves the complex operand type and rejects real operands.
-        assert_eq!(Operation::<DataType>::name(&operation), CONJUGATE_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
-            Ok(vec![DataType::C64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "'conjugate' requires a complex operand but got f64".to_string() }),
-        );
-
-        // Concrete interpretation negates the imaginary part, in both the scalar and the array universes.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -479,31 +445,26 @@ mod tests {
     }
 
     #[test]
+    fn test_conjugate_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ConjugateOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::F64],
+                    error = "'conjugate' requires a complex operand but got f64",
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_real() {
         let operation = RealOperation;
-
-        // Type inference maps the complex operand to its part data type and rejects real operands.
-        assert_eq!(Operation::<DataType>::name(&operation), REAL_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
-            Ok(vec![DataType::F32])
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C128], &[]),
-            Ok(vec![DataType::F64])
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
-            Err(TypeError { message: "'real' requires a complex operand but got f32".to_string() }),
-        );
-        let complex = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex], &[]),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))]),
-        );
-
-        // Concrete interpretation extracts the real part, in both the scalar and the array universes (where the
-        // output element data type maps to the part data type).
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -525,22 +486,30 @@ mod tests {
     }
 
     #[test]
+    fn test_real_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = RealOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::C128],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F32],
+                    error = "'real' requires a complex operand but got f32",
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_imaginary() {
         let operation = ImaginaryOperation;
-
-        // Type inference maps the complex operand to its part data type and rejects real operands.
-        assert_eq!(Operation::<DataType>::name(&operation), IMAGINARY_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
-            Ok(vec![DataType::F32])
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean], &[]),
-            Err(TypeError { message: "'imaginary' requires a complex operand but got bool".to_string() }),
-        );
-
-        // Concrete interpretation extracts the imaginary part, in both the scalar and the array universes (where the
-        // output element data type maps to the part data type).
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -558,6 +527,24 @@ mod tests {
                 &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
             ),
             Ok(vec![Array::vector(vec![-2.0f64, 1.0f64])]),
+        );
+    }
+
+    #[test]
+    fn test_imaginary_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ImaginaryOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "'imaginary' requires a complex operand but got bool",
+                },
+            ],
         );
     }
 

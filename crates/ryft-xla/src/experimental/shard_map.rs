@@ -3455,6 +3455,122 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_custom_call_lowers_inside_manual_region_and_executes_on_cpu() {
+        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+
+        use crate::tests::{ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        ensure_add_one_handler_registered(&client).unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 2);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+
+        // The custom call executes per shard inside the manual region: its declared output type is the local
+        // shard type, and the lowered `stablehlo.custom_call` appears inside the `sdy.manual_computation` body.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            let operation = CustomCallOperation::new(
+                                ADD_ONE_CUSTOM_CALL_TARGET,
+                                vec![local_x.r#type().into_owned()],
+                            );
+                            CustomCall::custom_call(&operation, std::slice::from_ref(&local_x)).unwrap().remove(0)
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with a custom call should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.custom_call @ryft.test.add_one(%arg1) {api_version = 4 : i32, backend_config = {}} : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[4], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 2);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Shards are [1, 2] and [3, 4], so the kernel produces [2, 3] and [4, 5] respectively.
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, [device_index as f32 * 2.0 + 2.0, device_index as f32 * 2.0 + 3.0]);
+        }
+    }
+
+    #[test]
     fn test_shard_map_pmean_lowers_to_all_reduce_with_axis_size_division() {
         use ryft_core::operations::collectives::{Collective, CollectiveKind};
 
@@ -3946,5 +4062,594 @@ mod tests {
             global_input_type,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::AllGather;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 2);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+
+        // `all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full `f32[4]`
+        // concatenation on every device. Its output still varies along the manual axis for VMA purposes (a replicated
+        // out sharding is rejected with `OutputVaryingManualAxisNotInOutSpecs`, mirroring JAX's vma tracking), so the
+        // output stays sharded over `"x"`, giving the global `f32[8]` concatenation of the per-device gathers. The
+        // staged collective lowers to a channeled `stablehlo.all_gather` over the two devices along `"x"`.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.all_gather("x", 0).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with all_gather should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
+                      sdy.return %1 : tensor<4xf32>
+                    } : (tensor<4xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[4], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 2);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Shards are [1, 2] and [3, 4], so every device receives the full concatenation [1, 2, 3, 4].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for output in outputs {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 4] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, [1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_psum_scatter_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::PSumScatter;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 2);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // `psum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and scatters
+        // the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`. The
+        // staged collective lowers to a channeled `stablehlo.reduce_scatter` with a sum reduction.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.psum_scatter("x", 0).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with psum_scatter should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<4xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %2 : tensor<f32>
+                      }) : (tensor<4xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let scale = if device_index == 0 { 1.0f32 } else { 10.0f32 };
+                let shard_values = [scale, scale * 2.0, scale * 3.0, scale * 4.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 2);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Shards are [1, 2, 3, 4] and [10, 20, 30, 40], so the elementwise sum is [11, 22, 33, 44]: device 0
+        // receives the first chunk [11, 22] and device 1 the second chunk [33, 44].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        let expected_values_by_device = [[11.0f32, 22.0], [33.0, 44.0]];
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, expected_values_by_device[device_index]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_ppermute_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::Ppermute;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 2);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+
+        // `ppermute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two local
+        // shards without changing their shapes. The staged collective lowers to a channeled
+        // `stablehlo.collective_permute` with the axis-local pairs expanded to global device pairs.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with ppermute should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = "stablehlo.collective_permute"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[0, 1], [1, 0]]> : tensor<2x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[4], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 2);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Shards are [1, 2] and [3, 4]; the rotation swaps them, so device 0 receives [3, 4] and device 1 [1, 2].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        let expected_values_by_device = [[3.0f32, 4.0], [1.0, 2.0]];
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, expected_values_by_device[device_index]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_all_to_all_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::AllToAll;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .expect("failed to create 2-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 2);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // `all_to_all` over the manual mesh axis `"x"` with split and concat both at axis 0 keeps the local `f32[4]`
+        // shape: each device splits its shard into two chunks, keeps its own chunk, and receives the peer's matching
+        // chunk. The staged collective lowers to a channeled `stablehlo.all_to_all`.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.all_to_all("x", 0, 0).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with all_to_all should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %1 = "stablehlo.all_to_all"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 0 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<4xf32>) -> tensor<4xf32>
+                      sdy.return %1 : tensor<4xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let base = device_index as f32 * 4.0;
+                let shard_values = [base + 1.0, base + 2.0, base + 3.0, base + 4.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(2)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 2);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Shards are [1, 2, 3, 4] and [5, 6, 7, 8]: the exchange leaves device 0 with the two first halves
+        // [1, 2, 5, 6] and device 1 with the two second halves [3, 4, 7, 8].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        let expected_values_by_device = [[1.0f32, 2.0, 5.0, 6.0], [3.0, 4.0, 7.0, 8.0]];
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 4] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, expected_values_by_device[device_index]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_all_gather_gradient_transposes_to_psum_scatter() {
+        use ryft_core::differentiation::LinearizationTracer;
+        use ryft_core::operations::collectives::AllGather;
+        use ryft_core::operations::math::{Reduce, ReductionKind};
+
+        // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through
+        // the differentiated closure are linearization tracers over the XLA staging context.
+        type GradientTracer = LinearizationTracer<DomainTracingContext<XlaDomain<'static>>>;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+
+        // `sum(all_gather(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the tiled
+        // `all_gather` is a `psum_scatter` over the same axis and dimension, which lowers to a channeled
+        // `stablehlo.reduce_scatter` inside the transposed manual region.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    let context = x.context().clone();
+                    context
+                        .gradient(
+                            {
+                                let mesh = mesh.clone();
+                                let sharding = sharding.clone();
+                                move |y| {
+                                    let gathered = shard_map::<_, _, ArrayType, GradientTracer>(
+                                        |local_x: ShardMapTracer| local_x.all_gather("x", 0).unwrap(),
+                                        y,
+                                        mesh.clone(),
+                                        sharding.clone(),
+                                        sharding.clone(),
+                                    )
+                                    .expect("shard_map with all_gather should trace inside grad");
+                                    gathered.reduce(&[0], ReductionKind::Sum)
+                                }
+                            },
+                            x,
+                        )
+                        .expect("grad around shard_map with all_gather should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %2 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<4xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_shard_map_ppermute_gradient_transposes_to_inverted_pairs() {
+        use ryft_core::differentiation::LinearizationTracer;
+        use ryft_core::operations::collectives::Ppermute;
+        use ryft_core::operations::math::{Reduce, ReductionKind};
+
+        // Reverse mode wraps the shard_map staging context in a linearization trace, so the values flowing through
+        // the differentiated closure are linearization tracers over the XLA staging context.
+        type GradientTracer = LinearizationTracer<DomainTracingContext<XlaDomain<'static>>>;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+
+        // `sum(ppermute(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the rotation
+        // [(0, 1), (1, 0)] is the permutation with every pair inverted, [(1, 0), (0, 1)], which lowers to a channeled
+        // `stablehlo.collective_permute` with the inverted global device pairs inside the transposed manual region.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    let context = x.context().clone();
+                    context
+                        .gradient(
+                            {
+                                let mesh = mesh.clone();
+                                let sharding = sharding.clone();
+                                move |y| {
+                                    let permuted = shard_map::<_, _, ArrayType, GradientTracer>(
+                                        |local_x: ShardMapTracer| {
+                                            local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap()
+                                        },
+                                        y,
+                                        mesh.clone(),
+                                        sharding.clone(),
+                                        sharding.clone(),
+                                    )
+                                    .expect("shard_map with ppermute should trace inside grad");
+                                    permuted.reduce(&[0], ReductionKind::Sum)
+                                }
+                            },
+                            x,
+                        )
+                        .expect("grad around shard_map with ppermute should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %2 = "stablehlo.collective_permute"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, source_target_pairs = dense<[[1, 0], [0, 1]]> : tensor<2x2xi64>}> : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
     }
 }

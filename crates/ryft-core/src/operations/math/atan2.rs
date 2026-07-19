@@ -116,23 +116,13 @@ mod tests {
 
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, jvp, value_and_gradient, value_and_gradient_holomorphic};
-    use crate::interpretation::InterpretableOperation;
+    use crate::differentiation::{jvp, value_and_gradient_holomorphic};
     use crate::macros::{
-        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
-    use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -165,139 +155,32 @@ mod tests {
             epsilon = 1e-12,
         );
 
-        let operation = Atan2Operation;
-
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), ATAN2_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "Atan2Operation");
-        assert_eq!(format!("{operation}"), ATAN2_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32], &[]),
-            Ok(vec![DataType::F32]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(0.5), Scalar::from(-0.25)],
-            ),
-            Ok(vec![Scalar::from(0.5f64.atan2(-0.25f64))]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(0.5), Array::scalar(-0.25)],
-            ),
-            Ok(vec![Array::scalar(0.5f64.atan2(-0.25f64))]),
-        );
-
-        // Array type inference preserves shape, layout, and sharding metadata for its identical inputs.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            <Atan2Operation as Operation<ArrayType>>::infer_output_types(
-                &operation,
-                &[input.clone(), input.clone()],
-                &[],
-            ),
-            Ok(vec![input]),
-        );
-
-        // Floating-point and complex operands promote to a common type.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::F64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
-            Ok(vec![DataType::C64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::C128], &[]),
-            Ok(vec![DataType::C128]),
-        );
-        let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex_type.clone(), complex_type.clone()], &[]),
-            Ok(vec![complex_type]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(0.5f32), Scalar::from(-0.25f64)],
-            ),
-            Ok(vec![Scalar::from(0.5f64.atan2(-0.25f64))]),
-        );
-
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Scalar, Atan2Operation>::new();
-        let y = builder.add_input(DataType::F64);
-        let x = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, Vec::new(), vec![y, x]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = atan2 %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
+        assert_eq!(Array::scalar(0.5).atan2(&Array::scalar(-0.25)).unwrap(), Array::scalar(0.5f64.atan2(-0.25f64)),);
     }
 
     #[test]
     fn test_atan2_type_inference() {
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&Atan2Operation, &[DataType::I32, DataType::F32], &[]),
-            Err(TypeError { message: "'atan2' does not support input data type i32".to_string() }),
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = Atan2Operation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::F32, DataType::C128],
+                    output_data_types = [DataType::C128],
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::F32],
+                    error = "'atan2' does not support input data type i32",
+                },
+            ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
@@ -358,20 +241,10 @@ mod tests {
                 "},
             }],
         );
-        let (value, (y_gradient, x_gradient)) =
-            value_and_gradient(|(y, x)| y.atan2(&x).unwrap(), (Scalar::from(y), Scalar::from(x))).unwrap();
-        assert_abs_diff_eq!(value, y.atan2(x), epsilon = 1e-9);
-        assert_abs_diff_eq!(y_gradient, x / (x * x + y * y), epsilon = 1e-9);
-        assert_abs_diff_eq!(x_gradient, -y / (x * x + y * y), epsilon = 1e-9);
-        check_gradient!(@scalar, |y| y.atan2(&y.one_like()), at = 0.7, step = 1e-6, tolerance = 1e-6);
+    }
 
-        // Second-order differentiation recovers d²(atan2(y, 1))/dy² = -2y / (1 + y²)².
-        assert_abs_diff_eq!(
-            gradient(|y| gradient(|y| y.atan2(&y.one_like()).unwrap(), y).unwrap(), Scalar::from(0.7f64)).unwrap(),
-            -2.0 * 0.7 / ((1.0 + 0.7f64 * 0.7) * (1.0 + 0.7f64 * 0.7)),
-            epsilon = 1e-9,
-        );
-
+    #[test]
+    fn test_atan2_differentiation_avoids_overflow() {
         let (_, tangent): (Scalar, Scalar) = jvp(
             |(y, x)| y.atan2(&x),
             (Scalar::from(1.0e308), Scalar::from(1.0e308)),
@@ -379,7 +252,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tangent, Scalar::from(0.0));
+    }
 
+    #[test]
+    fn test_atan2_complex_differentiation() {
         let y = Complex::new(0.7f64, -0.2);
         let x = Complex::new(-0.3f64, 0.4);
         let (value, (y_gradient, x_gradient)) =
@@ -393,7 +269,10 @@ mod tests {
         );
         assert_abs_diff_eq!(y_gradient, Scalar::from(x / denominator), epsilon = 1e-12);
         assert_abs_diff_eq!(x_gradient, Scalar::from(-y / denominator), epsilon = 1e-12);
+    }
 
+    #[test]
+    fn test_atan2_low_precision_differentiation_uses_widened_tangents() {
         let y = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let x = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let (primal, tangent): (Scalar, Scalar) =

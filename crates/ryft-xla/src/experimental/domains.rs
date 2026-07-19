@@ -1980,6 +1980,10 @@ impl<'c> XlaDomain<'c> {
             options.mesh.devices().len(),
             options.feedback_directed_profile.as_ref(),
         );
+        // The target platform gates platform-specific lowerings (e.g., the block-scaled dot fast path); a failed
+        // platform query degrades to the portable lowerings instead of failing compilation.
+        let target_platform =
+            self.client.and_then(|client| client.platform_name().ok()).map(|platform| platform.into_owned());
         let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program(
             program,
             &[],
@@ -1988,6 +1992,7 @@ impl<'c> XlaDomain<'c> {
             "main",
             Some(logical_argument_shardings.as_slice()),
             result_shardings.as_deref(),
+            target_platform.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
         let (stable_hlo, signature) = lowered_module.into_parts();

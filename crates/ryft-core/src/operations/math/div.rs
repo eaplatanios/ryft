@@ -67,8 +67,6 @@ define_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operati
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex;
@@ -77,24 +75,18 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, gradient, gradient_holomorphic};
+    use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
-        check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::constants::OneLike;
     use crate::operations::manipulation::ConvertElementType;
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::atoms::MaybeZero;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
@@ -102,14 +94,6 @@ mod tests {
     fn test_div() {
         let operation = DivOperation;
 
-        // Operation identity and concrete interpretation.
-        assert_eq!(Operation::<DataType>::name(&operation), DIV_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "DivOperation");
-        assert_eq!(format!("{operation}"), DIV_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
-            Ok(vec![DataType::F64]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -141,138 +125,23 @@ mod tests {
             Scalar::from(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
             epsilon = 1e-12,
         );
-
-        // Array type inference broadcasts shapes and promotes data types.
-        let output = <DivOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::scalar(DataType::F32),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))]);
-
-        // Array type inference drops layout metadata when inputs disagree.
-        let output = <DivOperation as Operation<ArrayType>>::infer_output_types(
-            &operation,
-            &[
-                ArrayType::new(DataType::F32, Shape::scalar()).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
-                ArrayType::scalar(DataType::F32),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
-
-        // Array type inference tolerates compatible inputs that only disagree on varying manual axes.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let left = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let right = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["y"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let output =
-            <DivOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().as_ref().unwrap().varying_manual_axes(),
-            &BTreeSet::from(["x".to_string(), "y".to_string()]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.0)],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0)]
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        );
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Scalar, DivOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = div %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_div_type_inference() {
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&DivOperation, &[DataType::F8E3M4, DataType::F32], &[]),
-            Err(TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }),
-        );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean] {
-            let expected =
-                TypeError { message: format!("'{DIV_OPERATION_NAME}' does not support input data type {input_type}") };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&DivOperation, &[input_type, input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(
-                    &DivOperation,
-                    &[ArrayType::scalar(input_type), ArrayType::scalar(input_type)],
-                    &[],
-                ),
-                Err(expected),
-            );
-        }
-        assert_eq!(
-            <DivOperation as Operation<ArrayType>>::infer_output_types(
-                &DivOperation,
-                &[
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-                ],
-                &[],
-            ),
-            Err(TypeError { message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible") }),
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = DivOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F8E3M4, DataType::F32],
+                    error = format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible"),
+                },
+            ],
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -295,16 +164,24 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let expected = Err(TypeError { message: "'div' does not support unreduced operands".to_string() });
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&DivOperation, &[unreduced.clone(), plain.clone()], &[]),
-            expected,
+        let unreduced_error = || "'div' does not support unreduced operands";
+        check_operation_type_inference!(
+            operation = DivOperation,
+            cases = [
+                {
+                    input_types = [unreduced.clone(), plain.clone()],
+                    error = unreduced_error(),
+                },
+                {
+                    input_types = [plain, unreduced.clone()],
+                    error = unreduced_error(),
+                },
+                {
+                    input_types = [unreduced, reduced],
+                    error = unreduced_error(),
+                },
+            ],
         );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&DivOperation, &[plain, unreduced.clone()], &[]),
-            expected,
-        );
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&DivOperation, &[unreduced, reduced], &[]), expected);
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = DivOperation,
@@ -330,7 +207,6 @@ mod tests {
 
     #[test]
     fn test_div_differentiation() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = DivOperation,
@@ -352,6 +228,11 @@ mod tests {
                 "},
             }],
         );
+    }
+
+    #[test]
+    fn test_div_differentiation_preserves_small_tangents() {
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let smallest_positive = f64::from_bits(1);
         let outputs = DivOperation
             .jvp(
@@ -367,28 +248,11 @@ mod tests {
             MaybeZero::Value(tangent) => assert_eq!(tangent, &Scalar::from(1.0)),
             MaybeZero::Zero(_) => panic!("expected a live division tangent"),
         }
-        fn normalized_ratio<V>(input: V) -> V
-        where
-            V: Clone + OneLike + std::ops::Add<Output = V> + std::ops::Div<Output = V>,
-        {
-            input.clone() / (input.clone() + input.one_like())
-        }
-        check_gradient!(@scalar, normalized_ratio, at = 0.7, step = 1e-6, tolerance = 1e-6);
-        let input = Complex::new(0.7f64, -0.3);
-        let holomorphic_gradient = gradient_holomorphic(normalized_ratio, Scalar::from(input)).unwrap();
-        assert_abs_diff_eq!(
-            holomorphic_gradient,
-            Scalar::from(Complex::new(1.0, 0.0) / (input + 1.0).powu(2)),
-            epsilon = 1e-12,
-        );
+    }
 
-        // Second-order differentiation recovers d²(x / (x + 1))/dx² = -2 / (x + 1)³.
-        assert_abs_diff_eq!(
-            gradient(|x| gradient(normalized_ratio, x).unwrap(), Scalar::from(0.7f64)).unwrap(),
-            -2.0 / (1.7f64 * 1.7 * 1.7),
-            epsilon = 1e-9,
-        );
-
+    #[test]
+    fn test_div_low_precision_differentiation_uses_widened_tangents() {
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let left = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let right = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let (primal, tangent): (Scalar, Scalar) = context
