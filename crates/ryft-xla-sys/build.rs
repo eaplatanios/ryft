@@ -91,7 +91,7 @@ impl UrlWithChecksum {
             bail!("encountered HTTP error ({}) while downloading '{}'", response.status(), self.url);
         }
 
-        // Create the parent directory of the destination `Path`, if it does not exist already.
+        // Create the parent directory of the destination `Path` if it does not exist already.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
