@@ -167,17 +167,12 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_transposition,
+        check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::math::{Reduce, ReductionKind};
-    use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
+    use crate::types::ArrayType;
 
     use super::*;
 
@@ -185,14 +180,6 @@ mod tests {
     fn test_abs() {
         let operation = AbsOperation;
 
-        // Operation identity and concrete interpretation, including the complex magnitude with its real result.
-        assert_eq!(Operation::<DataType>::name(&operation), ABS_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "AbsOperation");
-        assert_eq!(format!("{operation}"), ABS_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
-            Ok(vec![DataType::F32]),
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -211,151 +198,53 @@ mod tests {
             ),
             Ok(vec![Scalar::from(5.0)]),
         );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(-2.0)],
-            ),
-            Ok(vec![Array::scalar(2.0)]),
-        );
-
-        // Array type inference preserves shape, layout, and sharding metadata for its single input.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            <AbsOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
-            Ok(vec![input]),
-        );
-
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(true)],
-            ),
-            Err(ProgramError::Type(TypeError {
-                message: "cannot compute the absolute value of a scalar of data type bool".to_string(),
-            })),
-        );
-
-        // Program rendering uses the canonical operation name, with the complex magnitude typed by its real part.
-        let mut builder = ProgramBuilder::<Scalar, AbsOperation>::new();
-        let input = builder.add_input(DataType::C128);
-        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:c128 .
-                let %1:f64 = abs %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
     fn test_abs_type_inference() {
-        // Signed-integer inputs, including the sub-byte `si2` and `si4` types, pass through unchanged.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I32], &[]),
-            Ok(vec![DataType::I32]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I2], &[]),
-            Ok(vec![DataType::I2]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::I4], &[]),
-            Ok(vec![DataType::I4]),
-        );
-
-        // Complex element types map to their real part data type, preserving the shape for arrays.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::C64], &[]),
-            Ok(vec![DataType::F32]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&AbsOperation, &[DataType::C128], &[]),
-            Ok(vec![DataType::F64]),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &AbsOperation,
-                &[ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]))],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::I32],
+                    output_data_types = [DataType::I32],
+                },
+                {
+                    input_data_types = [DataType::I2],
+                    output_data_types = [DataType::I2],
+                },
+                {
+                    input_data_types = [DataType::I4],
+                    output_data_types = [DataType::I4],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::C128],
+                    output_data_types = [DataType::F64],
+                },
+            ],
         );
 
         for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::I1, DataType::U32] {
-            let expected = TypeError {
-                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-            };
-            assert_eq!(
-                Operation::<DataType>::infer_output_types(&AbsOperation, &[input_type], &[]),
-                Err(expected.clone()),
-            );
-            assert_eq!(
-                Operation::<ArrayType>::infer_output_types(&AbsOperation, &[ArrayType::scalar(input_type)], &[]),
-                Err(expected),
+            let message = format!("cannot compute the absolute value of a value of data type {input_type}");
+            check_operation_type_inference!(
+                @elementwise @unary,
+                operation = AbsOperation,
+                cases = [{
+                    input_data_types = [input_type],
+                    error = message,
+                }],
             );
         }
 
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&AbsOperation, &[input], &[]),
-            Err(TypeError { message: "'abs' does not support unreduced operands".to_string() }),
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = AbsOperation,
+            input_types = [ArrayType::scalar(DataType::F32)],
         );
     }
 
@@ -406,18 +295,21 @@ mod tests {
                 },
             ],
         );
-        // The real rule uses +1 at and above zero and -1 below zero.
-        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.7f64)).unwrap(), 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_abs_differentiation_at_zero() {
+        // The real rule chooses the right derivative at zero and remains constant under another derivative.
         assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.0f64)).unwrap(), 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(-0.7f64)).unwrap(), -1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(
             gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Scalar::from(0.0f64)).unwrap(),
             0.0,
             epsilon = 1e-9,
         );
-        check_gradient!(@scalar, |x| x.abs(), at = 0.7, step = 1e-6, tolerance = 1e-6);
-        check_gradient!(@scalar, |x| x.abs(), at = -2.5, step = 1e-6, tolerance = 1e-6);
+    }
 
+    #[test]
+    fn test_abs_complex_differentiation() {
         // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With
         // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
         // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
@@ -427,7 +319,6 @@ mod tests {
         let expected = z.conj() / z.norm();
         let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
         assert!((actual - expected).norm() < 1e-12, "expected {expected} but got {actual}");
-        check_gradient!(@scalar, |z| z.abs(), at = z, step = 1e-6, tolerance = 1e-6);
 
         // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
         // finite-difference oracle perturbs each element's real and imaginary parts independently.
@@ -454,9 +345,13 @@ mod tests {
             gradient(|z| z.abs().unwrap(), Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
             Ok(Scalar::from(ComplexNumber::new(0.0f64, 0.0f64))),
         );
+    }
 
+    #[test]
+    fn test_abs_complex_differentiation_avoids_overflow() {
         // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
         // directional derivative `Re((conj(z) / |z|) * dz)`.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
             context.jvp(
                 |z| z.abs(),
@@ -465,7 +360,10 @@ mod tests {
             ),
             Ok((Scalar::from(1e308f64), Scalar::from(2.0f64))),
         );
+    }
 
+    #[test]
+    fn test_abs_low_precision_differentiation_uses_widened_tangents() {
         // The coefficient and tangent are computed in the widened differential representation.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
