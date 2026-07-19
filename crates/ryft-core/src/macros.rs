@@ -2276,12 +2276,17 @@ macro_rules! define_tracer_operator {
 /// Cases are expanded independently, so one invocation may cover different [`Type`](crate::Type) families such as
 /// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType). A case whose input and output types do not
 /// identify the family, most commonly an empty-input error case, may declare it explicitly with `type = ...`. The
-/// macro also provides selectors for shared sharding rejection contracts whose generated mesh fixtures would otherwise
-/// obscure the behavior under test:
+/// `@elementwise @unary` and `@elementwise @binary` selectors check an elementwise operation's data-type inference
+/// together with its lifting to representative, metadata-bearing [`ArrayType`](crate::ArrayType)s. Their successful
+/// cases declare input element data types and the expected output element data type; rejected cases declare the exact
+/// data-type inference diagnostic. The macro also provides selectors for shared sharding rejection contracts whose
+/// generated mesh fixtures would otherwise obscure the behavior under test:
 ///
+///   - `@elementwise @unary`: Checks unary element-type inference and successful array-type lifting.
+///   - `@elementwise @binary`: Checks binary element-type inference and successful array-type lifting.
 ///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
-///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands must carry the
-///     same reduced-axis markers.
+///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands
+///     must carry the same reduced-axis markers.
 ///
 /// # Examples
 ///
@@ -2289,20 +2294,17 @@ macro_rules! define_tracer_operator {
 /// [`AddOperation`](crate::AddOperation):
 ///
 /// ```rust
-/// # use ryft_core::{AddOperation, ArrayType, DataType, check_operation_type_inference};
+/// # use ryft_core::{AddOperation, DataType, check_operation_type_inference};
 /// check_operation_type_inference!(
+///     @elementwise @binary,
 ///     operation = AddOperation,
 ///     cases = [
 ///         {
-///             input_types = [DataType::F32, DataType::F64],
-///             output_types = [DataType::F64],
+///             input_data_types = [DataType::F32, DataType::F64],
+///             output_data_types = [DataType::F64],
 ///         },
 ///         {
-///             input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
-///             output_types = [ArrayType::scalar(DataType::F64)],
-///         },
-///         {
-///             input_types = [DataType::Boolean, DataType::Boolean],
+///             input_data_types = [DataType::Boolean, DataType::Boolean],
 ///             error = "'add' does not support input data type bool",
 ///         },
 ///     ],
@@ -2323,17 +2325,46 @@ macro_rules! define_tracer_operator {
 ///
 /// # Parameters
 ///
-///   - `$selector`: Optional generated type-inference contract: `@reject @unreduced` or `@reject @mismatched_reduced`.
+///   - `$selector`: Optional generated type-inference contract: `@elementwise @unary`, `@elementwise @binary`,
+///     `@reject @unreduced`, or `@reject @mismatched_reduced`.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
-///   - `cases = $cases`: Type-inference test cases, each with `input_types` and either `output_types` or `error`.
+///   - `cases = $cases`: Type-inference test cases. Ordinary cases use `input_types` and either `output_types` or
+///     `error`; elementwise cases use the corresponding element-data-type fields documented below.
 ///   - `type = $type`: Optional explicit [`Type`](crate::Type) family for a case whose other expressions cannot
 ///     determine the operation implementation.
 ///   - `input_types = $input_types`: Input types used by one ordinary case or by the selected generated rejection
 ///     check, in operation input order.
 ///   - `output_types = $output_types`: Expected output types for one successful ordinary case, in result order.
 ///   - `error = $error`: Exact [`TypeError`](crate::TypeError) message expected from one rejected ordinary case.
+///   - `input_data_types = $input_data_types`: Input element data types used by an elementwise case. Unary cases
+///     contain one data type, while binary cases contain two.
+///   - `output_data_types = $output_data_types`: Expected output element data types for a successful elementwise
+///     case, in result order.
 #[macro_export]
 macro_rules! check_operation_type_inference {
+    // This branch checks unary element-type cases and lifts every successful case through a representative array type.
+    // It leaves rejected cases in the data-type universe because custom array inference may own a more specific error.
+    (
+        @elementwise @unary,
+        operation = $operation:expr,
+        cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
+    ) => {{
+        let operation = $operation;
+        $($crate::check_operation_type_inference!(@elementwise_unary_case operation, { $($case)* });)+
+    }};
+
+    // This branch checks binary element-type cases and lifts every successful case through matching representative
+    // array structures. Using matching structures keeps the contract valid for elementwise operations that deliberately
+    // impose stricter array relationships than ordinary broadcasting.
+    (
+        @elementwise @binary,
+        operation = $operation:expr,
+        cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
+    ) => {{
+        let operation = $operation;
+        $($crate::check_operation_type_inference!(@elementwise_binary_case operation, { $($case)* });)+
+    }};
+
     // This branch checks one or more exact regionless type-inference cases. It evaluates the operation once and
     // delegates each heterogeneous success or error case to an internal assertion branch.
     (
@@ -2444,6 +2475,112 @@ macro_rules! check_operation_type_inference {
             ),
             Ok(vec![$($output_type),*]),
         );
+    };
+
+    // This internal branch checks a successful unary element-type case in both the data-type and array-type universes.
+    // The array fixture carries shape, layout, and memory metadata so the assertion also verifies structural lifting.
+    (
+        @elementwise_unary_case $operation:ident,
+        {
+            input_data_types = [$input_data_type:expr $(,)?],
+            output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
+        }
+    ) => {{
+        let input_data_type = $input_data_type;
+        let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
+        assert_eq!(
+            $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
+                &$operation,
+                &[input_data_type],
+                &[],
+            ),
+            Ok(output_data_types.clone()),
+        );
+        let input_type = $crate::types::ArrayType::new(
+            input_data_type,
+            $crate::types::Shape::new(vec![$crate::types::Size::Static(2), $crate::types::Size::Static(3)]),
+        )
+        .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
+        .with_memory($crate::types::Memory::Host { pinned: true });
+        assert_eq!(
+            $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
+                &$operation,
+                &[input_type.clone()],
+                &[],
+            ),
+            Ok(output_data_types
+                .into_iter()
+                .map(|output_data_type| input_type.clone().with_data_type(output_data_type))
+                .collect::<::std::vec::Vec<_>>()),
+        );
+    }};
+
+    // This internal branch checks a rejected unary element-type case and compares the exact operation-owned diagnostic.
+    (
+        @elementwise_unary_case $operation:ident,
+        {
+            input_data_types = [$input_data_type:expr $(,)?],
+            error = $message:expr $(,)?
+        }
+    ) => {
+        $crate::check_operation_type_inference!(@case $operation, {
+            input_types = [$input_data_type],
+            error = $message,
+        });
+    };
+
+    // This internal branch checks a successful binary element-type case in both universes. Matching array structures
+    // isolate element-type lifting from the separately tested shared broadcasting contract.
+    (
+        @elementwise_binary_case $operation:ident,
+        {
+            input_data_types = [$left_data_type:expr, $right_data_type:expr $(,)?],
+            output_data_types = [$($output_data_type:expr),* $(,)?] $(,)?
+        }
+    ) => {{
+        let left_data_type = $left_data_type;
+        let right_data_type = $right_data_type;
+        let output_data_types: ::std::vec::Vec<$crate::types::DataType> = ::std::vec![$($output_data_type),*];
+        assert_eq!(
+            $crate::programs::operations::Operation::<$crate::types::DataType>::infer_output_types(
+                &$operation,
+                &[left_data_type, right_data_type],
+                &[],
+            ),
+            Ok(output_data_types.clone()),
+        );
+        let left_type = $crate::types::ArrayType::new(
+            left_data_type,
+            $crate::types::Shape::new(vec![$crate::types::Size::Static(2), $crate::types::Size::Static(3)]),
+        )
+        .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
+        .with_memory($crate::types::Memory::Host { pinned: true });
+        let right_type = left_type.clone().with_data_type(right_data_type);
+        assert_eq!(
+            $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
+                &$operation,
+                &[left_type.clone(), right_type],
+                &[],
+            ),
+            Ok(output_data_types
+                .into_iter()
+                .map(|output_data_type| left_type.clone().with_data_type(output_data_type))
+                .collect::<::std::vec::Vec<_>>()),
+        );
+    }};
+
+    // This internal branch checks a rejected binary element-type case and compares the exact operation-owned diagnostic.
+    (
+        @elementwise_binary_case $operation:ident,
+        {
+            input_data_types = [$left_data_type:expr, $right_data_type:expr $(,)?],
+            error = $message:expr $(,)?
+        }
+    ) => {
+        $crate::check_operation_type_inference!(@case $operation, {
+            input_types = [$left_data_type, $right_data_type],
+            error = $message,
+        });
     };
 
     // This internal branch checks a rejected explicitly typed case. It provides the same disambiguation as the typed
@@ -3598,8 +3735,8 @@ mod tests {
     use crate::operations::constants::ZeroOperation;
     use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
     use crate::operations::math::{
-        Abs, Add, AddOperation, DivOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind,
-        SinOperation, Sub, SubOperation,
+        Abs, AbsOperation, Add, AddOperation, DivOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce,
+        ReductionKind, SinOperation, Sub, SubOperation,
     };
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
@@ -4211,6 +4348,79 @@ mod tests {
 
     #[test]
     fn test_check_operation_type_inference() {
+        #[derive(Clone, Debug)]
+        struct TestMultiOutputOperation;
+
+        impl Display for TestMultiOutputOperation {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("test_multi_output")
+            }
+        }
+
+        impl<T: Type> Operation<T> for TestMultiOutputOperation {
+            fn name(&self) -> &'static str {
+                "test_multi_output"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[T],
+                _region_interfaces: &[crate::RegionInterface<T>],
+            ) -> Result<Vec<T>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone(), input_types[0].clone()])
+            }
+        }
+
+        impl ElementwiseOperation for TestMultiOutputOperation {
+            fn input_count(&self) -> usize {
+                1
+            }
+
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                Operation::infer_output_types(self, input_types, &[])
+            }
+        }
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = TestMultiOutputOperation,
+            cases = [{
+                input_data_types = [DataType::F64],
+                output_data_types = [DataType::F64, DataType::F64],
+            }],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the absolute value of a value of data type bool",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = AddOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::Boolean, DataType::Boolean],
+                    error = "'add' does not support input data type bool",
+                },
+            ],
+        );
+
         check_operation_type_inference!(
             operation = AddOperation,
             cases = [
@@ -4233,11 +4443,13 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             @reject @unreduced,
             operation = SinOperation,
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = AddOperation,
