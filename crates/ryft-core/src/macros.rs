@@ -28,19 +28,33 @@ macro_rules! check_count {
 }
 
 /// Checks types against a structural or semantic type contract. All forms use an `@` selector and return
-/// [`TypeError`](crate::TypeError)s as appropriate, converted into the enclosing function's error type,
-/// when the selected contract is not satisfied. The available selectors are:
+/// [`TypeError`](crate::TypeError)s as appropriate, converted into the enclosing function's error type, when the
+/// selected contract is not satisfied. Data-type selectors compose by intersection when written next to one another.
+/// For example, `@numeric @real` accepts real numeric types, while `@float @real` accepts real floating-point types.
+/// The available selectors are:
 ///
 ///   - `@same`: Requires the provided expected and actual flat type signatures to be identical.
-///   - `@numeric`: Accepts only numeric [`DataType`](crate::DataType)s.
-///   - `@floating_or_complex`: Accepts only floating-point and complex [`DataType`](crate::DataType)s.
+///   - `@numeric`: Accepts integer, floating-point, and complex [`DataType`](crate::DataType)s.
+///   - `@float`: Accepts floating-point and complex [`DataType`](crate::DataType)s.
+///   - `@real`: Excludes complex [`DataType`](crate::DataType)s and is intended to refine `@numeric` or `@float`.
 ///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
 ///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets.
 ///   - `@same_reduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching reduced-axis sets.
 ///
+/// # Examples
+///
+/// Compose selectors to express the intersection of their contracts. Selector order does not affect the accepted types,
+/// so both invocations below accept real numeric data types and reject Boolean, token, zero-space, and complex types:
+///
+/// ```rust,ignore
+/// check_types!(@numeric @real, "maximum", input_types);
+/// check_types!(@real @numeric, "maximum", input_types);
+/// ```
+///
 /// # Parameters
 ///
-///   - `$selector`: Selector identifying the structural or semantic contract to validate.
+///   - `$selectors`: One structural selector, or one or more composable [`DataType`](crate::DataType) selectors
+///     identifying the contract to validate.
 ///   - `$descriptor`: Expression evaluating to a string that identifies the checked operation or signature in errors.
 ///   - `$types`: Expression evaluating to the data or array types checked by `$selector`.
 ///   - `$signatures`: Bracketed pair containing the expected and actual flat type signatures checked by `@same`.
@@ -58,51 +72,6 @@ macro_rules! check_types {
                     actual.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 ),
             });
-        }
-    }};
-
-    (@numeric, $descriptor:expr, $types:expr $(,)?) => {{
-        let descriptor = $descriptor;
-        let types = &$types[..];
-        if let Some(input_type) = types.iter().find(|input_type| {
-            matches!(input_type, $crate::DataType::Token | $crate::DataType::Zero | $crate::DataType::Boolean)
-        }) {
-            return Err($crate::TypeError {
-                message: format!("'{descriptor}' does not support input data type {input_type}"),
-            }
-            .into());
-        }
-    }};
-
-    (@floating_or_complex, $descriptor:expr, $types:expr $(,)?) => {{
-        let descriptor = $descriptor;
-        let types = &$types[..];
-        if let Some(input_type) = types.iter().find(|input_type| {
-            !matches!(
-                input_type,
-                $crate::DataType::F4E2M1FN
-                    | $crate::DataType::F6E2M3FN
-                    | $crate::DataType::F6E3M2FN
-                    | $crate::DataType::F8E3M4
-                    | $crate::DataType::F8E4M3
-                    | $crate::DataType::F8E4M3FN
-                    | $crate::DataType::F8E4M3FNUZ
-                    | $crate::DataType::F8E4M3B11FNUZ
-                    | $crate::DataType::F8E5M2
-                    | $crate::DataType::F8E5M2FNUZ
-                    | $crate::DataType::F8E8M0FNU
-                    | $crate::DataType::BF16
-                    | $crate::DataType::F16
-                    | $crate::DataType::F32
-                    | $crate::DataType::F64
-                    | $crate::DataType::C64
-                    | $crate::DataType::C128
-            )
-        }) {
-            return Err($crate::TypeError {
-                message: format!("'{descriptor}' does not support input data type {input_type}"),
-            }
-            .into());
         }
     }};
 
@@ -143,6 +112,68 @@ macro_rules! check_types {
             .into());
         }
     }};
+
+    ($(@$selector:ident)+, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        if let Some(input_type) = types.iter().find(|input_type| {
+            !$crate::check_types!(@matches_data_type input_type; $(@$selector)+)
+        }) {
+            return Err($crate::TypeError {
+                message: format!("'{descriptor}' does not support input data type {input_type}"),
+            }
+            .into());
+        }
+    }};
+
+    // This internal helper terminates a composed data-type contract after every predicate has accepted the candidate.
+    // It supplies the `true` identity needed to combine an arbitrary number of selectors with logical conjunction.
+    (@matches_data_type $input_type:ident;) => {
+        true
+    };
+
+    // This internal helper accepts the numeric universe: signed and unsigned integers, real floating-point values,
+    // and complex values. It recurses so later selectors can refine that universe without duplicating its variant list.
+    (@matches_data_type $input_type:ident; @numeric $($selectors:tt)*) => {
+        !matches!(
+            $input_type,
+            $crate::DataType::Token | $crate::DataType::Zero | $crate::DataType::Boolean
+        ) && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+    };
+
+    // This internal helper accepts real floating-point and complex types as one float-capable universe. Keeping this
+    // predicate independent from `@real` lets callers retain complex values with `@float` or exclude them by composing
+    // `@float @real`.
+    (@matches_data_type $input_type:ident; @float $($selectors:tt)*) => {
+        matches!(
+            $input_type,
+            $crate::DataType::F4E2M1FN
+                | $crate::DataType::F6E2M3FN
+                | $crate::DataType::F6E3M2FN
+                | $crate::DataType::F8E3M4
+                | $crate::DataType::F8E4M3
+                | $crate::DataType::F8E4M3FN
+                | $crate::DataType::F8E4M3FNUZ
+                | $crate::DataType::F8E4M3B11FNUZ
+                | $crate::DataType::F8E5M2
+                | $crate::DataType::F8E5M2FNUZ
+                | $crate::DataType::F8E8M0FNU
+                | $crate::DataType::BF16
+                | $crate::DataType::F16
+                | $crate::DataType::F32
+                | $crate::DataType::F64
+                | $crate::DataType::C64
+                | $crate::DataType::C128
+        ) && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+    };
+
+    // This internal helper excludes complex types from the universe established by preceding or following selectors.
+    // Its independent predicate makes selector order irrelevant and supports both `@numeric @real` and `@float @real`
+    // without compound selector names.
+    (@matches_data_type $input_type:ident; @real $($selectors:tt)*) => {
+        !matches!($input_type, $crate::DataType::C64 | $crate::DataType::C128)
+            && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+    };
 }
 
 /// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same
@@ -218,7 +249,7 @@ macro_rules! check_builders {
 ///     /// Elementwise sine operation.
 ///     SinOperation, SIN_OPERATION_NAME,
 ///     Sin, sin,
-///     check_data_types = [@floating_or_complex],
+///     check_data_types = [@float],
 ///     check_array_types = [@no_unreduced],
 /// );
 /// ```
@@ -263,8 +294,9 @@ macro_rules! check_builders {
 ///     [`ArrayType`](crate::ArrayType) slice with signature `fn(&[ArrayType]) -> Result<Vec<ArrayType>, TypeError>`.
 ///     It receives the validated input array types and returns the single output array type. When omitted, the macro
 ///     broadcasts the input array structure and applies `infer_data_types` to the input element data types.
-///   - `check_data_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to scalar
-///     input types and array element types before type inference.
+///   - `check_data_types = [@selector ..., ...]`: Optional ordered list of [`check_types!`] data-type contracts applied
+///     to scalar input types and array element types before type inference. Space-separated selectors compose one
+///     contract, while commas separate independently checked contracts.
 ///   - `check_array_types = [@selector, ...]`: Optional ordered list of [`check_types!`] selectors applied to array
 ///     input types before array broadcasting.
 #[macro_export]
@@ -276,7 +308,7 @@ macro_rules! define_elementwise_operation {
         $capability:ident, $method:ident
         $(, infer_data_types = $infer_data_types:path)?
         $(, infer_array_types = $infer_array_types:path)?
-        $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
+        $(, check_data_types = [$($(@$data_type_check:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
@@ -303,7 +335,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
+                $($($crate::check_types!($(@$data_type_check)+, $name, input_types);)*)?
                 let output_types = $crate::define_elementwise_operation!(
                     @infer_data_types [$($infer_data_types)?] @unary input_types
                 )?;
@@ -340,7 +372,7 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type()]);)*)?
+                $($($crate::check_types!($(@$data_type_check)+, $name, &[input_types[0].data_type()]);)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 let output_types = $crate::define_elementwise_operation!(
                     @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self, input_types
@@ -379,7 +411,7 @@ macro_rules! define_elementwise_operation {
         $capability:ident, $method:ident
         $(, infer_data_types = $infer_data_types:path)?
         $(, infer_array_types = $infer_array_types:path)?
-        $(, check_data_types = [$(@$data_type_check:ident),* $(,)?])?
+        $(, check_data_types = [$($(@$data_type_selector:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
         $(#[$documentation])*
@@ -406,7 +438,7 @@ macro_rules! define_elementwise_operation {
                 _region_interfaces: &[$crate::RegionInterface<$crate::DataType>],
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, input_types);)*)?
+                $($($crate::check_types!($(@$data_type_selector)+, $name, input_types);)*)?
                 let output_types = $crate::define_elementwise_operation!(
                     @infer_data_types [$($infer_data_types)?] @binary input_types, $name
                 )?;
@@ -443,7 +475,11 @@ macro_rules! define_elementwise_operation {
                 input_types: &[$crate::ArrayType],
             ) -> Result<Vec<$crate::ArrayType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
-                $($($crate::check_types!(@$data_type_check, $name, &[input_types[0].data_type(), input_types[1].data_type()]);)*)?
+                $($($crate::check_types!(
+                    $(@$data_type_selector)+,
+                    $name,
+                    &[input_types[0].data_type(), input_types[1].data_type()],
+                );)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
                 let output_types = $crate::define_elementwise_operation!(
                     @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self, input_types, $name
@@ -794,11 +830,15 @@ macro_rules! define_elementwise_capability {
 ///   - `$output_cotangent`: Name bound to the live output cotangent in a transposition case.
 #[macro_export]
 macro_rules! impl_differentiable_elementwise_operation {
+    // This public branch implements an operation with no differential dependence by replaying its primal outputs with
+    // structural-zero tangents and generating the standard rejecting primitive-transposition rule.
     (@non_differentiable $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
         $crate::impl_non_transposable_operation!($operation);
     };
 
+    // This public branch implements a unary result that is constant with respect to its exemplar input. Its JVP has a
+    // structural-zero tangent, while transposition returns a structural-zero cotangent shaped by that input.
     (@constant $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
 
@@ -826,22 +866,130 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // `macro_rules!` has no fragment specifier for a complete `where` clause. The public entry arms therefore collect
-    // predicates one token tree at a time until the JVP body. This keeps the bounds attached to `jvp<C>` while
-    // allowing callers to write ordinary, unbraced Rust predicates.
+    // This public branch starts parsing a unary rule, whose single independently lazy tangent contribution may bind
+    // its input primal and output primal. The shared parser handles its optional unbraced JVP bounds.
     (@unary $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [unary] $($tail)*);
     };
 
+    // This public branch starts parsing a binary rule with one independently lazy contribution per input tangent and
+    // either a structured or custom primitive-transposition rule.
     (@binary $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [binary] $($tail)*);
     };
 
+    // This public branch starts parsing caller-supplied JVP and transposition closures for an operation whose behavior
+    // cannot be expressed by the unary or binary contribution DSLs.
     (@custom $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [custom] $($tail)*);
     };
 
-    // The following branch is an internal helper.
+    // This public branch implements a positive unary linear rule. Both its tangent and cotangent pass through
+    // unchanged, so the generated implementations need no arithmetic capabilities beyond the operation itself.
+    (
+        @linear
+        $operation:ty,
+        rule = [@positive $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_unary [positive]
+            impl<__C> $operation
+            where {}
+            transpose_type_bound { $crate::Type }
+            transpose_operation_bounds {}
+        }
+    };
+
+    // This public branch implements a negative unary linear rule. Both its tangent and cotangent are negated, so it
+    // supplies the shared generator with the `Neg` value capability and `NegOperation` operation-family conversion.
+    (
+        @linear
+        $operation:ty,
+        rule = [@negative $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_unary [negative]
+            impl<__C> $operation
+            where {
+                <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
+            }
+            transpose_type_bound { $crate::DifferentiableType }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    // This public branch implements a binary linear rule with two positive coefficients. It combines live tangents
+    // with addition and forwards the output cotangent positively to each linear input.
+    (
+        @linear
+        $operation:ty,
+        rule = [@positive, @positive $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_binary [positive, positive]
+            impl<__C> $operation
+            where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
+            transpose_operation_bounds {}
+        }
+    };
+
+    // This public branch implements a binary linear rule with a positive left coefficient and negative right
+    // coefficient. It stages subtraction for the tangent and negates only the right cotangent contribution.
+    (
+        @linear
+        $operation:ty,
+        rule = [@positive, @negative $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_binary [positive, negative]
+            impl<__C> $operation
+            where {
+                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    // This public branch implements a binary linear rule with a negative left coefficient and positive right
+    // coefficient. It stages the reversed subtraction needed for the tangent and negates only the left cotangent.
+    (
+        @linear
+        $operation:ty,
+        rule = [@negative, @positive $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_binary [negative, positive]
+            impl<__C> $operation
+            where {
+                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    // This public branch implements a binary linear rule with two negative coefficients. It negates the sum of live
+    // tangents and negates both input cotangent contributions.
+    (
+        @linear
+        $operation:ty,
+        rule = [@negative, @negative $(,)?] $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @linear_binary [negative, negative]
+            impl<__C> $operation
+            where {
+                ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+            }
+            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
+        }
+    };
+
+    // This internal helper recognizes a public JVP with an unbraced `where` clause and initializes token-by-token
+    // bound collection. Collection is necessary because `macro_rules!` has no fragment that matches a complete Rust
+    // `where` clause while also identifying where the following JVP body begins.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -855,7 +1003,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper recognizes a public JVP without additional bounds and forwards it directly to normalized
+    // rule dispatch. It bypasses the collector so the common boundless form does not take an unnecessary recursive
+    // parsing path.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -870,7 +1020,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper terminates JVP-bound collection when it reaches the brace-delimited JVP expression and
+    // forwards the accumulated predicates to normalized rule dispatch. A terminal arm is required to distinguish the
+    // body delimiter from ordinary token trees inside the preceding `where` clause.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -884,7 +1036,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper consumes one token tree from an unbraced JVP `where` clause and recurses with that token
+    // appended to the bound accumulator. It exists because arbitrary Rust predicates cannot be captured as one macro
+    // fragment without also consuming the JVP body that follows them.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -896,25 +1050,66 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper emits a unary elementwise JVP after the public parser has normalized its optional bounds.
+    // It remains a dedicated branch because unary rules have one tangent contribution and always reject
+    // transposition, unlike the binary and fully custom forms.
     (
         @jvp_ready [unary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
         { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
         transpose = @nonlinear $(,)?
     ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @unary_with_bounds
-            $($documentation)*
-            impl<$context> $operation
-            where { $($bounds)* }
-            {
-                jvp = |($input_primal, $input_tangent) $(-> $output_primal)?| $term;
-                transpose = @nonlinear;
+        $($documentation)*
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <$context as $crate::Domain>::Value:
+                $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($bounds)*
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                context: &$context,
+                _driver: &D,
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                $crate::unary_elementwise_jvp(
+                    self,
+                    inputs,
+                    |input| {
+                        let mut outputs = $crate::Context::bind(
+                            context,
+                            self.clone(),
+                            Vec::new(),
+                            ::std::slice::from_ref(input),
+                        )?;
+                        $crate::check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs.remove(0))
+                    },
+                    |operands| {
+                        $crate::impl_differentiable_elementwise_operation! {
+                            @bind_unary_input_primal operands, $input_primal
+                        }
+                        $($crate::impl_differentiable_elementwise_operation! {
+                            @bind_unary_output_primal operands, $output_primal
+                        })?
+                        let $input_tangent = operands.input_tangent()?;
+                        Ok($term)
+                    },
+                )
             }
         }
+
+        $crate::impl_non_transposable_operation!($operation);
     };
 
-    // The following branch is an internal helper.
+    // This internal helper emits a binary JVP whose operation is explicitly nonlinear under transposition, then adds
+    // the standard rejecting transposition implementation. Separating this terminal form avoids forcing nonlinear
+    // operations through the transposition-bound parser.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
         { $($jvp:tt)* }
@@ -931,7 +1126,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // The following branch is an internal helper.
+    // This internal helper recognizes a binary rule with a transposition implementation and starts collecting its
+    // unbraced transposition bounds. The JVP is carried along unchanged so both implementations can be emitted once
+    // the transposition body supplies an unambiguous end marker.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { $($jvp:tt)* }
@@ -947,30 +1144,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
-    (
-        @collect_public_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block } $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @binary_ready
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            {
-                $($jvp_documentation)*
-                jvp { $($jvp)* }
-                $($transpose_documentation)*
-                transpose<$value, $operations>
-                where { $($transpose_bounds)* }
-                |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
-            }
-        }
-    };
-
-    // The following branch is an internal helper.
+    // This internal helper ends binary transposition-bound collection at the brace-delimited rule body and forwards a
+    // normalized representation to code generation. One terminal arm handles both structured cases and the custom
+    // closure escape hatch because the braces already provide an unambiguous boundary after an arbitrary `where`.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -992,7 +1168,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper consumes one token tree from a binary transposition `where` clause and recurses with it in
+    // the bound accumulator. It is the recursive counterpart to the brace-delimited terminal arm above and is needed
+    // solely because `macro_rules!` cannot parse a complete unbraced `where` clause.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -1006,7 +1184,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper emits a fully custom JVP whose operation is explicitly nonlinear under transposition, then
+    // adds the standard rejecting transposition implementation. The dedicated terminal form preserves the custom JVP
+    // escape hatch without invoking transposition-bound collection.
     (
         @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1023,7 +1203,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // The following branch is an internal helper.
+    // This internal helper recognizes a fully custom rule with a custom transposition implementation and starts
+    // collecting the latter's unbraced bounds. Its larger parser state retains both closures and their documentation
+    // until the transposition body marks the end of the predicates.
     (
         @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1040,7 +1222,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper finishes custom transposition-bound collection when it reaches the closure body, then emits
+    // the JVP and transposition implementations directly. The closure delimiter is the only reliable end marker for
+    // an unbraced `where` clause, so this terminal collector branch cannot be folded into its recursive companion.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1050,19 +1234,25 @@ macro_rules! impl_differentiable_elementwise_operation {
             $outputs:ident| $transpose_body:block } $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @custom_ready
+            @custom_jvp
+            $($jvp_documentation)*
             impl<$context> $operation
             where { $($jvp_bounds)* }
-            $($jvp_documentation)*
-            jvp |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_transpose
             $($transpose_documentation)*
-            transpose<$value, $operations>
+            impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
             |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper consumes one token tree from a custom transposition `where` clause and preserves the two
+    // custom closures while recursing. It is separate from the binary collector because the fully custom JVP carries
+    // operation, context, driver, and complete-input bindings instead of contribution expressions.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1078,24 +1268,30 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // This internal helper emits the shared unary linear JVP and transposition algorithms after the public
+    // sign-specific arms have supplied their minimal bounds. Keeping the sign as a token lets one shell preserve
+    // positive tangents and cotangents or negate negative ones without duplicating both trait implementations.
     (
-        @linear
-        $operation:ty,
-        rule = [@positive $(,)?] $(,)?
+        @linear_unary [$sign:ident]
+        impl<$context:ident> $operation:ty
+        where { $($jvp_bounds:tt)* }
+        transpose_type_bound { $($transpose_type_bound:tt)+ }
+        transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
     ) => {
-        impl<__C: $crate::Context> $crate::DifferentiableOperation<__C> for $operation
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
         where
-            <__C as $crate::Domain>::Type: $crate::DifferentiableType,
-            <__C as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            $operation: $crate::Operation<<__C as $crate::Domain>::Type>,
+            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($jvp_bounds)*
         {
-            fn jvp<D: $crate::DifferentiationDriver<__C>>(
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
                 &self,
-                context: &__C,
+                context: &$context,
                 _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<__C as $crate::Domain>::Value>],
+                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
             ) -> Result<
-                Vec<$crate::DifferentiationDual<<__C as $crate::Domain>::Value>>,
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
@@ -1106,76 +1302,17 @@ macro_rules! impl_differentiable_elementwise_operation {
                     ::std::slice::from_ref(inputs[0].primal()),
                 )?;
                 $crate::check_count!("output", primals, 1, ProgramError);
-                Ok(vec![$crate::DifferentiationDual::new(
-                    primals.remove(0),
-                    inputs[0].tangent().clone(),
-                )?])
-            }
-        }
-
-        impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T>>
-            $crate::TransposableOperation<V, O> for $operation
-        where
-            $operation: $crate::Operation<T>,
-        {
-            fn transpose<D: $crate::TranspositionDriver<V, O>>(
-                &self,
-                _context: &mut $crate::TracingContext<V, O>,
-                _driver: &D,
-                inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<V, O>>>],
-                outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<V, O>>>>,
-                $crate::DifferentiationError,
-            > {
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                $crate::check_count!("output", outputs, 1, ProgramError);
-                // A unary elementwise operation preserves its operand type exactly, so the output cotangent already
-                // has the input's cotangent type and passes through without unaligning.
-                Ok(vec![outputs[0].clone()])
-            }
-        }
-    };
-
-    (
-        @linear
-        $operation:ty,
-        rule = [@negative $(,)?] $(,)?
-    ) => {
-        impl<__C: $crate::Context> $crate::DifferentiableOperation<__C> for $operation
-        where
-            <__C as $crate::Domain>::Type: $crate::DifferentiableType,
-            <__C as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
-            $operation: $crate::Operation<<__C as $crate::Domain>::Type>,
-        {
-            fn jvp<D: $crate::DifferentiationDriver<__C>>(
-                &self,
-                context: &__C,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<__C as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<__C as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
-                $crate::check_count!("input", inputs, 1, ProgramError);
-                let mut primals = $crate::Context::bind(
-                    context,
-                    self.clone(),
-                    Vec::new(),
-                    ::std::slice::from_ref(inputs[0].primal()),
-                )?;
-                $crate::check_count!("output", primals, 1, ProgramError);
-                let primal = primals.remove(0);
-                let tangent = inputs[0].tangent().clone().map(::std::ops::Neg::neg);
-                Ok(vec![$crate::DifferentiationDual::new(primal, tangent)?])
+                let tangent = inputs[0].tangent().clone().map(|tangent| {
+                    $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, tangent)
+                });
+                Ok(vec![$crate::DifferentiationDual::new(primals.remove(0), tangent)?])
             }
         }
 
         impl<
-            T: $crate::DifferentiableType,
+            T: $($transpose_type_bound)+,
             V: $crate::Value<Type = T>,
-            O: $crate::Operation<T> + ::std::convert::From<$crate::NegOperation>,
+            O: $crate::Operation<T> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<V, O> for $operation
         where
             $operation: $crate::Operation<T>,
@@ -1192,77 +1329,18 @@ macro_rules! impl_differentiable_elementwise_operation {
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                // A unary elementwise operation preserves its operand type exactly, so the negated output cotangent
-                // already has the input's cotangent type and needs no unaligning.
-                Ok(vec![outputs[0].clone().map(::std::ops::Neg::neg)])
+                // Unary elementwise linear operations preserve their operand type, so applying the declared sign is
+                // sufficient; the output cotangent needs no unalignment before becoming the input contribution.
+                Ok(vec![outputs[0].clone().map(|cotangent| {
+                    $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, cotangent)
+                })])
             }
         }
     };
 
-    // The four binary sign combinations below dispatch to the shared `@linear_binary` shell, each passing the
-    // minimal value and operation bounds that its signed tangent and cotangent formulas need.
-    (
-        @linear
-        $operation:ty,
-        rule = [@positive, @positive $(,)?] $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @linear_binary [positive, positive]
-            impl<__C> $operation
-            where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
-            transpose_operation_bounds {}
-        }
-    };
-
-    (
-        @linear
-        $operation:ty,
-        rule = [@positive, @negative $(,)?] $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @linear_binary [positive, negative]
-            impl<__C> $operation
-            where {
-                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
-            }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
-        }
-    };
-
-    (
-        @linear
-        $operation:ty,
-        rule = [@negative, @positive $(,)?] $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @linear_binary [negative, positive]
-            impl<__C> $operation
-            where {
-                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
-            }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
-        }
-    };
-
-    (
-        @linear
-        $operation:ty,
-        rule = [@negative, @negative $(,)?] $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @linear_binary [negative, negative]
-            impl<__C> $operation
-            where {
-                ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
-            }
-            transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
-        }
-    };
-
-    // The following branch is an internal helper.
+    // This internal helper emits the shared binary linear JVP and transposition algorithms after a public sign rule has
+    // selected the minimal arithmetic bounds. The two signs remain explicit because they determine both the natural
+    // staged tangent expression and each operand's cotangent contribution.
     (
         @linear_binary [$left_sign:ident, $right_sign:ident]
         impl<$context:ident> $operation:ty
@@ -1386,25 +1464,33 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper combines two positive tangent contributions with addition. A sign-specific expansion keeps
+    // the generated program in the operation's natural linear form and requires only `Add` from the value type.
     (@combine_linear_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
 
-    // The following branch is an internal helper.
+    // This internal helper subtracts a negative right contribution from a positive left contribution. Emitting `Sub`
+    // directly preserves the expected staged program instead of rewriting the rule as addition plus negation.
     (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
 
-    // The following branch is an internal helper.
+    // This internal helper subtracts a negative left contribution from a positive right contribution. The reversed
+    // operand order implements `-left + right` directly while retaining the minimal `Sub` requirement.
     (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
 
-    // The following branch is an internal helper.
+    // This internal helper adds two magnitudes and negates the result when both tangent contributions are negative.
+    // Keeping this case explicit avoids imposing subtraction bounds that its formula does not use.
     (@combine_linear_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
 
-    // The following branch is an internal helper.
+    // This internal helper applies a positive derivative sign as the identity. It pairs with the negative arm so the
+    // shared unary and binary generators can select sign behavior without duplicating their surrounding algorithms.
     (@apply_tangent_sign positive, $tangent:expr) => { $tangent };
 
-    // The following branch is an internal helper.
+    // This internal helper applies a negative derivative sign with one negation. It is isolated from the positive arm
+    // so positive linear rules do not acquire an unnecessary `Neg` bound or staged negation operation.
     (@apply_tangent_sign negative, $tangent:expr) => { -$tangent };
 
-    // The following branch is an internal helper.
+    // This internal helper converts one live output cotangent into a signed input contribution for a binary linear
+    // rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly that
+    // boundary handling even though their signs can differ.
     (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
         if $crate::DifferentiableType::is_zero_space(&target) {
@@ -1419,68 +1505,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
     }};
 
-    // The following branch is an internal helper.
-    (
-        @unary_with_bounds
-        $(#[$documentation:meta])*
-        impl<$context:ident> $operation:ty
-        where { $($bounds:tt)* }
-        {
-            jvp = |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr;
-
-            transpose = @nonlinear;
-        }
-    ) => {
-        $(#[$documentation])*
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <$context as $crate::Domain>::Value:
-                $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-            $($bounds)*
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                context: &$context,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
-                $crate::unary_elementwise_jvp(
-                    self,
-                    inputs,
-                    |input| {
-                        let mut outputs = $crate::Context::bind(
-                            context,
-                            self.clone(),
-                            Vec::new(),
-                            ::std::slice::from_ref(input),
-                        )?;
-                        $crate::check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs.remove(0))
-                    },
-                    |operands| {
-                        $crate::impl_differentiable_elementwise_operation! {
-                            @bind_unary_input_primal operands, $input_primal
-                        }
-                        $($crate::impl_differentiable_elementwise_operation! {
-                            @bind_unary_output_primal operands, $output_primal
-                        })?
-                        let $input_tangent = operands.input_tangent()?;
-                        Ok($term)
-                    },
-                )
-            }
-        }
-
-        $crate::impl_non_transposable_operation!($operation);
-    };
-
-    // The following branch is an internal helper.
+    // This internal helper generates a binary rule whose transposition supports either operand being linear while the
+    // other is known. It must remain distinct from one-sided rules because it selects between two user-provided
+    // cotangent formulas at runtime and reports the actual unsupported knownness pattern.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1611,7 +1638,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper generates a binary rule that can transpose only a linear left operand with a known right
+    // operand. A dedicated branch keeps one-sided operations from pretending to support the mirrored case and avoids
+    // requiring a second formula that is mathematically invalid or unavailable.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1697,7 +1726,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper pairs the shared binary JVP generator with a caller-supplied transposition closure. It is
+    // the low-level escape hatch for rules whose knownness handling cannot be described by the structured symmetric
+    // or one-sided forms above.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1709,8 +1740,10 @@ macro_rules! impl_differentiable_elementwise_operation {
             $(#[$transpose_documentation:meta])*
             transpose<$value:ident, $operations:ident>
             where { $($transpose_bounds:tt)* }
-            |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-                $outputs:ident| $transpose_body:block
+            {
+                |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+                    $outputs:ident| $transpose_body:block
+            }
         }
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
@@ -1730,7 +1763,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper emits the common binary JVP implementation from two per-operand tangent formulas. It owns
+    // primal replay, derivative alignment, structural-zero handling, and contribution summation so operation rules
+    // only state the mathematics unique to each operand.
     (
         @binary_jvp
         $(#[$documentation:meta])*
@@ -1775,21 +1810,21 @@ macro_rules! impl_differentiable_elementwise_operation {
                         $crate::check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
-                    |operands, $left_tangent| {
+                    |_operands, $left_tangent| {
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_left_primal operands, $left_primal_for_left
+                            @bind_binary_left_primal _operands, $left_primal_for_left
                         }
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_right_primal operands, $right_primal_for_left
+                            @bind_binary_right_primal _operands, $right_primal_for_left
                         }
                         Ok($left_term)
                     },
-                    |operands, $right_tangent| {
+                    |_operands, $right_tangent| {
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_left_primal operands, $left_primal_for_right
+                            @bind_binary_left_primal _operands, $left_primal_for_right
                         }
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_right_primal operands, $right_primal_for_right
+                            @bind_binary_right_primal _operands, $right_primal_for_right
                         }
                         Ok($right_term)
                     },
@@ -1798,66 +1833,45 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper handles `_` for a unary input primal by emitting no binding and, importantly, no accessor
+    // call. Avoiding the call preserves the DSL's promise that omitted primals are not evaluated unnecessarily.
     (@bind_unary_input_primal $operands:ident, _) => {};
 
-    // The following branch is an internal helper.
+    // This internal helper binds a named unary input primal through the lazy operand accessor. It is separate from the
+    // `_` arm so only formulas that reference the primal pay for alignment and possible replay.
     (@bind_unary_input_primal $operands:ident, $input_primal:ident) => {
         let $input_primal = $operands.input_primal()?;
     };
 
-    // The following branch is an internal helper.
+    // This internal helper binds the optional unary output primal at the tangent target type. The whole invocation is
+    // conditionally expanded by the caller, so rules without an `-> output` binding never recompute that value.
     (@bind_unary_output_primal $operands:ident, $output_primal:ident) => {
         let $output_primal = $operands.output_primal_at_tangent_type()?;
     };
 
-    // The following branch is an internal helper.
+    // This internal helper handles `_` for a binary left primal by emitting neither a binding nor an accessor call.
+    // The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the right operand.
     (@bind_binary_left_primal $operands:ident, _) => {};
 
-    // The following branch is an internal helper.
+    // This internal helper binds a named binary left primal through the lazy operand accessor. It complements the `_`
+    // arm so the generated rule evaluates and aligns the left primal only when its formula references it.
     (@bind_binary_left_primal $operands:ident, $left_primal:ident) => {
         let $left_primal = $operands.left_primal()?;
     };
 
-    // The following branch is an internal helper.
+    // This internal helper handles `_` for a binary right primal by emitting neither a binding nor an accessor call.
+    // The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the left operand.
     (@bind_binary_right_primal $operands:ident, _) => {};
 
-    // The following branch is an internal helper.
+    // This internal helper binds a named binary right primal through the lazy operand accessor. It complements the `_`
+    // arm so the generated rule evaluates and aligns the right primal only when its formula references it.
     (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
         let $right_primal = $operands.right_primal()?;
     };
 
-    // The following branch is an internal helper.
-    (
-        @custom_ready
-        impl<$context:ident> $operation:ty
-        where { $($jvp_bounds:tt)* }
-        $(#[$jvp_documentation:meta])*
-        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
-        $(#[$transpose_documentation:meta])*
-        transpose<$value:ident, $operations:ident>
-        where { $($transpose_bounds:tt)* }
-        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_jvp
-            $(#[$jvp_documentation])*
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
-        }
-
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_transpose
-            $(#[$transpose_documentation])*
-            impl<$value, $operations> $operation
-            where { $($transpose_bounds)* }
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
-        }
-    };
-
-    // The following branch is an internal helper.
+    // This internal helper emits the `DifferentiableOperation` shell for a fully custom JVP closure. It exists as the
+    // common endpoint for custom rules with either nonlinear or custom transposition, keeping trait boilerplate out of
+    // the public DSL while leaving the JVP algorithm entirely under caller control.
     (
         @custom_jvp
         $(#[$documentation:meta])*
@@ -1886,7 +1900,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The following branch is an internal helper.
+    // This internal helper emits the `TransposableOperation` shell for a fully custom transposition closure. Structured
+    // binary rules also lower through it, which centralizes the trait signature and user-specified bounds without
+    // imposing a second transposition abstraction.
     (
         @custom_transpose
         $(#[$documentation:meta])*
@@ -3467,7 +3483,7 @@ mod tests {
         /// Unary operation used to test [`define_elementwise_operation!`].
         TestUnaryOperation, TEST_UNARY_OPERATION_NAME,
         Neg, neg,
-        check_data_types = [@numeric],
+        check_data_types = [@numeric @real],
         check_array_types = [@no_unreduced],
     );
 
@@ -3476,7 +3492,7 @@ mod tests {
         /// Binary operation used to test [`define_elementwise_operation!`].
         TestBinaryOperation, TEST_BINARY_OPERATION_NAME,
         Add, add,
-        check_data_types = [@numeric],
+        check_data_types = [@numeric, @real],
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
 
@@ -3898,8 +3914,28 @@ mod tests {
             check_types!(@numeric, "test", types);
             Ok(())
         };
-        let check_floating_or_complex = |types: &[DataType]| -> Result<(), TypeError> {
-            check_types!(@floating_or_complex, "test", types);
+        let check_real = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@real, "test", types);
+            Ok(())
+        };
+        let check_float = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@float, "test", types);
+            Ok(())
+        };
+        let check_numeric_then_real = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@numeric @real, "test", types);
+            Ok(())
+        };
+        let check_real_then_numeric = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@real @numeric, "test", types);
+            Ok(())
+        };
+        let check_float_then_real = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@float @real, "test", types);
+            Ok(())
+        };
+        let check_real_then_float = |types: &[DataType]| -> Result<(), TypeError> {
+            check_types!(@real @float, "test", types);
             Ok(())
         };
         assert_eq!(check_numeric(&[DataType::I32, DataType::F64, DataType::C128]), Ok(()));
@@ -3909,9 +3945,34 @@ mod tests {
                 Err(TypeError { message: format!("'test' does not support input data type {type}", type = r#type) }),
             );
         }
-        assert_eq!(check_floating_or_complex(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
+        assert_eq!(check_real(&[DataType::I64, DataType::F32]), Ok(()));
         assert_eq!(
-            check_floating_or_complex(&[DataType::I64]),
+            check_real(&[DataType::C64]),
+            Err(TypeError { message: "'test' does not support input data type c64".to_string() }),
+        );
+        assert_eq!(check_float(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
+        assert_eq!(
+            check_float(&[DataType::I64]),
+            Err(TypeError { message: "'test' does not support input data type i64".to_string() }),
+        );
+        assert_eq!(check_numeric_then_real(&[DataType::I32, DataType::F64]), Ok(()));
+        assert_eq!(check_real_then_numeric(&[DataType::I32, DataType::F64]), Ok(()));
+        assert_eq!(
+            check_numeric_then_real(&[DataType::C128]),
+            Err(TypeError { message: "'test' does not support input data type c128".to_string() }),
+        );
+        assert_eq!(
+            check_numeric_then_real(&[DataType::Boolean]),
+            Err(TypeError { message: "'test' does not support input data type bool".to_string() }),
+        );
+        assert_eq!(check_float_then_real(&[DataType::BF16, DataType::F64]), Ok(()));
+        assert_eq!(check_real_then_float(&[DataType::BF16, DataType::F64]), Ok(()));
+        assert_eq!(
+            check_float_then_real(&[DataType::C64]),
+            Err(TypeError { message: "'test' does not support input data type c64".to_string() }),
+        );
+        assert_eq!(
+            check_float_then_real(&[DataType::I64]),
             Err(TypeError { message: "'test' does not support input data type i64".to_string() }),
         );
     }
@@ -4314,6 +4375,10 @@ mod tests {
             Ok(vec![DataType::I64]),
         );
         assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Err(TypeError { message: "'test_unary' does not support input data type c64".to_string() }),
+        );
+        assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
@@ -4321,6 +4386,10 @@ mod tests {
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[matrix_type.clone()], &[]),
             Ok(vec![matrix_type]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::C64)], &[]),
+            Err(TypeError { message: "'test_unary' does not support input data type c64".to_string() }),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
@@ -4379,11 +4448,23 @@ mod tests {
             Operation::<DataType>::infer_output_types(&operation, &[DataType::I64, DataType::I64], &[]),
             Ok(vec![DataType::I64]),
         );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
+            Err(TypeError { message: "'test_binary' does not support input data type c64".to_string() }),
+        );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type, vector_type.clone()], &[]),
             Ok(vec![vector_type]),
+        );
+        assert_eq!(
+            Operation::<ArrayType>::infer_output_types(
+                &operation,
+                &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
+                &[],
+            ),
+            Err(TypeError { message: "'test_binary' does not support input data type c64".to_string() }),
         );
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
