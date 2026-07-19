@@ -656,11 +656,12 @@ macro_rules! define_elementwise_capability {
 /// elementwise differentiation helpers. Each JVP contribution is written as a closure over `(primal, tangent)` pairs.
 /// An `_` pattern declares that a contribution does not consume that value, so the macro does not evaluate or align it.
 /// Contributions are invoked independently and lazily: a structural-zero tangent neither evaluates its contribution nor
-/// stages conversions for the primals that contribution would consume. Unary rules use the concise `jvp = |...| ...;`
-/// form and may additionally bind the primal output after `->`. That value is evaluated at the output tangent type only
-/// when the contribution is live. Binary rules use a block that lists the left-tangent contribution first and the
-/// right-tangent contribution second. The tangent slot for the other operand is `_` in each contribution, making the
-/// contribution's dependency explicit at the call site.
+/// stages conversions for the primals that contribution would consume. Each JVP rule declares the context parameter and
+/// its operation-specific bounds in a `jvp<C> where ... { ... }` block. Unary rules contain one contribution and may
+/// additionally bind the primal output after `->`. That value is evaluated at the output tangent type only when the
+/// contribution is live. Binary rules list the left-tangent contribution first and the right-tangent contribution
+/// second. The tangent slot for the other operand is `_` in each contribution, making the contribution's dependency
+/// explicit at the call site.
 ///
 /// `@signed_linear` implements both JVP and transposition from signed coefficients: unary rules take one `@positive` or
 /// `@negative` coefficient, binary rules take two, and every sign combination is supported. Binary rules combine live
@@ -691,9 +692,8 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
 ///     @signed_linear
-///     impl<C> AddOperation {
-///         rule = [@positive, @positive];
-///     }
+///     AddOperation,
+///     rule = [@positive, @positive]
 /// }
 /// ```
 ///
@@ -704,11 +704,11 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
 ///     @unary
-///     impl<C> ExpOperation where C::Value: std::ops::Mul<Output = C::Value>,
-///     {
-///         jvp = |(_, input_tangent) -> output| output * input_tangent;
-///         transpose = @nonlinear;
-///     }
+///     ExpOperation,
+///     jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
+///         |(_, input_tangent) -> output| output * input_tangent
+///     },
+///     transpose = @nonlinear,
 /// }
 /// ```
 ///
@@ -718,31 +718,28 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
 ///     @binary
-///     impl<C> MulOperation where C::Value: std::ops::Mul<Output = C::Value>,
+///     MulOperation,
+///     jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
+///         |(_, left_tangent), (right, _)| right * left_tangent;
+///         |(left, _), (_, right_tangent)| left * right_tangent;
+///     },
+///     transpose<V, O>
+///     where
+///         V::Type: DifferentiableType,
+///         O: From<MulOperation>,
+///         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
 ///     {
-///         jvp {
-///             |(_, left_tangent), (right, _)| right * left_tangent;
-///             |(left, _), (_, right_tangent)| left * right_tangent;
-///         }
+///         [left = @linear, right = @known] =>
+///             |output_cotangent| right.binary(output_cotangent, MulOperation);
+///         [left = @known, right = @linear] =>
+///             |output_cotangent| left.binary(output_cotangent, MulOperation);
 ///
-///         transpose<V, O>
-///         where
-///             V::Type: DifferentiableType,
-///             O: From<MulOperation>,
-///             Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-///         {
-///             [left = @linear, right = @known] =>
-///                 |output_cotangent| right.binary(output_cotangent, MulOperation);
-///             [left = @known, right = @linear] =>
-///                 |output_cotangent| left.binary(output_cotangent, MulOperation);
-///
-///             errors {
-///                 no_cotangent = "'mul' linear input has no cotangent space";
-///                 both_linear = "bilinear 'mul' with two linear operands cannot be transposed";
-///                 no_linear = "'mul' with no linear operand cannot be transposed";
-///             }
+///         errors {
+///             no_cotangent = "'mul' linear input has no cotangent space";
+///             both_linear = "bilinear 'mul' with two linear operands cannot be transposed";
+///             no_linear = "'mul' with no linear operand cannot be transposed";
 ///         }
-///     }
+///     },
 /// }
 /// ```
 ///
@@ -752,14 +749,17 @@ macro_rules! define_elementwise_capability {
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
 ///     @custom
-///     impl<C> SelectOperation where C::Type: DifferentiableType, C::Operation: From<SelectOperation>
-///     jvp |operation, context, driver, inputs| {
-///         custom_select_jvp(operation, context, driver, inputs)
-///     }
-///     transpose<V, O> where V::Type: DifferentiableType, O: From<SelectOperation>
-///     |operation, context, driver, inputs, outputs| {
-///         custom_select_transpose(operation, context, driver, inputs, outputs)
-///     }
+///     SelectOperation,
+///     jvp<C> where C::Type: DifferentiableType, C::Operation: From<SelectOperation> {
+///         |operation, context, driver, inputs| {
+///             custom_select_jvp(operation, context, driver, inputs)
+///         }
+///     },
+///     transpose<V, O> where V::Type: DifferentiableType, O: From<SelectOperation> {
+///         |operation, context, driver, inputs, outputs| {
+///             custom_select_transpose(operation, context, driver, inputs, outputs)
+///         }
+///     },
 /// }
 /// ```
 ///
@@ -780,10 +780,11 @@ macro_rules! define_elementwise_capability {
 ///   - `@binary`: Selects a binary JVP with one lazily evaluated term per input tangent.
 ///   - `@custom`: Selects caller-provided JVP and, optionally, transposition bodies.
 ///   - `@nonlinear`: Selects the standard unsupported primitive transposition rule.
-///   - `$context`: Generic parameter used for the generated differentiation context.
+///   - `$context`: Context parameter declared by `jvp<$context>` and used by the generated differentiation
+///     implementation and its bounds.
 ///   - `$operation`: Elementwise operation type for which the rules are generated.
-///   - `$bounds`: Additional bounds required by the operation-specific formulas, written directly after `where` using
-///     ordinary Rust `where`-predicate syntax without an additional delimiter.
+///   - `$bounds`: Additional bounds required by a JVP or transposition formula, written directly after that rule's
+///     `where` using ordinary Rust `where`-predicate syntax without an additional delimiter.
 ///   - `$input_primal`: Name bound to an aligned input primal. `_` omits that value without evaluating it.
 ///   - `$input_tangent`: Name bound to the live, aligned tangent whose contribution is being evaluated.
 ///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
@@ -830,116 +831,262 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // `macro_rules!` has no fragment specifier for a complete `where` clause. These entry arms therefore collect
-    // predicates one token tree at a time until the final rule body, allowing the public syntax to remain Rust-like
-    // without constraining which predicates callers may write.
+    // `macro_rules!` has no fragment specifier for a complete `where` clause. The public entry arms therefore collect
+    // predicates one token tree at a time until the JVP body. This keeps the bounds attached to `jvp<C>` while
+    // allowing callers to write ordinary, unbraced Rust predicates.
+    (@unary $($tail:tt)*) => {
+        $crate::impl_differentiable_elementwise_operation!(@public_jvp [unary] $($tail)*);
+    };
+
+    (@binary $($tail:tt)*) => {
+        $crate::impl_differentiable_elementwise_operation!(@public_jvp [binary] $($tail)*);
+    };
+
+    (@custom $($tail:tt)*) => {
+        $crate::impl_differentiable_elementwise_operation!(@public_jvp [custom] $($tail)*);
+    };
+
     (
-        @unary
-        impl<$context:ident> $operation:ty
+        @public_jvp [$kind:ident]
+        $operation:ty,
+        $(#[$documentation:meta])*
+        jvp<$context:ident>
         where
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @collect_outer_where [unary] [$context] [$operation] [] $($tail)*
+            @collect_jvp_where [$kind] [$context] [$operation] [$(#[$documentation])*] [] $($tail)*
         }
     };
 
     (
-        @binary
-        impl<$context:ident> $operation:ty
-        where
+        @public_jvp [$kind:ident]
+        $operation:ty,
+        $(#[$documentation:meta])*
+        jvp<$context:ident> { $($jvp:tt)* },
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @collect_outer_where [binary] [$context] [$operation] [] $($tail)*
+            @jvp_ready [$kind] [$context] [$operation] [$(#[$documentation])*] []
+            { $($jvp)* }
+            $($tail)*
         }
     };
 
     (
-        @collect_outer_where [unary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        { $($body:tt)* }
+        @collect_jvp_where
+        [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        { $($jvp:tt)* },
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @jvp_ready [$kind] [$context] [$operation] [$($documentation)*] [$($bounds)*]
+            { $($jvp)* }
+            $($tail)*
+        }
+    };
+
+    (
+        @collect_jvp_where
+        [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_jvp_where
+            [$kind] [$context] [$operation] [$($documentation)*] [$($bounds)* $next] $($rest)*
+        }
+    };
+
+    (
+        @jvp_ready [unary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
+        transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @unary_with_bounds
+            $($documentation)*
             impl<$context> $operation
             where { $($bounds)* }
-            { $($body)* }
+            {
+                jvp = |($input_primal, $input_tangent) $(-> $output_primal)?| $term;
+                transpose = @nonlinear;
+            }
         }
     };
 
     (
-        @collect_outer_where [binary] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        { $($body:tt)* }
+        @jvp_ready [binary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        { $($jvp:tt)* }
+        transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @binary_with_bounds
+            @binary_jvp
+            $($documentation)*
             impl<$context> $operation
             where { $($bounds)* }
-            { $($body)* }
+            jvp { $($jvp)* }
         }
+
+        $crate::impl_non_transposable_operation!($operation);
     };
 
     (
-        @collect_outer_where [$kind:ident] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        $next:tt $($rest:tt)+
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_outer_where [$kind] [$context] [$operation] [$($bounds)* $next] $($rest)*
-        }
-    };
-
-    // Custom rules have no enclosing rule-body braces, so their outer predicates end at `jvp`.
-    (
-        @custom
-        impl<$context:ident> $operation:ty
+        @jvp_ready [binary] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        { $($jvp:tt)* }
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
         where
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @collect_custom_where [$context] [$operation] [] $($tail)*
+            @collect_public_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*] [$($jvp)*]
+            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
         }
     };
 
     (
-        @collect_custom_where [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        $(#[$documentation:meta])* jvp $($body:tt)*
+        @collect_public_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block } $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @custom_with_bounds
+            @binary_ready
             impl<$context> $operation
-            where { $($bounds)* }
-            $(#[$documentation])* jvp $($body)*
+            where { $($jvp_bounds)* }
+            {
+                $($jvp_documentation)*
+                jvp { $($jvp)* }
+                $($transpose_documentation)*
+                transpose<$value, $operations>
+                where { $($transpose_bounds)* }
+                |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+            }
         }
     };
 
     (
-        @collect_custom_where [$context:ident] [$operation:ty] [$($bounds:tt)*]
+        @collect_public_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        { $($transpose_body:tt)* } $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @binary_ready
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            {
+                $($jvp_documentation)*
+                jvp { $($jvp)* }
+                $($transpose_documentation)*
+                transpose<$value, $operations>
+                where { $($transpose_bounds)* }
+                { $($transpose_body)* }
+            }
+        }
+    };
+
+    (
+        @collect_public_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $next:tt $($rest:tt)+
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @collect_custom_where [$context] [$operation] [$($bounds)* $next] $($rest)*
+            @collect_public_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*] [$($jvp)*]
+            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+        }
+    };
+
+    (
+        @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
+        transpose = @nonlinear $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_jvp
+            $($jvp_documentation)*
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    (
+        @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_public_custom_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
+        }
+    };
+
+    (
+        @collect_public_custom_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block } $(,)?
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @custom_ready
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            $($jvp_documentation)*
+            jvp |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            $($transpose_documentation)*
+            transpose<$value, $operations>
+            where { $($transpose_bounds)* }
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    (
+        @collect_public_custom_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_elementwise_operation! {
+            @collect_public_custom_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
         }
     };
 
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@positive $(,)?];
-        }
+        $operation:ty,
+        rule = [@positive $(,)?] $(,)?
     ) => {
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        impl<__C: $crate::Context> $crate::DifferentiableOperation<__C> for $operation
         where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            <__C as $crate::Domain>::Type: $crate::DifferentiableType,
+            <__C as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<<__C as $crate::Domain>::Type>,
         {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+            fn jvp<D: $crate::DifferentiationDriver<__C>>(
                 &self,
-                context: &$context,
+                context: &__C,
                 _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+                inputs: &[$crate::DifferentiationDual<<__C as $crate::Domain>::Value>],
             ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                Vec<$crate::DifferentiationDual<<__C as $crate::Domain>::Value>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
@@ -983,25 +1130,23 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@negative $(,)?];
-        }
+        $operation:ty,
+        rule = [@negative $(,)?] $(,)?
     ) => {
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        impl<__C: $crate::Context> $crate::DifferentiableOperation<__C> for $operation
         where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <$context as $crate::Domain>::Value:
-                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            <__C as $crate::Domain>::Type: $crate::DifferentiableType,
+            <__C as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
+            $operation: $crate::Operation<<__C as $crate::Domain>::Type>,
         {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+            fn jvp<D: $crate::DifferentiationDriver<__C>>(
                 &self,
-                context: &$context,
+                context: &__C,
                 _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+                inputs: &[$crate::DifferentiationDual<<__C as $crate::Domain>::Value>],
             ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                Vec<$crate::DifferentiationDual<<__C as $crate::Domain>::Value>>,
                 $crate::DifferentiationError,
             > {
                 $crate::check_count!("input", inputs, 1, ProgramError);
@@ -1049,30 +1194,28 @@ macro_rules! impl_differentiable_elementwise_operation {
     // minimal value and operation bounds that its signed tangent and cotangent formulas need.
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@positive, @positive $(,)?];
-        }
+        $operation:ty,
+        rule = [@positive, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @signed_linear_binary [positive, positive]
-            impl<$context> $operation
-            where { ::std::ops::Add<Output = <$context as $crate::Domain>::Value> }
+            impl<__C> $operation
+            where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
             transpose_operation_bounds {}
         }
     };
 
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@positive, @negative $(,)?];
-        }
+        $operation:ty,
+        rule = [@positive, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @signed_linear_binary [positive, negative]
-            impl<$context> $operation
+            impl<__C> $operation
             where {
-                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <$context as $crate::Domain>::Value>
+                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
         }
@@ -1080,16 +1223,15 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@negative, @positive $(,)?];
-        }
+        $operation:ty,
+        rule = [@negative, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @signed_linear_binary [negative, positive]
-            impl<$context> $operation
+            impl<__C> $operation
             where {
-                ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <$context as $crate::Domain>::Value>
+                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
         }
@@ -1097,16 +1239,15 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (
         @signed_linear
-        impl<$context:ident> $operation:ty {
-            rule = [@negative, @negative $(,)?];
-        }
+        $operation:ty,
+        rule = [@negative, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @signed_linear_binary [negative, negative]
-            impl<$context> $operation
+            impl<__C> $operation
             where {
-                ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
-                    + ::std::ops::Neg<Output = <$context as $crate::Domain>::Value>
+                ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
+                    + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation> }
         }
@@ -1263,6 +1404,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (
         @unary_with_bounds
+        $(#[$documentation:meta])*
         impl<$context:ident> $operation:ty
         where { $($bounds:tt)* }
         {
@@ -1271,6 +1413,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             transpose = @nonlinear;
         }
     ) => {
+        $(#[$documentation])*
         impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
         where
             <$context as $crate::Domain>::Type: $crate::DifferentiableType,
@@ -1319,111 +1462,15 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // Binary transposition has its own generic parameters and `where` clause inside the outer rule body. Collect its
-    // predicates until either the knownness-case body or the custom transposition closure.
-    (
-        @binary_with_bounds
-        impl<$context:ident> $operation:ty
-        where { $($bounds:tt)* }
-        {
-            jvp { $($jvp:tt)* }
-
-            transpose = @nonlinear;
-        }
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @binary_jvp
-            impl<$context> $operation
-            where { $($bounds)* }
-            jvp { $($jvp)* }
-        }
-
-        $crate::impl_non_transposable_operation!($operation);
-    };
-
-    (
-        @binary_with_bounds
-        impl<$context:ident> $operation:ty
-        where { $($jvp_bounds:tt)* }
-        {
-            jvp { $($jvp:tt)* }
-
-            $(#[$transpose_documentation:meta])*
-            transpose<$value:ident, $operations:ident>
-            where
-            $($tail:tt)*
-        }
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_binary_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
-            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
-        }
-    };
-
-    (
-        @collect_binary_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        { $($transpose_body:tt)* }
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @binary_ready
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            {
-                jvp { $($jvp)* }
-
-                $($transpose_documentation)*
-                transpose<$value, $operations>
-                where { $($transpose_bounds)* }
-                { $($transpose_body)* }
-            }
-        }
-    };
-
-    (
-        @collect_binary_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @binary_ready
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            {
-                jvp { $($jvp)* }
-
-                $($transpose_documentation)*
-                transpose<$value, $operations>
-                where { $($transpose_bounds)* }
-                |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
-            }
-        }
-    };
-
-    (
-        @collect_binary_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        $next:tt $($rest:tt)+
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_binary_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*] [$($jvp)*]
-            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
-        }
-    };
-
     (
         @binary_ready
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
+            $(#[$jvp_documentation:meta])*
             jvp { $($jvp:tt)* }
 
+            $(#[$transpose_documentation:meta])*
             transpose<$value:ident, $operations:ident>
             where { $($transpose_bounds:tt)* }
             {
@@ -1442,6 +1489,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
+            $(#[$jvp_documentation])*
             impl<$context> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
@@ -1449,6 +1497,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
         $crate::impl_differentiable_elementwise_operation! {
             @custom_transpose
+            $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
             |_operation, _context, _driver, inputs, outputs| {
@@ -1545,8 +1594,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
+            $(#[$jvp_documentation:meta])*
             jvp { $($jvp:tt)* }
 
+            $(#[$transpose_documentation:meta])*
             transpose<$value:ident, $operations:ident>
             where { $($transpose_bounds:tt)* }
             {
@@ -1563,6 +1614,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
+            $(#[$jvp_documentation])*
             impl<$context> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
@@ -1570,6 +1622,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
         $crate::impl_differentiable_elementwise_operation! {
             @custom_transpose
+            $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
             |_operation, _context, _driver, inputs, outputs| {
@@ -1625,6 +1678,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<$context:ident> $operation:ty
         where { $($jvp_bounds:tt)* }
         {
+            $(#[$jvp_documentation:meta])*
             jvp { $($jvp:tt)* }
 
             $(#[$transpose_documentation:meta])*
@@ -1636,6 +1690,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @binary_jvp
+            $(#[$jvp_documentation])*
             impl<$context> $operation
             where { $($jvp_bounds)* }
             jvp { $($jvp)* }
@@ -1652,6 +1707,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (
         @binary_jvp
+        $(#[$documentation:meta])*
         impl<$context:ident> $operation:ty
         where { $($bounds:tt)* }
         jvp {
@@ -1661,6 +1717,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $right_term:expr;
         }
     ) => {
+        $(#[$documentation])*
         impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
         where
             <$context as $crate::Domain>::Type: $crate::DifferentiableType,
@@ -1735,82 +1792,6 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
         let $right_primal = $operands.right_primal()?;
-    };
-
-    (
-        @custom_with_bounds
-        impl<$context:ident> $operation:ty
-        where { $($bounds:tt)* }
-        $(#[$jvp_documentation:meta])*
-        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
-        transpose = @nonlinear;
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_jvp
-            $(#[$jvp_documentation])*
-            impl<$context> $operation
-            where { $($bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
-        }
-
-        $crate::impl_non_transposable_operation!($operation);
-    };
-
-    (
-        @custom_with_bounds
-        impl<$context:ident> $operation:ty
-        where { $($jvp_bounds:tt)* }
-        $(#[$jvp_documentation:meta])*
-        jvp |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block
-        $(#[$transpose_documentation:meta])*
-        transpose<$value:ident, $operations:ident>
-        where
-        $($tail:tt)*
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_custom_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*]
-            [$(#[$jvp_documentation])*] [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
-        }
-    };
-
-    (
-        @collect_custom_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$($jvp_documentation:tt)*] [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident]
-        [$jvp_body:block] [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident]
-        [$($transpose_bounds:tt)*]
-        |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_ready
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            $($jvp_documentation)*
-            jvp |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
-            $($transpose_documentation)*
-            transpose<$value, $operations>
-            where { $($transpose_bounds)* }
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
-        }
-    };
-
-    (
-        @collect_custom_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$($jvp_documentation:tt)*] [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident]
-        [$jvp_body:block] [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident]
-        [$($transpose_bounds:tt)*]
-        $next:tt $($rest:tt)+
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_custom_transpose_where
-            [$context] [$operation] [$($jvp_bounds)*]
-            [$($jvp_documentation)*] [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
-        }
     };
 
     (
@@ -3545,16 +3526,14 @@ mod tests {
 
     impl_differentiable_elementwise_operation! {
         @signed_linear
-        impl<C> TestReversedSubOperation {
-            rule = [@negative, @positive];
-        }
+        TestReversedSubOperation,
+        rule = [@negative, @positive]
     }
 
     impl_differentiable_elementwise_operation! {
         @signed_linear
-        impl<C> TestNegatedAddOperation {
-            rule = [@negative, @negative];
-        }
+        TestNegatedAddOperation,
+        rule = [@negative, @negative]
     }
 
     impl_non_differentiable_operation!(TestUnaryOperation);
