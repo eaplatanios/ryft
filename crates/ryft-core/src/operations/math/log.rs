@@ -1,12 +1,8 @@
 use std::ops::Div as StandardDiv;
 
-use crate::contexts::Context;
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, unary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
-use crate::programs::operations::Operation;
 
 // TODO(eaplatanios): Review this module.
 
@@ -24,35 +20,23 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced],
 );
 
-impl<C: Context> DifferentiableOperation<C> for LogOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Log + StandardDiv<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
-    LogOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(ln(x)) = dx / x.
-        unary_elementwise_jvp(
-            self,
-            inputs,
-            |input| input.log(),
-            |operands| Ok(operands.input_tangent()? / operands.input_primal()?),
-        )
-    }
+impl_differentiable_elementwise_operation! {
+    @unary
+    LogOperation,
+    jvp<C> where C::Value: StandardDiv<Output = C::Value> {
+        |(input, input_tangent)| input_tangent / input
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(LogOperation);
 
 define_elementwise_capability!(
     @unary
     /// Value-level elementwise natural-logarithm capability. [`Log`] fills the same role for
     /// [`LogOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-    Log, log, LogOperation,
+    Log,
+    /// Computes [`LogOperation`] elementwise for this value.
+    log,
+    LogOperation,
 );
 
 #[cfg(test)]
@@ -75,6 +59,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{TypeError, Typed};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

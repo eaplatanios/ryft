@@ -140,10 +140,9 @@ where
 }
 
 impl_differentiable_elementwise_operation! {
-    @signed_linear
-    impl<C> PrintOperation {
-        rule = [@positive];
-    }
+    @linear
+    PrintOperation,
+    rule = [@positive]
 }
 
 #[cfg(test)]

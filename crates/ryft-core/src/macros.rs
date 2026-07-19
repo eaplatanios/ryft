@@ -663,11 +663,11 @@ macro_rules! define_elementwise_capability {
 /// second. The tangent slot for the other operand is `_` in each contribution, making the contribution's dependency
 /// explicit at the call site.
 ///
-/// `@signed_linear` implements both JVP and transposition from signed coefficients: unary rules take one `@positive` or
+/// `@linear` implements both JVP and transposition from signed coefficients: unary rules take one `@positive` or
 /// `@negative` coefficient, binary rules take two, and every sign combination is supported. Binary rules combine live
 /// tangents with the operation's natural signed combination (e.g., a single staged `sub` for a `[@positive, @negative]`
 /// rule) so that the staged tangent program mirrors the primal operation. `@non_differentiable` replays the primal and
-/// assigns structural-zero output tangents, while rejecting primitive transposition. `@constant_like` represents a
+/// assigns structural-zero output tangents, while rejecting primitive transposition. `@constant` represents a
 /// unary, single-output operation whose result is constant with respect to its exemplar input. Its transpose therefore
 /// returns a structural-zero exemplar cotangent.
 ///
@@ -686,12 +686,12 @@ macro_rules! define_elementwise_capability {
 ///
 /// # Examples
 ///
-/// Signed-linear operations need only declare the sign with which each input contributes.
+/// Linear operations need only declare the sign with which each input contributes.
 /// The macro generates both the JVP and the transposition rules:
 ///
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
-///     @signed_linear
+///     @linear
 ///     AddOperation,
 ///     rule = [@positive, @positive]
 /// }
@@ -713,7 +713,8 @@ macro_rules! define_elementwise_capability {
 /// ```
 ///
 /// A binary rule provides one independently lazy contribution per input tangent. It can additionally describe the
-/// supported primitive-transposition knownness cases and their operation-specific diagnostics:
+/// supported primitive-transposition knownness cases. The macro derives diagnostics for omitted knownness patterns
+/// and linear inputs without cotangent spaces from the operation and operand names:
 ///
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
@@ -733,12 +734,6 @@ macro_rules! define_elementwise_capability {
 ///             |output_cotangent| right.binary(output_cotangent, MulOperation);
 ///         [left = @known, right = @linear] =>
 ///             |output_cotangent| left.binary(output_cotangent, MulOperation);
-///
-///         errors {
-///             no_cotangent = "'mul' linear input has no cotangent space";
-///             both_linear = "bilinear 'mul' with two linear operands cannot be transposed";
-///             no_linear = "'mul' with no linear operand cannot be transposed";
-///         }
 ///     },
 /// }
 /// ```
@@ -764,18 +759,18 @@ macro_rules! define_elementwise_capability {
 /// ```
 ///
 /// Finally, operations with no differential dependence use the compact selectors. `@non_differentiable` gives every
-/// output a structural-zero tangent, while `@constant_like` also gives its exemplar input a structural-zero cotangent:
+/// output a structural-zero tangent, while `@constant` also gives its exemplar input a structural-zero cotangent:
 ///
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation!(@non_differentiable CompareOperation);
-/// impl_differentiable_elementwise_operation!(@constant_like ZeroLikeOperation);
+/// impl_differentiable_elementwise_operation!(@constant ZeroLikeOperation);
 /// ```
 ///
 /// # Parameters
 ///
 ///   - `@non_differentiable`: Selects a structural-zero JVP and unsupported primitive transposition rule.
-///   - `@constant_like`: Selects a unary constant-in-its-input JVP and structural-zero transposition rule.
-///   - `@signed_linear`: Selects a fully linear unary or binary rule with the provided signed coefficients.
+///   - `@constant`: Selects a unary constant-in-its-input JVP and structural-zero transposition rule.
+///   - `@linear`: Selects a fully linear unary or binary rule with the provided signed coefficients.
 ///   - `@unary`: Selects a unary JVP with one lazily evaluated tangent term.
 ///   - `@binary`: Selects a binary JVP with one lazily evaluated term per input tangent.
 ///   - `@custom`: Selects caller-provided JVP and, optionally, transposition bodies.
@@ -796,7 +791,6 @@ macro_rules! define_elementwise_capability {
 ///   - `@linear`: Marks an operand that is unknown because it belongs to the linear program being transposed.
 ///   - `@known`: Marks an operand that is available as a known primal value during transposition.
 ///   - `$output_cotangent`: Name bound to the live output cotangent in a transposition case.
-///   - `errors`: Operation-specific errors provider for unsupported knownness patterns and missing cotangent spaces.
 #[macro_export]
 macro_rules! impl_differentiable_elementwise_operation {
     (@non_differentiable $operation:ty $(,)?) => {
@@ -804,7 +798,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    (@constant_like $operation:ty $(,)?) => {
+    (@constant $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
 
         impl<T: $crate::DifferentiableType, V: $crate::Value<Type = T>, O: $crate::Operation<T>>
@@ -846,6 +840,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [custom] $($tail)*);
     };
 
+    // The following branch is an internal helper.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -859,6 +854,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -873,6 +869,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -886,6 +883,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -897,6 +895,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @jvp_ready [unary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
         { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
@@ -914,6 +913,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
         { $($jvp:tt)* }
@@ -930,6 +930,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
+    // The following branch is an internal helper.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { $($jvp:tt)* }
@@ -945,6 +946,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -967,6 +969,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -988,6 +991,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -1001,6 +1005,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1017,6 +1022,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
+    // The following branch is an internal helper.
     (
         @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1033,6 +1039,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1054,6 +1061,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1070,7 +1078,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@positive $(,)?] $(,)?
     ) => {
@@ -1129,7 +1137,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@negative $(,)?] $(,)?
     ) => {
@@ -1190,15 +1198,15 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // The four binary sign combinations below dispatch to the shared `@signed_linear_binary` shell, each passing the
+    // The four binary sign combinations below dispatch to the shared `@linear_binary` shell, each passing the
     // minimal value and operation bounds that its signed tangent and cotangent formulas need.
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@positive, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @signed_linear_binary [positive, positive]
+            @linear_binary [positive, positive]
             impl<__C> $operation
             where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
             transpose_operation_bounds {}
@@ -1206,12 +1214,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@positive, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @signed_linear_binary [positive, negative]
+            @linear_binary [positive, negative]
             impl<__C> $operation
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
@@ -1222,12 +1230,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@negative, @positive $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @signed_linear_binary [negative, positive]
+            @linear_binary [negative, positive]
             impl<__C> $operation
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
@@ -1238,12 +1246,12 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     (
-        @signed_linear
+        @linear
         $operation:ty,
         rule = [@negative, @negative $(,)?] $(,)?
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
-            @signed_linear_binary [negative, negative]
+            @linear_binary [negative, negative]
             impl<__C> $operation
             where {
                 ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
@@ -1253,8 +1261,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
-        @signed_linear_binary [$left_sign:ident, $right_sign:ident]
+        @linear_binary [$left_sign:ident, $right_sign:ident]
         impl<$context:ident> $operation:ty
         where { $($value_bounds:tt)* }
         transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
@@ -1308,7 +1317,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target)?;
                         let right = $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
-                            @combine_signed_tangents [$left_sign, $right_sign], left, right
+                                    @combine_linear_tangents [$left_sign, $right_sign], left, right
                         ))
                     }
                     (Some(tangent), None) => {
@@ -1364,10 +1373,10 @@ macro_rules! impl_differentiable_elementwise_operation {
                         let operation_name = $crate::Operation::<T>::name(self);
                         Ok(vec![
                             $crate::impl_differentiable_elementwise_operation!(
-                                @signed_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
+                        @linear_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
                             ),
                             $crate::impl_differentiable_elementwise_operation!(
-                                @signed_transpose_contribution $right_sign, operation_name, &inputs[1], cotangent
+                        @linear_transpose_contribution $right_sign, operation_name, &inputs[1], cotangent
                             ),
                         ])
                     }
@@ -1376,19 +1385,26 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    (@combine_signed_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
+    // The following branch is an internal helper.
+    (@combine_linear_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
 
-    (@combine_signed_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
+    // The following branch is an internal helper.
+    (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
 
-    (@combine_signed_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
+    // The following branch is an internal helper.
+    (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
 
-    (@combine_signed_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
+    // The following branch is an internal helper.
+    (@combine_linear_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
 
+    // The following branch is an internal helper.
     (@apply_tangent_sign positive, $tangent:expr) => { $tangent };
 
+    // The following branch is an internal helper.
     (@apply_tangent_sign negative, $tangent:expr) => { -$tangent };
 
-    (@signed_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
+    // The following branch is an internal helper.
+    (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
         if $crate::DifferentiableType::is_zero_space(&target) {
             return Err($crate::ProgramError::UnsupportedOperation {
@@ -1402,6 +1418,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
     }};
 
+    // The following branch is an internal helper.
     (
         @unary_with_bounds
         $(#[$documentation:meta])*
@@ -1462,6 +1479,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
+    // The following branch is an internal helper.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1478,12 +1496,6 @@ macro_rules! impl_differentiable_elementwise_operation {
                     |$left_output_cotangent:ident| $left_contribution:expr;
                 [$transpose_left_again:ident = @known, $transpose_right_again:ident = @linear] =>
                     |$right_output_cotangent:ident| $right_contribution:expr;
-
-                errors {
-                    no_cotangent = $no_cotangent_message:expr;
-                    both_linear = $both_linear_message:expr;
-                    no_linear = $no_linear_message:expr;
-                }
             }
         }
     ) => {
@@ -1500,7 +1512,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
-            |_operation, _context, _driver, inputs, outputs| {
+            |operation, _context, _driver, inputs, outputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 let (linear_index, contribution) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
@@ -1513,7 +1525,11 @@ macro_rules! impl_differentiable_elementwise_operation {
                             $crate::MaybeZero::Value($left_output_cotangent) => {
                                 if $crate::DifferentiableType::is_zero_space(&target) {
                                     return Err($crate::ProgramError::UnsupportedOperation {
-                                        message: $no_cotangent_message.to_string(),
+                                        message: format!(
+                                            "linear input `{}` of operation `{}` has no cotangent space",
+                                            stringify!($transpose_left),
+                                            $crate::Operation::name(operation),
+                                        ),
                                     }
                                     .into());
                                 }
@@ -1542,7 +1558,11 @@ macro_rules! impl_differentiable_elementwise_operation {
                             $crate::MaybeZero::Value($right_output_cotangent) => {
                                 if $crate::DifferentiableType::is_zero_space(&target) {
                                     return Err($crate::ProgramError::UnsupportedOperation {
-                                        message: $no_cotangent_message.to_string(),
+                                        message: format!(
+                                            "linear input `{}` of operation `{}` has no cotangent space",
+                                            stringify!($transpose_right_again),
+                                            $crate::Operation::name(operation),
+                                        ),
                                     }
                                     .into());
                                 }
@@ -1562,15 +1582,16 @@ macro_rules! impl_differentiable_elementwise_operation {
                         };
                         (1, contribution)
                     }
-                    (true, true) => {
+                    (left_is_linear, right_is_linear) => {
                         return Err($crate::ProgramError::UnsupportedOperation {
-                            message: $both_linear_message.to_string(),
-                        }
-                        .into());
-                    }
-                    (false, false) => {
-                        return Err($crate::ProgramError::UnsupportedOperation {
-                            message: $no_linear_message.to_string(),
+                            message: format!(
+                                "operation `{}` does not support transposition for input pattern [{} = {}, {} = {}]",
+                                $crate::Operation::name(operation),
+                                stringify!($transpose_left),
+                                if left_is_linear { "linear" } else { "known" },
+                                stringify!($transpose_right),
+                                if right_is_linear { "linear" } else { "known" },
+                            ),
                         }
                         .into());
                     }
@@ -1589,6 +1610,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1603,12 +1625,6 @@ macro_rules! impl_differentiable_elementwise_operation {
             {
                 [$transpose_left:ident = @linear, $transpose_right:ident = @known] =>
                     |$output_cotangent:ident| $contribution:expr;
-
-                errors {
-                    no_cotangent = $no_cotangent_message:expr;
-                    nonlinear_right = $nonlinear_right_message:expr;
-                    no_linear = $no_linear_message:expr;
-                }
             }
         }
     ) => {
@@ -1625,18 +1641,21 @@ macro_rules! impl_differentiable_elementwise_operation {
             $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
-            |_operation, _context, _driver, inputs, outputs| {
+            |operation, _context, _driver, inputs, outputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                if !inputs[0].is_unknown() {
+                let left_is_linear = inputs[0].is_unknown();
+                let right_is_linear = inputs[1].is_unknown();
+                if !left_is_linear || right_is_linear {
                     return Err($crate::ProgramError::UnsupportedOperation {
-                        message: $no_linear_message.to_string(),
-                    }
-                    .into());
-                }
-                if inputs[1].is_unknown() {
-                    return Err($crate::ProgramError::UnsupportedOperation {
-                        message: $nonlinear_right_message.to_string(),
+                        message: format!(
+                            "operation `{}` does not support transposition for input pattern [{} = {}, {} = {}]",
+                            $crate::Operation::name(operation),
+                            stringify!($transpose_left),
+                            if left_is_linear { "linear" } else { "known" },
+                            stringify!($transpose_right),
+                            if right_is_linear { "linear" } else { "known" },
+                        ),
                     }
                     .into());
                 }
@@ -1648,7 +1667,11 @@ macro_rules! impl_differentiable_elementwise_operation {
                     $crate::MaybeZero::Value($output_cotangent) => {
                         if $crate::DifferentiableType::is_zero_space(&target) {
                             return Err($crate::ProgramError::UnsupportedOperation {
-                                message: $no_cotangent_message.to_string(),
+                                message: format!(
+                                    "linear input `{}` of operation `{}` has no cotangent space",
+                                    stringify!($transpose_left),
+                                    $crate::Operation::name(operation),
+                                ),
                             }
                             .into());
                         }
@@ -1673,6 +1696,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1705,6 +1729,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @binary_jvp
         $(#[$documentation:meta])*
@@ -1772,28 +1797,36 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (@bind_unary_input_primal $operands:ident, _) => {};
 
+    // The following branch is an internal helper.
     (@bind_unary_input_primal $operands:ident, $input_primal:ident) => {
         let $input_primal = $operands.input_primal()?;
     };
 
+    // The following branch is an internal helper.
     (@bind_unary_output_primal $operands:ident, $output_primal:ident) => {
         let $output_primal = $operands.output_primal_at_tangent_type()?;
     };
 
+    // The following branch is an internal helper.
     (@bind_binary_left_primal $operands:ident, _) => {};
 
+    // The following branch is an internal helper.
     (@bind_binary_left_primal $operands:ident, $left_primal:ident) => {
         let $left_primal = $operands.left_primal()?;
     };
 
+    // The following branch is an internal helper.
     (@bind_binary_right_primal $operands:ident, _) => {};
 
+    // The following branch is an internal helper.
     (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
         let $right_primal = $operands.right_primal()?;
     };
 
+    // The following branch is an internal helper.
     (
         @custom_ready
         impl<$context:ident> $operation:ty
@@ -1823,6 +1856,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @custom_jvp
         $(#[$documentation:meta])*
@@ -1851,6 +1885,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
+    // The following branch is an internal helper.
     (
         @custom_transpose
         $(#[$documentation:meta])*
@@ -3408,8 +3443,8 @@ mod tests {
     use crate::operations::constants::ZeroOperation;
     use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
     use crate::operations::math::{
-        Abs, Add, AddOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation,
-        Sub, SubOperation,
+        Abs, Add, AddOperation, DivOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind,
+        SinOperation, Sub, SubOperation,
     };
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
@@ -3525,13 +3560,13 @@ mod tests {
     );
 
     impl_differentiable_elementwise_operation! {
-        @signed_linear
+        @linear
         TestReversedSubOperation,
         rule = [@negative, @positive]
     }
 
     impl_differentiable_elementwise_operation! {
-        @signed_linear
+        @linear
         TestNegatedAddOperation,
         rule = [@negative, @negative]
     }
@@ -4450,7 +4485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_differentiable_elementwise_operation_signed_linear() {
+    fn test_impl_differentiable_elementwise_operation_linear() {
         let inputs = [
             DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
             DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
@@ -4485,7 +4520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_differentiable_elementwise_operation_signed_linear_negative_signs() {
+    fn test_impl_differentiable_elementwise_operation_linear_negative_signs() {
         // A `[@negative, @positive]` rule combines both live tangents as `right - left` and negates a left-only
         // tangent. The primal values come from the stand-in `Sub` interpretation and are irrelevant to the rule.
         let context = EagerContext::<Scalar, TestReversedSubOperation>::new();
@@ -4527,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_differentiable_elementwise_operation_signed_linear_negative_transposition() {
+    fn test_impl_differentiable_elementwise_operation_linear_negative_transposition() {
         // A negative coefficient stages a negation of the output cotangent while a positive coefficient passes it
         // through unchanged.
         let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
@@ -4623,6 +4658,92 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Scalar::from(6.0f32));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(22.0f32)));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_symmetric_transposition_diagnostics() {
+        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let outputs = [MaybeZero::Value(output_cotangent)];
+        assert!(matches!(
+            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "operation `mul` does not support transposition for input pattern \
+                        [left = linear, right = linear]",
+        ));
+
+        let left = context.input(DataType::F32);
+        let right = context.input(DataType::F32);
+        assert!(matches!(
+            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Known(left), PartialValue::Known(right)],
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "operation `mul` does not support transposition for input pattern \
+                        [left = known, right = known]",
+        ));
+
+        let right = context.input(DataType::I32);
+        let output_cotangent = context.input(DataType::I32);
+        assert!(matches!(
+            <MulOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &MulOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::I32), PartialValue::Known(right)],
+                &[MaybeZero::Value(output_cotangent)],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "linear input `left` of operation `mul` has no cotangent space",
+        ));
+    }
+
+    #[test]
+    fn test_impl_differentiable_elementwise_operation_one_sided_transposition_diagnostics() {
+        let mut context = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let outputs = [MaybeZero::Value(output_cotangent)];
+        assert!(matches!(
+            <DivOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &DivOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "operation `div` does not support transposition for input pattern \
+                        [numerator = linear, denominator = linear]",
+        ));
+
+        let numerator = context.input(DataType::F32);
+        let denominator = context.input(DataType::F32);
+        assert!(matches!(
+            <DivOperation as TransposableOperation<Scalar, ScalarOperation<Scalar>>>::transpose(
+                &DivOperation,
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Known(numerator), PartialValue::Known(denominator)],
+                &outputs,
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "operation `div` does not support transposition for input pattern \
+                        [numerator = known, denominator = known]",
+        ));
     }
 
     #[test]

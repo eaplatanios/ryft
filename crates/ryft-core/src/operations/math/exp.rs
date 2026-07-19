@@ -1,12 +1,8 @@
 use std::ops::Mul as StandardMul;
 
-use crate::contexts::Context;
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, unary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
-use crate::programs::operations::Operation;
 
 // TODO(eaplatanios): Review this module.
 
@@ -24,38 +20,23 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced],
 );
 
-impl<C: Context> DifferentiableOperation<C> for ExpOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Exp + StandardMul<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
-    ExpOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(eˣ) = eˣ · dx, reusing the primal output as the coefficient when no widening is required.
-        unary_elementwise_jvp(
-            self,
-            inputs,
-            |input| input.exp(),
-            |operands| {
-                let output_primal = operands.output_primal_at_tangent_type()?;
-                Ok(output_primal * operands.input_tangent()?)
-            },
-        )
-    }
+impl_differentiable_elementwise_operation! {
+    @unary
+    ExpOperation,
+    jvp<C> where C::Value: StandardMul<Output = C::Value> {
+        |(_, input_tangent) -> output| output * input_tangent
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(ExpOperation);
 
 define_elementwise_capability!(
     @unary
     /// Value-level elementwise natural-exponential capability. [`Exp`] fills the same role for
     /// [`ExpOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-    Exp, exp, ExpOperation,
+    Exp,
+    /// Computes [`ExpOperation`] elementwise for this value.
+    exp,
+    ExpOperation,
 );
 
 #[cfg(test)]
@@ -78,6 +59,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::{TypeError, Typed};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

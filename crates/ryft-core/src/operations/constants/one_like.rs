@@ -1,18 +1,15 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableType;
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
-use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
@@ -67,25 +64,7 @@ impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation {
 
 impl<C: Context<Operation: From<OneLikeOperation>>> PartiallyEvaluatableOperation<C> for OneLikeOperation {}
 
-impl_non_differentiable_operation!(OneLikeOperation);
-
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for OneLikeOperation
-where
-    V::Type: DifferentiableType,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_type = inputs[0].r#type();
-        Ok(vec![MaybeZero::Zero(input_type.cotangent())])
-    }
-}
+impl_differentiable_elementwise_operation!(@constant OneLikeOperation);
 
 /// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to [`One`](super::One).
 /// It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.

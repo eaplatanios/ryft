@@ -108,10 +108,9 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
 }
 
 impl_differentiable_elementwise_operation! {
-    @signed_linear
-    impl<C> TagOperation {
-        rule = [@positive];
-    }
+    @linear
+    TagOperation,
+    rule = [@positive]
 }
 
 // TODO(eaplatanios): Add unit tests mirroring the structure and style of the tests in

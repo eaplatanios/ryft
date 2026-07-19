@@ -1,16 +1,13 @@
 use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
-use crate::contexts::Context;
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::macros::{
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::macros::{check_count, define_elementwise_operation, impl_non_transposable_operation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
 use crate::programs::types::Typed;
-use crate::programs::values::Value;
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,91 +27,84 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
-impl<C: Context> DifferentiableOperation<C> for Atan2Operation
-where
-    C::Type: DifferentiableType,
-    C::Value: Atan2
-        + StandardNeg<Output = C::Value>
-        + StandardAdd<Output = C::Value>
-        + StandardMul<Output = C::Value>
-        + StandardDiv<Output = C::Value>
-        + ElementwiseDerivativeAlignment<C::Type>,
-    Atan2Operation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(atan2(y, x)) = x / (x² + y²) · dy - y / (x² + y²) · dx. The shared denominator is computed once for both
-        // terms, and each divided coefficient is formed independently, matching the primitive's numerical rule:
-        // combining the terms into one numerator can produce `inf - inf` before division for large finite inputs even
-        // when the two finite quotient terms cancel. This rule stays hand-written instead of delegating to
-        // `binary_elementwise_jvp` because independent per-side term closures would recompute the shared denominator.
-        check_count!("input", inputs, 2, ProgramError);
-        let y = &inputs[0];
-        let x = &inputs[1];
-        let primal = y.primal().atan2(x.primal())?;
-        let target = primal.r#type().tangent();
-        let has_y_tangent = y.tangent().as_value().is_some();
-        let has_x_tangent = x.tangent().as_value().is_some();
-        if !has_y_tangent && !has_x_tangent {
-            return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
-        }
-        if target.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'atan2' output type {} has no tangent space", primal.r#type()),
+impl_differentiable_elementwise_operation! {
+    @custom
+    Atan2Operation,
+    jvp<C>
+    where
+        C::Type: DifferentiableType,
+        C::Value: Atan2
+            + StandardNeg<Output = C::Value>
+            + StandardAdd<Output = C::Value>
+            + StandardMul<Output = C::Value>
+            + StandardDiv<Output = C::Value>
+            + ElementwiseDerivativeAlignment<C::Type>,
+    {
+        |_operation, _context, _driver, inputs| {
+            // d(atan2(y, x)) = x / (x² + y²) · dy - y / (x² + y²) · dx. The shared denominator is computed once for
+            // both terms, and each divided coefficient is formed independently, matching the primitive's numerical
+            // rule: combining the terms into one numerator can produce `inf - inf` before division for large finite
+            // inputs even when the two finite quotient terms cancel. The custom form also computes the shared
+            // denominator only once; independent per-side term expressions would recompute it.
+            check_count!("input", inputs, 2, ProgramError);
+            let y = &inputs[0];
+            let x = &inputs[1];
+            let primal = y.primal().atan2(x.primal())?;
+            let target = primal.r#type().tangent();
+            let has_y_tangent = y.tangent().as_value().is_some();
+            let has_x_tangent = x.tangent().as_value().is_some();
+            if !has_y_tangent && !has_x_tangent {
+                return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
             }
-            .into());
+            if target.is_zero_space() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("'atan2' output type {} has no tangent space", primal.r#type()),
+                }
+                .into());
+            }
+            let x_primal = x.primal().align_tangent(&target)?;
+            let y_primal = y.primal().align_tangent(&target)?;
+            let denominator = x_primal.clone() * x_primal.clone() + y_primal.clone() * y_primal.clone();
+            let y_term = y
+                .tangent()
+                .as_value()
+                .map(|tangent| {
+                    Ok::<_, DifferentiationError>(
+                        (x_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
+                    )
+                })
+                .transpose()?;
+            let x_term = x
+                .tangent()
+                .as_value()
+                .map(|tangent| {
+                    Ok::<_, DifferentiationError>(
+                        -(y_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
+                    )
+                })
+                .transpose()?;
+            let tangent = y_term
+                .into_iter()
+                .chain(x_term)
+                .reduce(|y_term, x_term| y_term + x_term)
+                .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        let x_primal = x.primal().align_tangent(&target)?;
-        let y_primal = y.primal().align_tangent(&target)?;
-        let denominator = x_primal.clone() * x_primal.clone() + y_primal.clone() * y_primal.clone();
-        let y_term = y
-            .tangent()
-            .as_value()
-            .map(|tangent| {
-                Ok::<_, DifferentiationError>(
-                    (x_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
-                )
-            })
-            .transpose()?;
-        let x_term = x
-            .tangent()
-            .as_value()
-            .map(|tangent| {
-                Ok::<_, DifferentiationError>(
-                    -(y_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
-                )
-            })
-            .transpose()?;
-        let tangent = y_term
-            .into_iter()
-            .chain(x_term)
-            .reduce(|y_term, x_term| y_term + x_term)
-            .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
+    },
+    transpose = @nonlinear,
 }
 
-impl_non_transposable_operation!(Atan2Operation);
-
-/// Value-level elementwise two-argument arc-tangent capability, computing `atan2(self, x)`. [`Atan2`] fills the same
-/// role for [`Atan2Operation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait Atan2: Sized {
+define_elementwise_capability!(
+    @binary
+    /// Value-level elementwise two-argument arc-tangent capability, computing `atan2(self, x)`. [`Atan2`] fills the
+    /// same role for [`Atan2Operation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Atan2,
     /// Computes the elementwise two-argument arc tangent `atan2(self, x)` (i.e., with this value as the `y`
     /// coordinate), promoting both operands to a common floating-point or complex element type and returning a
     /// [`ProgramError`] if something goes wrong.
-    fn atan2(&self, x: &Self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<Atan2Operation>>>> Atan2 for V {
-    #[inline]
-    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(Atan2Operation, Vec::new(), &[self.clone(), x.clone()])?.remove(0))
-    }
-}
+    atan2(x),
+    Atan2Operation,
+);
 
 #[cfg(test)]
 mod tests {
@@ -138,6 +128,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

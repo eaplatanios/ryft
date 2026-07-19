@@ -1,18 +1,11 @@
-use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
+use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
-use crate::contexts::Context;
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+use crate::differentiation::DifferentiableType;
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_differentiable_elementwise_operation,
 };
-use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
-use crate::partial::PartialValue;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
@@ -31,85 +24,31 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
-impl<C: Context> DifferentiableOperation<C> for DivOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: StandardNeg<Output = C::Value>
-        + StandardAdd<Output = C::Value>
-        + StandardMul<Output = C::Value>
-        + StandardDiv<Output = C::Value>
-        + ElementwiseDerivativeAlignment<C::Type>,
-    DivOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(x / y) = dx / y - (x / y²) · dy.
-        binary_elementwise_jvp(
-            self,
-            inputs,
-            |left, right| Ok(left.clone() / right.clone()),
-            |operands, tangent| Ok(tangent / operands.right_primal()?),
-            |operands, tangent| {
-                let right = operands.right_primal()?;
-                let coefficient = -(operands.left_primal()? / (right.clone() * right));
-                Ok(coefficient * tangent)
-            },
-        )
-    }
-}
-
-/// Transposes division when its numerator is linear and its denominator is a known runtime value.
-impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation<V, O> for DivOperation
-where
-    V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-    DivOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        if !inputs[0].is_unknown() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'div' with no linear numerator cannot be transposed".to_string(),
-            }
-            .into());
-        }
-        if inputs[1].is_unknown() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'div' with a linear denominator is nonlinear and cannot be transposed".to_string(),
-            }
-            .into());
-        }
-        let numerator_type = inputs[0].r#type().cotangent();
-        let numerator_contribution = match &outputs[0] {
-            MaybeZero::Zero(_) => MaybeZero::Zero(numerator_type),
-            MaybeZero::Value(output_cotangent) => {
-                if numerator_type.is_zero_space() {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "'div' numerator has no cotangent space".to_string(),
-                    }
-                    .into());
-                }
-                // The `is_unknown` check above guarantees the denominator is a known operand.
-                let denominator = inputs[1].as_known().unwrap();
-                let denominator = denominator.align_tangent(output_cotangent.r#type().as_ref())?;
-                MaybeZero::Value(
-                    output_cotangent.binary(&denominator, DivOperation).unalign_cotangent(&numerator_type)?,
-                )
-            }
+// Transposition accepts a linear numerator and a known denominator.
+impl_differentiable_elementwise_operation! {
+    @binary
+    DivOperation,
+    jvp<C>
+    where
+        C::Value: StandardNeg<Output = C::Value>
+            + StandardMul<Output = C::Value>
+            + StandardDiv<Output = C::Value>,
+    {
+        |(_, left_tangent), (right, _)| left_tangent / right;
+        |(left, _), (right, right_tangent)| {
+            let coefficient = -(left / (right.clone() * right));
+            coefficient * right_tangent
         };
-        Ok(vec![numerator_contribution, MaybeZero::Zero(inputs[1].r#type().cotangent())])
-    }
+    },
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<DivOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+    {
+        [numerator = @linear, denominator = @known] =>
+            |output_cotangent| output_cotangent.binary(&denominator, DivOperation);
+    },
 }
 
 define_elementwise_capability!(
@@ -118,7 +57,10 @@ define_elementwise_capability!(
     /// that [`DivOperation`] interprets through, surfacing a [`ProgramError`] when something
     /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Div`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
-    Div, div, DivOperation,
+    Div,
+    /// Divides this value by `right`, returning a [`ProgramError`] if something goes wrong.
+    div(right),
+    DivOperation,
 );
 
 define_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operation failed");
@@ -135,7 +77,7 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, gradient_holomorphic};
+    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, gradient, gradient_holomorphic};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -145,6 +87,7 @@ mod tests {
     use crate::operations::manipulation::ConvertElementType;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
+    use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;

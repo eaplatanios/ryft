@@ -1,20 +1,7 @@
-use std::ops::{Neg as StandardNeg, Sub as StandardSub};
-
-use crate::contexts::Context;
-use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_differentiable_elementwise_operation,
 };
-use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
-use crate::operations::math::NegOperation;
-use crate::partial::PartialValue;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
@@ -34,81 +21,10 @@ define_elementwise_operation!(
     check_array_types = [@same_unreduced_axes, @same_reduced_axes],
 );
 
-impl<C: Context> DifferentiableOperation<C> for SubOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: StandardNeg<Output = C::Value> + StandardSub<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
-    SubOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(x - y) = dx - dy. This rule stays hand-written instead of delegating to `binary_elementwise_jvp` because
-        // its two-sided combination is one staged `sub` instruction rather than a negated right term followed by the
-        // helper's additive combination. A structural-zero operand tangent propagates as a structural zero —
-        // including through outputs without a tangent space (e.g., integer outputs), which only reject *live*
-        // tangents.
-        check_count!("input", inputs, 2, ProgramError);
-        let primal = inputs[0].primal().clone() - inputs[1].primal().clone();
-        let left = inputs[0].tangent().as_value().cloned();
-        let right = inputs[1].tangent().as_value().cloned();
-        let target = primal.r#type().tangent();
-        if target.is_zero_space() && (left.is_some() || right.is_some()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'sub' output type {} has no tangent space", primal.r#type()),
-            }
-            .into());
-        }
-        let tangent = match (left, right) {
-            (Some(left), Some(right)) => MaybeZero::Value(left.align_tangent(&target)? - right.align_tangent(&target)?),
-            (Some(tangent), None) => MaybeZero::Value(tangent.align_tangent(&target)?),
-            (None, Some(tangent)) => MaybeZero::Value(-tangent.align_tangent(&target)?),
-            (None, None) => MaybeZero::Zero(target),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transposes subtraction by unbroadcasting the output cotangent for the left operand and its negation for the right
-/// operand. A structural-zero output cotangent propagates as structural zeros — including to operands without a
-/// cotangent space (e.g., integer operands), which only reject *live* cotangents.
-impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for SubOperation
-where
-    V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-    SubOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => inputs
-                .iter()
-                .enumerate()
-                .map(|(input_index, input)| {
-                    let target = input.r#type().cotangent();
-                    if target.is_zero_space() {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "'sub' input has no cotangent space".to_string(),
-                        }
-                        .into());
-                    }
-                    let contribution = if input_index == 0 { cotangent.clone() } else { -cotangent.clone() };
-                    Ok(MaybeZero::Value(contribution.unalign_cotangent(&target)?))
-                })
-                .collect(),
-            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect()),
-        }
-    }
+impl_differentiable_elementwise_operation! {
+    @linear
+    SubOperation,
+    rule = [@positive, @negative]
 }
 
 define_elementwise_capability!(
@@ -117,7 +33,10 @@ define_elementwise_capability!(
     /// that [`SubOperation`] interprets through, surfacing a [`ProgramError`] when something
     /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Sub`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
-    Sub, sub, SubOperation,
+    Sub,
+    /// Subtracts `right` from this value, returning a [`ProgramError`] if something goes wrong.
+    sub(right),
+    SubOperation,
 );
 
 define_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");

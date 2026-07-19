@@ -1,12 +1,8 @@
 use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 
-use crate::contexts::Context;
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, unary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::macros::{define_elementwise_capability, define_elementwise_operation, impl_non_transposable_operation};
-use crate::programs::operations::Operation;
 
 use super::Sin;
 
@@ -25,40 +21,24 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced],
 );
 
-impl<C: Context> DifferentiableOperation<C> for CosOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Sin
-        + Cos
-        + StandardNeg<Output = C::Value>
-        + StandardMul<Output = C::Value>
-        + ElementwiseDerivativeAlignment<C::Type>,
-    CosOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(cos(x)) = -sin(x) · dx.
-        unary_elementwise_jvp(
-            self,
-            inputs,
-            |input| input.cos(),
-            |operands| Ok(-(operands.input_primal()?.sin()? * operands.input_tangent()?)),
-        )
-    }
+impl_differentiable_elementwise_operation! {
+    @unary
+    CosOperation,
+    jvp<C> where C::Value: Sin + StandardNeg<Output = C::Value> + StandardMul<Output = C::Value> {
+        |(input, input_tangent)| -(input.sin()? * input_tangent)
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(CosOperation);
 
 define_elementwise_capability!(
     @unary
     /// Value-level elementwise cosine capability. [`Cos`] fills the same role for [`CosOperation`] that
     /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic
     /// [`Operation`]s.
-    Cos, cos, CosOperation,
+    Cos,
+    /// Computes [`CosOperation`] elementwise for this value.
+    cos,
+    CosOperation,
 );
 
 #[cfg(test)]

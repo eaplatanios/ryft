@@ -3,15 +3,12 @@ use std::fmt::Display;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -141,119 +138,111 @@ where
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context> PartiallyEvaluatableOperation<C> for SelectOperation where C::Operation: From<SelectOperation> {}
 
-/// Forward-mode rule for [`SelectOperation`]: the primal output is `select(condition, on_true, on_false)` over
-/// the input primals, and the tangent selects the branch tangents under the *same* primal condition (a `select` is
-/// piecewise linear in its branches), with the condition carried as an ordinary primal operand edge. When both branch
-/// tangents are structural zeros, the output tangent is a structural zero of the output type.
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for SelectOperation
-where
-    C::Type: DifferentiableType,
-    C::Operation: From<SelectOperation>,
-    C::Value: ElementwiseDerivativeAlignment<C::Type>,
-    SelectOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 3, ProgramError);
-        let condition = &inputs[0];
-        let on_true = &inputs[1];
-        let on_false = &inputs[2];
-        // Bind the primal and tangent selects through the context rather than the value-level `Select` capability:
-        // binding works uniformly under staging and eager contexts, whereas eager value types select over their own
-        // condition representations (for example, `Scalar` selects over `bool`).
-        let mut primal = context.bind(
-            SelectOperation,
-            Vec::new(),
-            &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
-        )?;
-        check_count!("output", primal, 1, ProgramError);
-        let primal = primal.remove(0);
-        let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent())
-        } else {
-            // A select needs both branch tangents as real values, so materialize the structurally zero side.
-            let on_true_tangent = on_true.tangent().clone().materialize(context)?;
-            let on_false_tangent = on_false.tangent().clone().materialize(context)?;
-            let mut tangents = context.bind(
+impl_differentiable_elementwise_operation! {
+    @custom
+    SelectOperation,
+    /// Forward-mode rule for [`SelectOperation`]: the primal output is `select(condition, on_true, on_false)` over
+    /// the input primals, and the tangent selects the branch tangents under the *same* primal condition (a `select` is
+    /// piecewise linear in its branches), with the condition carried as an ordinary primal operand edge. When both
+    /// branch tangents are structural zeros, the output tangent is a structural zero of the output type.
+    jvp<C>
+    where
+        C: Zero<C::Value>,
+        C::Type: DifferentiableType,
+        C::Operation: From<SelectOperation>,
+        C::Value: ElementwiseDerivativeAlignment<C::Type>,
+    {
+        |_operation, context, _driver, inputs| {
+            check_count!("input", inputs, 3, ProgramError);
+            let condition = &inputs[0];
+            let on_true = &inputs[1];
+            let on_false = &inputs[2];
+            // Bind the primal and tangent selects through the context rather than the value-level `Select` capability:
+            // binding works uniformly under staging and eager contexts, whereas eager value types select over their own
+            // condition representations (for example, `Scalar` selects over `bool`).
+            let mut primal = context.bind(
                 SelectOperation,
                 Vec::new(),
-                &[condition.primal().clone(), on_true_tangent, on_false_tangent],
+                &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
             )?;
-            check_count!("output", tangents, 1, ProgramError);
-            let output_tangent_type = primal.r#type().tangent();
-            MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type)?)
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Partition-aware transpose rule for [`SelectOperation`]. The Boolean condition (operand 0) has no tangent space,
-/// so in a valid pushforward it is the known operand and the two branches (operands 1 and 2) are the linear ones.
-/// The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the output cotangent into the
-/// branch the known condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
-/// `on_false` cotangent is `select(condition, 0, cotangent)`, each staged as a primal `select` over the condition
-/// read from the pullback through the known operand's value. The condition receives a structural zero, and a zero
-/// output cotangent stays a structural zero.
-///
-/// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`), the
-/// known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore
-/// applies to both the array [`ArrayOperation::Select`](crate::backends::arrays::ArrayOperation) and the scalar
-/// [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
-impl<V: Value, O> TransposableOperation<V, O> for SelectOperation
-where
-    V::Type: DifferentiableType,
-    SelectOperation: Operation<V::Type>,
-    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 3, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs
-                .iter()
-                .map(|input| {
-                    let input_type = input.r#type();
-                    MaybeZero::Zero(input_type.cotangent())
-                })
-                .collect()),
-            MaybeZero::Value(cotangent) => {
-                // The condition is the known operand; the dispatch guarantees a `Known` operand carries its pullback
-                // value, so read the tracer directly.
-                let condition = inputs[0]
-                    .as_known()
-                    .expect("dispatch guarantees a known operand carries its pullback value")
-                    .clone();
-                let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
-                let on_true = context.stage_operation(
+            check_count!("output", primal, 1, ProgramError);
+            let primal = primal.remove(0);
+            let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
+                MaybeZero::Zero(primal.r#type().tangent())
+            } else {
+                // A select needs both branch tangents as real values, so materialize the structurally zero side.
+                let on_true_tangent = on_true.tangent().clone().materialize(context)?;
+                let on_false_tangent = on_false.tangent().clone().materialize(context)?;
+                let mut tangents = context.bind(
                     SelectOperation,
                     Vec::new(),
-                    &[condition.clone(), cotangent.clone(), zero.clone()],
+                    &[condition.primal().clone(), on_true_tangent, on_false_tangent],
                 )?;
-                check_count!("output", on_true, 1, ProgramError);
-                let on_false =
-                    context.stage_operation(SelectOperation, Vec::new(), &[condition, zero, cotangent.clone()])?;
-                check_count!("output", on_false, 1, ProgramError);
-                let on_true_type = inputs[1].r#type().cotangent();
-                let on_false_type = inputs[2].r#type().cotangent();
-                Ok(vec![
-                    MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                    MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
-                    MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
-                ])
+                check_count!("output", tangents, 1, ProgramError);
+                let output_tangent_type = primal.r#type().tangent();
+                MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type)?)
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+
+    /// Partition-aware transpose rule for [`SelectOperation`]. The Boolean condition (operand 0) has no tangent space,
+    /// so in a valid pushforward it is the known operand and the two branches (operands 1 and 2) are the linear ones.
+    /// The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the output cotangent into the
+    /// branch the known condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
+    /// `on_false` cotangent is `select(condition, 0, cotangent)`, each staged as a primal `select` over the condition
+    /// read from the pullback through the known operand's value. The condition receives a structural zero, and a zero
+    /// output cotangent stays a structural zero.
+    ///
+    /// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`),
+    /// the known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It
+    /// therefore applies to both the array [`ArrayOperation::Select`](crate::backends::arrays::ArrayOperation) and the
+    /// scalar [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<ZeroOperation<V::Type>> + From<SelectOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+    {
+        |_operation, context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 3, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(inputs
+                    .iter()
+                    .map(|input| {
+                        let input_type = input.r#type();
+                        MaybeZero::Zero(input_type.cotangent())
+                    })
+                    .collect()),
+                MaybeZero::Value(cotangent) => {
+                    // The condition is the known operand; the dispatch guarantees a `Known` operand carries its
+                    // pullback value, so read the tracer directly.
+                    let condition = inputs[0]
+                        .as_known()
+                        .expect("dispatch guarantees a known operand carries its pullback value")
+                        .clone();
+                    let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
+                    let on_true = context.stage_operation(
+                        SelectOperation,
+                        Vec::new(),
+                        &[condition.clone(), cotangent.clone(), zero.clone()],
+                    )?;
+                    check_count!("output", on_true, 1, ProgramError);
+                    let on_false =
+                        context.stage_operation(SelectOperation, Vec::new(), &[condition, zero, cotangent.clone()])?;
+                    check_count!("output", on_false, 1, ProgramError);
+                    let on_true_type = inputs[1].r#type().cotangent();
+                    let on_false_type = inputs[2].r#type().cotangent();
+                    Ok(vec![
+                        MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                        MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
+                        MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
+                    ])
+                }
             }
         }
-    }
+    },
 }
 
 /// Represents the ability to perform an elementwise selection between two values driven by a condition. This is the

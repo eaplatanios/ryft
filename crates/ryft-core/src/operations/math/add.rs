@@ -1,19 +1,7 @@
-use std::ops::Add as StandardAdd;
-
-use crate::contexts::Context;
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_differentiable_elementwise_operation,
 };
-use crate::macros::{check_count, define_elementwise_capability, define_elementwise_operation, define_tracer_operator};
-use crate::partial::PartialValue;
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
@@ -32,64 +20,10 @@ define_elementwise_operation!(
     check_array_types = [@same_unreduced_axes, @same_reduced_axes],
 );
 
-impl<C: Context> DifferentiableOperation<C> for AddOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: StandardAdd<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
-    AddOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(x + y) = dx + dy.
-        binary_elementwise_jvp(
-            self,
-            inputs,
-            |left, right| Ok(left.clone() + right.clone()),
-            |_, tangent| Ok(tangent),
-            |_, tangent| Ok(tangent),
-        )
-    }
-}
-
-/// Transposes addition by unbroadcasting its output cotangent to each operand's exact cotangent type. A
-/// structural-zero output cotangent propagates as structural zeros — including to operands without a cotangent space
-/// (e.g., integer operands), which only reject *live* cotangents.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
-where
-    V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-    AddOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect()),
-            MaybeZero::Value(cotangent) => inputs
-                .iter()
-                .map(|input| {
-                    let target = input.r#type().cotangent();
-                    if target.is_zero_space() {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "'add' input has no cotangent space".to_string(),
-                        }
-                        .into());
-                    }
-                    Ok(MaybeZero::Value(cotangent.unalign_cotangent(&target)?))
-                })
-                .collect(),
-        }
-    }
+impl_differentiable_elementwise_operation! {
+    @linear
+    AddOperation,
+    rule = [@positive, @positive]
 }
 
 define_elementwise_capability!(
@@ -98,7 +32,10 @@ define_elementwise_capability!(
     /// [`AddOperation`] interprets through, surfacing a [`ProgramError`] when something goes
     /// wrong, instead of panicking. Value types additionally provide [`std::ops::Add`] as ergonomic (albeit
     /// panicking) sugar layered on top of this capability.
-    Add, add, AddOperation,
+    Add,
+    /// Adds `right` to this value, returning a [`ProgramError`] if something goes wrong.
+    add(right),
+    AddOperation,
 );
 
 define_tracer_operator!(@binary std::ops::Add, add, AddOperation, "`add` operation failed");

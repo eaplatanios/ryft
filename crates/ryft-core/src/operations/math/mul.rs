@@ -1,287 +1,147 @@
 use std::collections::BTreeSet;
-use std::fmt::Display;
-use std::ops::{Add as StandardAdd, Mul as StandardMul};
+use std::ops::Mul as StandardMul;
 
-use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, Domain};
-use crate::differentiation::elementwise::{ElementwiseDerivativeAlignment, binary_elementwise_jvp};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+use crate::differentiation::DifferentiableType;
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
+use crate::macros::{
+    define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
+    impl_differentiable_elementwise_operation,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, define_tracer_operator};
 use crate::operations::ElementwiseOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::types::TypeError;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
+use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
 
-/// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting their
-/// shapes. Its bilinear reduction-state rule permits one unreduced operand only when the other operand is reduced over
-/// exactly the same mesh axes.
-#[derive(Clone, Debug, Default)]
-pub struct MulOperation;
+/// Infers multiplication output array types using its bilinear reduction-state rule.
+fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
+    // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
+    // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
+    // and the recomputed state is reattached afterward.
+    let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
+    let output = MulOperation.broadcast_output_type(&stripped)?;
+    let left_unreduced = input_types[0].unreduced_axes();
+    let left_reduced = input_types[0].reduced_axes();
+    let right_unreduced = input_types[1].unreduced_axes();
+    let right_reduced = input_types[1].reduced_axes();
 
-impl Display for MulOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(MUL_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for MulOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        MUL_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        check_types!(@numeric, MUL_OPERATION_NAME, input_types);
-        input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
-        })
-    }
-}
-
-impl Operation<ArrayType> for MulOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        MUL_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for MulOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        2
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
-        // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
-        // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
-        // and the recomputed state is reattached afterward.
-        check_count!("input", input_types, 2, TypeError);
-        check_types!(@numeric, MUL_OPERATION_NAME, [
-            input_types[0].data_type(),
-            input_types[1].data_type(),
-        ]);
-        let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
-        let output = self.broadcast_output_type(&stripped)?;
-        let left_unreduced = input_types[0].unreduced_axes();
-        let left_reduced = input_types[0].reduced_axes();
-        let right_unreduced = input_types[1].unreduced_axes();
-        let right_reduced = input_types[1].reduced_axes();
-
-        // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of
-        // two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
-        // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
-        // consumed when the reduced set is computed below).
-        let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
-            (false, false) => {
+    // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of
+    // two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
+    // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
+    // consumed when the reduced set is computed below).
+    let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
+        (false, false) => {
+            return Err(TypeError {
+                message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
+            });
+        }
+        (false, true) => {
+            if left_unreduced != right_reduced {
                 return Err(TypeError {
-                    message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
+                    message: format!(
+                        "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
+                             the first is unreduced over",
+                    ),
                 });
             }
-            (false, true) => {
-                if left_unreduced != right_reduced {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
-                             the first is unreduced over",
-                        ),
-                    });
-                }
-                left_unreduced.clone()
-            }
-            (true, false) => {
-                if right_unreduced != left_reduced {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
-                             the second is unreduced over",
-                        ),
-                    });
-                }
-                right_unreduced.clone()
-            }
-            (true, true) => BTreeSet::new(),
-        };
-
-        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
-        // partial-sum-times-reduced case above; a one-sided marker without a matching unreduced operand would
-        // incorrectly propagate reduction state from only one input.
-        let mut output_reduced = if left_reduced == right_reduced {
-            left_reduced.clone()
-        } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
-            right_reduced.clone()
-        } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
-            left_reduced.clone()
-        } else {
-            return Err(TypeError {
-                message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
-            });
-        };
-        output_reduced.retain(|axis| !output_unreduced.contains(axis));
-
-        // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
-        // of reduction axes) carries a sharding onto which the recomputed state is reattached; otherwise it is already
-        // correct as is.
-        if output_unreduced.is_empty() && output_reduced.is_empty() {
-            return Ok(vec![output]);
+            left_unreduced.clone()
         }
-        let sharding = output.sharding().expect("bilinear reduction state implies a sharded output");
-        let rebuilt = sharding
-            .clone()
-            .with_unreduced_axes(output_unreduced)
-            .map_err(|error| TypeError { message: error.to_string() })?
-            .with_reduced_axes(output_reduced)
-            .map_err(|error| TypeError { message: error.to_string() })?;
-        Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
-    }
-}
-
-impl<C: Domain<Value: Mul>> InterpretableOperation<C> for MulOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].mul(&inputs[1])?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for MulOperation where C::Operation: From<MulOperation> {}
-
-impl<C: Context> DifferentiableOperation<C> for MulOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: StandardAdd<Output = C::Value> + StandardMul<Output = C::Value> + ElementwiseDerivativeAlignment<C::Type>,
-    MulOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // d(x · y) = y · dx + x · dy.
-        binary_elementwise_jvp(
-            self,
-            inputs,
-            |left, right| Ok(left.clone() * right.clone()),
-            |operands, tangent| Ok(operands.right_primal()? * tangent),
-            |operands, tangent| Ok(operands.left_primal()? * tangent),
-        )
-    }
-}
-
-/// Transposes multiplication when exactly one operand is linear and the other is a known runtime value.
-/// Multiplication by that known value is self-adjoint under Ryft's bilinear cotangent pairing. The contribution is
-/// unbroadcast to the linear operand's exact cotangent type, while the known operand receives a structural zero.
-impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation<V, O> for MulOperation
-where
-    V::Type: DifferentiableType,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
-    MulOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let (linear_index, known_index) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
-            (true, false) => (0, 1),
-            (false, true) => (1, 0),
-            (true, true) => {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "bilinear 'mul' with two linear operands cannot be transposed".to_string(),
-                }
-                .into());
+        (true, false) => {
+            if right_unreduced != left_reduced {
+                return Err(TypeError {
+                    message: format!(
+                        "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
+                             the second is unreduced over",
+                    ),
+                });
             }
-            (false, false) => {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "'mul' with no linear operand cannot be transposed".to_string(),
-                }
-                .into());
-            }
-        };
-        let target = inputs[linear_index].r#type().cotangent();
-        let contribution = match &outputs[0] {
-            MaybeZero::Zero(_) => MaybeZero::Zero(target),
-            MaybeZero::Value(output_cotangent) => {
-                if target.is_zero_space() {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "'mul' linear input has no cotangent space".to_string(),
-                    }
-                    .into());
-                }
-                // The `is_unknown` match above guarantees the selected operand is a known operand.
-                let known_value = inputs[known_index].as_known().unwrap();
-                let output_type = output_cotangent.r#type();
-                let contribution =
-                    known_value.align_tangent(output_type.as_ref())?.binary(output_cotangent, MulOperation);
-                MaybeZero::Value(contribution.unalign_cotangent(&target)?)
-            }
-        };
-        let mut contributions =
-            inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect::<Vec<_>>();
-        contributions[linear_index] = contribution;
-        Ok(contributions)
+            right_unreduced.clone()
+        }
+        (true, true) => BTreeSet::new(),
+    };
+
+    // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
+    // partial-sum-times-reduced case above; a one-sided marker without a matching unreduced operand would
+    // incorrectly propagate reduction state from only one input.
+    let mut output_reduced = if left_reduced == right_reduced {
+        left_reduced.clone()
+    } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
+        right_reduced.clone()
+    } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
+        left_reduced.clone()
+    } else {
+        return Err(TypeError {
+            message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
+        });
+    };
+    output_reduced.retain(|axis| !output_unreduced.contains(axis));
+
+    // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
+    // of reduction axes) carries a sharding onto which the recomputed state is reattached; otherwise it is already
+    // correct as is.
+    if output_unreduced.is_empty() && output_reduced.is_empty() {
+        return Ok(vec![output]);
     }
+    let sharding = output.sharding().expect("bilinear reduction state implies a sharded output");
+    let rebuilt = sharding
+        .clone()
+        .with_unreduced_axes(output_unreduced)
+        .map_err(|error| TypeError { message: error.to_string() })?
+        .with_reduced_axes(output_reduced)
+        .map_err(|error| TypeError { message: error.to_string() })?;
+    Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
 }
 
-/// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to [`std::ops::Mul`]
-/// that [`MulOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
-/// panicking. Value types additionally provide [`std::ops::Mul`] as ergonomic (albeit panicking) sugar layered on top
-/// of this capability.
-pub trait Mul: Sized {
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting
+    /// their shapes. Its bilinear reduction-state rule permits one unreduced operand only when the other operand is
+    /// reduced over exactly the same mesh axes.
+    MulOperation, MUL_OPERATION_NAME,
+    Mul, mul,
+    infer_array_types = infer_mul_output_array_types,
+    check_data_types = [@numeric],
+);
+
+// Transposition accepts exactly one linear operand and scales its output cotangent by the other, known operand. The
+// contribution is unbroadcast to the linear operand's exact cotangent type, while the known operand receives a
+// structural zero.
+impl_differentiable_elementwise_operation! {
+    @binary
+    MulOperation,
+    jvp<C> where C::Value: StandardMul<Output = C::Value> {
+        |(_, left_tangent), (right, _)| right * left_tangent;
+        |(left, _), (_, right_tangent)| left * right_tangent;
+    },
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<MulOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
+    {
+        [left = @linear, right = @known] =>
+            |output_cotangent| right.binary(output_cotangent, MulOperation);
+        [left = @known, right = @linear] =>
+            |output_cotangent| left.binary(output_cotangent, MulOperation);
+    },
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to
+    /// [`std::ops::Mul`] that [`MulOperation`] interprets through, surfacing a [`ProgramError`] when something goes
+    /// wrong, instead of panicking. Value types additionally provide [`std::ops::Mul`] as ergonomic (albeit panicking)
+    /// sugar layered on top of this capability.
+    Mul,
     /// Multiplies `self` by `right`, returning a [`ProgramError`] if something goes wrong.
-    fn mul(&self, right: &Self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<MulOperation>>>> Mul for V {
-    #[inline]
-    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(MulOperation, Vec::new(), &[self.clone(), right.clone()])?.remove(0))
-    }
-}
+    mul(right),
+    MulOperation,
+);
 
 define_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operation failed");
 
@@ -298,6 +158,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, gradient_holomorphic};
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition,
@@ -306,10 +167,11 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::types::{Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 

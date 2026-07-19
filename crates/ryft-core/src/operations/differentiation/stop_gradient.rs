@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
@@ -96,9 +96,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for StopGradientOperation wher
 {
 }
 
-impl_non_differentiable_operation!(StopGradientOperation);
-
-impl_non_transposable_operation!(StopGradientOperation);
+impl_differentiable_elementwise_operation!(@non_differentiable StopGradientOperation);
 
 /// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
 /// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).

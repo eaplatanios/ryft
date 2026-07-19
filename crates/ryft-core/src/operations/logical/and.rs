@@ -1,6 +1,6 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_differentiable_elementwise_operation,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -18,8 +18,7 @@ define_elementwise_operation!(
     And, and,
 );
 
-impl_non_differentiable_operation!(AndOperation);
-impl_non_transposable_operation!(AndOperation);
+impl_differentiable_elementwise_operation!(@non_differentiable AndOperation);
 
 define_elementwise_capability!(
     @binary
@@ -28,7 +27,10 @@ define_elementwise_capability!(
     /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
     /// support conjunction), instead of panicking. Value types additionally provide [`std::ops::BitAnd`] as
     /// ergonomic (albeit panicking) sugar layered on top of this capability.
-    And, and, AndOperation,
+    And,
+    /// Computes [`AndOperation`] elementwise for this value and `right`.
+    and(right),
+    AndOperation,
 );
 
 define_tracer_operator!(@binary std::ops::BitAnd, bitand, AndOperation, "`and` operation failed");

@@ -1,18 +1,15 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableType;
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
-use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
@@ -72,22 +69,7 @@ impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation
 
 impl<C: Context<Operation: From<ZeroLikeOperation>>> PartiallyEvaluatableOperation<C> for ZeroLikeOperation {}
 
-impl_non_differentiable_operation!(ZeroLikeOperation);
-
-impl<V: Value<Type: DifferentiableType>, O: Operation<V::Type>> TransposableOperation<V, O> for ZeroLikeOperation {
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_type = inputs[0].r#type();
-        Ok(vec![MaybeZero::Zero(input_type.cotangent())])
-    }
-}
+impl_differentiable_elementwise_operation!(@constant ZeroLikeOperation);
 
 /// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to [`Zero`](super::Zero).
 /// It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.

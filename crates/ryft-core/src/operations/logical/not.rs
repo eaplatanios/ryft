@@ -1,6 +1,6 @@
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_differentiable_elementwise_operation,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -18,8 +18,7 @@ define_elementwise_operation!(
     Not, not,
 );
 
-impl_non_differentiable_operation!(NotOperation);
-impl_non_transposable_operation!(NotOperation);
+impl_differentiable_elementwise_operation!(@non_differentiable NotOperation);
 
 define_elementwise_capability!(
     @unary
@@ -28,7 +27,10 @@ define_elementwise_capability!(
     /// goes wrong (e.g., when a value's data type does not support negation), instead of panicking. Value types
     /// additionally provide [`std::ops::Not`] as ergonomic (albeit panicking) sugar layered on top of this
     /// capability.
-    Not, not, NotOperation,
+    Not,
+    /// Computes [`NotOperation`] elementwise for this value.
+    not,
+    NotOperation,
 );
 
 define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");

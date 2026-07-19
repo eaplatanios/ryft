@@ -1,33 +1,27 @@
-use std::fmt::Display;
 use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
 
-use crate::contexts::{Context, Domain};
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_differentiable_elementwise_operation};
-use crate::operations::ElementwiseOperation;
+use crate::macros::{
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::{OneLike, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
-use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType};
+use crate::types::DataType;
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
-/// Infers the result [`DataType`] of an absolute-value operation for one input element type.
-fn infer_abs_output_data_type(input_type: DataType) -> Result<DataType, TypeError> {
-    match input_type {
+/// Infers the result [`DataType`]s of an absolute-value operation from its input element data types.
+fn infer_abs_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    let output_type = match input_types[0] {
         DataType::I2
         | DataType::I4
         | DataType::I8
@@ -48,106 +42,37 @@ fn infer_abs_output_data_type(input_type: DataType) -> Result<DataType, TypeErro
         | DataType::BF16
         | DataType::F16
         | DataType::F32
-        | DataType::F64 => Ok(input_type),
-        DataType::C64 => Ok(DataType::F32),
-        DataType::C128 => Ok(DataType::F64),
+        | DataType::F64 => input_types[0],
+        DataType::C64 => DataType::F32,
+        DataType::C128 => DataType::F64,
         input_type => Err(TypeError {
             message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-        }),
-    }
+        })?,
+    };
+    Ok(vec![output_type])
 }
 
-/// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|` on
-/// complex operands with a real result) while preserving all other type metadata. Inputs that still represent partial
-/// sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial-sum
-/// semantics. Matching the operand constraints of [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs),
-/// signed-integer (including the sub-byte `si2` and `si4` types, with the minimum value wrapping to itself),
-/// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, structural-zero, and
-/// single-bit `si1` inputs (whose only negative value `-1` has no representable absolute value) are rejected.
-#[derive(Clone, Debug, Default)]
-pub struct AbsOperation;
-
-impl Display for AbsOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(ABS_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for AbsOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        ABS_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![infer_abs_output_data_type(input_types[0])?])
-    }
-}
-
-impl Operation<ArrayType> for AbsOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        ABS_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for AbsOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // The absolute value maps complex element types to their real part data type while preserving all other
-        // metadata, so the generic broadcasting default does not apply.
-        check_count!("input", input_types, 1, TypeError);
-        check_types!(@no_unreduced, ABS_OPERATION_NAME, input_types);
-        Ok(vec![ArrayType {
-            data_type: infer_abs_output_data_type(input_types[0].data_type())?,
-            ..input_types[0].clone()
-        }])
-    }
-}
-
-impl<C: Domain<Value: Abs>> InterpretableOperation<C> for AbsOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].abs()?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Operation: From<AbsOperation> {}
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|`
+    /// on complex operands with a real result) while preserving all other type metadata. Inputs that still represent
+    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve
+    /// partial-sum semantics. Matching the operand constraints of
+    /// [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs), signed-integer (including the sub-byte `si2` and
+    /// `si4` types, with the minimum value wrapping to itself), floating-point, and complex inputs are supported,
+    /// while unsigned-integer, Boolean, token, structural-zero, and single-bit `si1` inputs (whose only negative value
+    /// `-1` has no representable absolute value) are rejected.
+    AbsOperation, ABS_OPERATION_NAME,
+    Abs, abs,
+    infer_data_types = infer_abs_output_data_types,
+    check_array_types = [@no_unreduced],
+);
 
 impl_differentiable_elementwise_operation! {
     @custom
-    impl<C> AbsOperation
-    where {
+    AbsOperation,
+    jvp<C>
+    where
         C::Type: DifferentiableType,
         C::Value: Abs
             + Compare<Output = C::Value>
@@ -163,72 +88,70 @@ impl_differentiable_elementwise_operation! {
             + StandardMul<Output = C::Value>
             + StandardDiv<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
-    }
-    jvp |_operation, _context, _driver, inputs| {
-        // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ
-        // map with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`; at the
-        // complex origin, replace the zero denominator with one so the zero numerator yields zero. These conventions
-        // keep the rule finite and stable under higher-order transforms. A structural zero tangent stays symbolic,
-        // retyped to the real output's tangent type.
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().abs()?;
-        let target = primal.r#type().tangent();
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(target),
-            MaybeZero::Value(_) if target.is_zero_space() => {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!("'abs' output type {} has no tangent space", primal.r#type()),
+    {
+        |_operation, _context, _driver, inputs| {
+            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a
+            // ℂ → ℝ map with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return
+            // `dx`; at the complex origin, replace the zero denominator with one so the zero numerator yields zero.
+            // These conventions keep the rule finite and stable under higher-order transforms. A structural zero
+            // tangent stays symbolic, retyped to the real output's tangent type.
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().abs()?;
+            let target = primal.r#type().tangent();
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(target),
+                MaybeZero::Value(_) if target.is_zero_space() => {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!("'abs' output type {} has no tangent space", primal.r#type()),
+                    }
+                    .into());
                 }
-                .into());
-            }
-            MaybeZero::Value(tangent) => {
-                if input.primal().r#type().is_complex() {
-                    let denominator = primal.align_tangent(&target)?;
-                    let zero = denominator.zero_like();
-                    let one = denominator.one_like();
-                    let denominator_is_zero =
-                        denominator.compare(&zero, ComparisonDirection::Equal)?.select_condition()?;
-                    let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
-                    // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
-                    // algebraically equivalent but can overflow even when the final directional derivative is finite.
-                    let conjugate = input.primal().conjugate()?;
-                    let coefficient =
-                        (conjugate.real()? / denominator.clone()).complex(&(conjugate.imaginary()? / denominator))?;
-                    let input_target = input.primal().r#type().tangent();
-                    MaybeZero::Value(
-                        (tangent.align_tangent(&input_target)? * coefficient).real()?.align_tangent(&target)?,
-                    )
-                } else {
-                    let input = input.primal().align_tangent(&target)?;
-                    let tangent = tangent.align_tangent(&target)?;
-                    let zero = input.zero_like();
-                    let nonnegative =
-                        input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
-                    MaybeZero::Value(C::Value::select(&nonnegative, &tangent, &-tangent.clone())?)
+                MaybeZero::Value(tangent) => {
+                    if input.primal().r#type().is_complex() {
+                        let denominator = primal.align_tangent(&target)?;
+                        let zero = denominator.zero_like();
+                        let one = denominator.one_like();
+                        let denominator_is_zero =
+                            denominator.compare(&zero, ComparisonDirection::Equal)?.select_condition()?;
+                        let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
+                        // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
+                        // algebraically equivalent but can overflow even when the final directional derivative is
+                        // finite.
+                        let conjugate = input.primal().conjugate()?;
+                        let coefficient =
+                            (conjugate.real()? / denominator.clone()).complex(&(conjugate.imaginary()? / denominator))?;
+                        let input_target = input.primal().r#type().tangent();
+                        MaybeZero::Value(
+                            (tangent.align_tangent(&input_target)? * coefficient).real()?.align_tangent(&target)?,
+                        )
+                    } else {
+                        let input = input.primal().align_tangent(&target)?;
+                        let tangent = tangent.align_tangent(&target)?;
+                        let zero = input.zero_like();
+                        let nonnegative =
+                            input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
+                        MaybeZero::Value(C::Value::select(&nonnegative, &tangent, &-tangent.clone())?)
+                    }
                 }
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-    transpose = @nonlinear;
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose = @nonlinear,
 }
 
-/// Value-level elementwise absolute-value capability. [`Abs`] fills the same role for [`AbsOperation`] that
-/// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait Abs: Sized {
+define_elementwise_capability!(
+    @unary
+    /// Value-level elementwise absolute-value capability. [`Abs`] fills the same role for [`AbsOperation`] that
+    /// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Abs,
     /// Computes the elementwise absolute value of this value (i.e., the magnitude for complex values, with a real
     /// result), returning a [`ProgramError`] if something goes wrong (e.g., when the value's data type carries no
     /// absolute value, such as a Boolean).
-    fn abs(&self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<AbsOperation>>>> Abs for V {
-    #[inline]
-    fn abs(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(AbsOperation, Vec::new(), std::slice::from_ref(self))?.remove(0))
-    }
-}
+    abs,
+    AbsOperation,
+);
 
 #[cfg(test)]
 mod tests {
@@ -241,6 +164,7 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition,
@@ -249,6 +173,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::ForwardModeDifferentiate;

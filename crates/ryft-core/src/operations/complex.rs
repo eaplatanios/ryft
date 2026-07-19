@@ -1,22 +1,11 @@
-use std::fmt::Display;
-
-use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::macros::{
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::operations::ElementwiseOperation;
 use crate::operations::constants::{Zero, ZeroLikeOperation};
 use crate::operations::math::NegOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
+use crate::programs::MaybeZero;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
@@ -53,619 +42,336 @@ fn complex_to_part_data_type(complex: DataType, op: &'static str) -> Result<Data
     }
 }
 
-/// [`Operation`] that constructs a complex value from its real and imaginary parts (i.e., `(re, im) ↦ re + im·i`,
-/// with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This is the analogue of
-/// [JAX's `lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of the
-/// [`RealOperation`]/[`ImaginaryOperation`] pair. The two parts must have identical types.
-///
-/// As a map from the pair of real parts, the operation is linear, and its transpose is the
-/// `ȳ ↦ (real(ȳ), imaginary(-ȳ))` pair under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition
-/// uses over complex types.
-#[derive(Clone, Debug, Default)]
-pub struct ComplexOperation;
-
-impl Display for ComplexOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(COMPLEX_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for ComplexOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        COMPLEX_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        if input_types[0] != input_types[1] {
-            return Err(TypeError {
-                message: format!(
-                    "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
-                    input_types[0], input_types[1],
-                ),
-            });
-        }
-        Ok(vec![part_to_complex_data_type(input_types[0].clone(), COMPLEX_OPERATION_NAME)?])
-    }
-}
-
-impl Operation<ArrayType> for ComplexOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        COMPLEX_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        if input_types[0] != input_types[1] {
-            return Err(TypeError {
-                message: format!(
-                    "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
-                    input_types[0], input_types[1],
-                ),
-            });
-        }
-        let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
-        Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
-    }
-}
-
-impl ElementwiseOperation for ComplexOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        2
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
-    }
-}
-
-impl<C: Domain<Value: Complex>> InterpretableOperation<C> for ComplexOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].complex(&inputs[1])?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for ComplexOperation where C::Operation: From<ComplexOperation> {}
-
-impl<C: Context> DifferentiableOperation<C> for ComplexOperation
-where
-    C::Type: DifferentiableType,
-    C: Zero<C::Value>,
-    C::Value: Complex,
-    ComplexOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let real = &inputs[0];
-        let imaginary = &inputs[1];
-        let primal = real.primal().complex(imaginary.primal())?;
-        // Complex construction is linear in its two real parts: `d(complex(re, im)) = complex(dre, dim)`. When both
-        // part tangents are structural zeros the output tangent stays a symbolic zero of the complex output type;
-        // when only one is, the missing part is materialized as a real zero through the context so the staged
-        // `complex` keeps its two-part arity.
-        let tangent = match (real.tangent(), imaginary.tangent()) {
-            (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()),
-            (real_tangent, imaginary_tangent) => MaybeZero::Value(
-                real_tangent
-                    .clone()
-                    .materialize(context)?
-                    .complex(&imaginary_tangent.clone().materialize(context)?)?,
+/// Infers complex-construction output data types from its real and imaginary part data types.
+fn infer_complex_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    if input_types[0] != input_types[1] {
+        return Err(TypeError {
+            message: format!(
+                "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
+                input_types[0], input_types[1],
             ),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        });
     }
+    Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
 }
 
-/// Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-/// Ryft's transposition uses over complex types, the transpose of `(re, im) ↦ re + im·i` maps the output cotangent
-/// `ȳ` to the part cotangents `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against `(re, im)` picks out
-/// the real part of `ȳ` for `re` and the *negated* imaginary part for `im`. Like the `Add` rule, known-ness is
-/// ignored — a known part contributes an additive constant whose adjoint is dropped at the pullback output boundary.
-impl<V: Value, O> TransposableOperation<V, O> for ComplexOperation
-where
-    V::Type: DifferentiableType,
-    O: Operation<V::Type> + From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
-    ComplexOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect(),
-            MaybeZero::Value(output_cotangent) => vec![
-                MaybeZero::Value(output_cotangent.unary(RealOperation)),
-                MaybeZero::Value(output_cotangent.unary(NegOperation).unary(ImaginaryOperation)),
-            ],
-        })
+/// Infers complex-construction output array types while requiring structurally identical part types.
+fn infer_complex_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    if input_types[0] != input_types[1] {
+        return Err(TypeError {
+            message: format!(
+                "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
+                input_types[0], input_types[1],
+            ),
+        });
     }
+    let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
+    Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
 }
 
-/// Value-level capability that constructs a complex value from this value as the real part and `imaginary` as the
-/// imaginary part. [`Complex`] fills the same role for [`ComplexOperation`] that [`Sin`](crate::Sin) fills for
-/// [`SinOperation`](crate::SinOperation).
-pub trait Complex: Sized {
+/// Infers complex-conjugation output data types.
+fn infer_conjugate_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    complex_to_part_data_type(input_types[0], CONJUGATE_OPERATION_NAME)?;
+    Ok(vec![input_types[0]])
+}
+
+/// Infers real-part extraction output data types.
+fn infer_real_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    Ok(vec![complex_to_part_data_type(input_types[0], REAL_OPERATION_NAME)?])
+}
+
+/// Infers imaginary-part extraction output data types.
+fn infer_imaginary_output_data_types(input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    Ok(vec![complex_to_part_data_type(input_types[0], IMAGINARY_OPERATION_NAME)?])
+}
+
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`] that constructs a complex value from its real and imaginary parts (i.e., `(re, im) ↦ re + im·i`,
+    /// with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This is the analogue of
+    /// [JAX's `lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of the
+    /// [`RealOperation`]/[`ImaginaryOperation`] pair. The two parts must have identical types.
+    ///
+    /// As a map from the pair of real parts, the operation is linear, and its transpose is the
+    /// `ȳ ↦ (real(ȳ), imaginary(-ȳ))` pair under the bilinear (i.e., conjugation-free) pairing that Ryft's
+    /// transposition uses over complex types.
+    ComplexOperation, COMPLEX_OPERATION_NAME,
+    Complex, complex,
+    infer_data_types = infer_complex_output_data_types,
+    infer_array_types = infer_complex_output_array_types,
+);
+
+impl_differentiable_elementwise_operation! {
+    @custom
+    ComplexOperation,
+    jvp<C>
+    where
+        C::Type: DifferentiableType,
+        C: Zero<C::Value>,
+        C::Value: Complex,
+    {
+        |_operation, context, _driver, inputs| {
+            check_count!("input", inputs, 2, ProgramError);
+            let real = &inputs[0];
+            let imaginary = &inputs[1];
+            let primal = real.primal().complex(imaginary.primal())?;
+            // Complex construction is linear in its two real parts: `d(complex(re, im)) = complex(dre, dim)`. When both
+            // part tangents are structural zeros the output tangent stays a symbolic zero of the complex output type;
+            // when only one is, the missing part is materialized as a real zero through the context so the staged
+            // `complex` keeps its two-part arity.
+            let tangent = match (real.tangent(), imaginary.tangent()) {
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()),
+                (real_tangent, imaginary_tangent) => MaybeZero::Value(
+                    real_tangent
+                        .clone()
+                        .materialize(context)?
+                        .complex(&imaginary_tangent.clone().materialize(context)?)?,
+                ),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+
+    /// Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
+    /// Ryft's transposition uses over complex types, the transpose of `(re, im) ↦ re + im·i` maps the output cotangent
+    /// `ȳ` to the part cotangents `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against `(re, im)` picks out
+    /// the real part of `ȳ` for `re` and the *negated* imaginary part for `im`. Like the `Add` rule, known-ness is
+    /// ignored — a known part contributes an additive constant whose adjoint is dropped at the pullback output
+    /// boundary.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(match &outputs[0] {
+                MaybeZero::Zero(_) =>
+                    inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect(),
+                MaybeZero::Value(output_cotangent) => vec![
+                    MaybeZero::Value(output_cotangent.unary(RealOperation)),
+                    MaybeZero::Value(output_cotangent.unary(NegOperation).unary(ImaginaryOperation)),
+                ],
+            })
+        }
+    },
+}
+
+define_elementwise_capability!(
+    @binary
+    /// Value-level capability that constructs a complex value from this value as the real part and `imaginary` as the
+    /// imaginary part. [`Complex`] fills the same role for [`ComplexOperation`] that [`Sin`](crate::Sin) fills for
+    /// [`SinOperation`](crate::SinOperation).
+    Complex,
     /// Constructs the complex value `self + imaginary·i`, returning a [`ProgramError`] if something goes wrong (e.g.,
     /// when the parts are not both `f32` or both `f64` valued).
-    fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError>;
+    complex(imaginary),
+    ComplexOperation,
+);
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that computes the elementwise complex conjugate of one complex value (i.e., `z ↦ z̄`, negating
+    /// the imaginary part) while preserving its type metadata. Real operands are rejected: the conjugate of a real
+    /// value is the identity, so real call sites should simply not conjugate.
+    ///
+    /// Conjugation is ℝ-linear but not ℂ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's
+    /// transposition uses over complex types, it is self-adjoint: the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
+    ConjugateOperation, CONJUGATE_OPERATION_NAME,
+    Conjugate, conjugate,
+    infer_data_types = infer_conjugate_output_data_types,
+);
+
+impl_differentiable_elementwise_operation! {
+    @custom
+    ConjugateOperation,
+    jvp<C>
+    where
+        C::Type: DifferentiableType,
+        C::Value: Conjugate,
+    {
+        |_operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().conjugate()?;
+            // Conjugation is ℝ-linear (but not ℂ-linear): `d(z̄) = d̄z`. A structural zero tangent stays
+            // symbolic.
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.conjugate()?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+
+    /// Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
+    /// Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing `Re(ȳ · z̄)` against `z`
+    /// shows that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<ConjugateOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(match &outputs[0] {
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Value(output_cotangent) =>
+                    vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation))],
+            })
+        }
+    },
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<ComplexOperation>>>> Complex for V {
-    #[inline]
-    fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ComplexOperation, Vec::new(), &[self.clone(), imaginary.clone()])?
-            .remove(0))
-    }
-}
-
-/// [`Operation`] that computes the elementwise complex conjugate of one complex value (i.e., `z ↦ z̄`, negating the
-/// imaginary part) while preserving its type metadata. Real operands are rejected: the conjugate of a real value is
-/// the identity, so real call sites should simply not conjugate.
-///
-/// Conjugation is ℝ-linear but not ℂ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's
-/// transposition uses over complex types, it is self-adjoint: the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
-#[derive(Clone, Debug, Default)]
-pub struct ConjugateOperation;
-
-impl Display for ConjugateOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(CONJUGATE_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for ConjugateOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONJUGATE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        complex_to_part_data_type(input_types[0].clone(), CONJUGATE_OPERATION_NAME)?;
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl Operation<ArrayType> for ConjugateOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONJUGATE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        complex_to_part_data_type(input_types[0].data_type(), CONJUGATE_OPERATION_NAME)?;
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl ElementwiseOperation for ConjugateOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
-    }
-}
-
-impl<C: Domain<Value: Conjugate>> InterpretableOperation<C> for ConjugateOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].conjugate()?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for ConjugateOperation where C::Operation: From<ConjugateOperation> {}
-
-impl<C: Context> DifferentiableOperation<C> for ConjugateOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Conjugate,
-    ConjugateOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().conjugate()?;
-        // Conjugation is ℝ-linear (but not ℂ-linear): `d(z̄) = d̄z`. A structural zero tangent stays symbolic.
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.conjugate()?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-/// Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing `Re(ȳ · z̄)` against `z` shows
-/// that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
-impl<V: Value, O: Operation<V::Type> + From<ConjugateOperation>> TransposableOperation<V, O> for ConjugateOperation
-where
-    V::Type: DifferentiableType,
-    ConjugateOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
-            MaybeZero::Value(output_cotangent) => vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation))],
-        })
-    }
-}
-
-/// Value-level elementwise complex-conjugation capability. [`Conjugate`] fills the same role for
-/// [`ConjugateOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait Conjugate: Sized {
+define_elementwise_capability!(
+    @unary
+    /// Value-level elementwise complex-conjugation capability. [`Conjugate`] fills the same role for
+    /// [`ConjugateOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Conjugate,
     /// Computes the elementwise complex conjugate of this value, returning a [`ProgramError`] if something goes wrong
     /// (e.g., when the value is not complex valued).
-    fn conjugate(&self) -> Result<Self, ProgramError>;
+    conjugate,
+    ConjugateOperation,
+);
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`, with
+    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving all other type metadata. This is the analogue of
+    /// [JAX's `lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
+    ///
+    /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
+    /// over complex types, the transpose of `z ↦ Re(z)` is `ȳ ↦ complex(ȳ, 0)`.
+    RealOperation, REAL_OPERATION_NAME,
+    Real, real,
+    infer_data_types = infer_real_output_data_types,
+);
+
+impl_differentiable_elementwise_operation! {
+    @custom
+    RealOperation,
+    jvp<C>
+    where
+        C::Type: DifferentiableType,
+        C::Value: Real,
+    {
+        |_operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().real()?;
+            // Real-part extraction is ℝ-linear: `d(Re(z)) = Re(dz)`. A structural zero tangent stays symbolic,
+            // retyped to the real output type.
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+
+    /// Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
+    /// Ryft's transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the transpose of
+    /// `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<ComplexOperation> + From<ZeroLikeOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(match &outputs[0] {
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Value(output_cotangent) => {
+                    let zero = output_cotangent.unary(ZeroLikeOperation);
+                    vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation))]
+                }
+            })
+        }
+    },
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<ConjugateOperation>>>> Conjugate for V {
-    #[inline]
-    fn conjugate(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ConjugateOperation, Vec::new(), &[self.clone()])?.remove(0))
-    }
-}
-
-/// [`Operation`] that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`, with `c64 ↦ f32`
-/// and `c128 ↦ f64`) while preserving all other type metadata. This is the analogue of
-/// [JAX's `lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
-///
-/// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
-/// over complex types, the transpose of `z ↦ Re(z)` is `ȳ ↦ complex(ȳ, 0)`.
-#[derive(Clone, Debug, Default)]
-pub struct RealOperation;
-
-impl Display for RealOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(REAL_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for RealOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        REAL_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![complex_to_part_data_type(input_types[0].clone(), REAL_OPERATION_NAME)?])
-    }
-}
-
-impl Operation<ArrayType> for RealOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        REAL_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        let data_type = complex_to_part_data_type(input_types[0].data_type(), REAL_OPERATION_NAME)?;
-        Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
-    }
-}
-
-impl ElementwiseOperation for RealOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
-    }
-}
-
-impl<C: Domain<Value: Real>> InterpretableOperation<C> for RealOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].real()?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for RealOperation where C::Operation: From<RealOperation> {}
-
-impl<C: Context> DifferentiableOperation<C> for RealOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Real,
-    RealOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().real()?;
-        // Real-part extraction is ℝ-linear: `d(Re(z)) = Re(dz)`. A structural zero tangent stays symbolic, retyped
-        // to the real output type.
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing that Ryft's
-/// transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the transpose of `z ↦ Re(z)` is
-/// `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
-impl<V: Value, O> TransposableOperation<V, O> for RealOperation
-where
-    V::Type: DifferentiableType,
-    O: Operation<V::Type> + From<ComplexOperation> + From<ZeroLikeOperation>,
-    RealOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
-            MaybeZero::Value(output_cotangent) => {
-                let zero = output_cotangent.unary(ZeroLikeOperation);
-                vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation))]
-            }
-        })
-    }
-}
-
-/// Value-level elementwise real-part extraction capability. [`Real`] fills the same role for [`RealOperation`] that
-/// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait Real: Sized {
+define_elementwise_capability!(
+    @unary
+    /// Value-level elementwise real-part extraction capability. [`Real`] fills the same role for [`RealOperation`] that
+    /// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Real,
     /// Extracts the elementwise real part of this value, returning a [`ProgramError`] if something goes wrong (e.g.,
     /// when the value is not complex valued).
-    fn real(&self) -> Result<Self, ProgramError>;
+    real,
+    RealOperation,
+);
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that extracts the elementwise imaginary part of one complex value (i.e., `z ↦ Im(z)`, with
+    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving all other type metadata. This is the analogue of
+    /// [JAX's `lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
+    ///
+    /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
+    /// over complex types, the transpose of `z ↦ Im(z)` is `ȳ ↦ complex(0, -ȳ)`.
+    ImaginaryOperation, IMAGINARY_OPERATION_NAME,
+    Imaginary, imaginary,
+    infer_data_types = infer_imaginary_output_data_types,
+);
+
+impl_differentiable_elementwise_operation! {
+    @custom
+    ImaginaryOperation,
+    jvp<C>
+    where
+        C::Type: DifferentiableType,
+        C::Value: Imaginary,
+    {
+        |_operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let input = &inputs[0];
+            let primal = input.primal().imaginary()?;
+            // Imaginary-part extraction is ℝ-linear: `d(Im(z)) = Im(dz)`. A structural zero tangent stays symbolic,
+            // retyped to the real output type.
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+
+    /// Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
+    /// Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the transpose of
+    /// `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary part.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType,
+        O: From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(match &outputs[0] {
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Value(output_cotangent) => {
+                    let zero = output_cotangent.unary(ZeroLikeOperation);
+                    let negated = output_cotangent.unary(NegOperation);
+                    vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation))]
+                }
+            })
+        }
+    },
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<RealOperation>>>> Real for V {
-    #[inline]
-    fn real(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(RealOperation, Vec::new(), &[self.clone()])?.remove(0))
-    }
-}
-
-/// [`Operation`] that extracts the elementwise imaginary part of one complex value (i.e., `z ↦ Im(z)`, with
-/// `c64 ↦ f32` and `c128 ↦ f64`) while preserving all other type metadata. This is the analogue of
-/// [JAX's `lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
-///
-/// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
-/// over complex types, the transpose of `z ↦ Im(z)` is `ȳ ↦ complex(0, -ȳ)`.
-#[derive(Clone, Debug, Default)]
-pub struct ImaginaryOperation;
-
-impl Display for ImaginaryOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(IMAGINARY_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for ImaginaryOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        IMAGINARY_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![complex_to_part_data_type(input_types[0].clone(), IMAGINARY_OPERATION_NAME)?])
-    }
-}
-
-impl Operation<ArrayType> for ImaginaryOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        IMAGINARY_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        let data_type = complex_to_part_data_type(input_types[0].data_type(), IMAGINARY_OPERATION_NAME)?;
-        Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])
-    }
-}
-
-impl ElementwiseOperation for ImaginaryOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
-    }
-}
-
-impl<C: Domain<Value: Imaginary>> InterpretableOperation<C> for ImaginaryOperation
-where
-    Self: Operation<C::Type>,
-{
-    #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].imaginary()?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for ImaginaryOperation where C::Operation: From<ImaginaryOperation> {}
-
-impl<C: Context> DifferentiableOperation<C> for ImaginaryOperation
-where
-    C::Type: DifferentiableType,
-    C::Value: Imaginary,
-    ImaginaryOperation: Operation<C::Type>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let primal = input.primal().imaginary()?;
-        // Imaginary-part extraction is ℝ-linear: `d(Im(z)) = Im(dz)`. A structural zero tangent stays symbolic,
-        // retyped to the real output type.
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-/// Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the transpose of
-/// `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary part.
-impl<V: Value, O> TransposableOperation<V, O> for ImaginaryOperation
-where
-    V::Type: DifferentiableType,
-    O: Operation<V::Type> + From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
-    ImaginaryOperation: Operation<V::Type>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(match &outputs[0] {
-            MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
-            MaybeZero::Value(output_cotangent) => {
-                let zero = output_cotangent.unary(ZeroLikeOperation);
-                let negated = output_cotangent.unary(NegOperation);
-                vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation))]
-            }
-        })
-    }
-}
-
-/// Value-level elementwise imaginary-part extraction capability. [`Imaginary`] fills the same role for
-/// [`ImaginaryOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
-pub trait Imaginary: Sized {
+define_elementwise_capability!(
+    @unary
+    /// Value-level elementwise imaginary-part extraction capability. [`Imaginary`] fills the same role for
+    /// [`ImaginaryOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    Imaginary,
     /// Extracts the elementwise imaginary part of this value, returning a [`ProgramError`] if something goes wrong
     /// (e.g., when the value is not complex valued).
-    fn imaginary(&self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<ImaginaryOperation>>>> Imaginary for V {
-    #[inline]
-    fn imaginary(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ImaginaryOperation, Vec::new(), &[self.clone()])?.remove(0))
-    }
-}
+    imaginary,
+    ImaginaryOperation,
+);
 
 #[cfg(test)]
 mod tests {
@@ -675,6 +381,8 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
+    use crate::interpretation::InterpretableOperation;
+    use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{Shape, Size};
