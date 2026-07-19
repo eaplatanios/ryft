@@ -2271,15 +2271,46 @@ macro_rules! define_tracer_operator {
     };
 }
 
-/// Checks type-inference rejection contracts shared by concrete [`Operation`](crate::Operation) implementations:
+/// Checks exact type-inference behavior for a concrete, regionless [`Operation`](crate::Operation). Each ordinary case
+/// declares `input_types` and either the expected `output_types` or exact [`TypeError`](crate::TypeError) message.
+/// Cases are expanded independently, so one invocation may cover different [`Type`](crate::Type) families such as
+/// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType). A case whose input and output types do not
+/// identify the family, most commonly an empty-input error case, may declare it explicitly with `type = ...`. The
+/// macro also provides selectors for shared sharding rejection contracts whose generated mesh fixtures would otherwise
+/// obscure the behavior under test:
 ///
 ///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
 ///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands must carry the
 ///     same reduced-axis markers.
 ///
-/// # Example
+/// # Examples
 ///
-/// This is an example of how to use this macro to check the elementwise [`SinOperation`](crate::SinOperation):
+/// This example checks both successful and rejected type inference for the elementwise
+/// [`AddOperation`](crate::AddOperation):
+///
+/// ```rust
+/// # use ryft_core::{AddOperation, ArrayType, DataType, check_operation_type_inference};
+/// check_operation_type_inference!(
+///     operation = AddOperation,
+///     cases = [
+///         {
+///             input_types = [DataType::F32, DataType::F64],
+///             output_types = [DataType::F64],
+///         },
+///         {
+///             input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+///             output_types = [ArrayType::scalar(DataType::F64)],
+///         },
+///         {
+///             input_types = [DataType::Boolean, DataType::Boolean],
+///             error = "'add' does not support input data type bool",
+///         },
+///     ],
+/// );
+/// ```
+///
+/// This example uses a generated sharding fixture to check the unreduced-input rejection contract
+/// of [`SinOperation`](crate::SinOperation):
 ///
 /// ```rust
 /// # use ryft_core::{ArrayType, DataType, SinOperation, check_operation_type_inference};
@@ -2292,11 +2323,29 @@ macro_rules! define_tracer_operator {
 ///
 /// # Parameters
 ///
-///   - `$selector`: Type-inference rejection contract to check: `@reject @unreduced` or `@reject @mismatched_reduced`.
+///   - `$selector`: Optional generated type-inference contract: `@reject @unreduced` or `@reject @mismatched_reduced`.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
-///   - `input_types = $input_types`: Input types used by the selected rejection check, in operation input order.
+///   - `cases = $cases`: Type-inference test cases, each with `input_types` and either `output_types` or `error`.
+///   - `type = $type`: Optional explicit [`Type`](crate::Type) family for a case whose other expressions cannot
+///     determine the operation implementation.
+///   - `input_types = $input_types`: Input types used by one ordinary case or by the selected generated rejection
+///     check, in operation input order.
+///   - `output_types = $output_types`: Expected output types for one successful ordinary case, in result order.
+///   - `error = $error`: Exact [`TypeError`](crate::TypeError) message expected from one rejected ordinary case.
 #[macro_export]
 macro_rules! check_operation_type_inference {
+    // This branch checks one or more exact regionless type-inference cases. It evaluates the operation once and
+    // delegates each heterogeneous success or error case to an internal assertion branch.
+    (
+        operation = $operation:expr,
+        cases = [$( { $($case:tt)* } ),+ $(,)?] $(,)?
+    ) => {{
+        let operation = $operation;
+        $($crate::check_operation_type_inference!(@case operation, { $($case)* });)+
+    }};
+
+    // This branch generates an unreduced sharding fixture for every declared input and checks the standard
+    // rejection used by operations that cannot consume partial sums.
     (
         @reject @unreduced,
         operation = $operation:expr,
@@ -2327,6 +2376,8 @@ macro_rules! check_operation_type_inference {
         );
     }};
 
+    // This branch generates both operand orderings with mismatched reduced-axis markers and checks that
+    // a binary operation rejects each ordering with the same diagnostic.
     (
         @reject @mismatched_reduced,
         operation = $operation:expr,
@@ -2374,6 +2425,88 @@ macro_rules! check_operation_type_inference {
             expected,
         );
     }};
+
+    // This internal branch checks a successful explicitly typed case. The type annotation disambiguates applications
+    // with no input or output expressions from which Rust could infer the operation's `Type` family.
+    (
+        @case $operation:ident,
+        {
+            type = $type:ty,
+            input_types = [$($input_type:expr),* $(,)?],
+            output_types = [$($output_type:expr),* $(,)?] $(,)?
+        }
+    ) => {
+        assert_eq!(
+            $crate::programs::operations::Operation::<$type>::infer_output_types(
+                &$operation,
+                &[$($input_type),*],
+                &[],
+            ),
+            Ok(vec![$($output_type),*]),
+        );
+    };
+
+    // This internal branch checks a rejected explicitly typed case. It provides the same disambiguation as the typed
+    // success branch while retaining exact comparison of the operation-owned diagnostic.
+    (
+        @case $operation:ident,
+        {
+            type = $type:ty,
+            input_types = [$($input_type:expr),* $(,)?],
+            error = $message:expr $(,)?
+        }
+    ) => {
+        assert_eq!(
+            $crate::programs::operations::Operation::<$type>::infer_output_types(
+                &$operation,
+                &[$($input_type),*],
+                &[],
+            ),
+            Err($crate::programs::types::TypeError {
+                message: ::core::convert::Into::<::std::string::String>::into($message),
+            }),
+        );
+    };
+
+    // This internal branch checks a successful ordinary case by inferring with no attached regions and comparing the
+    // complete ordered output-type vector. Keeping success separate lets callers use natural `output_types` syntax.
+    (
+        @case $operation:ident,
+        {
+            input_types = [$($input_type:expr),* $(,)?],
+            output_types = [$($output_type:expr),* $(,)?] $(,)?
+        }
+    ) => {
+        assert_eq!(
+            $crate::programs::operations::Operation::infer_output_types(
+                &$operation,
+                &[$($input_type),*],
+                &[],
+            ),
+            Ok(vec![$($output_type),*]),
+        );
+    };
+
+    // This internal branch checks a rejected ordinary case against its complete `TypeError` message. It is distinct
+    // from the success branch so diagnostics remain exact without making callers construct the error wrapper.
+    (
+        @case $operation:ident,
+        {
+            input_types = [$($input_type:expr),* $(,)?],
+            error = $message:expr $(,)?
+        }
+    ) => {
+        assert_eq!(
+            $crate::programs::operations::Operation::infer_output_types(
+                &$operation,
+                &[$($input_type),*],
+                &[],
+            ),
+            Err($crate::programs::types::TypeError {
+                message: ::core::convert::Into::<::std::string::String>::into($message),
+            }),
+        );
+    };
 }
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under partial evaluation. The concise `inputs`
@@ -4078,6 +4211,28 @@ mod tests {
 
     #[test]
     fn test_check_operation_type_inference() {
+        check_operation_type_inference!(
+            operation = AddOperation,
+            cases = [
+                {
+                    input_types = [DataType::F32, DataType::F64],
+                    output_types = [DataType::F64],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+                    output_types = [ArrayType::scalar(DataType::F64)],
+                },
+                {
+                    type = DataType,
+                    input_types = [],
+                    error = "expected 2 inputs but got 0",
+                },
+                {
+                    input_types = [DataType::Boolean, DataType::Boolean],
+                    error = "'add' does not support input data type bool",
+                },
+            ],
+        );
         check_operation_type_inference!(
             @reject @unreduced,
             operation = SinOperation,

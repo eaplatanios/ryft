@@ -92,6 +92,14 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   with `indoc!` and `pretty_assertions::assert_eq`.
 - Test operations individually where possible. Prefer full-string equality assertions over partial `.contains(...)`
   checks for rendered IR.
+- Use `check_operation_type_inference!` for exact regionless operation type-inference cases. Keep explicit assertions
+  for field-level metadata projections and operations whose inference contract depends on attached region interfaces.
+- Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
+  `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
+  and `check_operation_transposition!`.
+- Keep per-operation tests focused on semantics selected or implemented by that operation. Test shared declarative
+  macro rendering, arity validation, and generated formatting centrally rather than repeating those checks for every
+  macro-generated operation.
 - When testing operation accessors, assert operands, results, attributes, properties, and collection lengths before
   inserting the operation into a final block if detached-operation behavior matters.
 - For wrapper hierarchies, cover construction, context ownership, accessor values, equality within one context,
