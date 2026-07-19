@@ -16,7 +16,7 @@ define_elementwise_operation!(
     /// floating-point and complex operands are supported, and operands that still carry partial sums are rejected.
     ExpOperation, EXP_OPERATION_NAME,
     Exp, exp,
-    check_data_types = [@floating_or_complex],
+    check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
 

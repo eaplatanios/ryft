@@ -17,7 +17,7 @@ define_elementwise_operation!(
     /// preserving its array metadata. Array operands that still carry partial sums are rejected.
     SinOperation, SIN_OPERATION_NAME,
     Sin, sin,
-    check_data_types = [@floating_or_complex],
+    check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
 

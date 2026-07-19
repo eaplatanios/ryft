@@ -16,7 +16,7 @@ define_elementwise_operation!(
     /// complex operands are supported, and operands that still carry partial sums are rejected.
     SqrtOperation, SQRT_OPERATION_NAME,
     Sqrt, sqrt,
-    check_data_types = [@floating_or_complex],
+    check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
 
