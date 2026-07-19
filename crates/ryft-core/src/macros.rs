@@ -675,7 +675,8 @@ macro_rules! define_elementwise_capability {
 /// other `@known`, then gives the contribution to the linear operand as an ordinary Rust expression. The macro aligns
 /// the known value to the live output cotangent, unaligns the contribution to the linear operand's cotangent type, and
 /// returns structural zeros for known operands. Symmetric bilinear rules provide both operand orderings. One-sided
-/// linear rules provide only the supported ordering. The `errors` block keeps operation-specific diagnostics explicit.
+/// linear rules provide only the supported ordering. Unsupported patterns and missing cotangent spaces receive
+/// diagnostics derived from the operation and operand names.
 ///
 /// `@nonlinear` implements the standard erroring primitive transpose rule: reverse-mode differentiation remains
 /// available by transposing the linear operations produced by the JVP. `@custom` is the escape hatch for elementwise
