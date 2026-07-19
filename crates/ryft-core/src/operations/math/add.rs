@@ -10,12 +10,14 @@ pub const ADD_OPERATION_NAME: &str = "add";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that adds two numeric values elementwise, promoting their element types and
-    /// broadcasting their shapes. Array operands that carry partial sums must both be unreduced over exactly the same
-    /// mesh axes; mixing an unreduced operand with an already reduced operand would duplicate the reduced contribution
-    /// when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
-    AddOperation, ADD_OPERATION_NAME,
-    Add, add,
+    /// [`Operation`] that adds two numeric values elementwise, promoting their element [`DataType`](crate::DataType)s
+    /// and broadcasting their [`Shape`](crate::Shape)s. Array operands that carry partial sums must both be unreduced
+    /// over exactly the same mesh axes. Mixing an unreduced operand with an already reduced operand would duplicate the
+    /// reduced contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    AddOperation,
+    ADD_OPERATION_NAME,
+    Add,
+    add,
     check_data_types = [@numeric],
     check_array_types = [@same_unreduced_axes, @same_reduced_axes],
 );
@@ -28,13 +30,13 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value-level elementwise addition capability. [`Add`] is the fallible Ryft counterpart to [`std::ops::Add`] that
-    /// [`AddOperation`] interprets through, surfacing a [`ProgramError`] when something goes
-    /// wrong, instead of panicking. Value types additionally provide [`std::ops::Add`] as ergonomic (albeit
-    /// panicking) sugar layered on top of this capability.
+    /// Value-level elementwise addition capability. [`Add`] is the fallible Ryft counterpart to [`std::ops::Add`]
+    /// that [`AddOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
+    /// panicking. Value types additionally provide [`std::ops::Add`] as ergonomic (albeit panicking) sugar layered
+    /// on top of this capability.
     Add,
-    /// Adds `right` to this value, returning a [`ProgramError`] if something goes wrong.
-    add(right),
+    /// Adds `rhs` to this value.
+    add(rhs),
     AddOperation,
 );
 
@@ -65,11 +67,9 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let operation = AddOperation;
-
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
+                &AddOperation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(2.0f32), Scalar::from(3.5f64)],
@@ -78,7 +78,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
+                &AddOperation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0), Array::vector(vec![3.5, -1.0])],
@@ -87,7 +87,7 @@ mod tests {
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
+                &AddOperation,
                 &EagerContext::new(),
                 &EmptyRegionDriver,
                 &[Scalar::from(Complex::new(1.0f64, 2.0)), Scalar::from(Complex::new(0.5f64, -1.0))],
@@ -194,6 +194,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = AddOperation,
