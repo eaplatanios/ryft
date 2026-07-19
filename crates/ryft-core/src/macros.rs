@@ -680,7 +680,6 @@ macro_rules! define_elementwise_capability {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
 /// Implements the forward-mode differentiation (Jacobian-Vector Product; JVP) and primitive transposition rules for
 /// an elementwise [`Operation`](crate::Operation). The macro keeps the operation-specific mathematical rule at the
 /// invocation site while generating the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
@@ -830,14 +829,14 @@ macro_rules! define_elementwise_capability {
 ///   - `$output_cotangent`: Name bound to the live output cotangent in a transposition case.
 #[macro_export]
 macro_rules! impl_differentiable_elementwise_operation {
-    // This public branch implements an operation with no differential dependence by replaying its primal outputs with
+    // This branch implements an operation with no differential dependence by replaying its primal outputs with
     // structural-zero tangents and generating the standard rejecting primitive-transposition rule.
     (@non_differentiable $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // This public branch implements a unary result that is constant with respect to its exemplar input. Its JVP has a
+    // This branch implements a unary result that is constant with respect to its exemplar input. Its JVP has a
     // structural-zero tangent, while transposition returns a structural-zero cotangent shaped by that input.
     (@constant $operation:ty $(,)?) => {
         $crate::impl_non_differentiable_operation!($operation);
@@ -866,26 +865,26 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch starts parsing a unary rule, whose single independently lazy tangent contribution may bind
+    // This branch starts parsing a unary rule, whose single independently lazy tangent contribution may bind
     // its input primal and output primal. The shared parser handles its optional unbraced JVP bounds.
     (@unary $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [unary] $($tail)*);
     };
 
-    // This public branch starts parsing a binary rule with one independently lazy contribution per input tangent and
-    // either a structured or custom primitive-transposition rule.
+    // This branch starts parsing a binary rule with one independently lazy contribution per input tangent
+    // and either a structured or custom primitive-transposition rule.
     (@binary $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [binary] $($tail)*);
     };
 
-    // This public branch starts parsing caller-supplied JVP and transposition closures for an operation whose behavior
-    // cannot be expressed by the unary or binary contribution DSLs.
+    // This branch starts parsing caller-supplied JVP and transposition closures for an operation
+    // whose behavior cannot be expressed by the unary or binary contribution DSLs.
     (@custom $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [custom] $($tail)*);
     };
 
-    // This public branch implements a positive unary linear rule. Both its tangent and cotangent pass through
-    // unchanged, so the generated implementations need no arithmetic capabilities beyond the operation itself.
+    // This branch implements a positive unary linear rule. Both its tangent and cotangent pass through unchanged,
+    // so the generated implementations need no arithmetic capabilities beyond the operation itself.
     (
         @linear
         $operation:ty,
@@ -900,8 +899,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch implements a negative unary linear rule. Both its tangent and cotangent are negated, so it
-    // supplies the shared generator with the `Neg` value capability and `NegOperation` operation-family conversion.
+    // This branch implements a negative unary linear rule. Both its tangent and cotangent are negated, so it supplies
+    // the shared generator with the `Neg` value capability and `NegOperation` operation-family conversion.
     (
         @linear
         $operation:ty,
@@ -918,7 +917,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch implements a binary linear rule with two positive coefficients. It combines live tangents
+    // This branch implements a binary linear rule with two positive coefficients. It combines live tangents
     // with addition and forwards the output cotangent positively to each linear input.
     (
         @linear
@@ -933,8 +932,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch implements a binary linear rule with a positive left coefficient and negative right
-    // coefficient. It stages subtraction for the tangent and negates only the right cotangent contribution.
+    // This branch implements a binary linear rule with a positive left coefficient and negative right coefficient.
+    // It stages subtraction for the tangent and negates only the right cotangent contribution.
     (
         @linear
         $operation:ty,
@@ -951,8 +950,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch implements a binary linear rule with a negative left coefficient and positive right
-    // coefficient. It stages the reversed subtraction needed for the tangent and negates only the left cotangent.
+    // This branch implements a binary linear rule with a negative left coefficient and positive right coefficient.
+    // It stages the reversed subtraction needed for the tangent and negates only the left cotangent.
     (
         @linear
         $operation:ty,
@@ -969,7 +968,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This public branch implements a binary linear rule with two negative coefficients. It negates the sum of live
+    // This branch implements a binary linear rule with two negative coefficients. It negates the sum of live
     // tangents and negates both input cotangent contributions.
     (
         @linear
@@ -987,9 +986,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper recognizes a public JVP with an unbraced `where` clause and initializes token-by-token
-    // bound collection. Collection is necessary because `macro_rules!` has no fragment that matches a complete Rust
-    // `where` clause while also identifying where the following JVP body begins.
+    // This internal helper branch recognizes a public JVP with an unbraced `where` clause and initializes
+    // token-by-token bound collection. Collection is necessary because `macro_rules!` has no fragment that
+    // matches a complete Rust `where` clause while also identifying where the following JVP body begins.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -1003,9 +1002,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper recognizes a public JVP without additional bounds and forwards it directly to normalized
-    // rule dispatch. It bypasses the collector so the common boundless form does not take an unnecessary recursive
-    // parsing path.
+    // This internal helper branch recognizes a public JVP without additional bounds and forwards it directly to
+    // normalized rule dispatch. It bypasses the collector so the common boundless form does not take an unnecessary
+    // recursive parsing path.
     (
         @public_jvp [$kind:ident]
         $operation:ty,
@@ -1020,9 +1019,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper terminates JVP-bound collection when it reaches the brace-delimited JVP expression and
-    // forwards the accumulated predicates to normalized rule dispatch. A terminal arm is required to distinguish the
-    // body delimiter from ordinary token trees inside the preceding `where` clause.
+    // This internal helper branch terminates JVP-bound collection when it reaches the brace-delimited JVP expression
+    // and forwards the accumulated predicates to normalized rule dispatch. A terminal arm is required to distinguish
+    // the body delimiter from ordinary token trees inside the preceding `where` clause.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -1036,9 +1035,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper consumes one token tree from an unbraced JVP `where` clause and recurses with that token
-    // appended to the bound accumulator. It exists because arbitrary Rust predicates cannot be captured as one macro
-    // fragment without also consuming the JVP body that follows them.
+    // This internal helper branch consumes one token tree from an unbraced JVP `where` clause and recurses with that
+    // token appended to the bound accumulator. It exists because arbitrary Rust predicates cannot be captured as one
+    // macro fragment without also consuming the JVP body that follows them.
     (
         @collect_jvp_where
         [$kind:ident] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -1050,8 +1049,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits a unary elementwise JVP after the public parser has normalized its optional bounds.
-    // It remains a dedicated branch because unary rules have one tangent contribution and always reject
+    // This internal helper branch emits a unary elementwise JVP after the public parser has normalized its optional
+    // bounds. It remains a dedicated branch because unary rules have one tangent contribution and always reject
     // transposition, unlike the binary and fully custom forms.
     (
         @jvp_ready [unary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -1107,8 +1106,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // This internal helper emits a binary JVP whose operation is explicitly nonlinear under transposition, then adds
-    // the standard rejecting transposition implementation. Separating this terminal form avoids forcing nonlinear
+    // This internal helper branch emits a binary JVP whose operation is explicitly nonlinear under transposition, then
+    // adds the standard rejecting transposition implementation. Separating this terminal form avoids forcing nonlinear
     // operations through the transposition-bound parser.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
@@ -1126,9 +1125,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // This internal helper recognizes a binary rule with a transposition implementation and starts collecting its
-    // unbraced transposition bounds. The JVP is carried along unchanged so both implementations can be emitted once
-    // the transposition body supplies an unambiguous end marker.
+    // This internal helper branch recognizes a binary rule with a transposition implementation and starts collecting
+    // its unbraced transposition bounds. The JVP is carried along unchanged so both implementations can be emitted
+    // once the transposition body supplies an unambiguous end marker.
     (
         @jvp_ready [binary] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { $($jvp:tt)* }
@@ -1144,9 +1143,10 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper ends binary transposition-bound collection at the brace-delimited rule body and forwards a
-    // normalized representation to code generation. One terminal arm handles both structured cases and the custom
-    // closure escape hatch because the braces already provide an unambiguous boundary after an arbitrary `where`.
+    // This internal helper branch ends binary transposition-bound collection at the brace-delimited rule body and
+    // forwards a normalized representation to code generation. One terminal arm handles both structured cases and
+    // the custom closure escape hatch because the braces already provide an unambiguous boundary after an arbitrary
+    // `where`.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -1168,9 +1168,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper consumes one token tree from a binary transposition `where` clause and recurses with it in
-    // the bound accumulator. It is the recursive counterpart to the brace-delimited terminal arm above and is needed
-    // solely because `macro_rules!` cannot parse a complete unbraced `where` clause.
+    // This internal helper branch consumes one token tree from a binary transposition `where` clause and recurses with
+    // it in the bound accumulator. It is the recursive counterpart to the brace-delimited terminal arm above and is
+    // needed solely because `macro_rules!` cannot parse a complete unbraced `where` clause.
     (
         @collect_public_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*] [$($jvp:tt)*]
@@ -1184,9 +1184,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits a fully custom JVP whose operation is explicitly nonlinear under transposition, then
-    // adds the standard rejecting transposition implementation. The dedicated terminal form preserves the custom JVP
-    // escape hatch without invoking transposition-bound collection.
+    // This internal helper branch emits a fully custom JVP whose operation is explicitly nonlinear under transposition,
+    // then adds the standard rejecting transposition implementation. The dedicated terminal form preserves the custom
+    // JVP escape hatch without invoking transposition-bound collection.
     (
         @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1203,7 +1203,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // This internal helper recognizes a fully custom rule with a custom transposition implementation and starts
+    // This internal helper branch recognizes a fully custom rule with a custom transposition implementation and starts
     // collecting the latter's unbraced bounds. Its larger parser state retains both closures and their documentation
     // until the transposition body marks the end of the predicates.
     (
@@ -1222,9 +1222,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper finishes custom transposition-bound collection when it reaches the closure body, then emits
-    // the JVP and transposition implementations directly. The closure delimiter is the only reliable end marker for
-    // an unbraced `where` clause, so this terminal collector branch cannot be folded into its recursive companion.
+    // This internal helper branch finishes custom transposition-bound collection when it reaches the closure body, then
+    // emits the JVP and transposition implementations directly. The closure delimiter is the only reliable end marker
+    // for an unbraced `where` clause, so this terminal collector branch cannot be folded into its recursive companion.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1250,9 +1250,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper consumes one token tree from a custom transposition `where` clause and preserves the two
-    // custom closures while recursing. It is separate from the binary collector because the fully custom JVP carries
-    // operation, context, driver, and complete-input bindings instead of contribution expressions.
+    // This internal helper branch consumes one token tree from a custom transposition `where` clause and preserves
+    // the two custom closures while recursing. It is separate from the binary collector because the fully custom JVP
+    // carries operation, context, driver, and complete-input bindings instead of contribution expressions.
     (
         @collect_public_custom_transpose_where
         [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
@@ -1268,7 +1268,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits the shared unary linear JVP and transposition algorithms after the public
+    // This internal helper branch emits the shared unary linear JVP and transposition algorithms after the public
     // sign-specific arms have supplied their minimal bounds. Keeping the sign as a token lets one shell preserve
     // positive tangents and cotangents or negate negative ones without duplicating both trait implementations.
     (
@@ -1338,9 +1338,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits the shared binary linear JVP and transposition algorithms after a public sign rule has
-    // selected the minimal arithmetic bounds. The two signs remain explicit because they determine both the natural
-    // staged tangent expression and each operand's cotangent contribution.
+    // This internal helper branch emits the shared binary linear JVP and transposition algorithms after a public sign
+    // rule has selected the minimal arithmetic bounds. The two signs remain explicit because they determine both the
+    // natural staged tangent expression and each operand's cotangent contribution.
     (
         @linear_binary [$left_sign:ident, $right_sign:ident]
         impl<$context:ident> $operation:ty
@@ -1386,11 +1386,12 @@ macro_rules! impl_differentiable_elementwise_operation {
                     }
                     .into());
                 }
+
                 // This rule combines live tangents with the operation's natural signed combination (e.g., a single
-                // staged `sub` for a `[@positive, @negative]` rule) instead of delegating to
-                // `binary_elementwise_jvp`, which always sums its per-side contributions and would therefore stage
-                // `add(left, neg(right))` here. Staged tangent program shapes are part of an operation's
-                // differentiation contract, so this difference is load-bearing and not a consolidation candidate.
+                // staged `sub` for a `[@positive, @negative]` rule) instead of delegating to `binary_elementwise_jvp`,
+                // which always sums its per-side contributions and would therefore stage `add(left, neg(right))` here.
+                // Staged tangent program shapes are part of an operation's differentiation contract, so this difference
+                // is load-bearing and not a consolidation candidate.
                 let tangent = match (left, right) {
                     (Some(left), Some(right)) => {
                         let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target)?;
@@ -1464,33 +1465,33 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper combines two positive tangent contributions with addition. A sign-specific expansion keeps
-    // the generated program in the operation's natural linear form and requires only `Add` from the value type.
+    // This internal helper branch combines two positive tangent contributions with addition. A sign-specific expansion
+    // keeps the generated program in the operation's natural linear form and requires only `Add` from the value type.
     (@combine_linear_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
 
-    // This internal helper subtracts a negative right contribution from a positive left contribution. Emitting `Sub`
-    // directly preserves the expected staged program instead of rewriting the rule as addition plus negation.
+    // This internal helper branch subtracts a negative right contribution from a positive left contribution. Emitting
+    // `Sub` directly preserves the expected staged program instead of rewriting the rule as addition plus negation.
     (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
 
-    // This internal helper subtracts a negative left contribution from a positive right contribution. The reversed
-    // operand order implements `-left + right` directly while retaining the minimal `Sub` requirement.
+    // This internal helper branch subtracts a negative left contribution from a positive right contribution. The
+    // reversed operand order implements `-left + right` directly while retaining the minimal `Sub` requirement.
     (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
 
-    // This internal helper adds two magnitudes and negates the result when both tangent contributions are negative.
-    // Keeping this case explicit avoids imposing subtraction bounds that its formula does not use.
+    // This internal helper branch adds two magnitudes and negates the result when both tangent contributions are
+    // negative. Keeping this case explicit avoids imposing subtraction bounds that its formula does not use.
     (@combine_linear_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
 
-    // This internal helper applies a positive derivative sign as the identity. It pairs with the negative arm so the
-    // shared unary and binary generators can select sign behavior without duplicating their surrounding algorithms.
+    // This internal helper branch applies a positive derivative sign as the identity. It pairs with the negative arm so
+    // the shared unary and binary generators can select sign behavior without duplicating their surrounding algorithms.
     (@apply_tangent_sign positive, $tangent:expr) => { $tangent };
 
-    // This internal helper applies a negative derivative sign with one negation. It is isolated from the positive arm
-    // so positive linear rules do not acquire an unnecessary `Neg` bound or staged negation operation.
+    // This internal helper branch applies a negative derivative sign with one negation. It is isolated from the
+    // positive arm so positive linear rules do not acquire an unnecessary `Neg` bound or staged negation operation.
     (@apply_tangent_sign negative, $tangent:expr) => { -$tangent };
 
-    // This internal helper converts one live output cotangent into a signed input contribution for a binary linear
-    // rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly that
-    // boundary handling even though their signs can differ.
+    // This internal helper branch converts one live output cotangent into a signed input contribution for a binary
+    // linear rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly
+    // that boundary handling even though their signs can differ.
     (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
         if $crate::DifferentiableType::is_zero_space(&target) {
@@ -1505,9 +1506,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
     }};
 
-    // This internal helper generates a binary rule whose transposition supports either operand being linear while the
-    // other is known. It must remain distinct from one-sided rules because it selects between two user-provided
-    // cotangent formulas at runtime and reports the actual unsupported knownness pattern.
+    // This internal helper branch generates a binary rule whose transposition supports either operand being linear
+    // while the other is known. It must remain distinct from one-sided rules because it selects between two
+    // user-provided cotangent formulas at runtime and reports the actual unsupported knownness pattern.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1638,9 +1639,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper generates a binary rule that can transpose only a linear left operand with a known right
-    // operand. A dedicated branch keeps one-sided operations from pretending to support the mirrored case and avoids
-    // requiring a second formula that is mathematically invalid or unavailable.
+    // This internal helper branch generates a binary rule that can transpose only a linear left operand with a known
+    // right operand. A dedicated branch keeps one-sided operations from pretending to support the mirrored case and
+    // avoids requiring a second formula that is mathematically invalid or unavailable.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1726,9 +1727,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper pairs the shared binary JVP generator with a caller-supplied transposition closure. It is
-    // the low-level escape hatch for rules whose knownness handling cannot be described by the structured symmetric
-    // or one-sided forms above.
+    // This internal helper branch pairs the shared binary JVP generator with a caller-supplied transposition closure.
+    // It is the low-level escape hatch for rules whose knownness handling cannot be described by the structured
+    // symmetric or one-sided forms above.
     (
         @binary_ready
         impl<$context:ident> $operation:ty
@@ -1763,8 +1764,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits the common binary JVP implementation from two per-operand tangent formulas. It owns
-    // primal replay, derivative alignment, structural-zero handling, and contribution summation so operation rules
+    // This internal helper branch emits the common binary JVP implementation from two per-operand tangent formulas. It
+    // owns primal replay, derivative alignment, structural-zero handling, and contribution summation so operation rules
     // only state the mathematics unique to each operand.
     (
         @binary_jvp
@@ -1833,45 +1834,49 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper handles `_` for a unary input primal by emitting no binding and, importantly, no accessor
-    // call. Avoiding the call preserves the DSL's promise that omitted primals are not evaluated unnecessarily.
+    // This internal helper branch handles `_` for a unary input primal by emitting no binding and, importantly,
+    // no accessor call. Avoiding the call preserves the DSL's promise that omitted primals are not evaluated
+    // unnecessarily.
     (@bind_unary_input_primal $operands:ident, _) => {};
 
-    // This internal helper binds a named unary input primal through the lazy operand accessor. It is separate from the
-    // `_` arm so only formulas that reference the primal pay for alignment and possible replay.
+    // This internal helper branch binds a named unary input primal through the lazy operand accessor. It is separate
+    // from the `_` arm so only formulas that reference the primal pay for alignment and possible replay.
     (@bind_unary_input_primal $operands:ident, $input_primal:ident) => {
         let $input_primal = $operands.input_primal()?;
     };
 
-    // This internal helper binds the optional unary output primal at the tangent target type. The whole invocation is
-    // conditionally expanded by the caller, so rules without an `-> output` binding never recompute that value.
+    // This internal helper branch binds the optional unary output primal at the tangent target type. The whole
+    // invocation is conditionally expanded by the caller, so rules without an `-> output` binding never recompute
+    // that value.
     (@bind_unary_output_primal $operands:ident, $output_primal:ident) => {
         let $output_primal = $operands.output_primal_at_tangent_type()?;
     };
 
-    // This internal helper handles `_` for a binary left primal by emitting neither a binding nor an accessor call.
-    // The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the right operand.
+    // This internal helper branch handles `_` for a binary left primal by emitting neither a binding nor an accessor
+    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the right
+    // operand.
     (@bind_binary_left_primal $operands:ident, _) => {};
 
-    // This internal helper binds a named binary left primal through the lazy operand accessor. It complements the `_`
-    // arm so the generated rule evaluates and aligns the left primal only when its formula references it.
+    // This internal helper branch binds a named binary left primal through the lazy operand accessor. It complements
+    // the `_` arm so the generated rule evaluates and aligns the left primal only when its formula references it.
     (@bind_binary_left_primal $operands:ident, $left_primal:ident) => {
         let $left_primal = $operands.left_primal()?;
     };
 
-    // This internal helper handles `_` for a binary right primal by emitting neither a binding nor an accessor call.
-    // The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the left operand.
+    // This internal helper branch handles `_` for a binary right primal by emitting neither a binding nor an accessor
+    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the left
+    // operand.
     (@bind_binary_right_primal $operands:ident, _) => {};
 
-    // This internal helper binds a named binary right primal through the lazy operand accessor. It complements the `_`
-    // arm so the generated rule evaluates and aligns the right primal only when its formula references it.
+    // This internal helper branch binds a named binary right primal through the lazy operand accessor. It complements
+    // the `_` arm so the generated rule evaluates and aligns the right primal only when its formula references it.
     (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
         let $right_primal = $operands.right_primal()?;
     };
 
-    // This internal helper emits the `DifferentiableOperation` shell for a fully custom JVP closure. It exists as the
-    // common endpoint for custom rules with either nonlinear or custom transposition, keeping trait boilerplate out of
-    // the public DSL while leaving the JVP algorithm entirely under caller control.
+    // This internal helper branch emits the `DifferentiableOperation` shell for a fully custom JVP closure. It exists
+    // as the common endpoint for custom rules with either nonlinear or custom transposition, keeping trait boilerplate
+    // out of the public DSL while leaving the JVP algorithm entirely under caller control.
     (
         @custom_jvp
         $(#[$documentation:meta])*
@@ -1900,9 +1905,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper emits the `TransposableOperation` shell for a fully custom transposition closure. Structured
-    // binary rules also lower through it, which centralizes the trait signature and user-specified bounds without
-    // imposing a second transposition abstraction.
+    // This internal helper branch emits the `TransposableOperation` shell for a fully custom transposition closure.
+    // Structured binary rules also lower through it, which centralizes the trait signature and user-specified bounds
+    // without imposing a second transposition abstraction.
     (
         @custom_transpose
         $(#[$documentation:meta])*
