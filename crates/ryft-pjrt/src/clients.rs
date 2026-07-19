@@ -153,7 +153,7 @@ impl<'s> Client<'s> {
         use ffi::PJRT_Client_UpdateGlobalProcessInfo_Args;
 
         // We extract the process information that we need, but we also pull out the error messages and collect them
-        // into a [`Vec`]. That is because they need to remain alive for the duration of the lifetime of the process
+        // into a `Vec`. That is because they need to remain alive for the duration of the lifetime of the process
         // information as they represent the backing storage for the error messages that are referenced from there.
         let (process_information, _): (Vec<_>, Vec<_>) = processes
             .iter()

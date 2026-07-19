@@ -911,8 +911,8 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
         unsafe {
-            // We forget `self` and return a new [`OperationRef`] to make sure that ownership is transferred
-            // correctly if `self` is a [`DetachedOperation`].
+            // We forget `self` and return a new `OperationRef` to make sure that ownership is transferred
+            // correctly if `self` is a `DetachedOperation`.
             let context = self.context();
             let handle = self.to_c_api();
             mlirOperationMoveAfter(handle, other.to_c_api());
@@ -938,8 +938,8 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
         unsafe {
-            // We forget `self` and return a new [`OperationRef`] to make sure that ownership is transferred
-            // correctly if `self` is a [`DetachedOperation`].
+            // We forget `self` and return a new `OperationRef` to make sure that ownership is transferred
+            // correctly if `self` is a `DetachedOperation`.
             let context = self.context();
             let handle = self.to_c_api();
             mlirOperationMoveBefore(handle, other.to_c_api());
@@ -1102,7 +1102,7 @@ pub trait DetachedOp<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 }
 
 /// Trait used to represent non-owning references to [`Operation`]s.
-pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Clone + Operation<'o, 'c, 't> {
+pub trait OpRef<'o, 'c: 'o, 't: 'c>: Copy + Operation<'o, 'c, 't> {
     /// Tries to cast this [`OpRef`] to an instance of `O` (e.g., an instance of [`OperationRef`]). If this
     /// is not an instance of the specified [`OpRef`] type, this function will return [`None`].
     unsafe fn cast<O: OpRef<'o, 'c, 't>>(&self) -> Option<O> {
@@ -1940,7 +1940,7 @@ mod tests {
             )
             .unwrap();
 
-        // Test with [`WalkResult::Advance`].
+        // Test with `WalkResult::Advance`.
         let mut result: Vec<String> = Vec::new();
         op.walk(WalkOrder::PreOrder, |op| {
             result.push(op.name().as_str().unwrap().to_string());
@@ -1948,7 +1948,7 @@ mod tests {
         });
         assert_eq!(vec!["parent", "child_0", "child_1"], result);
 
-        // Test with [`WalkResult::Interrupt`].
+        // Test with `WalkResult::Interrupt`.
         result.clear();
         op.walk(WalkOrder::PreOrder, |op| {
             let name = op.name().as_str().unwrap().to_string();
@@ -1960,7 +1960,7 @@ mod tests {
         });
         assert_eq!(vec!["parent", "child_0"], result);
 
-        // Test with [`WalkResult::Skip`].
+        // Test with `WalkResult::Skip`.
         result.clear();
         op.walk(WalkOrder::PreOrder, |op| {
             result.push(op.name().as_str().unwrap().to_string());
@@ -2001,7 +2001,7 @@ mod tests {
             )
             .unwrap();
 
-        // Test with [`WalkResult::Advance`].
+        // Test with `WalkResult::Advance`.
         let mut result: Vec<String> = Vec::new();
         op.walk(WalkOrder::PostOrder, |op| {
             result.push(op.name().as_str().unwrap().to_string());
@@ -2009,7 +2009,7 @@ mod tests {
         });
         assert_eq!(vec!["child", "parent", "grandparent"], result);
 
-        // Test with [`WalkResult::Interrupt`].
+        // Test with `WalkResult::Interrupt`.
         result.clear();
         op.walk(WalkOrder::PostOrder, |op| {
             let name = op.name().as_str().unwrap().to_string();
@@ -2021,8 +2021,8 @@ mod tests {
         });
         assert_eq!(vec!["child", "parent"], result);
 
-        // Test with [`WalkResult::Skip`], which should result in the same behavior as [`WalkResult::Advance`]
-        // because when walking in [`WalkOrder::PostOrder`] we always visit children before their parents.
+        // Test with `WalkResult::Skip`, which should result in the same behavior as `WalkResult::Advance`
+        // because when walking in `WalkOrder::PostOrder` we always visit children before their parents.
         result.clear();
         op.walk(WalkOrder::PostOrder, |op| {
             result.push(op.name().as_str().unwrap().to_string());
@@ -2107,7 +2107,7 @@ mod tests {
         let context = Context::new();
         let op = OperationBuilder::new("foo", context.unknown_location()).build().unwrap();
 
-        // We are just checking that [`Operation::dump`] runs successfully without crashing.
+        // We are just checking that `Operation::dump` runs successfully without crashing.
         // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
         op.dump();
     }

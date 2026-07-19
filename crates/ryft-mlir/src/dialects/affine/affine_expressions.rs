@@ -17,7 +17,7 @@ use crate::{AffineMap, Context, Error, mlir_subtype_trait_impls};
 ///
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/Affine/#affine-expressions)
 /// for more information.
-pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
+pub trait AffineExpression<'c, 't: 'c>: Sized + Eq + Display {
     /// Constructs a new instance of this type from the provided handle that came from a function in the MLIR C API.
     ///
     /// This function is marked as unsafe because handling the MLIR C API representations in Rust is generally not

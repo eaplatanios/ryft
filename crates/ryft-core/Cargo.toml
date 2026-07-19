@@ -29,17 +29,25 @@ pre-release-replacements = [
 
 [dependencies]
 ryft-macros.workspace = true
+approx.workspace = true
 aquamarine.workspace = true
 convert_case.workspace = true
 dyn-eq.workspace = true
 dyn-hash.workspace = true
+flate2.workspace = true
 half.workspace = true
+num-complex.workspace = true
+lru.workspace = true
 paste.workspace = true
+serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+trybuild.workspace = true
 indoc.workspace = true
 pretty_assertions.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []

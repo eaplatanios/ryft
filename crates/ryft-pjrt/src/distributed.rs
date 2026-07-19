@@ -555,7 +555,7 @@ mod tests {
         let service = plugin.distributed_runtime_service(&address, service_options).unwrap();
         drop(service);
 
-        // Test constructing invalid [`DistributedRuntimeService`]s.
+        // Test constructing invalid `DistributedRuntimeService`s.
         assert!(matches!(
             DistributedRuntimeService::from_c_api(std::ptr::null_mut(), plugin.api()),
             Err(Error::InvalidArgument { message, .. })
@@ -632,7 +632,7 @@ mod tests {
         drop(client);
         assert_eq!(callback_counter.load(Ordering::SeqCst), 1);
 
-        // Test constructing invalid [`DistributedRuntimeClient`]s.
+        // Test constructing invalid `DistributedRuntimeClient`s.
         assert!(matches!(
             DistributedRuntimeClient::from_c_api(std::ptr::null_mut(), None, plugin.api()),
             Err(Error::InvalidArgument { message, .. })

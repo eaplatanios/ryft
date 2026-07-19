@@ -332,7 +332,7 @@ mod tests {
         let column_count = 5;
         let background_colors = ShardingVisualization::background_colors(row_count, column_count);
 
-        // The first [`VISUALIZATION_COLOR_PALETTE.len()`] colors should all be unique.
+        // The first `VISUALIZATION_COLOR_PALETTE.len()` colors should all be unique.
         let colors = background_colors.iter().flatten().copied().collect::<Vec<_>>();
         let unique_colors = colors.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
         assert_eq!(unique_colors.len(), VISUALIZATION_COLOR_PALETTE.len());

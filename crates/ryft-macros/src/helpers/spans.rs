@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn test_with_span() {
-        // Test whether [`with_span`] preserves group structure.
+        // Test whether `with_span` preserves group structure.
         fn group_count(stream: TokenStream) -> usize {
             stream
                 .into_iter()
@@ -47,7 +47,7 @@ mod tests {
         assert_eq!(transformed.to_string(), stream.to_string());
         assert_eq!(group_count(transformed), group_count(stream));
 
-        // Test whether [`with_span`] preserves group delimiters.
+        // Test whether `with_span` preserves group delimiters.
         let transformed = with_span(quote!((value)), Span::call_site());
         let token = transformed.into_iter().next().expect("expected one token");
         let group = match token {
@@ -56,7 +56,7 @@ mod tests {
         };
         assert_eq!(group.delimiter(), Delimiter::Parenthesis);
 
-        // Test whether [`with_span`] handles empty streams correctly.
+        // Test whether `with_span` handles empty streams correctly.
         assert!(with_span(TokenStream::new(), Span::call_site()).is_empty());
     }
 }

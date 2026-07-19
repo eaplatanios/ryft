@@ -189,7 +189,7 @@ mod tests {
             .contains("different path")
         );
 
-        // Test [`Option::<syn::Ident>::from_meta`].
+        // Test `Option::<syn::Ident>::from_meta`.
         let mut parsed = None;
         syn::meta::parser(|meta| {
             parsed = Some(Option::<syn::Ident>::from_meta(&Symbol::new("crate"), &meta)?);
@@ -199,7 +199,7 @@ mod tests {
         .unwrap();
         assert!(parsed.expect("expected optional value to be parsed").is_none());
 
-        // Test [`bool::from_meta`].
+        // Test `bool::from_meta`.
         let mut bool_value = None;
         syn::meta::parser(|meta| {
             bool_value = Some(bool::from_meta(&Symbol::new("crate"), &meta)?);
@@ -218,7 +218,7 @@ mod tests {
         .unwrap();
         assert!(!bool_value.expect("expected boolean value to be parsed"));
 
-        // Test [`syn::LitStr::from_meta`].
+        // Test `syn::LitStr::from_meta`.
         assert!(
             syn::meta::parser(|meta| {
                 let _ = syn::LitStr::from_meta(&Symbol::new("crate"), &meta)?;
@@ -230,7 +230,7 @@ mod tests {
             .contains("expected ryft 'crate' attribute to be a string")
         );
 
-        // Test [`syn::Ident::from_meta`].
+        // Test `syn::Ident::from_meta`.
         let mut ident = None;
         syn::meta::parser(|meta| {
             ident = Some(syn::Ident::from_meta(&Symbol::new("crate"), &meta)?);
@@ -240,7 +240,7 @@ mod tests {
         .unwrap();
         assert_eq!(ident.expect("expected identifier to be parsed").to_string(), "ryft");
 
-        // Test [`syn::Path::from_meta`].
+        // Test `syn::Path::from_meta`.
         let mut path = None;
         syn::meta::parser(|meta| {
             path = Some(syn::Path::from_meta(&Symbol::new("crate"), &meta)?);
@@ -253,7 +253,7 @@ mod tests {
             "ryft::core",
         );
 
-        // Test [`syn::ExprPath::from_meta`].
+        // Test `syn::ExprPath::from_meta`.
         let mut expr_path = None;
         syn::meta::parser(|meta| {
             expr_path = Some(syn::ExprPath::from_meta(&Symbol::new("crate"), &meta)?);
@@ -270,7 +270,7 @@ mod tests {
             "ryft::core::Type",
         );
 
-        // Test [`Vec::<syn::WherePredicate>::from_meta`].
+        // Test `Vec::<syn::WherePredicate>::from_meta`.
         let mut predicates = None;
         syn::meta::parser(|meta| {
             predicates = Some(Vec::<syn::WherePredicate>::from_meta(&Symbol::new("bounds"), &meta)?);
@@ -287,7 +287,7 @@ mod tests {
             vec!["T:Clone", "U:Default"],
         );
 
-        // Test [`syn::Type::from_meta`].
+        // Test `syn::Type::from_meta`.
         let mut ty = None;
         syn::meta::parser(|meta| {
             ty = Some(syn::Type::from_meta(&Symbol::new("crate"), &meta)?);

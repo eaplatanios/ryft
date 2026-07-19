@@ -20,7 +20,7 @@ pub enum BroadcastingError {
     IncompatibleShapes { lhs: Shape, rhs: Shape },
 
     #[error("failed to broadcast due to incompatible shardings; lhs={lhs:?}, rhs={rhs:?}")]
-    IncompatibleShardings { lhs: Option<Sharding>, rhs: Option<Sharding> },
+    IncompatibleShardings { lhs: Option<Box<Sharding>>, rhs: Option<Box<Sharding>> },
 
     #[error(
         "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, so \
@@ -35,7 +35,7 @@ pub enum BroadcastingError {
     ShardingError(#[from] ShardingError),
 }
 
-/// Represents [`Type`](crate::types::Type)s or values that can be broadcast together.
+/// Represents [`Type`](crate::Type)s or values that can be broadcast together.
 ///
 /// Broadcasting in Ryft has two orthogonal components:
 ///
@@ -344,7 +344,10 @@ fn broadcast_sharding(
         (None, Some(right)) => right.mesh().clone(),
         (Some(left), Some(right)) if left.mesh() == right.mesh() => left.mesh().clone(),
         (Some(left), Some(right)) => {
-            return Err(BroadcastingError::IncompatibleShardings { lhs: Some(left.clone()), rhs: Some(right.clone()) });
+            return Err(BroadcastingError::IncompatibleShardings {
+                lhs: Some(Box::new(left.clone())),
+                rhs: Some(Box::new(right.clone())),
+            });
         }
     };
 
@@ -361,16 +364,16 @@ fn broadcast_sharding(
         let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
         let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         };
         if let ShardingDimension::Sharded(axis_names) = dimension {
             for axis_name in axis_names {
                 if !used_axes.insert(axis_name.clone()) {
                     return Err(BroadcastingError::IncompatibleShardings {
-                        lhs: lhs_sharding.cloned(),
-                        rhs: rhs_sharding.cloned(),
+                        lhs: lhs_sharding.cloned().map(Box::new),
+                        rhs: rhs_sharding.cloned().map(Box::new),
                     });
                 }
             }
@@ -385,8 +388,8 @@ fn broadcast_sharding(
         (Some(left), Some(right)) if left.unreduced_axes() == right.unreduced_axes() => left.unreduced_axes().clone(),
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
@@ -398,8 +401,8 @@ fn broadcast_sharding(
         (Some(left), Some(right)) if left.reduced_axes() == right.reduced_axes() => left.reduced_axes().clone(),
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
@@ -413,19 +416,18 @@ fn broadcast_sharding(
         }
         (Some(_), Some(_)) => {
             return Err(BroadcastingError::IncompatibleShardings {
-                lhs: lhs_sharding.cloned(),
-                rhs: rhs_sharding.cloned(),
+                lhs: lhs_sharding.cloned().map(Box::new),
+                rhs: rhs_sharding.cloned().map(Box::new),
             });
         }
     };
 
-    Ok(Some(Sharding::with_manual_axes(
-        mesh,
-        broadcasted_dimensions,
-        unreduced_axes,
-        reduced_axes,
-        varying_manual_axes,
-    )?))
+    Ok(Some(
+        Sharding::new(mesh, broadcasted_dimensions)?
+            .with_unreduced_axes(unreduced_axes)?
+            .with_reduced_axes(reduced_axes)?
+            .with_varying_manual_axes(varying_manual_axes)?,
+    ))
 }
 
 /// Returns `true` if the provided [`Sharding`]s are broadcastable, according to the rules of [`broadcast_sharding`].
@@ -571,56 +573,32 @@ mod tests {
         ])
         .unwrap();
 
-        let s0 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["x"],
-        )
-        .unwrap();
-        let s1 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["x"],
-        )
-        .unwrap();
-        let s2 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["y"],
-        )
-        .unwrap();
-        let s3 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
-            Vec::<&str>::new(),
-            ["y"],
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s4 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            ["y"],
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let s0 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let s1 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let s2 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["y"])
+            .unwrap();
+        let s3 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+            .unwrap()
+            .with_reduced_axes(["y"])
+            .unwrap();
+        let s4 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_reduced_axes(["y"])
+            .unwrap();
         let s5 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
             .unwrap();
-        let s6 = Sharding::with_manual_axes(
-            m0,
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["x"],
-        )
-        .unwrap();
+        let s6 = Sharding::new(m0, vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
         let s7 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let s8 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
             .unwrap();
@@ -745,7 +723,6 @@ mod tests {
     #[test]
     fn test_parameterized_array_type_broadcastable() {
         #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
-        #[ryft(crate = "crate::parameters")]
         enum TestEnum<P: Parameter> {
             Wrapped { inner: P },
             Pair { left: P, right: P },

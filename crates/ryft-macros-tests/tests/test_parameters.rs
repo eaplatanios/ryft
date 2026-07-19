@@ -40,6 +40,20 @@ fn test_simple_struct() {
 }
 
 #[test]
+fn test_simple_struct_with_i_and_p_generics() {
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    struct Struct<I, P: Parameter> {
+        input: I,
+        values: Vec<P>,
+    }
+
+    let value = Struct { input: "metadata", values: vec![1_i32, 2_i32] };
+    let structure = value.parameter_structure();
+    let reparameterized = Struct::from_parameters(structure, [3_i64, 4_i64]).unwrap();
+    assert_eq!(reparameterized, Struct { input: "metadata", values: vec![3_i64, 4_i64] });
+}
+
+#[test]
 fn test_tuple_struct() {
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     #[ryft(crate = "ryft")]
@@ -740,7 +754,7 @@ fn test_generics() {
 
 #[test]
 fn test_map_parameters() {
-    // This test implements a toy forward-differentiation approach to test [`Parameterized::map_parameters`].
+    // This test implements a toy forward-differentiation approach to test `Parameterized::map_parameters`.
 
     #[derive(Parameter, Parameterized, Debug, Clone, PartialEq, Eq)]
     struct ValueWithTangent<P: Parameter> {
@@ -795,7 +809,7 @@ fn test_map_parameters() {
     }
 
     // We will go a little weird and compute a second derivative which means we need two layers
-    // of [`ValueWithTangent`] wrapping.
+    // of `ValueWithTangent` wrapping.
     let x = ValueWithTangent { primal: 1f64, tangent: 1f64 };
     let x = ValueWithTangent { primal: x.clone(), tangent: x };
     let linear1 = Linear { weights: 4f64, bias: 2f64 };

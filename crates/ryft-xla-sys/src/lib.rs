@@ -49,3 +49,9 @@ pub mod distributed;
 pub mod mlir;
 pub mod profiler;
 pub mod protos;
+
+/// OpenXLA source revision used to build this crate's native XLA and PJRT artifacts.
+pub const XLA_COMMIT: &str = env!("RYFT_XLA_COMMIT");
+
+/// JAX source revision paired with [`XLA_COMMIT`] by this crate's native build.
+pub const JAX_COMMIT: &str = env!("RYFT_JAX_COMMIT");

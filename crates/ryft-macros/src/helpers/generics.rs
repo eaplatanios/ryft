@@ -120,7 +120,7 @@ impl GenericsHelpers for syn::Generics {
     }
 
     fn matches_any_param(&self, ident: &syn::Ident) -> bool {
-        // Note that we could precompute a [`HashSet`] with all the parameter identifiers. We do not currently do that
+        // Note that we could precompute a `HashSet` with all the parameter identifiers. We do not currently do that
         // because we assume that the number of generic parameters is usually quite small and so looping over them
         // should be sufficiently fast.
         self.params.iter().any(|param| param.ident() == Some(ident))

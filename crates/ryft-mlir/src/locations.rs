@@ -23,7 +23,7 @@ use crate::{Context, Error, mlir_subtype_trait_impls};
 ///
 /// For more information on MLIR locations refer to the
 /// [official MLIR documentation](https://mlir.llvm.org/docs/Dialects/Builtin/#location-attributes).
-pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + Debug {
+pub trait Location<'c, 't: 'c>: Sized + Copy + Eq + Display + Debug {
     /// Constructs a new [`Location`] of this type from the provided handle
     /// that came from a function in the MLIR C API.
     ///
@@ -115,7 +115,7 @@ pub(crate) mod tests {
     ) {
         assert_eq!(format!("{}", location), expected);
 
-        // Extract the type name for `L` to check the [`Debug`] implementation.
+        // Extract the type name for `L` to check the `Debug` implementation.
         let type_name = std::any::type_name::<L>().rsplit("::").next().unwrap_or("").split("<").next().unwrap_or("");
         assert_eq!(format!("{:?}", location), format!("{type_name}[{expected}]"));
     }

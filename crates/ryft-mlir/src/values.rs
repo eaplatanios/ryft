@@ -31,7 +31,7 @@ use crate::{
 ///
 /// Refer to the [official MLIR documentation](https://mlir.llvm.org/docs/LangRef/#high-level-structure)
 /// for more information.
-pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display {
+pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Eq + Display {
     /// Constructs a new [`Value`] of this type from the provided [`MlirValue`] handle that came from a function in the
     /// MLIR C API, and a reference to the [`Context`] that owns it.
     ///
@@ -544,8 +544,8 @@ mod tests {
         let value = unsafe { ValueRef::from_c_api(bad_handle, &context) };
         assert!(value.is_err());
 
-        // We are also checking that [`Value::dump`] runs successfully without crashing.
-        // Ideally, we would want a way to capture the standard error stream and verify that it printed the right thing.
+        // We are also checking that `Value::dump` runs successfully without crashing. Ideally, we would want a way
+        // to capture the standard error stream and verify that it printed the right thing.
         result.dump();
     }
 

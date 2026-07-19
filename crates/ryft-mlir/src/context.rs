@@ -106,7 +106,7 @@ impl<'t> Context<'t> {
     /// the new [`Context`] is effectively the original/provided [`Context`] but with its [`ThreadPoolRef`] replaced.
     pub fn with_thread_pool(self, thread_pool: ThreadPoolRef) -> Context {
         unsafe {
-            // Forget the original [`Context`] instance since we are going to be re-using its handle.
+            // Forget the original `Context` instance since we are going to be re-using its handle.
             let mut manually_dropped_self = ManuallyDrop::new(self);
             std::ptr::drop_in_place(&mut manually_dropped_self.thread_pool);
             mlirContextSetThreadPool(*manually_dropped_self.handle.borrow_mut(), thread_pool.to_c_api());

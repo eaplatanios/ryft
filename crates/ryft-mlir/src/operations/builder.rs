@@ -185,8 +185,8 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
 impl Drop for OperationBuilder<'_, '_> {
     fn drop(&mut self) {
         unsafe {
-            // [`OperationBuilder`]s only own the [`Region`]s that they contain. So, we only drop any regions that
-            // the current [`OperationBuilder`] owns and which are not `null` pointers (just in case something has
+            // `OperationBuilder`s only own the `Region`s that they contain. So, we only drop any regions that
+            // the current `OperationBuilder` owns and which are not `null` pointers (just in case something has
             // gone wrong; this should never really happen in practice).
             if self.handle.nRegions > 0 {
                 for region in std::slice::from_raw_parts(self.handle.regions, self.handle.nRegions.cast_unsigned()) {

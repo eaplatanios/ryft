@@ -238,9 +238,9 @@ impl Profiler {
         // The C API header documents a two-pass protocol (first call with null buffer to get the size and then call
         // with the allocated buffer to fill), but the actual XLA implementation handles everything in a single call
         // when `args->buffer` is null: it allocates an internal buffer of `serialized_size + 1` bytes, serializes
-        // the [`XSpace`] Protobuf message, and sets `args.buffer` and `args.buffer_size_in_bytes` to point to this
+        // the `XSpace` Protobuf message, and sets `args.buffer` and `args.buffer_size_in_bytes` to point to this
         // internal storage. A second call with a non-null buffer is a no-op. The internal buffer remains valid until
-        // the profiler is destroyed but here we decode the resulting [`XSpace`] anyway and so we do not need to worry
+        // the profiler is destroyed but here we decode the resulting `XSpace` anyway and so we do not need to worry
         // about its lifetime.
         invoke_profiler_api_error_fn!(
             self.extension,

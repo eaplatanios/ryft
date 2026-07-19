@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(format!("{memory_1:?}"), "PinnedHostMemory(id=1, process_index=0, client=cpu)");
         assert_eq!(format!("{memory_2:?}"), "UnpinnedHostMemorySpace(id=2, process_index=0, client=cpu)");
 
-        // Test creating a [`Memory`] from a null pointer.
+        // Test creating a `Memory` from a null pointer.
         assert!(matches!(
             unsafe { Memory::from_c_api(std::ptr::null_mut(), client.api()) },
             Err(Error::InvalidArgument { message, .. })

@@ -37,11 +37,11 @@ pub struct DistinctAttributeRef<'c, 't> {
 
 impl<'c, 't> Attribute<'c, 't> for DistinctAttributeRef<'c, 't> {
     unsafe fn from_c_api(_handle: MlirAttribute, _context: &'c Context<'t>) -> Result<Self, Error> {
-        // Unfortunately, the MLIR C API does not provide a way to check if an [`MlirAttribute`] is a
-        // [`DistinctAttributeRef`] or not and so we do not allow constructing [`DistinctAttributeRef`]s this way at all.
-        // This means that downcasting [`Attribute`]s to [`DistinctAttributeRef`]s is not possible, for example. The
-        // only way to construct a [`DistinctAttributeRef`] is to use the [`Context::distinct_attribute`] method, or
-        // to call [`Attribute::into`] to wrap an existing [`Attribute`] into a new [`DistinctAttributeRef`].
+        // Unfortunately, the MLIR C API does not provide a way to check if an `MlirAttribute` is a
+        // `DistinctAttributeRef` or not and so we do not allow constructing `DistinctAttributeRef`s this way at all.
+        // This means that downcasting `Attribute`s to `DistinctAttributeRef`s is not possible, for example. The only
+        // way to construct a `DistinctAttributeRef` is to use the `Context::distinct_attribute` method, or to call
+        // `Attribute::into` to wrap an existing `Attribute` into a new `DistinctAttributeRef`.
         Err(Error::invalid_argument("distinct attributes cannot be constructed from raw MLIR attribute handles"))
     }
 
@@ -88,7 +88,7 @@ mod tests {
         let attribute = context.distinct_attribute(context.integer_attribute(context.signless_integer_type(32), 42));
         assert_eq!(&context, attribute.context());
 
-        // Verify that [`DistinctAttributeRef::from_c_api`] always fails.
+        // Verify that `DistinctAttributeRef::from_c_api` always fails.
         assert!(unsafe { DistinctAttributeRef::from_c_api(attribute.handle, &context) }.is_err());
     }
 
@@ -97,7 +97,7 @@ mod tests {
         let context = Context::new();
         let boolean_attribute = context.boolean_attribute(true);
 
-        // Each call to [`Context::distinct_attribute`] creates a new distinct attribute instance, and so
+        // Each call to `Context::distinct_attribute` creates a new distinct attribute instance, and so
         // the following two attributes should NOT be equal even if they are wrapping the same attribute.
         let attribute_1 = context.distinct_attribute(boolean_attribute);
         let attribute_2 = context.distinct_attribute(boolean_attribute);

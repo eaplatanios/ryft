@@ -210,7 +210,7 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
         'c: 'o,
     {
         // Note that we cannot use a borrow guard on `self.context` here because that would prevent any
-        // [`ExternalPass`]es from modifying the context during this run.
+        // `ExternalPass`es from modifying the context during this run.
         unsafe { LogicalResult::from_c_api(mlirPassManagerRunOnOp(self.handle, operation.to_c_api())) }
     }
 }
