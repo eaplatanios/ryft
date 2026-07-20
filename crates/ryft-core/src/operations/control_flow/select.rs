@@ -113,7 +113,7 @@ impl ElementwiseOperation for SelectOperation {
         // result. The output shape and placement are then the standard elementwise broadcast of all three operands
         // and the output data type is the promotion of the two branch data types.
         let condition = condition.clone().with_data_type(on_true.data_type());
-        Ok(vec![self.broadcast_output_type(&[condition, on_true.clone(), on_false.clone()])?])
+        Ok(vec![self.infer_elementwise_broadcast_type(&[condition, on_true.clone(), on_false.clone()])?])
     }
 }
 
@@ -315,7 +315,7 @@ where
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
-    use half::{bf16, f16};
+    use half::bf16;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -400,13 +400,9 @@ mod tests {
             Ok(vec![Scalar::from(3.0)]),
         );
 
-        // Scalar values decode their in-band Boolean payload through `BooleanLike` and reinterpret it as a
-        // genuinely Boolean-typed `Scalar::Bool`.
+        // Scalar values decode their in-band Boolean payload through `BooleanLike`.
         assert_eq!(Scalar::from(1.5).boolean(), Ok(true));
         assert_eq!(Scalar::from(0.0).boolean(), Ok(false));
-        assert_eq!(Scalar::from(2.0).as_boolean(), Scalar::from(true));
-        assert_eq!(Scalar::from(0.0f32).as_boolean(), Scalar::from(false));
-        assert_eq!(Scalar::from(f16::from_f64(-3.0)).as_boolean(), Scalar::from(true));
         assert_eq!(Scalar::from(bf16::ZERO).boolean(), Ok(false));
 
         // Type inference validates the condition and branch types and returns the branch type.
@@ -714,7 +710,7 @@ mod tests {
     #[test]
     fn test_select_partitioned_transpose_routes_the_cotangent_into_the_selected_branch() {
         // Condition `[true, false]` (known), branches and cotangent are length-two f64 vectors (linear branches).
-        let condition = Array::vector(vec![1.0, 0.0]).as_boolean();
+        let condition = Array::vector(vec![true, false]);
         // The branches are linear operands, so only their type enters the transpose; their values are unused.
         let on_true = Array::vector(vec![10.0, 20.0]);
         let cotangent = Array::vector(vec![5.0, 7.0]);

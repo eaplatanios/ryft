@@ -24,7 +24,7 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
     // and the recomputed state is reattached afterward.
     let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
-    let output = MulOperation.broadcast_output_type(&stripped)?;
+    let output = MulOperation.infer_elementwise_broadcast_type(&stripped)?;
     let left_unreduced = input_types[0].unreduced_axes();
     let left_reduced = input_types[0].reduced_axes();
     let right_unreduced = input_types[1].unreduced_axes();

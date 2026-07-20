@@ -21,6 +21,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::BooleanLike;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
+use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -35,7 +36,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
@@ -85,7 +86,7 @@ impl<F: Value> Default for ConditionOperation<F> {
     }
 }
 
-impl<F: Value<Type: BooleanLike>> Display for ConditionOperation<F> {
+impl<F: Value<Type: ElementType>> Display for ConditionOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -116,7 +117,7 @@ fn validated_branch_interfaces<'i, T: Type>(
 
 impl<F: Value> Operation<F::Type> for ConditionOperation<F>
 where
-    F::Type: BooleanLike,
+    F::Type: ElementType,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -130,7 +131,7 @@ where
     ) -> Result<Vec<F::Type>, TypeError> {
         let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
-        if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
+        if !input_types[0].is_scalar() || input_types[0].element_type() != DataType::Boolean {
             return Err(TypeError {
                 message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
             });
@@ -158,7 +159,7 @@ where
 impl<F, C> InterpretableOperation<C> for ConditionOperation<F>
 where
     F: Value,
-    F::Type: BooleanLike,
+    F::Type: ElementType,
     C: Domain<Type = F::Type, Value: BooleanLike>,
 {
     fn interpret<D: InterpretationDriver<C>>(

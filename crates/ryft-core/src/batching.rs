@@ -701,15 +701,6 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 }
 
 impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
-    fn as_boolean(&self) -> Self {
-        // Returns an `ArrayBatch` that wraps the Boolean reinterpretation of the carried value (via the value's own
-        // `BooleanLike::as_boolean`) under the same batch axis. The `.unwrap()` here is safe because `as_boolean`
-        // preserves structural metadata, so the batch axis that was valid for this batch remains in bounds for the
-        // reinterpreted value.
-        let value = self.value().as_boolean();
-        Self::new(value.r#type().into_owned(), value, self.batch_axis()).unwrap()
-    }
-
     fn boolean(&self) -> Result<bool, ProgramError> {
         if let Some(axis) = self.batch_axis().axis() {
             return Err(ProgramError::Concretization {

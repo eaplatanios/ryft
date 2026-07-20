@@ -4,14 +4,15 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::{BooleanLike, ElementwiseOperation};
+use crate::operations::ElementwiseOperation;
+use crate::operations::manipulation::conversion::ElementType;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::types::ArrayType;
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -71,7 +72,7 @@ impl Display for CompareOperation {
     }
 }
 
-impl<T: Type + Broadcastable + BooleanLike> Operation<T> for CompareOperation {
+impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation {
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
@@ -98,7 +99,7 @@ impl<T: Type + Broadcastable + BooleanLike> Operation<T> for CompareOperation {
 
         let broadcasted = T::broadcasted(input_types)
             .map_err(|_| TypeError { message: "comparison input types are not broadcast-compatible".to_string() })?;
-        Ok(vec![broadcasted.as_boolean()])
+        Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -122,7 +123,7 @@ impl ElementwiseOperation for CompareOperation {
 impl<C: Domain> InterpretableOperation<C> for CompareOperation
 where
     C::Value: Compare<Output = C::Value>,
-    C::Type: Broadcastable + BooleanLike,
+    C::Type: Broadcastable + ElementType,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -220,7 +221,7 @@ mod tests {
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
     use crate::programs::ProgramError;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::DataType;
 
     use super::*;
 
@@ -274,15 +275,6 @@ mod tests {
                 output_data_types = [DataType::Boolean],
             }],
         );
-    }
-
-    #[test]
-    fn test_boolean_type_conversion() {
-        assert_eq!(DataType::F64.as_boolean(), DataType::Boolean);
-        assert!(DataType::F64.boolean().is_err());
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        assert_eq!(array_type.as_boolean(), ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])));
-        assert!(array_type.boolean().is_err());
     }
 
     #[test]

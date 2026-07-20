@@ -1755,13 +1755,9 @@ pub trait WhilePredicate: BooleanLike + Clone + Sized {
     }
 }
 
-// Type metadata and symbolic values inherit the scalar `WhilePredicate` defaults, which surface
-// `BooleanLike::boolean`'s concretization errors: none of these carry a concrete predicate payload, and staged
-// whiles are consumed by staging and lowering rather than by the eager masked loop.
-impl WhilePredicate for DataType {}
-
-impl WhilePredicate for ArrayType {}
-
+// Symbolic values inherit the scalar `WhilePredicate` defaults, which surface `BooleanLike::boolean`'s
+// concretization errors: none of these carry a concrete predicate payload, and staged whiles are consumed by staging
+// and lowering rather than by the eager masked loop.
 impl<C: Context> WhilePredicate for Tracer<C> {}
 
 impl WhilePredicate for CaptureReference<ArrayType> {}
@@ -2511,13 +2507,6 @@ mod tests {
     }
 
     impl BooleanLike for TestValue {
-        fn as_boolean(&self) -> Self {
-            match self {
-                Self::Bool(value) => Self::Bool(*value),
-                Self::Number(value) => Self::Bool(*value != 0.0),
-            }
-        }
-
         fn boolean(&self) -> Result<bool, ProgramError> {
             match self {
                 Self::Bool(value) => Ok(*value),

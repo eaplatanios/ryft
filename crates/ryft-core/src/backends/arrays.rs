@@ -50,6 +50,7 @@ use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
+use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
     DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation,
@@ -1756,7 +1757,7 @@ impl Compare for Array {
                 left.convert_element_type(target)?.compare(&right.convert_element_type(target)?, direction)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { r#type: broadcast_type.as_boolean(), values })
+        Ok(Self { r#type: broadcast_type.with_element_type(DataType::Boolean), values })
     }
 }
 
@@ -1791,13 +1792,6 @@ impl Select for Array {
 }
 
 impl BooleanLike for Array {
-    /// Returns an [`Array`] with a Boolean-typed counterpart of this array's type and with every element
-    /// reinterpreted as Boolean through the elementwise [`Scalar`] conversion (i.e., zero maps to `false` and any
-    /// nonzero element maps to `true`).
-    fn as_boolean(&self) -> Self {
-        Self { r#type: self.r#type.as_boolean(), values: self.values.iter().map(|value| value.as_boolean()).collect() }
-    }
-
     fn boolean(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
         // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
@@ -2220,7 +2214,7 @@ mod tests {
     #[test]
     fn test_array_boolean_like() {
         let vector = Array::vector(vec![0.0, 2.5]);
-        let boolean = vector.as_boolean();
+        let boolean = vector.compare(&Array::vector(vec![0.0, 0.0]), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.r#type().into_owned(), array_type(DataType::Boolean, &[2]));
         assert_eq!(boolean, Array::vector(vec![false, true]));
         assert_eq!(Array::scalar(true).boolean(), Ok(true));

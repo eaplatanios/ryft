@@ -2151,14 +2151,6 @@ impl Select for Scalar {
 
 impl BooleanLike for Scalar {
     #[inline]
-    fn as_boolean(&self) -> Self {
-        match self.boolean() {
-            Ok(value) => Scalar::Bool(value),
-            Err(_) => *self,
-        }
-    }
-
-    #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Ok(Self::decode_low_precision_float(r#type, bits) != 0.0);
@@ -2475,10 +2467,9 @@ mod tests {
         let token = Scalar::Token;
 
         // The token scalar carries no payload: it renders as `token`, supports no arithmetic, comparisons, or
-        // Boolean conversion, and its `zero_like`/`one_like` are the identity.
+        // Boolean extraction, and its `zero_like`/`one_like` are the identity.
         assert_eq!(token.r#type().into_owned(), DataType::Token);
         assert_eq!(token.to_string(), "token");
-        assert_eq!(token.as_boolean(), token);
         assert!(token.boolean().is_err());
         assert!(token.compare(&token, ComparisonDirection::Equal).is_err());
         assert!(Neg::neg(&token).is_err());
@@ -2505,7 +2496,6 @@ mod tests {
         assert_eq!(zero, Scalar::Zero);
         assert_ne!(zero, Scalar::from(false));
         assert_eq!(zero.partial_cmp(&Scalar::Zero), Some(Ordering::Equal));
-        assert_eq!(zero.as_boolean(), zero);
         assert!(zero.boolean().is_err());
         assert!(zero.compare(&zero, ComparisonDirection::Equal).is_err());
         assert!(Neg::neg(&zero).is_err());
@@ -2673,13 +2663,12 @@ mod tests {
     #[test]
     fn test_scalar_boolean_like() {
         // Boolean conversion treats any nonzero payload as true, decoding Booleans, integers, and floating-point
-        // scalars alike, and `as_boolean` re-wraps that truth value as a `Scalar::Bool`.
+        // scalars alike.
         assert_eq!(Scalar::from(true).boolean(), Ok(true));
         assert_eq!(Scalar::from(0i32).boolean(), Ok(false));
         assert_eq!(Scalar::from(-2i64).boolean(), Ok(true));
         assert_eq!(Scalar::from(0.0f64).boolean(), Ok(false));
         assert_eq!(Scalar::from(0.5f32).boolean(), Ok(true));
-        assert_eq!(Scalar::from(2.5f64).as_boolean(), Scalar::from(true));
     }
 
     #[test]

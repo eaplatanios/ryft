@@ -8,7 +8,6 @@ use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
-use ryft_core::operations::BooleanLike;
 use ryft_core::operations::attention::{
     AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
@@ -315,7 +314,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue + BooleanLike>(
+    pub(crate) fn lower_condition<V: MlirLowerableValue>(
         &mut self,
         branch_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -334,7 +333,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue + BooleanLike>(
+    pub(crate) fn lower_while<V: MlirLowerableValue>(
         &mut self,
         while_op: &WhileOperation,
         loop_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
@@ -355,7 +354,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue + BooleanLike, Capture>(
+    pub(crate) fn lower_scan<V: MlirLowerableValue, Capture>(
         &mut self,
         scan_op: &ScanOperation<Capture>,
         scan_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
@@ -393,7 +392,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 /// [`to_mlir_module_for_plain_program`] and related entry points. The core [`ArrayOperation`] enum provides the default
 /// blanket implementation, and backends can add their own closed operation enums by implementing this trait for those
 /// enums.
-pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue + BooleanLike>: Operation<ArrayType> {
+pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayType> {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -405,7 +404,7 @@ pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue + BooleanLike>: Ope
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConvertElementTypeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -520,7 +519,7 @@ where
     ])
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for AddOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -541,7 +540,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for AddOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SubOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -562,7 +561,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SubOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MulOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -583,7 +582,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MulOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DivOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -604,7 +603,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DivOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for NegOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -739,7 +738,7 @@ where
     Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SinOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -766,7 +765,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SinOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CosOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -794,7 +793,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CosOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Atan2Operation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Atan2Operation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -815,7 +814,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Atan2Oper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ExpOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -833,7 +832,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ExpOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -850,7 +849,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SqrtOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -867,7 +866,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SqrtOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RsqrtOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -884,7 +883,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RsqrtOper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for TanhOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -901,7 +900,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for TanhOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogisticOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -921,7 +920,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogisticO
 
 /// [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
 /// over StableHLO operations during compilation.
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ErfOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -935,7 +934,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ErfOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for PowOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for PowOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -956,7 +955,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for PowOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SignOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -970,7 +969,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SignOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FloorOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FloorOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -984,7 +983,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FloorOper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CeilOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CeilOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -998,7 +997,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CeilOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RoundOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1014,7 +1013,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RoundOper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MaximumOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaximumOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1035,7 +1034,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MaximumOp
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MinimumOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinimumOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1056,7 +1055,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for MinimumOp
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RemainderOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemainderOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1077,7 +1076,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Remainder
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for AbsOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AbsOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1091,7 +1090,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for AbsOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ComplexOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1110,7 +1109,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ComplexOp
 
 /// StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
 /// composition (the same decomposition JAX's `conj` lowering uses).
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConjugateOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1134,7 +1133,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Conjugate
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RealOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RealOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1148,7 +1147,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RealOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ImaginaryOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ImaginaryOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1162,7 +1161,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Imaginary
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for TransposeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TransposeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1180,7 +1179,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Transpose
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DotOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1210,7 +1209,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DotOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOperation<ArrayType, Scalar> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FillOperation<ArrayType, Scalar> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1241,7 +1240,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for IotaOperation<ArrayType> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1269,7 +1268,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for IotaOpera
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CoordinateBasisOperation<ArrayType> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CoordinateBasisOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1283,7 +1282,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Coordinat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConstantOperation<V> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1304,7 +1303,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConstantO
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ReshapeOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1325,7 +1324,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ReshapeOp
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for BroadcastOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1593,7 +1592,7 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
 
 impl<V> LowerableXlaOperation<V> for XlaOperation<V>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -2333,7 +2332,7 @@ where
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConditionOperation<V> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConditionOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -2346,7 +2345,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Condition
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for WhileOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for WhileOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -2359,7 +2358,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for WhileOper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike, Capture> LowerableXlaOperation<V> for ScanOperation<Capture>
+impl<V: MlirLowerableValue, Capture> LowerableXlaOperation<V> for ScanOperation<Capture>
 where
     Capture: Value<Type = ArrayType>,
 {
@@ -3808,7 +3807,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 impl<V> LowerableXlaOperation<V> for ArrayOperation<V>
 where
-    V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: MlirLowerableValue + Slice + UpdateSlice + Reshape,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -4695,7 +4694,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested condition operation inside this lowering context.
-    pub(crate) fn lower_condition<V: MlirLowerableValue + BooleanLike>(
+    pub(crate) fn lower_condition<V: MlirLowerableValue>(
         &mut self,
         branch_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -4714,7 +4713,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue + BooleanLike>(
+    pub(crate) fn lower_while<V: MlirLowerableValue>(
         &mut self,
         while_op: &WhileOperation,
         loop_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
@@ -4735,7 +4734,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue + BooleanLike, Capture>(
+    pub(crate) fn lower_scan<V: MlirLowerableValue, Capture>(
         &mut self,
         scan_op: &ScanOperation<Capture>,
         scan_regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
@@ -5165,7 +5164,6 @@ pub(crate) trait MlirLowerableValue: Value<Type = ArrayType> + 'static {
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>,
-        Self: BooleanLike,
     {
         lower_literal_value(self, block, context, location)
     }
@@ -5282,7 +5280,7 @@ impl MlirLowerableValue for CpuArray {
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
 #[cfg(any(test, feature = "benchmarking"))]
 pub(crate) fn to_mlir_module_for_plain_program<
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: LowerableXlaOperation<V>,
@@ -5480,7 +5478,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
     return_final_token: bool,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
@@ -5522,7 +5520,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
 {
     let [true_branch, false_branch] = branch_regions else {
         return Err(LoweringError::UnsupportedOp {
@@ -5597,7 +5595,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
 {
     let [condition, body] = loop_regions else {
         return Err(LoweringError::UnsupportedOp {
@@ -5941,7 +5939,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
@@ -6191,7 +6189,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
@@ -6595,7 +6593,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
 ///
 /// `input_values` are the lowered call operands in callee-input order; for a `linear_jit_call` they are the lowered
 /// captured prefix followed by the lowered linear inputs.
-fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue + BooleanLike>(
+fn lower_jit_call<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue>(
     program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -6677,7 +6675,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
@@ -6710,7 +6708,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O, V>(
     token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
 {
@@ -6863,7 +6861,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     O: LowerableXlaOperation<V>,
     XlaOperation<V>: From<O>,
     Input: Parameterized<V>,
@@ -7112,7 +7110,7 @@ fn lower_manual_computation_inline<'b, 'c: 'b, 't: 'c, V>(
     collective_state: &CollectiveLoweringState,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
 {
     let local_input_tensor_types = program
         .input_types()
@@ -7182,7 +7180,7 @@ fn lower_literal_value<'b, 'c: 'b, 't: 'c, B, V, L>(
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue,
     L: Copy + Location<'c, 't>,
 {
     let value_type = value.r#type();

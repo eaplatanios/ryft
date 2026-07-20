@@ -1,17 +1,17 @@
 use std::collections::BTreeSet;
 
-use crate::batching::{ArrayBatch, BatchingTracer};
+use crate::batching::BatchingTracer;
 use crate::broadcasting::Broadcastable;
 use crate::captures::CaptureReference;
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{DifferentiableType, DifferentiationTracer};
 use crate::macros::check_count;
-use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
+use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::TypeError;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType};
+use crate::types::ArrayType;
 
 pub mod attention;
 pub mod collectives;
@@ -60,8 +60,8 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
     /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output
     /// [`Sharding`](crate::Sharding) does not follow plain broadcasting semantics (e.g., [`MulOperation`], which is
     /// bilinear in its operands and combines their reduction state accordingly) must override this function, typically
-    /// using [`broadcast_output_type`](Self::infer_elementwise_broadcast_type) for the data type, shapes, and
-    /// placement, and layering their own sharding rule on top.
+    /// using [`infer_elementwise_broadcast_type`](Self::infer_elementwise_broadcast_type) for the data type, shapes,
+    /// and placement, and layering their own sharding rule on top.
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, self.input_count(), TypeError);
@@ -102,76 +102,19 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
     }
 }
 
-/// Represents [`Type`](crate::Type)s and [`Value`](crate::Value)s that have a Boolean counterpart and that may carry
-/// a scalar Rust Boolean. [`BooleanLike`] is the shared contract between predicate-producing and predicate-consuming
-/// operations:
-///
-/// - **Predicate-Producing Operations (e.g., [`CompareOperation`]):** Call [`as_boolean`](Self::as_boolean)
-///   on *type metadata* to infer their output types from their broadcasted input types. For type metadata (e.g.,
-///   [`DataType`] and [`ArrayType`]), the Boolean counterpart keeps the same structural metadata (e.g., shape, layout,
-///   and sharding) but uses a Boolean element data type.
-/// - **Predicate-Consuming Operations (e.g., [`ConditionOperation`] and [`WhileOperation`]):** Call
-///   [`boolean`](Self::boolean) on *values* to extract the concrete scalar Rust Boolean that drives branching
-///   or selection.
-///
-/// For values, [`as_boolean`](Self::as_boolean) reinterprets the carried payload as a Boolean value: zero maps to
-/// `false` and any non-zero payload maps to `true`. Values that carry no concrete payload (e.g., staged tracers and
-/// [`CaptureReference`]s) cannot reinterpret anything and return themselves unchanged. Similarly,
-/// [`boolean`](Self::boolean) errors for type metadata and for staged values because they carry no
-/// concrete payload to decode.
+/// Represents values from which one concrete scalar Rust Boolean can be extracted. Concrete scalar values
+/// return their truth value, while non-scalar, staged, unknown, batched, or otherwise inaccessible values return a
+/// [`ProgramError::Concretization`] error. Predicate-consuming operations such as [`ConditionOperation`] and eager
+/// [`WhileOperation`] interpretation use this capability to drive host control flow.
 pub trait BooleanLike {
-    /// Returns the Boolean counterpart of this instance. For type metadata this is the same structural metadata with
-    /// a Boolean data type, and for values this is the value with its payload reinterpreted as Boolean (i.e., zero
-    /// maps to `false` and any non-zero payload maps to `true`).
-    fn as_boolean(&self) -> Self;
-
-    /// Extracts the scalar Rust Boolean value represented by this instance when there is one. For scalar values zero
-    /// gets interpreted as `false` while non-zero values get interpreted as `true`, while for array values this
-    /// requires a rank-0 Boolean-typed payload. Type metadata and staged values (e.g., tracers) error because they
-    /// carry no concrete payload.
+    /// Extracts the scalar Rust Boolean represented by this value. Numeric scalar backends may use ordinary truthiness
+    /// semantics (i.e., zero is `false` and non-zero is `true`), while array backends generally require a rank-zero
+    /// Boolean-typed payload. Values that cannot presently be read as one concrete predicate result in a
+    /// [`ProgramError::Concretization`] error.
     fn boolean(&self) -> Result<bool, ProgramError>;
 }
 
-impl BooleanLike for DataType {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        DataType::Boolean
-    }
-
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // `DataType` is type metadata and carries no concrete payload to decode.
-        Err(ProgramError::Concretization {
-            message: format!("cannot extract a concrete boolean from a data type instance ({self})"),
-        })
-    }
-}
-
-impl BooleanLike for ArrayType {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        Self { data_type: DataType::Boolean, ..self.clone() }
-    }
-
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // `ArrayType` is only abstract staged-program metadata. It satisfies generic operation-enum bounds for
-        // transform composition, but it never contains the concrete boolean needed to choose a branch.
-        Err(ProgramError::Concretization {
-            message: format!("cannot extract a concrete boolean from an array type instance ({self})"),
-        })
-    }
-}
-
 impl<C: Context> BooleanLike for Tracer<C> {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        // Returns this `Tracer` unchanged. Tracers carry no concrete payload to reinterpret, and a staged Boolean
-        // reinterpretation must be expressed explicitly in the traced program (e.g., via a comparison against zero)
-        // rather than implicitly through this trait.
-        self.clone()
-    }
-
     #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
         Err(ProgramError::Concretization { message: "cannot extract a concrete boolean from a tracer".to_string() })
@@ -179,13 +122,6 @@ impl<C: Context> BooleanLike for Tracer<C> {
 }
 
 impl BooleanLike for CaptureReference<ArrayType> {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        // Returns this `CaptureReference` unchanged. A captured constant is a reference into a side table,
-        // not the concrete value itself, so there is no payload to reinterpret here.
-        self.clone()
-    }
-
     #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
         // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
@@ -196,29 +132,13 @@ impl BooleanLike for CaptureReference<ArrayType> {
     }
 }
 
-// A partial-evaluation value's Boolean view uses its known payload's: a known value reinterprets (and decodes) the
-// carried known-side value, so branching on a known value in a closure succeeds exactly when the known-side inner
-// context is eager, while an unknown value names a residual program variable that carries no concrete payload and so
-// returns itself unchanged from `as_boolean` and errors from `boolean`. This is what lets host control flow branch on
-// known values while partial evaluation is in progress.
-impl<C: Context<Value: BooleanLike, Type: BooleanLike>> BooleanLike for PartialTracer<C> {
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        // Unknown and poisoned values carry no concrete payload to reinterpret and return themselves unchanged.
-        match self.value() {
-            Ok(value) => match value.value() {
-                PartialValue::Known(known) => {
-                    PartialTracer::new(self.context().clone(), PartialEvaluationValue::known(known.as_boolean()))
-                }
-                PartialValue::Unknown(_) => self.clone(),
-            },
-            Err(_) => self.clone(),
-        }
-    }
-
+impl<C: Context<Value: BooleanLike>> BooleanLike for PartialTracer<C> {
     #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
-        // A poisoned value surfaces its deferred error here, since branching on it cannot proceed anyway.
+        // A partial-evaluation value delegates concrete Boolean extraction to its known payload. This lets host control
+        // flow branch on values known under an eager inner context, while unknown values report that they cannot be
+        // concretized. Also, a poisoned value surfaces its deferred error here, since branching on it cannot proceed
+        // anyway.
         match self.value()?.value() {
             PartialValue::Known(known) => known.boolean(),
             PartialValue::Unknown(_) => Err(ProgramError::Concretization {
@@ -228,19 +148,11 @@ impl<C: Context<Value: BooleanLike, Type: BooleanLike>> BooleanLike for PartialT
     }
 }
 
-// A batch-carrying value's Boolean view uses its packed value's Boolean view. Branching on it via `boolean()` succeeds
-// only for a *replicated* value whose packed value is concrete.  A batched value has one Boolean per item and cannot
-// drive a single branch, and a staged value carries no concrete payload.
 impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingTracer<C> {
     #[inline]
-    fn as_boolean(&self) -> Self {
-        let r#type = self.batch().r#type().as_boolean();
-        let batch = ArrayBatch::new(r#type, self.batch().value().as_boolean(), self.batch().batch_axis()).unwrap();
-        BatchingTracer::new(self.context().clone(), batch)
-    }
-
-    #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
+        // A batch-carrying value delegates concrete Boolean extraction to its packed value only when it is replicated.
+        // A mapped batch has one Boolean per item and cannot drive one host branch.
         if !self.batch().batch_axis().is_replicated() {
             return Err(ProgramError::Concretization {
                 message: "cannot extract a concrete boolean from a batched value".to_string(),
@@ -250,19 +162,11 @@ impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingT
     }
 }
 
-// TODO(eaplatanios): Review this implementation.
-// A dual's Boolean view uses its primal's: `as_boolean` reinterprets the primal with a
-// structural zero tangent, and `boolean` decodes the primal — so branching on a dual in a
-// closure succeeds exactly when the primal is a concrete (eager) value and errors when it is a staged tracer.
 impl<C: Context<Type: DifferentiableType, Value: BooleanLike>> BooleanLike for DifferentiationTracer<C> {
     #[inline]
-    fn as_boolean(&self) -> Self {
-        let primal = self.primal().as_boolean();
-        Self::new(DifferentiationDual::new_with_zero_tangent(primal), self.context().clone())
-    }
-
-    #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
+        // A differentiation tracer delegates concrete Boolean extraction to its primal, so host branching succeeds
+        // exactly when that primal is concrete.
         self.primal().boolean()
     }
 }

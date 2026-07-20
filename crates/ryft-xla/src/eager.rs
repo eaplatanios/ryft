@@ -1,11 +1,10 @@
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
-use ryft_core::operations::compare::{Compare, ComparisonDirection};
-use ryft_core::operations::constants::ZeroLike;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::Broadcast;
+use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{ProgramError, Value};
@@ -51,18 +50,6 @@ fn shard_host_bytes(shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
 }
 
 impl BooleanLike for Array<'_> {
-    /// Returns the Boolean counterpart of this [`Array`]: already-Boolean arrays are returned as-is, while other
-    /// element types are reinterpreted on device by comparing against a zero-filled counterpart (zero maps to
-    /// `false` and any nonzero element maps to `true`). The conversion executes eagerly and panics if the underlying
-    /// device execution fails, matching this method's infallible signature.
-    fn as_boolean(&self) -> Self {
-        if self.data_type() == DataType::Boolean {
-            return self.clone();
-        }
-        let zero = self.zero_like();
-        self.compare(&zero, ComparisonDirection::NotEqual).expect("`as_boolean` conversion failed")
-    }
-
     /// Extracts a concrete scalar Rust Boolean by copying one addressable shard of a rank-0 Boolean-typed [`Array`]
     /// to the host. Higher-rank or non-Boolean arrays error because they cannot collapse to a single Boolean, and
     /// arrays with no addressable shards error because the current process cannot read their payload.
@@ -137,7 +124,7 @@ impl WhilePredicate for Array<'_> {
         let condition = if self.r#type().shape() == on_true.r#type().shape() {
             self.clone()
         } else {
-            let output_type = on_true.r#type().as_boolean();
+            let output_type = on_true.r#type().with_element_type(DataType::Boolean);
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
             self.broadcast(output_type, output_axes.as_slice())?
         };
@@ -231,7 +218,8 @@ mod tests {
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
-    use ryft_core::operations::constants::OneLike;
+    use ryft_core::operations::compare::{Compare, ComparisonDirection};
+    use ryft_core::operations::constants::{OneLike, ZeroLike};
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
@@ -1666,10 +1654,11 @@ mod tests {
         assert_eq!(read_f32s(&branch), vec![7.0]);
         assert!(!large.compare(&small, ComparisonDirection::LessThan).unwrap().boolean().unwrap());
 
-        // Non-Boolean payloads reinterpret on device: zero maps to false and nonzero maps to true.
-        let as_boolean = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]).as_boolean();
-        assert_eq!(as_boolean.data_type(), DataType::Boolean);
-        assert_eq!(read_booleans(&as_boolean), vec![false, true, false]);
+        // Elementwise truthiness is an explicit comparison against zero: zero maps to false and nonzero maps to true.
+        let input = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]);
+        let boolean = input.compare(&input.zero_like(), ComparisonDirection::NotEqual).unwrap();
+        assert_eq!(boolean.data_type(), DataType::Boolean);
+        assert_eq!(read_booleans(&boolean), vec![false, true, false]);
 
         // Rank-one predicates cannot collapse to a single Boolean.
         let vector_predicate = boolean_vector(&client, &mesh, &[true, false]);

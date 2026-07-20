@@ -22,8 +22,8 @@ use crate::types::{ArrayType, DataType};
 /// Canonical operation name for [`ConvertElementTypeOperation`].
 pub const CONVERT_ELEMENT_TYPE_OPERATION_NAME: &str = "convert_element_type";
 
-/// Type whose values have a numeric element [`DataType`] that can be converted independently of the
-/// type's remaining structure and placement metadata.
+/// Type whose values have an element [`DataType`] that can be inspected or replaced independently of the type's
+/// remaining structure and placement metadata.
 pub trait ElementType: Type {
     /// Returns the element [`DataType`].
     fn element_type(&self) -> DataType;

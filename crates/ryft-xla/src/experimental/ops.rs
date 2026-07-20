@@ -186,7 +186,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
 
 impl<V> From<ArrayOperation<V>> for XlaOperation<V>
 where
-    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + Slice + UpdateSlice + Reshape,
 {
     fn from(operation: ArrayOperation<V>) -> Self {
         match operation {
