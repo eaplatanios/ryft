@@ -149,6 +149,8 @@ update this file so that they do not need to remind you again in the future.
   any other derived traits.
 - When changing a core trait contract that is consumed by derive macros, run the corresponding macro integration test
   crate (e.g., `ryft-macros-tests`) in addition to the macro crate's own unit tests.
+- Precede every non-trivial declarative-macro branch with a concise code comment explaining the accepted public form
+  or the internal generation role.
 
 ### Error Handling
 

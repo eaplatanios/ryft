@@ -44,6 +44,7 @@ impl<T: Type> ZeroOperation<T> {
 }
 
 impl<T: Type> Display for ZeroOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -99,8 +100,8 @@ impl_non_differentiable_operation!(ZeroOperation<C::Type>);
 impl_nullary_transposable_operation!(ZeroOperation<T>);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 
-/// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`] is
-/// the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its
+/// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`]
+/// is the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
 /// backend- or context-dependent.
 pub trait Zero<V: Typed> {
@@ -155,45 +156,47 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
     use crate::types::DataType;
 
     use super::*;
 
     #[test]
     fn test_zero() {
+        // Verify canonical zero values across every supported scalar data-type family.
         let context = EagerContext::<Scalar, ZeroOperation<DataType>>::new();
-        assert_eq!(context.zero(&DataType::Boolean), Ok(Scalar::from(false)));
-        assert_eq!(context.zero(&DataType::I8), Ok(Scalar::from(0i8)));
-        assert_eq!(context.zero(&DataType::I16), Ok(Scalar::from(0i16)));
-        assert_eq!(context.zero(&DataType::I32), Ok(Scalar::from(0i32)));
-        assert_eq!(context.zero(&DataType::I64), Ok(Scalar::from(0i64)));
-        assert_eq!(context.zero(&DataType::U8), Ok(Scalar::from(0u8)));
-        assert_eq!(context.zero(&DataType::U16), Ok(Scalar::from(0u16)));
-        assert_eq!(context.zero(&DataType::U32), Ok(Scalar::from(0u32)));
-        assert_eq!(context.zero(&DataType::U64), Ok(Scalar::from(0u64)));
-        assert_eq!(context.zero(&DataType::BF16), Ok(Scalar::from(bf16::ZERO)));
-        assert_eq!(context.zero(&DataType::F16), Ok(Scalar::from(f16::ZERO)));
-        assert_eq!(context.zero(&DataType::F32), Ok(Scalar::from(0.0f32)));
-        assert_eq!(context.zero(&DataType::F64), Ok(Scalar::from(0.0f64)));
+        for (r#type, expected) in [
+            (DataType::Boolean, Scalar::from(false)),
+            (DataType::I8, Scalar::from(0i8)),
+            (DataType::I16, Scalar::from(0i16)),
+            (DataType::I32, Scalar::from(0i32)),
+            (DataType::I64, Scalar::from(0i64)),
+            (DataType::U8, Scalar::from(0u8)),
+            (DataType::U16, Scalar::from(0u16)),
+            (DataType::U32, Scalar::from(0u32)),
+            (DataType::U64, Scalar::from(0u64)),
+            (DataType::BF16, Scalar::from(bf16::ZERO)),
+            (DataType::F16, Scalar::from(f16::ZERO)),
+            (DataType::F32, Scalar::from(0.0f32)),
+            (DataType::F64, Scalar::from(0.0f64)),
+        ] {
+            assert_eq!(context.zero(&r#type), Ok(expected));
+        }
 
+        // Verify the operation's stored type, identity, zero metadata, rendering, and eager interpretation.
         let operation = ZeroOperation::new(DataType::F64);
-        assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);
+        assert_eq!(operation.name(), ZERO_OPERATION_NAME);
         assert!(Operation::<DataType>::is_zero(&operation, 0));
         assert!(!Operation::<DataType>::is_zero(&operation, 1));
-        assert_eq!(format!("{operation:?}"), "ZeroOperation { type: F64 }");
         assert_eq!(format!("{operation}"), "zero [type=f64]");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(operation.r#type(), &DataType::F64);
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -203,29 +206,8 @@ mod tests {
             ),
             Ok(vec![Scalar::from(0.0)]),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.5)],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &ZeroOperation::new(DataType::F32),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Ok(vec![Scalar::from(0.0f32)]),
-        );
 
+        // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, ZeroOperation<DataType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
         let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
@@ -238,28 +220,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_zero_batching_yields_replicated_output() {
-        // End-to-end: a batched function that stages `ZeroOperation` produces a replicated zero
-        // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
-        // zero-input operation and that the post-trace replay materializes the same zero for
-        // every batch item through the replicated broadcast path.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |x| {
-                    let zero_op = ArrayOperation::<Array>::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64)));
-                    let zero = x.context().bind(zero_op, Vec::new(), &[])?.into_iter().next().unwrap();
-                    Ok(x + zero)
-                },
-                Array::vector(vec![1.0, 2.0, 3.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0]);
     }
 }

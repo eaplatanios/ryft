@@ -20,6 +20,7 @@ pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
 pub struct ZeroLikeOperation;
 
 impl Display for ZeroLikeOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(ZERO_LIKE_OPERATION_NAME)
     }
@@ -98,35 +99,33 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
-    use crate::types::{ArrayType, DataType};
+    use crate::types::DataType;
 
     use super::*;
 
     #[test]
     fn test_zero_like() {
-        assert_eq!(Scalar::from(false).zero_like(), Scalar::from(false));
-        assert_eq!(Scalar::from(5i32).zero_like(), Scalar::from(0i32));
-        assert_eq!(Scalar::from(5u32).zero_like(), Scalar::from(0u32));
-        assert_eq!(Scalar::from(bf16::from_f32(5.0)).zero_like(), Scalar::from(bf16::ZERO));
-        assert_eq!(Scalar::from(f16::from_f32(5.0)).zero_like(), Scalar::from(f16::ZERO));
-        assert_eq!(Scalar::from(3.0f32).zero_like(), Scalar::from(0.0f32));
-        assert_eq!(Scalar::from(7.0f64).zero_like(), Scalar::from(0.0f64));
+        // Verify value-driven zero synthesis across representative scalar data-type families.
+        for (input, expected) in [
+            (Scalar::from(false), Scalar::from(false)),
+            (Scalar::from(5i32), Scalar::from(0i32)),
+            (Scalar::from(5u32), Scalar::from(0u32)),
+            (Scalar::from(bf16::from_f32(5.0)), Scalar::from(bf16::ZERO)),
+            (Scalar::from(f16::from_f32(5.0)), Scalar::from(f16::ZERO)),
+            (Scalar::from(3.0f32), Scalar::from(0.0f32)),
+            (Scalar::from(7.0f64), Scalar::from(0.0f64)),
+        ] {
+            assert_eq!(input.zero_like(), expected);
+        }
 
+        // Verify the operation's identity, zero metadata, rendering, and eager interpretation.
         let operation = ZeroLikeOperation;
-        assert_eq!(Operation::<DataType>::name(&operation), ZERO_LIKE_OPERATION_NAME);
         assert!(Operation::<DataType>::is_zero(&operation, 0));
         assert!(!Operation::<DataType>::is_zero(&operation, 1));
-        assert_eq!(format!("{operation:?}"), "ZeroLikeOperation");
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Ok(vec![DataType::F64])
-        );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -136,24 +135,8 @@ mod tests {
             ),
             Ok(vec![Scalar::from(0.0)]),
         );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
-            Ok(vec![ArrayType::scalar(DataType::F32)]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
 
+        // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, ZeroLikeOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];

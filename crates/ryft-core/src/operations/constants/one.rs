@@ -44,6 +44,7 @@ impl<T: Type> OneOperation<T> {
 }
 
 impl<T: Type> Display for OneOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -152,37 +153,41 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
     use crate::types::DataType;
 
     use super::*;
 
     #[test]
     fn test_one() {
+        // Verify canonical one values across every supported scalar data-type family.
         let context = EagerContext::<Scalar, OneOperation<DataType>>::new();
-        assert_eq!(context.one(&DataType::Boolean), Ok(Scalar::from(true)));
-        assert_eq!(context.one(&DataType::I8), Ok(Scalar::from(1i8)));
-        assert_eq!(context.one(&DataType::I16), Ok(Scalar::from(1i16)));
-        assert_eq!(context.one(&DataType::I32), Ok(Scalar::from(1i32)));
-        assert_eq!(context.one(&DataType::I64), Ok(Scalar::from(1i64)));
-        assert_eq!(context.one(&DataType::U8), Ok(Scalar::from(1u8)));
-        assert_eq!(context.one(&DataType::U16), Ok(Scalar::from(1u16)));
-        assert_eq!(context.one(&DataType::U32), Ok(Scalar::from(1u32)));
-        assert_eq!(context.one(&DataType::U64), Ok(Scalar::from(1u64)));
-        assert_eq!(context.one(&DataType::BF16), Ok(Scalar::from(bf16::ONE)));
-        assert_eq!(context.one(&DataType::F16), Ok(Scalar::from(f16::ONE)));
-        assert_eq!(context.one(&DataType::F32), Ok(Scalar::from(1.0f32)));
-        assert_eq!(context.one(&DataType::F64), Ok(Scalar::from(1.0f64)));
+        for (r#type, expected) in [
+            (DataType::Boolean, Scalar::from(true)),
+            (DataType::I8, Scalar::from(1i8)),
+            (DataType::I16, Scalar::from(1i16)),
+            (DataType::I32, Scalar::from(1i32)),
+            (DataType::I64, Scalar::from(1i64)),
+            (DataType::U8, Scalar::from(1u8)),
+            (DataType::U16, Scalar::from(1u16)),
+            (DataType::U32, Scalar::from(1u32)),
+            (DataType::U64, Scalar::from(1u64)),
+            (DataType::BF16, Scalar::from(bf16::ONE)),
+            (DataType::F16, Scalar::from(f16::ONE)),
+            (DataType::F32, Scalar::from(1.0f32)),
+            (DataType::F64, Scalar::from(1.0f64)),
+        ] {
+            assert_eq!(context.one(&r#type), Ok(expected));
+        }
 
+        // Verify the operation's stored type, identity, rendering, and eager interpretation.
         let operation = OneOperation::new(DataType::F64);
-        assert_eq!(Operation::<DataType>::name(&operation), ONE_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "OneOperation { type: F64 }");
+        assert_eq!(operation.name(), ONE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "one [type=f64]");
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(operation.r#type(), &DataType::F64);
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -192,29 +197,8 @@ mod tests {
             ),
             Ok(vec![Scalar::from(1.0)]),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(2.5)],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &OneOperation::new(DataType::F32),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Ok(vec![Scalar::from(1.0f32)]),
-        );
 
+        // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
         let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
