@@ -128,6 +128,8 @@ update this file so that they do not need to remind you again in the future.
   - third-party crate imports
   - `crate::...` imports
   - `super::...` imports
+- At in-crate declarative macro call sites, import macros from `crate::macros` (grouping related macros where useful)
+  and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
 - Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
   function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
   preferred over spelled-out variants such as `absolute_value`.
