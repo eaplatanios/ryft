@@ -13,62 +13,25 @@ use crate::programs::types::{TypeError, Typed};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType};
 
-// TODO(eaplatanios): Review this file.
-
-/// Scaled dot-product attention operation and capability trait.
 pub mod attention;
-
-/// Named-axis collective operations (e.g., `psum`, `pmean`, `pmax`, and `axis_index`) and capability traits.
 pub mod collectives;
-
-/// Elementwise pairwise comparison operations and capability traits.
 pub mod compare;
-
-/// Elementwise complex-number construction, conjugation, and part-extraction operations and capability traits.
 pub mod complex;
-
-/// Type-driven constant operations and capability traits.
 pub mod constants;
-
-/// Higher-order control-flow operations and capability traits.
 pub mod control_flow;
-
-/// Foreign-kernel call operation (declared output types, backend-registered handlers) and capability trait.
 pub mod custom_call;
-
-/// Debugging operations with observable effects (e.g., printing values from inside programs).
 pub mod debugging;
-
-/// Differentiation-control operations and capability traits.
 pub mod differentiation;
-
-/// Elementwise logical operations and capability traits.
 pub mod logical;
-
-/// Array shape and axis manipulation operations and capability traits.
 pub mod manipulation;
-
-/// Arithmetic, trigonometric, reduction, and tensor-contraction math operations and capability traits.
 pub mod math;
-
-/// Memory-placement operations (moving values between memory spaces) and capability traits.
 pub mod memory;
-
-/// Deterministic counter-based random bit generation and the distributions composed from it.
 pub mod random;
-
-/// Sharding-related operations (e.g., resharding and propagation hints) and capability traits.
 pub mod sharding;
-
-/// Stable key-value sorting along one axis and the ranking capabilities composed from it (top-k, argmax, argmin).
 pub mod sort;
-
-/// Value tagging — attaching a string key to a value in a program (consumed by, e.g., rematerialization policies).
 pub mod tag;
 
-// TODO(eaplatanios): We should be importing specific symbols here.
-// The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
-// they do not shadow their `std::ops` counterparts; reach them through `crate::operations::math` instead.
+// TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
     forward_collective_to_parent,
@@ -86,23 +49,23 @@ pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
-/// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations:
-/// implementations declare their fixed input count, while the default type inference implementation checks
-/// the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
-/// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
+/// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations.
+/// Implementations declare their fixed input count, while the default type inference implementation checks
+/// the input count, broadcasts all input [`ArrayType`]s while tolerating [`Sharding`](crate::Sharding)s that
+/// differ only by [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
 pub trait ElementwiseOperation: Operation<ArrayType> {
     /// Returns the number of input arrays consumed by this elementwise [`Operation`].
     fn input_count(&self) -> usize;
 
-    /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output sharding
-    /// does not follow plain broadcasting semantics (e.g., [`MulOperation`], which is bilinear in its operands and
-    /// combines their reduction state accordingly) must override this function, typically using
-    /// [`broadcast_output_type`](Self::broadcast_output_type) for the data type, shapes, and placement, and layering
-    /// their own sharding rule on top.
+    /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output
+    /// [`Sharding`](crate::Sharding) does not follow plain broadcasting semantics (e.g., [`MulOperation`], which is
+    /// bilinear in its operands and combines their reduction state accordingly) must override this function, typically
+    /// using [`broadcast_output_type`](Self::infer_elementwise_broadcast_type) for the data type, shapes, and
+    /// placement, and layering their own sharding rule on top.
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, self.input_count(), TypeError);
-        Ok(vec![self.broadcast_output_type(input_types)?])
+        Ok(vec![self.infer_elementwise_broadcast_type(input_types)?])
     }
 
     /// Broadcasts the elementwise operands into a single output [`ArrayType`], tolerating shardings that differ only by
@@ -114,7 +77,7 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
     /// This is effectively a shared helper function for the default [`infer_output_types`](Self::infer_output_types)
     /// implementation and for operations that override that default to layer extra sharding rules on top of the
     /// broadcasted placement (e.g., [`MulOperation`]'s bilinear reduction-state rule).
-    fn broadcast_output_type(&self, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
+    fn infer_elementwise_broadcast_type(&self, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
         match ArrayType::broadcasted(input_types) {
             Ok(output) => Ok(output),
             Err(_) => {
