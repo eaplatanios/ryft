@@ -1,18 +1,18 @@
 /// Checks that `values` contains exactly `expected` entries and, if not, returns an error of the specified type.
 #[macro_export]
 macro_rules! check_count {
-    ("input", $values:expr, $expected:expr, TracingError $(,)?) => {{
+    ("input", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::tracing::TracingError::InvalidInputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidInputCount { expected, actual: values.len() }.into());
         }
     }};
-    ("output", $values:expr, $expected:expr, TracingError $(,)?) => {{
+    ("output", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
         if values.len() != expected {
-            return Err($crate::tracing::TracingError::InvalidOutputCount { expected, got: values.len() }.into());
+            return Err($crate::ProgramError::InvalidOutputCount { expected, actual: values.len() }.into());
         }
     }};
     ($descriptor:expr, $values:expr, $expected:expr, TypeError $(,)?) => {{
@@ -22,7 +22,7 @@ macro_rules! check_count {
             let count = values.len();
             let descriptor = $descriptor;
             let noun = if expected == 1 { descriptor.to_string() } else { format!("{descriptor}s") };
-            return Err($crate::types::TypeError { message: format!("expected {expected} {noun} but got {count}") });
+            return Err($crate::TypeError { message: format!("expected {expected} {noun} but got {count}") });
         }
     }};
 }
