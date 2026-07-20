@@ -15,7 +15,7 @@ use ryft_core::differentiation::{
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
-use ryft_core::operations::attention::DotProductAttentionOperation;
+use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
@@ -37,8 +37,8 @@ use ryft_core::operations::math::{
     NegOperation, PowOperation, ReduceOperation, RemainderOperation, RoundOperation, RsqrtOperation,
     ScaledDotOperation, SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
-use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::random::RngBitGeneratorOperation;
+use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::sort::SortOperation;
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -126,6 +126,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Dot(DotOperation),
     ScaledDot(ScaledDotOperation),
     DotProductAttention(DotProductAttentionOperation),
+    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
     Reshard(ReshardOperation),
@@ -234,6 +235,7 @@ where
             ArrayOperation::Dot(operation) => Self::Dot(operation),
             ArrayOperation::ScaledDot(operation) => Self::ScaledDot(operation),
             ArrayOperation::DotProductAttention(operation) => Self::DotProductAttention(operation),
+            ArrayOperation::DotProductAttentionBackward(operation) => Self::DotProductAttentionBackward(operation),
             ArrayOperation::Transpose(operation) => Self::Transpose(operation),
             ArrayOperation::Reshape(operation) => Self::Reshape(operation),
             ArrayOperation::Reshard(operation) => Self::Reshard(operation),

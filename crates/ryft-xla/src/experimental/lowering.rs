@@ -9,7 +9,9 @@ use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
-use ryft_core::operations::attention::{AttentionMask, DotProductAttentionOperation};
+use ryft_core::operations::attention::{
+    AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+};
 use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveKind, CollectiveOperation,
     PSumScatterOperation, PpermuteOperation,
@@ -2093,6 +2095,19 @@ where
                     lowerer.location,
                 )
             }
+            Self::DotProductAttentionBackward(operation) => {
+                let collective_state = lowerer.collective_state.clone();
+                lower_dot_product_attention_backward_to_mlir(
+                    operation,
+                    &collective_state,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
             Self::Compare(operation) => {
                 let operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
                 let [left, right] = normalize_binary_elementwise_operands(
@@ -2461,12 +2476,8 @@ fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
         RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
     };
     let output_type = lower_tensor_type(operation.output_type(), context, location)?;
-    let generated = block.append_operation(stable_hlo::rng_bit_generator(
-        input_values[0],
-        algorithm,
-        output_type,
-        location,
-    )?)?;
+    let generated =
+        block.append_operation(stable_hlo::rng_bit_generator(input_values[0], algorithm, output_type, location)?)?;
     Ok(vec![
         generated.result(0).expect("stablehlo.rng_bit_generator should return a state result").as_ref(),
         generated.result(1).expect("stablehlo.rng_bit_generator should return a bits result").as_ref(),
@@ -2491,8 +2502,9 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if output_types.is_empty() {
-        return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() }
-            .into());
+        return Err(
+            ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() }.into()
+        );
     }
     let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
     for output_type in output_types {
@@ -2514,9 +2526,20 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
         let left_key = comparator_block.argument(2 * key_index)?.as_ref();
         let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
         let comparison_type = match output_types[key_index].data_type() {
-            DataType::Boolean | DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16
-            | DataType::U32 | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
-            DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32
+            DataType::Boolean
+            | DataType::U1
+            | DataType::U2
+            | DataType::U4
+            | DataType::U8
+            | DataType::U16
+            | DataType::U32
+            | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
+            DataType::I1
+            | DataType::I2
+            | DataType::I4
+            | DataType::I8
+            | DataType::I16
+            | DataType::I32
             | DataType::I64 => stable_hlo::ComparisonType::Signed,
             _ => stable_hlo::ComparisonType::TotalOrder,
         };
@@ -2549,13 +2572,8 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     // A `SortOperation` always carries at least one key, so the chain is never empty.
     let compared = compared.unwrap();
     comparator_block.append_operation(stable_hlo::r#return(&[compared], location)?)?;
-    let sorted = block.append_operation(stable_hlo::sort(
-        input_values,
-        operation.axis(),
-        true,
-        comparator,
-        location,
-    )?)?;
+    let sorted =
+        block.append_operation(stable_hlo::sort(input_values, operation.axis(), true, comparator, location)?)?;
     Ok((0..output_types.len())
         .map(|index| sorted.result(index).expect("stablehlo.sort should return one result per operand").as_ref())
         .collect())
@@ -2568,8 +2586,7 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
 fn block_scaled_formats_qualify(elements: DataType, scales: DataType, block_size: usize) -> bool {
     matches!(
         (elements, scales, block_size),
-        (DataType::F8E4M3FN | DataType::F8E5M2, DataType::F8E8M0FNU, 32)
-            | (DataType::F4E2M1FN, DataType::F8E4M3FN, 16)
+        (DataType::F8E4M3FN | DataType::F8E5M2, DataType::F8E8M0FNU, 32) | (DataType::F4E2M1FN, DataType::F8E4M3FN, 16)
     )
 }
 
@@ -2598,19 +2615,10 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("output", output_types, 1, ProgramError);
     let is_cuda_target = collective_state.target_platform().is_some_and(|platform| platform == "cuda");
     if is_cuda_target
-        && block_scaled_formats_qualify(
-            input_types[0].data_type(),
-            input_types[1].data_type(),
-            operation.block_size(),
-        )
-        && block_scaled_formats_qualify(
-            input_types[2].data_type(),
-            input_types[3].data_type(),
-            operation.block_size(),
-        )
+        && block_scaled_formats_qualify(input_types[0].data_type(), input_types[1].data_type(), operation.block_size())
+        && block_scaled_formats_qualify(input_types[2].data_type(), input_types[3].data_type(), operation.block_size())
     {
-        let custom_call =
-            CustomCallOperation::new("__op$block_scaled_dot", vec![output_types[0].clone()]);
+        let custom_call = CustomCallOperation::new("__op$block_scaled_dot", vec![output_types[0].clone()]);
         let mut reordered_inputs = vec![input_values[0], input_values[2], input_values[1], input_values[3]];
         reordered_inputs.extend(input_values.get(4).copied());
         return lower_custom_call_to_mlir(
@@ -2728,114 +2736,266 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
-/// Lowers one traced dot-product attention. On CUDA targets with `bf16`/`f16` operands and a head dimension that is
-/// a multiple of 8 (cuDNN's compile-time gate), it emits the `__cudnn$fmhaSoftmax` custom call — the fused
-/// flash-attention path behind XLA's cuDNN custom-call compiler and
-/// `jax.nn.dot_product_attention(implementation="cudnn")` — whose first result is the attention output in the
-/// physical `[batch, heads, q_seq, head_dim]` layout (transposed back to the logical `BTNH` layout, which compiles
-/// to a pure bitcast given the declared result layout) and whose second result is a kernel workspace that is
-/// declared at size zero and never read. Everywhere else it inlines the portable StableHLO composition matching the
-/// reference semantics of [`DotProductAttentionOperation`]: scores at the operand type, a softmax running at `f32`
-/// for operand types narrower than `f32` (`f64` stays `f64`), optional causal masking, and max stabilization.
-fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &DotProductAttentionOperation,
+/// Static `[batch, sequence, heads, head_dim]`-style dimensions of one attention operand type, rejecting dynamic
+/// shapes and any rank other than 4 for the attention lowerings.
+fn attention_static_dimensions(input_type: &ArrayType) -> Result<[usize; 4], LoweringError> {
+    input_type
+        .static_shape()
+        .and_then(|shape| <[usize; 4]>::try_from(shape.dimensions()).ok())
+        .ok_or_else(|| LoweringError::UnsupportedOp { op: "dynamically shaped dot_product_attention".to_string() })
+}
+
+/// Returns the static [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
+fn attention_array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
+    ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect()))
+}
+
+/// The cuDNN fMHA proto-JSON dot-dimension-number block of the two forward attention matrix products under the
+/// `BTNH` operand convention (`bmm1 = Q·Kᵀ` contracting the head axis, `bmm2 = P·V` contracting the key/value
+/// sequence axis), exactly as validated on hardware.
+const FMHA_FORWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_dot_dimension_numbers\":\
+     {\"lhs_contracting_dimensions\":[\"3\"],\"rhs_contracting_dimensions\":[\"3\"],\
+     \"lhs_batch_dimensions\":[\"0\",\"2\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
+
+/// The cuDNN fMHA proto-JSON dot-dimension-number block of the four backward gradient matrix products
+/// (`bmm1_grad_gemm1 = dS·K`, `bmm1_grad_gemm2 = dSᵀ·Q`, `bmm2_grad_gemm1 = dO·Vᵀ`, `bmm2_grad_gemm2 = Pᵀ·dO`),
+/// exactly as validated on hardware. These replace the forward `bmm1`/`bmm2` blocks in the backward call's
+/// configuration.
+const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimension_numbers\":\
+     {\"lhs_contracting_dimensions\":[\"2\"],\"rhs_contracting_dimensions\":[\"1\"],\
+     \"lhs_batch_dimensions\":[\"0\",\"1\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm1_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_grad_gemm1_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"2\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"3\"],\"lhs_batch_dimensions\":[\"0\",\"2\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
+
+/// Renders the `GpuBackendConfig` proto-JSON string of one cuDNN fMHA custom call — the raw backend-config form
+/// (not typed-FFI dictionaries) that XLA's cuDNN custom-call compiler parses — with the score scale, the
+/// intermediate `[batch, q_heads, q_seq, kv_seq]` score shape at the operand element type (load-bearing on the
+/// backward path, where the `P` descriptor and statistic strides derive from it), the mask kind, the
+/// forward or backward dot-dimension-number block, the dropout rate and seed (the hardware-validated defaults
+/// `0.0`/`42` when dropout is off), and the sliding-window length.
+fn fmha_backend_config(
+    element_type: &str,
+    intermediate_dimensions: [usize; 4],
+    scale: f64,
+    mask_type: &str,
+    dot_dimension_numbers: &str,
+    dropout: Option<(f64, u64)>,
+    sliding_window_length: usize,
+) -> String {
+    let [batch, heads, query_sequence, key_value_sequence] = intermediate_dimensions;
+    // The `{:?}` rate formatting keeps the validated `0.0` spelling for the off state while rendering set rates
+    // with their shortest round-trip form.
+    let dropout_rate = dropout.map_or(0.0, |(rate, _)| rate);
+    let seed = dropout.map_or(42, |(_, seed)| seed);
+    format!(
+        "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
+         \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
+         {{\"17\":\"1\",\"24\":\"0\"}},\"is_cudnn_frontend\":true,\"workspace_size\":\"0\"}},\
+         \"fmha_scale\":{scale},\"intermediate_tensor_shape\":{{\"element_type\":\"{element_type}\",\
+         \"dimensions\":[\"{batch}\",\"{heads}\",\"{query_sequence}\",\"{key_value_sequence}\"],\
+         \"tuple_shapes\":[],\"layout\":{{\"dim_level_types\":[],\"dim_unique\":[],\"dim_ordered\":[],\
+         \"minor_to_major\":[\"3\",\"2\",\"1\",\"0\"],\"tiles\":[],\"element_size_in_bits\":\"0\",\
+         \"memory_space\":\"0\",\"index_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+         \"pointer_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+         \"dynamic_shape_metadata_prefix_bytes\":\"0\"}},\
+         \"is_dynamic_dimension\":[false,false,false,false]}},\
+         \"is_flash_attention\":true,\"mask_type\":\"{mask_type}\",\
+         {dot_dimension_numbers},\
+         \"dropout_rate\":{dropout_rate:?},\"seed\":{seed},\"sliding_window_length\":{sliding_window_length},\
+         \"max_seg_per_batch\":1,\"is_paged_attention\":false}}}}",
+    )
+}
+
+/// Returns the cuDNN fMHA custom-call target name for the provided feature set: the name varies only with the bias
+/// operand and dropout (`__cudnn$fmha[ScaleBias]Softmax[Dropout][Backward]`) — padding, sliding windows, and
+/// grouped-query head counts are carried by the backend configuration and the operand shapes instead.
+fn fmha_target_name(has_bias: bool, has_dropout: bool, backward: bool) -> String {
+    format!(
+        "__cudnn$fmha{}Softmax{}{}",
+        if has_bias { "ScaleBias" } else { "" },
+        if has_dropout { "Dropout" } else { "" },
+        if backward { "Backward" } else { "" },
+    )
+}
+
+/// Returns the cuDNN fMHA `mask_type` configuration value for the provided built-in mask and sequence-length
+/// presence: the padding mask kinds compose the built-in mask with the appended `i32[batch]` sequence-length
+/// operands.
+fn fmha_mask_type(mask: AttentionMask, has_sequence_lengths: bool) -> &'static str {
+    match (mask, has_sequence_lengths) {
+        (AttentionMask::None, false) => "NO_MASK",
+        (AttentionMask::Causal, false) => "CAUSAL",
+        (AttentionMask::None, true) => "PADDING",
+        (AttentionMask::Causal, true) => "PADDING_CAUSAL",
+    }
+}
+
+/// Whether the attention operations qualify for the fused cuDNN fMHA custom calls: a CUDA target, `bf16`/`f16`
+/// operands, and a head dimension that is a multiple of 8 (cuDNN's compile-time gate).
+fn fmha_fast_path_qualifies(
     collective_state: &CollectiveLoweringState,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
+    data_type: DataType,
+    head_dimension: usize,
+) -> bool {
+    collective_state.target_platform().is_some_and(|platform| platform == "cuda")
+        && matches!(data_type, DataType::BF16 | DataType::F16)
+        && head_dimension % 8 == 0
+}
+
+/// Mirrors [`expand_key_value_heads`](ryft_core::operations::attention) for the StableHLO composition fallbacks: a
+/// grouped `[b, s, kv_heads, h]` key/value operand broadcasts to `[b, s, kv_heads, group, h]` and reshapes to
+/// `[b, s, heads, h]`, so each key/value head repeats `group` times consecutively and query head `i` attends
+/// key/value head `i / group`. Operands that already carry one key/value head per query head pass through.
+#[allow(clippy::too_many_arguments)]
+fn lower_attention_expand_key_value_heads<'b, 'c: 'b, 't: 'c>(
+    operand: ValueRef<'b, 'c, 't>,
+    data_type: DataType,
+    [batch, key_value_sequence, key_value_heads, head_dimension]: [usize; 4],
+    heads: usize,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    check_count!("input", input_values, 3, ProgramError);
-    check_count!("input", input_types, 3, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let data_type = input_types[0].data_type();
-    let static_dimensions = |input_type: &ArrayType| -> Result<[usize; 4], LoweringError> {
-        input_type
-            .static_shape()
-            .and_then(|shape| <[usize; 4]>::try_from(shape.dimensions()).ok())
-            .ok_or_else(|| LoweringError::UnsupportedOp { op: "dynamically shaped dot_product_attention".to_string() })
-    };
-    let array_type = |data_type: DataType, dimensions: &[usize]| -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect()))
-    };
-    let [batch, query_sequence, heads, head_dimension] = static_dimensions(&input_types[0])?;
-    let key_value_sequence = static_dimensions(&input_types[1])?[1];
-    let is_cuda_target = collective_state.target_platform().is_some_and(|platform| platform == "cuda");
-    if is_cuda_target && matches!(data_type, DataType::BF16 | DataType::F16) && head_dimension % 8 == 0 {
-        // The backend configuration is the `GpuBackendConfig` proto-JSON that XLA's cuDNN custom-call compiler
-        // parses: the score scale, the mask kind (the operation's causal mask is top-left aligned, matching cuDNN),
-        // the fixed `BTNH` dot dimension numbers of the two attention matrix products, and the
-        // `[batch, heads, q_seq, kv_seq]` intermediate score shape. Everything else is constant for the
-        // inference-only forward call (no bias, no dropout, no sliding window, no paging).
-        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
-        let mask_type = match operation.mask() {
-            AttentionMask::None => "NO_MASK",
-            AttentionMask::Causal => "CAUSAL",
-        };
-        let scale = operation.scale();
-        let backend_config = format!(
-            "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
-             \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
-             {{\"17\":\"1\",\"24\":\"0\"}},\"is_cudnn_frontend\":true,\"workspace_size\":\"0\"}},\
-             \"fmha_scale\":{scale},\"intermediate_tensor_shape\":{{\"element_type\":\"{element_type}\",\
-             \"dimensions\":[\"{batch}\",\"{heads}\",\"{query_sequence}\",\"{key_value_sequence}\"],\
-             \"tuple_shapes\":[],\"layout\":{{\"dim_level_types\":[],\"dim_unique\":[],\"dim_ordered\":[],\
-             \"minor_to_major\":[\"3\",\"2\",\"1\",\"0\"],\"tiles\":[],\"element_size_in_bits\":\"0\",\
-             \"memory_space\":\"0\",\"index_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
-             \"pointer_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
-             \"dynamic_shape_metadata_prefix_bytes\":\"0\"}},\
-             \"is_dynamic_dimension\":[false,false,false,false]}},\
-             \"is_flash_attention\":true,\"mask_type\":\"{mask_type}\",\
-             \"bmm1_dot_dimension_numbers\":{{\"lhs_contracting_dimensions\":[\"3\"],\
-             \"rhs_contracting_dimensions\":[\"3\"],\"lhs_batch_dimensions\":[\"0\",\"2\"],\
-             \"rhs_batch_dimensions\":[\"0\",\"2\"]}},\
-             \"bmm2_dot_dimension_numbers\":{{\"lhs_contracting_dimensions\":[\"3\"],\
-             \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
-             \"rhs_batch_dimensions\":[\"0\",\"2\"]}},\
-             \"dropout_rate\":0.0,\"seed\":42,\"sliding_window_length\":0,\"max_seg_per_batch\":1,\
-             \"is_paged_attention\":false}}}}",
-        );
-        let attended_type = array_type(data_type, &[batch, heads, query_sequence, head_dimension]);
-        let custom_call_output_types = [
-            lower_tensor_type(&attended_type, context, location)?,
-            lower_tensor_type(&array_type(DataType::U8, &[0]), context, location)?,
-        ];
-        let custom_call = block.append_operation(stable_hlo::custom_call(
-            input_values,
-            "__cudnn$fmhaSoftmax",
-            false,
-            Some(context.string_attribute(backend_config.as_str()).as_ref()),
-            CustomCallApiVersion::StatusReturning,
-            &[],
-            Some(CustomCallMemoryLayouts {
-                operands: vec![vec![3, 2, 1, 0]; 3],
-                results: vec![vec![3, 1, 2, 0], vec![0]],
-            }),
-            &[],
-            None,
-            &custom_call_output_types,
-            location,
-        )?)?;
-        let attended =
-            custom_call.result(0).expect("stablehlo.custom_call should return the attention output").as_ref();
-        let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
-        return Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()]);
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if key_value_heads == heads {
+        return Ok(operand);
     }
+    let group = heads / key_value_heads;
+    let expanded_tensor_type = lower_tensor_type(
+        &attention_array_type(data_type, &[batch, key_value_sequence, key_value_heads, group, head_dimension]),
+        context,
+        location,
+    )?;
+    let expanded = block
+        .append_operation(stable_hlo::broadcast(operand, expanded_tensor_type, &[0, 1, 2, 4], location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    let reshaped = block.append_operation(stable_hlo::reshape(
+        expanded,
+        &[batch, key_value_sequence, heads, head_dimension],
+        location,
+    )?)?;
+    Ok(reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref())
+}
 
-    // Portable fallback mirroring the reference composition: scores per batch item and head at the operand type,
-    // converted to the softmax type, scaled, optionally masked causally, passed through a max-stabilized softmax
-    // over the key/value sequence axis, converted back, contracted with the values, and transposed back to `BTNH`.
+/// Mirrors [`apply_attention_masks`](ryft_core::operations::attention) for the StableHLO composition fallbacks:
+/// causal visibility (`column <= row`), the optional sliding-window lower bound (`column > row - window`), and the
+/// optional key/value sequence-length column exclusion (`column < key_value_sequence_lengths[b]`, with the
+/// `i32[batch]` lengths broadcast per batch item), replacing masked positions with `-1e30`.
+#[allow(clippy::too_many_arguments)]
+fn lower_attention_masks<'b, 'c: 'b, 't: 'c>(
+    scores: ValueRef<'b, 'c, 't>,
+    mask: AttentionMask,
+    sliding_window: Option<usize>,
+    key_value_sequence_lengths: Option<ValueRef<'b, 'c, 't>>,
+    softmax_scores_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if mask == AttentionMask::None && key_value_sequence_lengths.is_none() {
+        return Ok(scores);
+    }
+    let score_dimensions = softmax_scores_type.static_shape().expect("attention scores have a static shape");
+    let index_type = attention_array_type(DataType::I32, score_dimensions.dimensions());
+    let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
+    let columns = block
+        .append_operation(stable_hlo::iota(index_tensor_type, 3, location)?)?
+        .result(0)
+        .expect("stablehlo.iota should return one result")
+        .as_ref();
+    let mut visible = None;
+    if mask == AttentionMask::Causal {
+        // A score position is visible when its column (key/value) index does not exceed its row (query) index, and
+        // a sliding window additionally requires `column > row - window`.
+        let rows = block
+            .append_operation(stable_hlo::iota(index_tensor_type, 2, location)?)?
+            .result(0)
+            .expect("stablehlo.iota should return one result")
+            .as_ref();
+        let mut causal_visible =
+            lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, columns, rows, block, location)?;
+        if let Some(window) = sliding_window {
+            let window_splat =
+                lower_f64_constant_splat(window as f64, &index_type, index_tensor_type, block, context, location)?;
+            let lower_bound = block
+                .append_operation(stable_hlo::subtract(rows, window_splat, location)?)?
+                .result(0)
+                .expect("stablehlo.subtract should return one result")
+                .as_ref();
+            let in_window =
+                lower_compare_to_mlir(ComparisonDirection::GreaterThan, columns, lower_bound, block, location)?;
+            causal_visible = block
+                .append_operation(stable_hlo::and(causal_visible, in_window, location)?)?
+                .result(0)
+                .expect("stablehlo.and should return one result")
+                .as_ref();
+        }
+        visible = Some(causal_visible);
+    }
+    if let Some(lengths) = key_value_sequence_lengths {
+        // The `[batch]` lengths broadcast against the `[batch, heads, q_seq, kv_seq]` column indices.
+        let bounds = block
+            .append_operation(stable_hlo::broadcast(lengths, index_tensor_type, &[0], location)?)?
+            .result(0)
+            .expect("stablehlo.broadcast_in_dim should return one result")
+            .as_ref();
+        let in_range = lower_compare_to_mlir(ComparisonDirection::LessThan, columns, bounds, block, location)?;
+        visible = Some(match visible {
+            None => in_range,
+            Some(visible) => block
+                .append_operation(stable_hlo::and(visible, in_range, location)?)?
+                .result(0)
+                .expect("stablehlo.and should return one result")
+                .as_ref(),
+        });
+    }
+    let softmax_scores_tensor_type = lower_tensor_type(softmax_scores_type, context, location)?;
+    let masked =
+        lower_f64_constant_splat(-1.0e30, softmax_scores_type, softmax_scores_tensor_type, block, context, location)?;
+    // At least one mask contributed a visibility condition given the early return above.
+    let selected = block.append_operation(stable_hlo::select(visible.unwrap(), scores, masked, location)?)?;
+    Ok(selected.result(0).expect("stablehlo.select should return one result").as_ref())
+}
+
+/// Mirrors [`attention_logits`](ryft_core::operations::attention) for the StableHLO composition fallbacks: the
+/// `query · expanded-keyᵀ` scores per batch item and head (`[b, n, t, s]`, contracting the head axis with batch
+/// dimensions `[0, 2]` on both sides) at the operand type, converted to the softmax type, scaled, shifted by the
+/// optional broadcast bias (converted to the softmax type alongside the scores), and masked via
+/// [`lower_attention_masks`]. Returns the masked logits together with their softmax-typed [`ArrayType`].
+#[allow(clippy::too_many_arguments)]
+fn lower_attention_logits<'b, 'c: 'b, 't: 'c>(
+    query: ValueRef<'b, 'c, 't>,
+    expanded_key: ValueRef<'b, 'c, 't>,
+    bias: Option<(ValueRef<'b, 'c, 't>, &ArrayType)>,
+    key_value_sequence_lengths: Option<ValueRef<'b, 'c, 't>>,
+    scale: f64,
+    mask: AttentionMask,
+    sliding_window: Option<usize>,
+    data_type: DataType,
+    score_dimensions: [usize; 4],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(ValueRef<'b, 'c, 't>, ArrayType), LoweringError> {
     let softmax_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-    let score_dimensions = [batch, heads, query_sequence, key_value_sequence];
-    let scores_tensor_type = lower_tensor_type(&array_type(data_type, &score_dimensions), context, location)?;
-    let softmax_scores_type = array_type(softmax_type, &score_dimensions);
+    let scores_tensor_type = lower_tensor_type(&attention_array_type(data_type, &score_dimensions), context, location)?;
+    let softmax_scores_type = attention_array_type(softmax_type, &score_dimensions);
     let softmax_scores_tensor_type = lower_tensor_type(&softmax_scores_type, context, location)?;
     // Scores over `[batch, heads]`: `query [b, t, n, h] · key [b, s, n, h]` contracting `h` -> `[b, n, t, s]`.
     let scores = block.append_operation(stable_hlo::dot_general(
-        input_values[0],
-        input_values[1],
+        query,
+        expanded_key,
         context.stable_hlo_dot_dimensions(&[0, 2], &[0, 2], &[3], &[3])?,
         Some((Precision::Default, Precision::Default)),
         None,
@@ -2850,58 +3010,236 @@ fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
             .expect("stablehlo.convert should return one result")
             .as_ref();
     }
-    let scale = lower_f64_constant_splat(
-        operation.scale(),
-        &softmax_scores_type,
-        softmax_scores_tensor_type,
-        block,
-        context,
-        location,
-    )?;
+    let scale =
+        lower_f64_constant_splat(scale, &softmax_scores_type, softmax_scores_tensor_type, block, context, location)?;
     scores = block
         .append_operation(stable_hlo::multiply(scores, scale, location)?)?
         .result(0)
         .expect("stablehlo.multiply should return one result")
         .as_ref();
-    if operation.mask() == AttentionMask::Causal {
-        // A score position is visible when its column (key/value) index does not exceed its row (query) index.
-        let index_tensor_type = lower_tensor_type(&array_type(DataType::I32, &score_dimensions), context, location)?;
-        let rows = block
-            .append_operation(stable_hlo::iota(index_tensor_type, 2, location)?)?
+    if let Some((bias, bias_type)) = bias {
+        // The bias converts to the softmax type at its own (possibly broadcast) shape and then broadcasts against
+        // the scaled scores.
+        let mut bias = bias;
+        if bias_type.data_type() != softmax_type {
+            let softmax_bias_type =
+                lower_tensor_type(&ArrayType::new(softmax_type, bias_type.shape().clone()), context, location)?;
+            bias = block
+                .append_operation(stable_hlo::convert(bias, softmax_bias_type, location)?)?
+                .result(0)
+                .expect("stablehlo.convert should return one result")
+                .as_ref();
+        }
+        let broadcast_bias = block
+            .append_operation(stable_hlo::broadcast(bias, softmax_scores_tensor_type, &[0, 1, 2, 3], location)?)?
             .result(0)
-            .expect("stablehlo.iota should return one result")
+            .expect("stablehlo.broadcast_in_dim should return one result")
             .as_ref();
-        let columns = block
-            .append_operation(stable_hlo::iota(index_tensor_type, 3, location)?)?
-            .result(0)
-            .expect("stablehlo.iota should return one result")
-            .as_ref();
-        let visible = lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, columns, rows, block, location)?;
-        let masked = lower_f64_constant_splat(
-            -1.0e30,
-            &softmax_scores_type,
-            softmax_scores_tensor_type,
-            block,
-            context,
-            location,
-        )?;
         scores = block
-            .append_operation(stable_hlo::select(visible, scores, masked, location)?)?
+            .append_operation(stable_hlo::add(scores, broadcast_bias, location)?)?
             .result(0)
-            .expect("stablehlo.select should return one result")
+            .expect("stablehlo.add should return one result")
             .as_ref();
     }
+    let logits = lower_attention_masks(
+        scores,
+        mask,
+        sliding_window,
+        key_value_sequence_lengths,
+        &softmax_scores_type,
+        block,
+        context,
+        location,
+    )?;
+    Ok((logits, softmax_scores_type))
+}
+
+/// Mirrors [`zero_out_of_range_query_rows`](ryft_core::operations::attention) for the StableHLO composition
+/// fallbacks: replaces the rows of `value` whose query index along `row_axis` is at or beyond
+/// `query_sequence_lengths[b]` with exact zeros, matching XLA memzeroing every fMHA output.
+#[allow(clippy::too_many_arguments)]
+fn lower_attention_zero_out_of_range_query_rows<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    value_type: &ArrayType,
+    query_sequence_lengths: ValueRef<'b, 'c, 't>,
+    row_axis: usize,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let index_type = ArrayType::new(DataType::I32, value_type.shape().clone());
+    let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
+    let rows = block
+        .append_operation(stable_hlo::iota(index_tensor_type, row_axis, location)?)?
+        .result(0)
+        .expect("stablehlo.iota should return one result")
+        .as_ref();
+    let bounds = block
+        .append_operation(stable_hlo::broadcast(query_sequence_lengths, index_tensor_type, &[0], location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    let in_range = lower_compare_to_mlir(ComparisonDirection::LessThan, rows, bounds, block, location)?;
+    let value_tensor_type = lower_tensor_type(value_type, context, location)?;
+    let zero = lower_f64_constant_splat(0.0, value_type, value_tensor_type, block, context, location)?;
+    let selected = block.append_operation(stable_hlo::select(in_range, value, zero, location)?)?;
+    Ok(selected.result(0).expect("stablehlo.select should return one result").as_ref())
+}
+
+/// Lowers one traced dot-product attention. On CUDA targets with `bf16`/`f16` operands and a head dimension that is
+/// a multiple of 8 (cuDNN's compile-time gate), it emits the fused cuDNN flash-attention custom call — target
+/// `__cudnn$fmha[ScaleBias]Softmax[Dropout]` (the name varies only with the bias operand and dropout) — with the
+/// hardware-validated legacy contract: proto-JSON `backend_config` (mask kind `NO_MASK`/`CAUSAL`/`PADDING`/
+/// `PADDING_CAUSAL`, sliding-window length, dropout rate and seed, and the `[b, n_q, t, s]` intermediate score
+/// shape), `api_version = 2`, operands `(Q, K, V[, bias][, q_seqlen, kv_seqlen])` with `[3, 2, 1, 0]` layouts
+/// (`dense<0>` for the `i32[batch]` sequence lengths), and results `(out [b, n, t, h] {3, 1, 2, 0}[, activation
+/// f32[b, n, t] {2, 1, 0}], u8[0])` — the training form adds the activation statistic result exactly when the
+/// operation requests it. The attention output transposes back to the logical `BTNH` layout, which compiles to a
+/// pure bitcast given the declared result layout. Grouped-query attention needs no special handling: the key/value
+/// operands carry their own head count while the configuration keeps the query head count through the intermediate
+/// shape.
+///
+/// Everywhere else it inlines the portable StableHLO composition matching the reference semantics of
+/// [`DotProductAttentionOperation`] helper-for-helper (grouped-head expansion, masked logits, max-stabilized
+/// softmax, activation statistic, and padded-row zeroing) — except dropout, which only the fused kernels implement,
+/// so a dropout-carrying operation that misses the fast-path gate reports an explicit error instead of silently
+/// computing dropout-free attention.
+#[allow(clippy::too_many_arguments)]
+fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &DotProductAttentionOperation,
+    collective_state: &CollectiveLoweringState,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    if !matches!(input_values.len(), 3..=6) || input_values.len() != input_types.len() {
+        return Err(ProgramError::InvalidInputCount { expected: 3, actual: input_values.len() }.into());
+    }
+    let expected_output_count = if operation.activation_output() { 2 } else { 1 };
+    check_count!("output", output_types, expected_output_count, ProgramError);
+    let has_bias = matches!(input_values.len(), 4 | 6);
+    let has_sequence_lengths = matches!(input_values.len(), 5 | 6);
+    let data_type = input_types[0].data_type();
+    let [batch, query_sequence, heads, head_dimension] = attention_static_dimensions(&input_types[0])?;
+    let [_, key_value_sequence, key_value_heads, _] = attention_static_dimensions(&input_types[1])?;
+    if fmha_fast_path_qualifies(collective_state, data_type, head_dimension) {
+        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
+        let backend_config = fmha_backend_config(
+            element_type,
+            [batch, heads, query_sequence, key_value_sequence],
+            operation.scale(),
+            fmha_mask_type(operation.mask(), has_sequence_lengths),
+            FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
+            operation.dropout(),
+            operation.sliding_window().unwrap_or(0),
+        );
+        // The operand order matches the traced operand order exactly: the bias sits after the value and the
+        // `i32[batch]` sequence lengths trail. The workspace result is declared at size zero (the compiler resizes
+        // it as needed), and the training form inserts the `f32[b, n, t]` activation statistic before it.
+        let mut operand_layouts = vec![vec![3, 2, 1, 0]; if has_bias { 4 } else { 3 }];
+        if has_sequence_lengths {
+            operand_layouts.extend([vec![0], vec![0]]);
+        }
+        let attended_type = attention_array_type(data_type, &[batch, heads, query_sequence, head_dimension]);
+        let mut custom_call_output_types = vec![lower_tensor_type(&attended_type, context, location)?];
+        let mut result_layouts = vec![vec![3, 1, 2, 0]];
+        if operation.activation_output() {
+            let activation_type = attention_array_type(DataType::F32, &[batch, heads, query_sequence]);
+            custom_call_output_types.push(lower_tensor_type(&activation_type, context, location)?);
+            result_layouts.push(vec![2, 1, 0]);
+        }
+        custom_call_output_types.push(lower_tensor_type(&attention_array_type(DataType::U8, &[0]), context, location)?);
+        result_layouts.push(vec![0]);
+        let custom_call = block.append_operation(stable_hlo::custom_call(
+            input_values,
+            fmha_target_name(has_bias, operation.dropout().is_some(), false).as_str(),
+            false,
+            Some(context.string_attribute(backend_config.as_str()).as_ref()),
+            CustomCallApiVersion::StatusReturning,
+            &[],
+            Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
+            &[],
+            None,
+            &custom_call_output_types,
+            location,
+        )?)?;
+        let attended =
+            custom_call.result(0).expect("stablehlo.custom_call should return the attention output").as_ref();
+        let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
+        let mut results = vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()];
+        if operation.activation_output() {
+            results.push(
+                custom_call
+                    .result(1)
+                    .expect("stablehlo.custom_call should return the activation statistic")
+                    .as_ref(),
+            );
+        }
+        return Ok(results);
+    }
+    if operation.dropout().is_some() {
+        return Err(LoweringError::UnsupportedOp {
+            op: "'dot_product_attention' dropout is only supported by the fused CUDA lowering".to_string(),
+        });
+    }
+
+    // Portable fallback mirroring the reference composition helper-for-helper: grouped key/value heads expand to
+    // one head per query head, the masked logits run at the softmax type, a max-stabilized softmax over the
+    // key/value sequence axis recovers the weights, the context contraction transposes back to `BTNH`, and the
+    // optional activation statistic and padded-row zeroing follow the core semantics exactly.
+    let softmax_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    let key_value_dimensions = [batch, key_value_sequence, key_value_heads, head_dimension];
+    let expanded_key = lower_attention_expand_key_value_heads(
+        input_values[1],
+        data_type,
+        key_value_dimensions,
+        heads,
+        block,
+        context,
+        location,
+    )?;
+    let expanded_value = lower_attention_expand_key_value_heads(
+        input_values[2],
+        data_type,
+        key_value_dimensions,
+        heads,
+        block,
+        context,
+        location,
+    )?;
+    let sequence_lengths =
+        has_sequence_lengths.then(|| (input_values[input_values.len() - 2], input_values[input_values.len() - 1]));
+    let bias = has_bias.then(|| (input_values[3], &input_types[3]));
+    let score_dimensions = [batch, heads, query_sequence, key_value_sequence];
+    let (logits, softmax_scores_type) = lower_attention_logits(
+        input_values[0],
+        expanded_key,
+        bias,
+        sequence_lengths.map(|(_, key_value_lengths)| key_value_lengths),
+        operation.scale(),
+        operation.mask(),
+        operation.sliding_window(),
+        data_type,
+        score_dimensions,
+        block,
+        context,
+        location,
+    )?;
+    let softmax_scores_tensor_type = lower_tensor_type(&softmax_scores_type, context, location)?;
     // Max-stabilized softmax over the key/value sequence (last) axis.
-    let reduced_type = array_type(softmax_type, &[batch, heads, query_sequence]);
+    let reduced_type = attention_array_type(softmax_type, &[batch, heads, query_sequence]);
     let score_axes: &[usize] = &[0, 1, 2];
-    let maxima = lower_reduce_to_mlir(ReductionKind::Max, &[3], scores, &reduced_type, block, context, location)?;
-    let maxima = block
+    let maxima = lower_reduce_to_mlir(ReductionKind::Max, &[3], logits, &reduced_type, block, context, location)?;
+    let broadcast_maxima = block
         .append_operation(stable_hlo::broadcast(maxima, softmax_scores_tensor_type, score_axes, location)?)?
         .result(0)
         .expect("stablehlo.broadcast_in_dim should return one result")
         .as_ref();
     let shifted = block
-        .append_operation(stable_hlo::subtract(scores, maxima, location)?)?
+        .append_operation(stable_hlo::subtract(logits, broadcast_maxima, location)?)?
         .result(0)
         .expect("stablehlo.subtract should return one result")
         .as_ref();
@@ -2911,17 +3249,19 @@ fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
         .expect("stablehlo.exponential should return one result")
         .as_ref();
     let sums = lower_reduce_to_mlir(ReductionKind::Sum, &[3], exponentials, &reduced_type, block, context, location)?;
-    let sums = block
+    let broadcast_sums = block
         .append_operation(stable_hlo::broadcast(sums, softmax_scores_tensor_type, score_axes, location)?)?
         .result(0)
         .expect("stablehlo.broadcast_in_dim should return one result")
         .as_ref();
     let mut weights = block
-        .append_operation(stable_hlo::divide(exponentials, sums, location)?)?
+        .append_operation(stable_hlo::divide(exponentials, broadcast_sums, location)?)?
         .result(0)
         .expect("stablehlo.divide should return one result")
         .as_ref();
     if data_type != softmax_type {
+        let scores_tensor_type =
+            lower_tensor_type(&attention_array_type(data_type, &score_dimensions), context, location)?;
         weights = block
             .append_operation(stable_hlo::convert(weights, scores_tensor_type, location)?)?
             .result(0)
@@ -2930,11 +3270,14 @@ fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
     // Context values: `weights [b, n, t, s] · value [b, s, n, h]` contracting `s` -> `[b, n, t, h]`, then
     // transposed back to the `BTNH` output layout `[b, t, n, h]`.
-    let attended_tensor_type =
-        lower_tensor_type(&array_type(data_type, &[batch, heads, query_sequence, head_dimension]), context, location)?;
+    let attended_tensor_type = lower_tensor_type(
+        &attention_array_type(data_type, &[batch, heads, query_sequence, head_dimension]),
+        context,
+        location,
+    )?;
     let attended = block.append_operation(stable_hlo::dot_general(
         weights,
-        input_values[2],
+        expanded_value,
         context.stable_hlo_dot_dimensions(&[0, 1], &[0, 2], &[3], &[1])?,
         Some((Precision::Default, Precision::Default)),
         None,
@@ -2942,8 +3285,470 @@ fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let attended = attended.result(0).expect("stablehlo.dot_general should return one result").as_ref();
-    let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
-    Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
+    let transposed = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
+    let mut output = transposed.result(0).expect("stablehlo.transpose should return one result").as_ref();
+    if let Some((query_lengths, _)) = sequence_lengths {
+        output = lower_attention_zero_out_of_range_query_rows(
+            output,
+            &input_types[0],
+            query_lengths,
+            1,
+            block,
+            context,
+            location,
+        )?;
+    }
+    let mut results = vec![output];
+    if operation.activation_output() {
+        // The log-sum-exp statistic reuses the softmax reductions: `stat = max + ln(sum)` rowwise over the kv axis,
+        // always produced at `f32`.
+        let logarithms = block
+            .append_operation(stable_hlo::log(sums, Accuracy::Default, location)?)?
+            .result(0)
+            .expect("stablehlo.log should return one result")
+            .as_ref();
+        let mut statistic = block
+            .append_operation(stable_hlo::add(maxima, logarithms, location)?)?
+            .result(0)
+            .expect("stablehlo.add should return one result")
+            .as_ref();
+        let activation_type = attention_array_type(DataType::F32, &[batch, heads, query_sequence]);
+        if softmax_type != DataType::F32 {
+            let activation_tensor_type = lower_tensor_type(&activation_type, context, location)?;
+            statistic = block
+                .append_operation(stable_hlo::convert(statistic, activation_tensor_type, location)?)?
+                .result(0)
+                .expect("stablehlo.convert should return one result")
+                .as_ref();
+        }
+        if let Some((query_lengths, _)) = sequence_lengths {
+            statistic = lower_attention_zero_out_of_range_query_rows(
+                statistic,
+                &activation_type,
+                query_lengths,
+                2,
+                block,
+                context,
+                location,
+            )?;
+        }
+        results.push(statistic);
+    }
+    Ok(results)
+}
+
+/// Lowers one traced dot-product attention backward pass. Under the same gate as the forward fast path (a CUDA
+/// target, `bf16`/`f16` operands, and a head dimension that is a multiple of 8) it emits the fused
+/// `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward` custom call with the hardware-validated contract: the traced
+/// operand order `(q, k, v[, bias], output, activation, output_cotangent[, q_seqlen, kv_seqlen])` reorders to the
+/// kernel's `(Q, K, V, activation, dO[, bias], O[, q_seqlen, kv_seqlen])` call order (the bias sits between `dO`
+/// and `O`), the backend configuration swaps in the four gradient-GEMM dot-dimension-number blocks and keeps the
+/// operand-typed `[b, n_q, t, s]` intermediate score shape (load-bearing: the `P` descriptor and statistic strides
+/// derive from it), and the results are `(dQ [b, n_q, t, h], dK [b, n_kv, s, h], dV [b, n_kv, s, h][, dBias],
+/// u8[0])` with `{3, 1, 2, 0}` gradient layouts — each gradient transposes back to `BTNH`/`BSNH` (a pure bitcast)
+/// while the bias cotangent keeps its own shape and default layout.
+///
+/// Everywhere else it inlines the portable StableHLO composition mirroring
+/// [`dot_product_attention_backward_composition`](ryft_core::operations::attention): the masked logits are
+/// recomputed, the weights recover as `P = exp(S - stat)`, the four documented `dot_general`s produce the
+/// cotangents at the softmax type, grouped-query attention sums the key/value cotangents over the per-head group
+/// axis, the bias cotangent sums over the bias's broadcast leading dimensions, and variable sequence lengths zero
+/// the out-of-range output-cotangent and query-cotangent rows. Dropout outside the fast path reports an explicit
+/// error because only the fused kernels implement it.
+#[allow(clippy::too_many_arguments)]
+fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &DotProductAttentionBackwardOperation,
+    collective_state: &CollectiveLoweringState,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    if !matches!(input_values.len(), 6..=9) || input_values.len() != input_types.len() {
+        return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
+    }
+    let has_bias = matches!(input_values.len(), 7 | 9);
+    let has_sequence_lengths = matches!(input_values.len(), 8 | 9);
+    check_count!("output", output_types, if has_bias { 4 } else { 3 }, ProgramError);
+    let data_type = input_types[0].data_type();
+    let [batch, query_sequence, heads, head_dimension] = attention_static_dimensions(&input_types[0])?;
+    let [_, key_value_sequence, key_value_heads, _] = attention_static_dimensions(&input_types[1])?;
+    let offset = if has_bias { 4 } else { 3 };
+    let (output, activation, output_cotangent) =
+        (input_values[offset], input_values[offset + 1], input_values[offset + 2]);
+    let sequence_lengths =
+        has_sequence_lengths.then(|| (input_values[input_values.len() - 2], input_values[input_values.len() - 1]));
+    if fmha_fast_path_qualifies(collective_state, data_type, head_dimension) {
+        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
+        let backend_config = fmha_backend_config(
+            element_type,
+            [batch, heads, query_sequence, key_value_sequence],
+            operation.scale(),
+            fmha_mask_type(operation.mask(), has_sequence_lengths),
+            FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
+            operation.dropout(),
+            operation.sliding_window().unwrap_or(0),
+        );
+        // The kernel call order differs from the traced operand order: `(Q, K, V, activation, dO[, bias], O
+        // [, q_seqlen, kv_seqlen])`, with the bias between the output cotangent and the forward output.
+        let mut operands = vec![input_values[0], input_values[1], input_values[2], activation, output_cotangent];
+        let mut operand_layouts =
+            vec![vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![2, 1, 0], vec![3, 2, 1, 0]];
+        if has_bias {
+            operands.push(input_values[3]);
+            operand_layouts.push(vec![3, 2, 1, 0]);
+        }
+        operands.push(output);
+        operand_layouts.push(vec![3, 2, 1, 0]);
+        if let Some((query_lengths, key_value_lengths)) = sequence_lengths {
+            operands.extend([query_lengths, key_value_lengths]);
+            operand_layouts.extend([vec![0], vec![0]]);
+        }
+        let query_gradient_type = attention_array_type(data_type, &[batch, heads, query_sequence, head_dimension]);
+        let key_value_gradient_type =
+            attention_array_type(data_type, &[batch, key_value_heads, key_value_sequence, head_dimension]);
+        let mut custom_call_output_types = vec![
+            lower_tensor_type(&query_gradient_type, context, location)?,
+            lower_tensor_type(&key_value_gradient_type, context, location)?,
+            lower_tensor_type(&key_value_gradient_type, context, location)?,
+        ];
+        let mut result_layouts = vec![vec![3, 1, 2, 0], vec![3, 1, 2, 0], vec![3, 1, 2, 0]];
+        if has_bias {
+            custom_call_output_types.push(lower_tensor_type(&input_types[3], context, location)?);
+            result_layouts.push(vec![3, 2, 1, 0]);
+        }
+        custom_call_output_types.push(lower_tensor_type(&attention_array_type(DataType::U8, &[0]), context, location)?);
+        result_layouts.push(vec![0]);
+        let custom_call = block.append_operation(stable_hlo::custom_call(
+            operands.as_slice(),
+            fmha_target_name(has_bias, operation.dropout().is_some(), true).as_str(),
+            false,
+            Some(context.string_attribute(backend_config.as_str()).as_ref()),
+            CustomCallApiVersion::StatusReturning,
+            &[],
+            Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
+            &[],
+            None,
+            &custom_call_output_types,
+            location,
+        )?)?;
+        // Each gradient comes back in the physical `[b, n, seq, h]` layout and transposes to the logical
+        // `BTNH`/`BSNH` layout (a pure bitcast given the declared result layouts); the bias cotangent keeps its
+        // own shape.
+        let mut results = Vec::with_capacity(if has_bias { 4 } else { 3 });
+        for index in 0..3 {
+            let gradient = custom_call.result(index).expect("stablehlo.custom_call should return the gradient");
+            let transposed =
+                block.append_operation(stable_hlo::transpose(gradient.as_ref(), &[0, 2, 1, 3], location)?)?;
+            results.push(transposed.result(0).expect("stablehlo.transpose should return one result").as_ref());
+        }
+        if has_bias {
+            results
+                .push(custom_call.result(3).expect("stablehlo.custom_call should return the bias cotangent").as_ref());
+        }
+        return Ok(results);
+    }
+    if operation.dropout().is_some() {
+        return Err(LoweringError::UnsupportedOp {
+            op: "'dot_product_attention_backward' dropout is only supported by the fused CUDA lowering".to_string(),
+        });
+    }
+
+    // Portable fallback mirroring the reference backward composition helper-for-helper.
+    let softmax_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    let key_value_dimensions = [batch, key_value_sequence, key_value_heads, head_dimension];
+    let expanded_key = lower_attention_expand_key_value_heads(
+        input_values[1],
+        data_type,
+        key_value_dimensions,
+        heads,
+        block,
+        context,
+        location,
+    )?;
+    let expanded_value = lower_attention_expand_key_value_heads(
+        input_values[2],
+        data_type,
+        key_value_dimensions,
+        heads,
+        block,
+        context,
+        location,
+    )?;
+    let bias = has_bias.then(|| (input_values[3], &input_types[3]));
+    let score_dimensions = [batch, heads, query_sequence, key_value_sequence];
+    // Recompute the masked logits exactly as the forward does and recover the attention weights from the stashed
+    // log-sum-exp statistic: `P = exp(S - stat)`.
+    let (logits, softmax_scores_type) = lower_attention_logits(
+        input_values[0],
+        expanded_key,
+        bias,
+        sequence_lengths.map(|(_, key_value_lengths)| key_value_lengths),
+        operation.scale(),
+        operation.mask(),
+        operation.sliding_window(),
+        data_type,
+        score_dimensions,
+        block,
+        context,
+        location,
+    )?;
+    let softmax_scores_tensor_type = lower_tensor_type(&softmax_scores_type, context, location)?;
+    let reduced_dimensions = [batch, heads, query_sequence];
+    let mut statistic = activation;
+    if softmax_type != DataType::F32 {
+        let statistic_tensor_type =
+            lower_tensor_type(&attention_array_type(softmax_type, &reduced_dimensions), context, location)?;
+        statistic = block
+            .append_operation(stable_hlo::convert(statistic, statistic_tensor_type, location)?)?
+            .result(0)
+            .expect("stablehlo.convert should return one result")
+            .as_ref();
+    }
+    let score_axes: &[usize] = &[0, 1, 2];
+    let broadcast_statistic = block
+        .append_operation(stable_hlo::broadcast(statistic, softmax_scores_tensor_type, score_axes, location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    let shifted = block
+        .append_operation(stable_hlo::subtract(logits, broadcast_statistic, location)?)?
+        .result(0)
+        .expect("stablehlo.subtract should return one result")
+        .as_ref();
+    let weights = block
+        .append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?
+        .result(0)
+        .expect("stablehlo.exponential should return one result")
+        .as_ref();
+    // Out-of-range query rows of the incoming output cotangent are zeroed before any contraction so the key/value
+    // cotangents receive no contribution from them.
+    let mut output_cotangent = output_cotangent;
+    if let Some((query_lengths, _)) = sequence_lengths {
+        output_cotangent = lower_attention_zero_out_of_range_query_rows(
+            output_cotangent,
+            &input_types[0],
+            query_lengths,
+            1,
+            block,
+            context,
+            location,
+        )?;
+    }
+    // The gradient contractions all run at the softmax data type, like the forward softmax.
+    let query_dimensions = [batch, query_sequence, heads, head_dimension];
+    let expanded_key_value_dimensions = [batch, key_value_sequence, heads, head_dimension];
+    let convert = |operand: ValueRef<'b, 'c, 't>,
+                   dimensions: &[usize],
+                   block: &mut BlockRef<'b, 'c, 't>|
+     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        if data_type == softmax_type {
+            return Ok(operand);
+        }
+        let tensor_type = lower_tensor_type(&attention_array_type(softmax_type, dimensions), context, location)?;
+        Ok(block
+            .append_operation(stable_hlo::convert(operand, tensor_type, location)?)?
+            .result(0)
+            .expect("stablehlo.convert should return one result")
+            .as_ref())
+    };
+    let softmax_query = convert(input_values[0], &query_dimensions, block)?;
+    let softmax_key = convert(expanded_key, &expanded_key_value_dimensions, block)?;
+    let softmax_value = convert(expanded_value, &expanded_key_value_dimensions, block)?;
+    let softmax_output = convert(output, &query_dimensions, block)?;
+    let softmax_output_cotangent = convert(output_cotangent, &query_dimensions, block)?;
+    // `dP[b, n, t, s] = Σ_h dO[b, t, n, h] · V[b, s, n, h]`: batch `[0, 2]/[0, 2]`, contract the head axis `3/3`.
+    let weight_cotangents = block.append_operation(stable_hlo::dot_general(
+        softmax_output_cotangent,
+        softmax_value,
+        context.stable_hlo_dot_dimensions(&[0, 2], &[0, 2], &[3], &[3])?,
+        Some((Precision::Default, Precision::Default)),
+        None,
+        softmax_scores_tensor_type,
+        location,
+    )?)?;
+    let weight_cotangents =
+        weight_cotangents.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+    // `delta[b, n, t] = Σ_h dO[b, t, n, h] · O[b, t, n, h]`, transposed from `[b, t, n]` to `[b, n, t]`.
+    let products = block
+        .append_operation(stable_hlo::multiply(softmax_output_cotangent, softmax_output, location)?)?
+        .result(0)
+        .expect("stablehlo.multiply should return one result")
+        .as_ref();
+    let delta_type = attention_array_type(softmax_type, &[batch, query_sequence, heads]);
+    let delta = lower_reduce_to_mlir(ReductionKind::Sum, &[3], products, &delta_type, block, context, location)?;
+    let delta = block
+        .append_operation(stable_hlo::transpose(delta, &[0, 2, 1], location)?)?
+        .result(0)
+        .expect("stablehlo.transpose should return one result")
+        .as_ref();
+    let broadcast_delta = block
+        .append_operation(stable_hlo::broadcast(delta, softmax_scores_tensor_type, score_axes, location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    // `dS = P ∘ (dP - delta)` with `delta` broadcast over the kv axis.
+    let centered = block
+        .append_operation(stable_hlo::subtract(weight_cotangents, broadcast_delta, location)?)?
+        .result(0)
+        .expect("stablehlo.subtract should return one result")
+        .as_ref();
+    let logit_cotangents = block
+        .append_operation(stable_hlo::multiply(weights, centered, location)?)?
+        .result(0)
+        .expect("stablehlo.multiply should return one result")
+        .as_ref();
+    // The logits are `scale · (Q·Kᵀ) + bias`, so the query/key cotangents carry one extra `scale` factor while the
+    // bias cotangent reads `dS` unscaled.
+    let scale_splat = lower_f64_constant_splat(
+        operation.scale(),
+        &softmax_scores_type,
+        softmax_scores_tensor_type,
+        block,
+        context,
+        location,
+    )?;
+    let scaled_logit_cotangents = block
+        .append_operation(stable_hlo::multiply(logit_cotangents, scale_splat, location)?)?
+        .result(0)
+        .expect("stablehlo.multiply should return one result")
+        .as_ref();
+    // `dQ[b, t, n, h] = scale · Σ_s dS[b, n, t, s] · K[b, s, n, h]`: batch `[0, 1]/[0, 2]`, contract the
+    // kv-sequence axis `3/1`; the result `[b, n, t, h]` transposes to the `BTNH` layout, with out-of-range query
+    // rows forced to exact zeros.
+    let query_cotangent_tensor_type = lower_tensor_type(
+        &attention_array_type(softmax_type, &[batch, heads, query_sequence, head_dimension]),
+        context,
+        location,
+    )?;
+    let query_cotangent = block.append_operation(stable_hlo::dot_general(
+        scaled_logit_cotangents,
+        softmax_key,
+        context.stable_hlo_dot_dimensions(&[0, 1], &[0, 2], &[3], &[1])?,
+        Some((Precision::Default, Precision::Default)),
+        None,
+        query_cotangent_tensor_type,
+        location,
+    )?)?;
+    let query_cotangent = query_cotangent.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+    let mut query_cotangent = block
+        .append_operation(stable_hlo::transpose(query_cotangent, &[0, 2, 1, 3], location)?)?
+        .result(0)
+        .expect("stablehlo.transpose should return one result")
+        .as_ref();
+    if let Some((query_lengths, _)) = sequence_lengths {
+        query_cotangent = lower_attention_zero_out_of_range_query_rows(
+            query_cotangent,
+            &attention_array_type(softmax_type, &query_dimensions),
+            query_lengths,
+            1,
+            block,
+            context,
+            location,
+        )?;
+    }
+    // `dK[b, s, n, h] = scale · Σ_t dS[b, n, t, s] · Q[b, t, n, h]` and `dV[b, s, n, h] = Σ_t P[b, n, t, s] ·
+    // dO[b, t, n, h]`: batch `[0, 1]/[0, 2]`, contract the query-sequence axis `2/1`; the results `[b, n, s, h]`
+    // transpose to `[b, s, n, h]`.
+    let key_value_cotangent_tensor_type = lower_tensor_type(
+        &attention_array_type(softmax_type, &[batch, heads, key_value_sequence, head_dimension]),
+        context,
+        location,
+    )?;
+    let key_value_cotangent = |lhs: ValueRef<'b, 'c, 't>,
+                               rhs: ValueRef<'b, 'c, 't>,
+                               block: &mut BlockRef<'b, 'c, 't>|
+     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        let cotangent = block.append_operation(stable_hlo::dot_general(
+            lhs,
+            rhs,
+            context.stable_hlo_dot_dimensions(&[0, 1], &[0, 2], &[2], &[1])?,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            key_value_cotangent_tensor_type,
+            location,
+        )?)?;
+        let cotangent = cotangent.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+        let transposed = block.append_operation(stable_hlo::transpose(cotangent, &[0, 2, 1, 3], location)?)?;
+        Ok(transposed.result(0).expect("stablehlo.transpose should return one result").as_ref())
+    };
+    let mut key_cotangent = key_value_cotangent(scaled_logit_cotangents, softmax_query, block)?;
+    let mut value_cotangent = key_value_cotangent(weights, softmax_output_cotangent, block)?;
+    if key_value_heads != heads {
+        // Grouped-query attention: each key/value head serves `group` consecutive query heads, so its cotangent
+        // sums over the per-head group axis.
+        let group = heads / key_value_heads;
+        let grouped_dimensions = [batch, key_value_sequence, key_value_heads, group, head_dimension];
+        let summed_type =
+            attention_array_type(softmax_type, &[batch, key_value_sequence, key_value_heads, head_dimension]);
+        let sum_groups = |cotangent: ValueRef<'b, 'c, 't>,
+                          block: &mut BlockRef<'b, 'c, 't>|
+         -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+            let grouped = block
+                .append_operation(stable_hlo::reshape(cotangent, &grouped_dimensions, location)?)?
+                .result(0)
+                .expect("stablehlo.reshape should return one result")
+                .as_ref();
+            lower_reduce_to_mlir(ReductionKind::Sum, &[3], grouped, &summed_type, block, context, location)
+        };
+        key_cotangent = sum_groups(key_cotangent, block)?;
+        value_cotangent = sum_groups(value_cotangent, block)?;
+    }
+    let convert_back = |cotangent: ValueRef<'b, 'c, 't>,
+                        output_type: &ArrayType,
+                        block: &mut BlockRef<'b, 'c, 't>|
+     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        if data_type == softmax_type {
+            return Ok(cotangent);
+        }
+        let tensor_type = lower_tensor_type(output_type, context, location)?;
+        Ok(block
+            .append_operation(stable_hlo::convert(cotangent, tensor_type, location)?)?
+            .result(0)
+            .expect("stablehlo.convert should return one result")
+            .as_ref())
+    };
+    let mut results = vec![
+        convert_back(query_cotangent, &output_types[0], block)?,
+        convert_back(key_cotangent, &output_types[1], block)?,
+        convert_back(value_cotangent, &output_types[2], block)?,
+    ];
+    if let Some((_, bias_type)) = bias {
+        // The bias enters the logits unscaled, so its cotangent is `dS` summed over the bias's broadcast leading
+        // dimensions and reshaped back to the bias shape.
+        let bias_dimensions = attention_static_dimensions(bias_type)?;
+        let logit_dimensions = [batch, heads];
+        let reduce_axes =
+            (0..2).filter(|&axis| bias_dimensions[axis] == 1 && logit_dimensions[axis] != 1).collect::<Vec<_>>();
+        let mut bias_cotangent = logit_cotangents;
+        if !reduce_axes.is_empty() {
+            let mut summed_dimensions = score_dimensions.to_vec();
+            for &axis in &reduce_axes {
+                summed_dimensions[axis] = 0;
+            }
+            let summed_dimensions = summed_dimensions.into_iter().filter(|&size| size != 0).collect::<Vec<_>>();
+            let summed_type = attention_array_type(softmax_type, summed_dimensions.as_slice());
+            bias_cotangent = lower_reduce_to_mlir(
+                ReductionKind::Sum,
+                reduce_axes.as_slice(),
+                bias_cotangent,
+                &summed_type,
+                block,
+                context,
+                location,
+            )?;
+        }
+        let bias_shape = bias_dimensions.to_vec();
+        let bias_cotangent = block
+            .append_operation(stable_hlo::reshape(bias_cotangent, bias_shape.as_slice(), location)?)?
+            .result(0)
+            .expect("stablehlo.reshape should return one result")
+            .as_ref();
+        results.push(convert_back(bias_cotangent, &output_types[3], block)?);
+    }
+    Ok(results)
 }
 
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
@@ -3479,6 +4284,19 @@ where
             ArrayOperation::DotProductAttention(operation) => {
                 let collective_state = lowerer.collective_state.clone();
                 lower_dot_product_attention_to_mlir(
+                    operation,
+                    &collective_state,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            ArrayOperation::DotProductAttentionBackward(operation) => {
+                let collective_state = lowerer.collective_state.clone();
+                lower_dot_product_attention_backward_to_mlir(
                     operation,
                     &collective_state,
                     input_values,
@@ -6637,10 +7455,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.ceil should return one result").as_ref()])
         }
         XlaOperation::Round(_) => {
-            let result = lowerer.block.append_operation(stable_hlo::round_with_nearest_even_tie_break(
-                input_values[0],
-                lowerer.location,
-            )?)?;
+            let result = lowerer
+                .block
+                .append_operation(stable_hlo::round_with_nearest_even_tie_break(input_values[0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.round_nearest_even should return one result").as_ref()])
         }
         XlaOperation::Maximum(_) => {
@@ -6965,6 +7782,19 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.location,
             )
         }
+        XlaOperation::DotProductAttentionBackward(operation) => {
+            let collective_state = lowerer.collective_state.clone();
+            lower_dot_product_attention_backward_to_mlir(
+                operation,
+                &collective_state,
+                input_values,
+                &lowerer.input_types,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )
+        }
         XlaOperation::Compare(operation) => {
             let operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
             let [left, right] = normalize_binary_elementwise_operands(
@@ -7061,13 +7891,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Ppermute(operation) => {
             check_count!("input", input_values, 1, ProgramError);
             let collective_state = lowerer.collective_state.clone();
-            lower_ppermute_to_mlir(
-                operation,
-                &collective_state,
-                input_values[0],
-                &mut lowerer.block,
-                lowerer.location,
-            )
+            lower_ppermute_to_mlir(operation, &collective_state, input_values[0], &mut lowerer.block, lowerer.location)
         }
         XlaOperation::AllToAll(operation) => {
             check_count!("input", input_values, 1, ProgramError);
@@ -10140,8 +10964,10 @@ mod tests {
         let secondary = builder.add_input(secondary_type.clone());
         let passenger = builder.add_input(passenger_type.clone());
         let operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap();
-        let outputs =
-            builder.add_instruction(operation, Vec::new(), vec![primary, secondary, passenger]).unwrap().to_vec();
+        let outputs = builder
+            .add_instruction(operation, Vec::new(), vec![primary, secondary, passenger])
+            .unwrap()
+            .to_vec();
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
@@ -10265,18 +11091,10 @@ mod tests {
         // custom call (operand order lhs, rhs, lhs scales, rhs scales), which XLA's GPU block-scaling rewriter
         // lowers to cuDNN's native block-scaled dot or expanded reference HLO.
         let (program, input_types, output_types) = scaled_dot_fixture_program();
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"
@@ -10296,14 +11114,10 @@ mod tests {
     -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
         use ryft_core::operations::math::ScaledDotOperation;
 
-        let element_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(16)]),
-        );
-        let scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(1)]),
-        );
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(16)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(1)]));
         let global_scale_type = ArrayType::scalar(DataType::F32);
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
@@ -10361,18 +11175,10 @@ mod tests {
         // With a CUDA target the rank-3 form with a global scale lowers to the `__op$block_scaled_dot` custom call
         // with the scalar global scale appended as its fifth operand.
         let (program, input_types, output_types) = scaled_dot_rank_3_global_scale_fixture_program();
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"
@@ -10424,18 +11230,10 @@ mod tests {
             .unwrap();
         let input_types = vec![element_type.clone(), scale_type.clone(), element_type, scale_type];
         let output_types = vec![output_type];
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"
@@ -10489,18 +11287,10 @@ mod tests {
         // unused zero-sized workspace result — followed by the transpose back to the logical `BTNH` layout.
         let (program, input_types, output_types) =
             dot_product_attention_fixture_program(DataType::BF16, 8, AttentionMask::Causal);
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"
@@ -10520,18 +11310,10 @@ mod tests {
         // The unmasked `f16` variant emits `NO_MASK` and `F16` in the backend configuration.
         let (program, input_types, output_types) =
             dot_product_attention_fixture_program(DataType::F16, 8, AttentionMask::None);
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert_eq!(
             module,
             indoc! {r#"
@@ -10564,9 +11346,9 @@ mod tests {
                     %cst = stablehlo.constant dense<1.250000e-01> : tensor<f32>
                     %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
                     %2 = stablehlo.multiply %0, %1 : tensor<1x2x4x4xf32>
-                    %3 = stablehlo.iota dim = 2 : tensor<1x2x4x4xi32>
-                    %4 = stablehlo.iota dim = 3 : tensor<1x2x4x4xi32>
-                    %5 = stablehlo.compare LE, %4, %3, SIGNED : (tensor<1x2x4x4xi32>, tensor<1x2x4x4xi32>) -> tensor<1x2x4x4xi1>
+                    %3 = stablehlo.iota dim = 3 : tensor<1x2x4x4xi32>
+                    %4 = stablehlo.iota dim = 2 : tensor<1x2x4x4xi32>
+                    %5 = stablehlo.compare LE, %3, %4, SIGNED : (tensor<1x2x4x4xi32>, tensor<1x2x4x4xi32>) -> tensor<1x2x4x4xi1>
                     %cst_0 = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
                     %6 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
                     %7 = stablehlo.select %5, %2, %6 : tensor<1x2x4x4xi1>, tensor<1x2x4x4xf32>
@@ -10594,18 +11376,10 @@ mod tests {
         // portable composition.
         let (program, input_types, output_types) =
             dot_product_attention_fixture_program(DataType::F32, 8, AttentionMask::Causal);
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert!(!module.contains("fmhaSoftmax"));
         assert!(module.contains("stablehlo.dot_general"));
     }
@@ -10616,19 +11390,443 @@ mod tests {
         // operands still lowers the portable composition (which upcasts its softmax to `f32`).
         let (program, input_types, output_types) =
             dot_product_attention_fixture_program(DataType::BF16, 4, AttentionMask::Causal);
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .stable_hlo;
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
         assert!(!module.contains("fmhaSoftmax"));
+        assert!(module.contains("stablehlo.dot_general"));
+        assert!(module.contains("stablehlo.convert"));
+    }
+
+    /// Returns the inferred output [`ArrayType`]s of the provided staged output atoms.
+    fn builder_output_types(builder: &XlaProgramBuilder, outputs: &[AtomId]) -> Vec<ArrayType> {
+        outputs.iter().map(|output| builder.atoms()[output.index()].r#type().into_owned()).collect()
+    }
+
+    /// Builds an extended dot-product attention fixture program: `query [2, 4, query_heads, 8]` over
+    /// `key`/`value [2, 4, key_value_heads, 8]` at the provided data type, with an optional broadcast-batch bias
+    /// `[1, query_heads, 4, 4]` and an optional trailing `i32[2]` sequence-length pair.
+    fn dot_product_attention_extended_fixture_program(
+        data_type: DataType,
+        query_heads: usize,
+        key_value_heads: usize,
+        bias: bool,
+        sequence_lengths: bool,
+        operation: DotProductAttentionOperation,
+    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
+        let query_type = ArrayType::new(
+            data_type,
+            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(query_heads), Size::Static(8)]),
+        );
+        let key_value_type = ArrayType::new(
+            data_type,
+            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(key_value_heads), Size::Static(8)]),
+        );
+        let mut builder = XlaProgramBuilder::new();
+        let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
+        if bias {
+            input_types.push(ArrayType::new(
+                data_type,
+                Shape::new(vec![Size::Static(1), Size::Static(query_heads), Size::Static(4), Size::Static(4)]),
+            ));
+        }
+        if sequence_lengths {
+            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)]));
+            input_types.push(lengths_type.clone());
+            input_types.push(lengths_type);
+        }
+        let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
+        let outputs = builder.add_instruction(operation, Vec::new(), inputs).unwrap().to_vec();
+        let output_count = outputs.len();
+        let output_types = builder_output_types(&builder, outputs.as_slice());
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder; input_types.len()],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        (program, input_types, output_types)
+    }
+
+    /// Builds the matching backward fixture program for [`dot_product_attention_extended_fixture_program`]'s
+    /// operand convention: `(query, key, value[, bias], output, activation, output_cotangent[, sequence lengths])`.
+    fn dot_product_attention_backward_fixture_program(
+        data_type: DataType,
+        query_heads: usize,
+        key_value_heads: usize,
+        bias: bool,
+        sequence_lengths: bool,
+        operation: DotProductAttentionBackwardOperation,
+    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
+        let query_type = ArrayType::new(
+            data_type,
+            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(query_heads), Size::Static(8)]),
+        );
+        let key_value_type = ArrayType::new(
+            data_type,
+            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(key_value_heads), Size::Static(8)]),
+        );
+        let activation_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(2), Size::Static(query_heads), Size::Static(4)]),
+        );
+        let mut builder = XlaProgramBuilder::new();
+        let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
+        if bias {
+            input_types.push(ArrayType::new(
+                data_type,
+                Shape::new(vec![Size::Static(1), Size::Static(query_heads), Size::Static(4), Size::Static(4)]),
+            ));
+        }
+        input_types.extend([query_type.clone(), activation_type, query_type]);
+        if sequence_lengths {
+            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)]));
+            input_types.push(lengths_type.clone());
+            input_types.push(lengths_type);
+        }
+        let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
+        let outputs = builder.add_instruction(operation, Vec::new(), inputs).unwrap().to_vec();
+        let output_count = outputs.len();
+        let output_types = builder_output_types(&builder, outputs.as_slice());
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                outputs,
+                vec![Placeholder; input_types.len()],
+                vec![Placeholder; output_count],
+            )
+            .unwrap();
+        (program, input_types, output_types)
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_scale_bias_softmax_on_cuda() {
+        // A bias operand switches the fused target to `__cudnn$fmhaScaleBiasSoftmax`: the bias rides as the fourth
+        // operand with the standard `[3, 2, 1, 0]` layout while the backend configuration is unchanged (the bias
+        // enters the kernel post-scale and pre-mask).
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::BF16,
+            2,
+            2,
+            true,
+            false,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x2x8xbf16>, %arg1: tensor<2x4x2x8xbf16>, %arg2: tensor<2x4x2x8xbf16>, %arg3: tensor<1x2x4x4xbf16>) -> tensor<2x4x2x8xbf16> {
+                    %0:2 = stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax(%arg0, %arg1, %arg2, %arg3) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22BF16\22,\22dimensions\22:[\222\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22CAUSAL\22,\22bmm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.0,\22seed\22:42,\22sliding_window_length\22:0,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>]} : (tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<1x2x4x4xbf16>) -> (tensor<2x2x4x8xbf16>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    return %1 : tensor<2x4x2x8xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_training_forward_with_padding_on_cuda() {
+        // The training forward with variable sequence lengths emits the hardware-validated 3-tuple form: the
+        // `i32[batch]` sequence lengths trail the operands with `dense<0>` layouts, the mask kind composes to
+        // `PADDING_CAUSAL`, and the `f32[b, n, t]` activation statistic result (layout `{2, 1, 0}`) sits between
+        // the attention output and the zero-sized workspace.
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::BF16,
+            2,
+            2,
+            false,
+            true,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal).with_activation_output(),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x2x8xbf16>, %arg1: tensor<2x4x2x8xbf16>, %arg2: tensor<2x4x2x8xbf16>, %arg3: tensor<2xi32>, %arg4: tensor<2xi32>) -> (tensor<2x4x2x8xbf16>, tensor<2x2x4xf32>) {
+                    %0:3 = stablehlo.custom_call @__cudnn$fmhaSoftmax(%arg0, %arg1, %arg2, %arg3, %arg4) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22BF16\22,\22dimensions\22:[\222\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22PADDING_CAUSAL\22,\22bmm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.0,\22seed\22:42,\22sliding_window_length\22:0,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>, dense<0> : tensor<1xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<[2, 1, 0]> : tensor<3xindex>, dense<0> : tensor<1xindex>]} : (tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2xi32>, tensor<2xi32>) -> (tensor<2x2x4x8xbf16>, tensor<2x2x4xf32>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    return %1, %0#1 : tensor<2x4x2x8xbf16>, tensor<2x2x4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_dropout_with_sliding_window_on_cuda() {
+        // Dropout switches the fused target to `__cudnn$fmhaSoftmaxDropout` and threads its rate and seed through
+        // the backend configuration, while the sliding window rides purely as the `sliding_window_length`
+        // configuration field.
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::BF16,
+            2,
+            2,
+            false,
+            false,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal)
+                .with_sliding_window(2)
+                .with_dropout((0.5, 123)),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x2x8xbf16>, %arg1: tensor<2x4x2x8xbf16>, %arg2: tensor<2x4x2x8xbf16>) -> tensor<2x4x2x8xbf16> {
+                    %0:2 = stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout(%arg0, %arg1, %arg2) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22BF16\22,\22dimensions\22:[\222\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22CAUSAL\22,\22bmm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.5,\22seed\22:123,\22sliding_window_length\22:2,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>]} : (tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>) -> (tensor<2x2x4x8xbf16>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    return %1 : tensor<2x4x2x8xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_backward_with_bias_on_cuda() {
+        // The fused backward call reorders the traced operands `(q, k, v, bias, output, activation, output
+        // cotangent)` into the kernel's `(Q, K, V, activation, dO, bias, O)` call order (the bias sits between `dO`
+        // and `O`), swaps the four gradient-GEMM dot-dimension-number blocks into the configuration, keeps the
+        // operand-typed intermediate score shape, and returns `(dQ, dK, dV, dBias, workspace)` with the gradient
+        // transposes back to `BTNH` (the bias cotangent keeps its own shape and default layout).
+        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
+            DataType::BF16,
+            2,
+            2,
+            true,
+            false,
+            DotProductAttentionBackwardOperation::new(0.125, AttentionMask::Causal),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x2x8xbf16>, %arg1: tensor<2x4x2x8xbf16>, %arg2: tensor<2x4x2x8xbf16>, %arg3: tensor<1x2x4x4xbf16>, %arg4: tensor<2x4x2x8xbf16>, %arg5: tensor<2x2x4xf32>, %arg6: tensor<2x4x2x8xbf16>) -> (tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<1x2x4x4xbf16>) {
+                    %0:5 = stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward(%arg0, %arg1, %arg2, %arg5, %arg6, %arg3, %arg4) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22BF16\22,\22dimensions\22:[\222\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22CAUSAL\22,\22bmm1_grad_gemm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\222\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm1_grad_gemm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_grad_gemm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\222\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_grad_gemm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.0,\22seed\22:42,\22sliding_window_length\22:0,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[2, 1, 0]> : tensor<3xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>]} : (tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x2x4xf32>, tensor<2x4x2x8xbf16>, tensor<1x2x4x4xbf16>, tensor<2x4x2x8xbf16>) -> (tensor<2x2x4x8xbf16>, tensor<2x2x4x8xbf16>, tensor<2x2x4x8xbf16>, tensor<1x2x4x4xbf16>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    %2 = stablehlo.transpose %0#1, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    %3 = stablehlo.transpose %0#2, dims = [0, 2, 1, 3] : (tensor<2x2x4x8xbf16>) -> tensor<2x4x2x8xbf16>
+                    return %1, %2, %3, %0#3 : tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<2x4x2x8xbf16>, tensor<1x2x4x4xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_dot_product_attention_composition_with_extensions() {
+        // Without target information the extended features all lower through the portable StableHLO composition in
+        // one module: the grouped key/value heads expand via broadcast + reshape, the broadcast-batch bias adds to
+        // the scaled scores, the sliding window tightens the causal mask with a second iota compare, and the
+        // requested activation statistic is `max + ln(sum)` from the softmax's own reductions.
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::F32,
+            4,
+            2,
+            true,
+            false,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal)
+                .with_sliding_window(2)
+                .with_activation_output(),
+        );
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x4x8xf32>, %arg1: tensor<2x4x2x8xf32>, %arg2: tensor<2x4x2x8xf32>, %arg3: tensor<1x4x4x4xf32>) -> (tensor<2x4x4x8xf32>, tensor<2x4x4xf32>) {
+                    %0 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1, 2, 4] : (tensor<2x4x2x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<2x4x2x2x8xf32>) -> tensor<2x4x4x8xf32>
+                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1, 2, 4] : (tensor<2x4x2x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %3 = stablehlo.reshape %2 : (tensor<2x4x2x2x8xf32>) -> tensor<2x4x4x8xf32>
+                    %4 = stablehlo.dot_general %arg0, %1, batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x8xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x4xf32>
+                    %cst = stablehlo.constant dense<1.250000e-01> : tensor<f32>
+                    %5 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
+                    %6 = stablehlo.multiply %4, %5 : tensor<2x4x4x4xf32>
+                    %7 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1, 2, 3] : (tensor<1x4x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %8 = stablehlo.add %6, %7 : tensor<2x4x4x4xf32>
+                    %9 = stablehlo.iota dim = 3 : tensor<2x4x4x4xi32>
+                    %10 = stablehlo.iota dim = 2 : tensor<2x4x4x4xi32>
+                    %11 = stablehlo.compare LE, %9, %10, SIGNED : (tensor<2x4x4x4xi32>, tensor<2x4x4x4xi32>) -> tensor<2x4x4x4xi1>
+                    %c = stablehlo.constant dense<2> : tensor<i32>
+                    %12 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<2x4x4x4xi32>
+                    %13 = stablehlo.subtract %10, %12 : tensor<2x4x4x4xi32>
+                    %14 = stablehlo.compare GT, %9, %13, SIGNED : (tensor<2x4x4x4xi32>, tensor<2x4x4x4xi32>) -> tensor<2x4x4x4xi1>
+                    %15 = stablehlo.and %11, %14 : tensor<2x4x4x4xi1>
+                    %cst_0 = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
+                    %16 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
+                    %17 = stablehlo.select %15, %8, %16 : tensor<2x4x4x4xi1>, tensor<2x4x4x4xf32>
+                    %cst_1 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %18 = stablehlo.reduce(%17 init: %cst_1) applies stablehlo.maximum across dimensions = [3] : (tensor<2x4x4x4xf32>, tensor<f32>) -> tensor<2x4x4xf32>
+                    %19 = stablehlo.broadcast_in_dim %18, dims = [0, 1, 2] : (tensor<2x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %20 = stablehlo.subtract %17, %19 : tensor<2x4x4x4xf32>
+                    %21 = stablehlo.exponential %20 : tensor<2x4x4x4xf32>
+                    %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %22 = stablehlo.reduce(%21 init: %cst_2) applies stablehlo.add across dimensions = [3] : (tensor<2x4x4x4xf32>, tensor<f32>) -> tensor<2x4x4xf32>
+                    %23 = stablehlo.broadcast_in_dim %22, dims = [0, 1, 2] : (tensor<2x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %24 = stablehlo.divide %21, %23 : tensor<2x4x4x4xf32>
+                    %25 = stablehlo.dot_general %24, %3, batching_dims = [0, 1] x [0, 2], contracting_dims = [3] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x4xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %26 = stablehlo.transpose %25, dims = [0, 2, 1, 3] : (tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %27 = stablehlo.log %22 : tensor<2x4x4xf32>
+                    %28 = stablehlo.add %18, %27 : tensor<2x4x4xf32>
+                    return %26, %28 : tensor<2x4x4x8xf32>, tensor<2x4x4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_dot_product_attention_backward_composition() {
+        // The backward composition fallback mirrors the reference backward composition: the masked logits are
+        // recomputed, the weights recover as `P = exp(S - stat)`, the four documented `dot_general`s produce the
+        // cotangents, the grouped-query key/value cotangents sum over the per-head group axis, and the bias
+        // cotangent sums over the bias's broadcast batch dimension.
+        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
+            DataType::F32,
+            4,
+            2,
+            true,
+            false,
+            DotProductAttentionBackwardOperation::new(0.125, AttentionMask::Causal),
+        );
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x4x4x8xf32>, %arg1: tensor<2x4x2x8xf32>, %arg2: tensor<2x4x2x8xf32>, %arg3: tensor<1x4x4x4xf32>, %arg4: tensor<2x4x4x8xf32>, %arg5: tensor<2x4x4xf32>, %arg6: tensor<2x4x4x8xf32>) -> (tensor<2x4x4x8xf32>, tensor<2x4x2x8xf32>, tensor<2x4x2x8xf32>, tensor<1x4x4x4xf32>) {
+                    %0 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1, 2, 4] : (tensor<2x4x2x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<2x4x2x2x8xf32>) -> tensor<2x4x4x8xf32>
+                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1, 2, 4] : (tensor<2x4x2x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %3 = stablehlo.reshape %2 : (tensor<2x4x2x2x8xf32>) -> tensor<2x4x4x8xf32>
+                    %4 = stablehlo.dot_general %arg0, %1, batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x8xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x4xf32>
+                    %cst = stablehlo.constant dense<1.250000e-01> : tensor<f32>
+                    %5 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
+                    %6 = stablehlo.multiply %4, %5 : tensor<2x4x4x4xf32>
+                    %7 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1, 2, 3] : (tensor<1x4x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %8 = stablehlo.add %6, %7 : tensor<2x4x4x4xf32>
+                    %9 = stablehlo.iota dim = 3 : tensor<2x4x4x4xi32>
+                    %10 = stablehlo.iota dim = 2 : tensor<2x4x4x4xi32>
+                    %11 = stablehlo.compare LE, %9, %10, SIGNED : (tensor<2x4x4x4xi32>, tensor<2x4x4x4xi32>) -> tensor<2x4x4x4xi1>
+                    %cst_0 = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
+                    %12 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
+                    %13 = stablehlo.select %11, %8, %12 : tensor<2x4x4x4xi1>, tensor<2x4x4x4xf32>
+                    %14 = stablehlo.broadcast_in_dim %arg5, dims = [0, 1, 2] : (tensor<2x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %15 = stablehlo.subtract %13, %14 : tensor<2x4x4x4xf32>
+                    %16 = stablehlo.exponential %15 : tensor<2x4x4x4xf32>
+                    %17 = stablehlo.dot_general %arg6, %3, batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x8xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x4xf32>
+                    %18 = stablehlo.multiply %arg6, %arg4 : tensor<2x4x4x8xf32>
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %19 = stablehlo.reduce(%18 init: %cst_1) applies stablehlo.add across dimensions = [3] : (tensor<2x4x4x8xf32>, tensor<f32>) -> tensor<2x4x4xf32>
+                    %20 = stablehlo.transpose %19, dims = [0, 2, 1] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+                    %21 = stablehlo.broadcast_in_dim %20, dims = [0, 1, 2] : (tensor<2x4x4xf32>) -> tensor<2x4x4x4xf32>
+                    %22 = stablehlo.subtract %17, %21 : tensor<2x4x4x4xf32>
+                    %23 = stablehlo.multiply %16, %22 : tensor<2x4x4x4xf32>
+                    %cst_2 = stablehlo.constant dense<1.250000e-01> : tensor<f32>
+                    %24 = stablehlo.broadcast_in_dim %cst_2, dims = [] : (tensor<f32>) -> tensor<2x4x4x4xf32>
+                    %25 = stablehlo.multiply %23, %24 : tensor<2x4x4x4xf32>
+                    %26 = stablehlo.dot_general %25, %1, batching_dims = [0, 1] x [0, 2], contracting_dims = [3] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x4xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %27 = stablehlo.transpose %26, dims = [0, 2, 1, 3] : (tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %28 = stablehlo.dot_general %25, %arg0, batching_dims = [0, 1] x [0, 2], contracting_dims = [2] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x4xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %29 = stablehlo.transpose %28, dims = [0, 2, 1, 3] : (tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %30 = stablehlo.dot_general %16, %arg6, batching_dims = [0, 1] x [0, 2], contracting_dims = [2] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x4x4x4xf32>, tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %31 = stablehlo.transpose %30, dims = [0, 2, 1, 3] : (tensor<2x4x4x8xf32>) -> tensor<2x4x4x8xf32>
+                    %32 = stablehlo.reshape %29 : (tensor<2x4x4x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %cst_3 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %33 = stablehlo.reduce(%32 init: %cst_3) applies stablehlo.add across dimensions = [3] : (tensor<2x4x2x2x8xf32>, tensor<f32>) -> tensor<2x4x2x8xf32>
+                    %34 = stablehlo.reshape %31 : (tensor<2x4x4x8xf32>) -> tensor<2x4x2x2x8xf32>
+                    %cst_4 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %35 = stablehlo.reduce(%34 init: %cst_4) applies stablehlo.add across dimensions = [3] : (tensor<2x4x2x2x8xf32>, tensor<f32>) -> tensor<2x4x2x8xf32>
+                    %cst_5 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %36 = stablehlo.reduce(%23 init: %cst_5) applies stablehlo.add across dimensions = [0] : (tensor<2x4x4x4xf32>, tensor<f32>) -> tensor<4x4x4xf32>
+                    %37 = stablehlo.reshape %36 : (tensor<4x4x4xf32>) -> tensor<1x4x4x4xf32>
+                    return %27, %33, %35, %37 : tensor<2x4x4x8xf32>, tensor<2x4x2x8xf32>, tensor<2x4x2x8xf32>, tensor<1x4x4x4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_rejects_dot_product_attention_dropout_off_the_fast_path() {
+        // No composition implements dropout, so a dropout-carrying operation that misses the fused fast-path gate
+        // (here: `f32` operands on CUDA, and any operands without a target platform) reports an explicit error
+        // instead of silently computing dropout-free attention, for both the forward and the backward operations.
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::F32,
+            2,
+            2,
+            false,
+            false,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal).with_dropout((0.5, 123)),
+        );
+        for platform in [Some("cuda"), None] {
+            let result =
+                lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, platform);
+            assert!(matches!(
+                result,
+                Err(error) if error.to_string().contains(
+                    "'dot_product_attention' dropout is only supported by the fused CUDA lowering",
+                ),
+            ));
+        }
+        let (program, input_types, output_types) = dot_product_attention_backward_fixture_program(
+            DataType::F32,
+            2,
+            2,
+            false,
+            false,
+            DotProductAttentionBackwardOperation::new(0.125, AttentionMask::Causal).with_dropout((0.5, 123)),
+        );
+        let result =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"));
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains(
+                "'dot_product_attention_backward' dropout is only supported by the fused CUDA lowering",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_never_emits_fmha_for_f8_attention() {
+        // F8 attention is a validated NO-GO on the pinned cuDNN (the fused kernels reject F8 I/O at compile time),
+        // so `f8` operands never qualify for the fMHA fast path and take the ordinary composition route even on
+        // CUDA targets.
+        let (program, input_types, output_types) = dot_product_attention_extended_fixture_program(
+            DataType::F8E4M3FN,
+            2,
+            2,
+            false,
+            false,
+            DotProductAttentionOperation::new(0.125, AttentionMask::Causal),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+        assert!(!module.contains("fmha"));
         assert!(module.contains("stablehlo.dot_general"));
         assert!(module.contains("stablehlo.convert"));
     }
