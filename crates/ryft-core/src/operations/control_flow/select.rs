@@ -113,14 +113,13 @@ impl ElementwiseOperation for SelectOperation {
     }
 }
 
-/// Interpretation selects through the value-level [`Select`] capability, with the condition operand's
-/// [`SelectCondition`] view providing the condition representation of the active value semantics: eager scalar values
-/// decode the in-band Boolean into a plain [`bool`], eager array values pass themselves as the Boolean mask, and
-/// context-carrying values (e.g., staged [`Tracer`]s) select by binding a [`SelectOperation`] through
-/// their own context.
+/// Interpretation selects through the value-level [`Select`] capability. The condition is an ordinary value in the
+/// active domain: eager scalar values decode their in-band Boolean payload, eager array values use themselves as the
+/// Boolean mask, and context-carrying values (e.g., staged [`Tracer`]s) bind a [`SelectOperation`] through their own
+/// context.
 impl<C: Domain> InterpretableOperation<C> for SelectOperation
 where
-    C::Value: SelectCondition + Select<Condition = <C::Value as SelectCondition>::Condition>,
+    C::Value: Select,
     Self: Operation<C::Type>,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -130,7 +129,7 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        Ok(vec![C::Value::select(&inputs[0].select_condition()?, &inputs[1], &inputs[2])?])
+        Ok(vec![C::Value::select(&inputs[0], &inputs[1], &inputs[2])?])
     }
 }
 
@@ -157,9 +156,8 @@ impl_differentiable_elementwise_operation! {
             let condition = &inputs[0];
             let on_true = &inputs[1];
             let on_false = &inputs[2];
-            // Bind the primal and tangent selects through the context rather than the value-level `Select` capability:
-            // binding works uniformly under staging and eager contexts, whereas eager value types select over their own
-            // condition representations (for example, `Scalar` selects over `bool`).
+            // Bind the primal and tangent selects through the context rather than the value-level `Select` capability
+            // because this rule already owns the active differentiation context and must preserve its tracing behavior.
             let mut primal = context.bind(
                 SelectOperation,
                 Vec::new(),
@@ -253,9 +251,9 @@ impl_differentiable_elementwise_operation! {
 /// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three
 /// operand shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and
 /// `on_false` need not share a shape and the branches need not share a data type (see [`SelectOperation`]). The
-/// condition and branch value types may differ: for scalar values the condition is a plain [`bool`], while array
-/// value types pair with a Boolean-typed condition array. Value types that participate in closed staged operation
-/// sets (e.g., [`Tracer`]) use `Condition = Self`, representing the condition as a [`DataType::Boolean`] value.
+/// condition is represented by the same value type as the branches. Scalar values decode their in-band condition
+/// through [`BooleanLike`](crate::operations::BooleanLike), while arrays use Boolean-typed condition arrays and staged
+/// [`Tracer`]s use Boolean-typed tracer values.
 ///
 /// # Example
 ///
@@ -269,9 +267,9 @@ impl_differentiable_elementwise_operation! {
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Scalar values use a plain `bool` condition.
-/// assert_eq!(Scalar::select(&true, &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(2.0));
-/// assert_eq!(Scalar::select(&false, &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(3.0));
+/// // Scalar values use an in-band Boolean scalar condition.
+/// assert_eq!(Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(2.0));
+/// assert_eq!(Scalar::select(&Scalar::from(false), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(3.0));
 ///
 /// // Array values pair with a Boolean-typed condition array of the same shape.
 /// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
@@ -284,30 +282,9 @@ impl_differentiable_elementwise_operation! {
 /// # }
 /// ```
 pub trait Select: Sized {
-    /// Condition value type that drives the selection.
-    type Condition;
-
     /// Selects from `on_true` and `on_false` based on `condition`. Refer to the documentation of this
     /// trait for more information on what this operation does.
-    fn select(condition: &Self::Condition, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
-}
-
-// TODO(eaplatanios): Figure out whether we actually need this.
-/// Extracts the [`Select`] condition carried by a value: for value-condition domains (arrays, staged tracers) the
-/// condition is the value itself, while for scalar domains it is the decoded in-band Boolean.
-///
-/// The condition of a [`SelectOperation`] crosses the primal/tangent boundary differently per domain: array and
-/// staged [`Tracer`] values implement [`Select`] with `Condition = Self`, whereas eager scalar values
-/// implement it with `Condition = bool` by decoding an in-band Boolean via
-/// [`BooleanLike::boolean`](crate::operations::BooleanLike::boolean). This trait gives the interpretation rule of
-/// [`SelectOperation`] a single hook to obtain the right [`Select`] condition from a value without committing to one
-/// domain's condition representation.
-pub trait SelectCondition {
-    /// The condition type accepted by this value's [`Select`] implementation.
-    type Condition;
-
-    /// Extracts this value's [`Select`] condition.
-    fn select_condition(&self) -> Result<Self::Condition, ProgramError>;
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
 /// Any context-carrying value selects by binding a [`SelectOperation`] through its own context: a staged tracer
@@ -320,8 +297,6 @@ where
     V::DispatchDomain: Context,
     <V::DispatchDomain as Domain>::Operation: From<SelectOperation>,
 {
-    type Condition = Self;
-
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let mut outputs = condition.dispatch_domain().bind(
@@ -330,20 +305,6 @@ where
             &[condition.clone(), on_true.clone(), on_false.clone()],
         )?;
         Ok(outputs.remove(0))
-    }
-}
-
-/// For context-carrying values, the [`Select`] condition is the value itself.
-impl<V: Value> SelectCondition for V
-where
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<SelectOperation>,
-{
-    type Condition = Self;
-
-    #[inline]
-    fn select_condition(&self) -> Result<Self, ProgramError> {
-        Ok(self.clone())
     }
 }
 
@@ -521,15 +482,30 @@ mod tests {
         assert_eq!(*output[0].r#type(), branch_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
 
-        // The scalar implementation selects on plain `bool` conditions.
-        assert_eq!(Scalar::select(&true, &Scalar::from(2.0), &Scalar::from(3.0)), Ok(Scalar::from(2.0)));
-        assert_eq!(Scalar::select(&false, &Scalar::from(2.0f32), &Scalar::from(3.0f32)), Ok(Scalar::from(3.0f32)));
+        // The scalar implementation selects on in-band Boolean scalar conditions.
+        assert_eq!(
+            Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0)),
+            Ok(Scalar::from(2.0)),
+        );
+        assert_eq!(
+            Scalar::select(&Scalar::from(false), &Scalar::from(2.0f32), &Scalar::from(3.0f32)),
+            Ok(Scalar::from(3.0f32)),
+        );
 
         // Mixed-but-promotable branch data types promote the selected branch to the common type (`jnp.where`-style),
         // so the result carries the promoted data type regardless of which branch is selected.
-        assert_eq!(Scalar::select(&true, &Scalar::from(2.0f32), &Scalar::from(3.0f64)), Ok(Scalar::from(2.0f64)));
-        assert_eq!(Scalar::select(&false, &Scalar::from(2.0f32), &Scalar::from(3.0f64)), Ok(Scalar::from(3.0f64)));
-        assert_eq!(Scalar::select(&true, &Scalar::from(2i32), &Scalar::from(3.0f64)), Ok(Scalar::from(2.0f64)));
+        assert_eq!(
+            Scalar::select(&Scalar::from(true), &Scalar::from(2.0f32), &Scalar::from(3.0f64)),
+            Ok(Scalar::from(2.0f64)),
+        );
+        assert_eq!(
+            Scalar::select(&Scalar::from(false), &Scalar::from(2.0f32), &Scalar::from(3.0f64)),
+            Ok(Scalar::from(3.0f64)),
+        );
+        assert_eq!(
+            Scalar::select(&Scalar::from(true), &Scalar::from(2i32), &Scalar::from(3.0f64)),
+            Ok(Scalar::from(2.0f64)),
+        );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
@@ -638,7 +614,7 @@ mod tests {
 
         fn piecewise<V>(x: V, y: V) -> Result<V, ProgramError>
         where
-            V: Clone + Compare<Output = V> + Select<Condition = V> + std::ops::Add<Output = V>,
+            V: Clone + Compare<Output = V> + Select + std::ops::Add<Output = V>,
         {
             let mask = x.compare(&y, ComparisonDirection::GreaterThan)?;
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))

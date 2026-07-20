@@ -232,7 +232,6 @@ mod tests {
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
     use ryft_core::operations::constants::OneLike;
-    use ryft_core::operations::control_flow::SelectCondition;
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
     use ryft_core::operations::manipulation::{
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
@@ -1610,8 +1609,7 @@ mod tests {
         assert_eq!(less_than.data_type(), DataType::Boolean);
         assert_eq!(read_booleans(&less_than), vec![true, false, false, true]);
 
-        let condition = less_than.select_condition().unwrap();
-        let selected = Array::select(&condition, &a, &b).unwrap();
+        let selected = Array::select(&less_than, &a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
     }
 

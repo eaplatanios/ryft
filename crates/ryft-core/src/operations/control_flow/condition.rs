@@ -20,7 +20,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::BooleanLike;
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
+use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -775,11 +775,7 @@ fn reconcile_branch<C: Context>(
 impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: BooleanLike
-        + Broadcast
-        + Transpose
-        + SelectCondition<Condition = <C as Domain>::Value>
-        + Select<Condition = <C as Domain>::Value>,
+    <C as Domain>::Value: BooleanLike + Broadcast + Transpose + Select,
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
@@ -892,10 +888,7 @@ pub(crate) fn batch_condition_with_interpreter<C, F>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: Broadcast
-        + Transpose
-        + SelectCondition<Condition = C::Value>
-        + crate::operations::control_flow::Select<Condition = C::Value>,
+    C::Value: Broadcast + Transpose + Select,
     C::Operation: From<BroadcastOperation> + From<SelectOperation> + From<TransposeOperation>,
     F: FnMut(usize, Vec<ArrayBatch<C::Value>>) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>,
 {

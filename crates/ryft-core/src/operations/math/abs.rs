@@ -1,20 +1,17 @@
-use std::ops::{Div as StandardDiv, Mul as StandardMul};
-
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::types::DifferentiableType;
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::{OneLike, ZeroLike};
-use crate::operations::control_flow::{Select, SelectCondition};
+use crate::operations::control_flow::Select;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::types::DataType;
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
@@ -82,8 +79,7 @@ impl_differentiable_elementwise_operation! {
             + Conjugate
             + Imaginary
             + Real
-            + Select<Condition = <C::Value as SelectCondition>::Condition>
-            + SelectCondition
+            + Select
             + ZeroLike
             + OneLike
             + std::ops::Neg<Output = C::Value>
@@ -114,8 +110,7 @@ impl_differentiable_elementwise_operation! {
                         let denominator = primal.align_tangent(&primal_tangent_type)?;
                         let zero = denominator.zero_like();
                         let one = denominator.one_like();
-                        let denominator_is_zero =
-                            denominator.compare(&zero, ComparisonDirection::Equal)?.select_condition()?;
+                        let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
                         let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
                         // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
                         // algebraically equivalent but can overflow even when the final directional derivative is
@@ -131,8 +126,7 @@ impl_differentiable_elementwise_operation! {
                         let input = input.primal().align_tangent(&primal_tangent_type)?;
                         let tangent = tangent.align_tangent(&primal_tangent_type)?;
                         let zero = input.zero_like();
-                        let non_negative =
-                            input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
+                        let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
                         MaybeZero::Value(C::Value::select(&non_negative, &tangent, &-tangent.clone())?)
                     }
                 }
@@ -142,6 +136,8 @@ impl_differentiable_elementwise_operation! {
     },
     transpose = @nonlinear,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 define_elementwise_capability!(
     @unary

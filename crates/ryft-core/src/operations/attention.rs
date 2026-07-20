@@ -1522,7 +1522,7 @@ fn apply_attention_masks<C, V>(
     masked_fill: &V,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + And + Broadcast + Compare<Output = V> + Select<Condition = V> + Sub,
+    V: Value<Type = ArrayType> + And + Broadcast + Compare<Output = V> + Select + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
     if mask == AttentionMask::None && key_value_sequence_lengths.is_none() {
@@ -1579,7 +1579,7 @@ where
         + ConvertElementType
         + Dot
         + Mul
-        + Select<Condition = V>
+        + Select
         + Sub,
     C: Fill<Scalar, V> + Iota<V>,
 {
@@ -1624,7 +1624,7 @@ fn zero_out_of_range_query_rows<C, V>(
     row_axis: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Compare<Output = V> + Select<Condition = V>,
+    V: Value<Type = ArrayType> + Broadcast + Compare<Output = V> + Select,
     C: Fill<Scalar, V> + Iota<V>,
 {
     let value_type = value.r#type().into_owned();
@@ -1676,7 +1676,7 @@ where
         + Mul
         + Reduce
         + Reshape
-        + Select<Condition = V>
+        + Select
         + Sub
         + Transpose,
     C: Fill<Scalar, V> + Iota<V>,
@@ -1807,7 +1807,7 @@ where
         + Mul
         + Reduce
         + Reshape
-        + Select<Condition = V>
+        + Select
         + Sub
         + Transpose,
     C: Fill<Scalar, V> + Iota<V>,

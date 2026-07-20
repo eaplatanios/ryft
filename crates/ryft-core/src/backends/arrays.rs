@@ -23,6 +23,7 @@ use ryft_macros::Operation;
 
 // TODO(eaplatanios): Review from here onwards.
 
+use crate::Select;
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
@@ -88,7 +89,6 @@ use crate::tracing_v2::operations::custom_derivatives::{
 };
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
-use crate::{Select, SelectCondition};
 
 /// Reusable [`Operation`] enum for ordinary staged array programs.
 ///
@@ -1761,8 +1761,6 @@ impl Compare for Array {
 }
 
 impl Select for Array {
-    type Condition = Self;
-
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
         // the three operand shapes broadcast together, and the two branch data types promote together to the output
@@ -1786,17 +1784,9 @@ impl Select for Array {
             .iter()
             .zip(on_true.iter())
             .zip(on_false.iter())
-            .map(|((condition, on_true), on_false)| Scalar::select(&condition.boolean()?, on_true, on_false))
+            .map(|((condition, on_true), on_false)| Scalar::select(condition, on_true, on_false))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { r#type: output_type, values })
-    }
-}
-
-impl SelectCondition for Array {
-    type Condition = Self;
-
-    fn select_condition(&self) -> Result<Self, ProgramError> {
-        Ok(self.clone())
     }
 }
 
@@ -2225,7 +2215,6 @@ mod tests {
             Array::select(&Array::scalar(true), &Array::vector(vec![1.0f32, 2.0]), &Array::vector(vec![-1.0f64, -2.0]))
                 .unwrap();
         assert_eq!(broadcast, Array::vector(vec![1.0f64, 2.0]));
-        assert_eq!(condition.select_condition().unwrap(), condition);
     }
 
     #[test]

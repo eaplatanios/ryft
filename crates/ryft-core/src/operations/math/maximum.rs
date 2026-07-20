@@ -3,7 +3,7 @@ use crate::macros::{
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::ZeroLike;
-use crate::operations::control_flow::{Select, SelectCondition};
+use crate::operations::control_flow::Select;
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,20 +30,17 @@ impl_differentiable_elementwise_operation! {
     MaximumOperation,
     jvp<C>
     where
-        C::Value: Compare<Output = C::Value>
-            + Select<Condition = <C::Value as SelectCondition>::Condition>
-            + SelectCondition
-            + ZeroLike,
+        C::Value: Compare<Output = C::Value> + Select + ZeroLike,
     {
         // The tangent follows the winning operand, with ties routing to the left operand: each contribution masks
         // its own tangent by the same `left >= right` predicate, so the combined tangent is
         // `select(left >= right, left_tangent, right_tangent)`.
         |(left, left_tangent), (right, _)| {
-            let left_wins = left.compare(&right, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
+            let left_wins = left.compare(&right, ComparisonDirection::GreaterThanOrEqual)?;
             C::Value::select(&left_wins, &left_tangent, &left_tangent.zero_like())?
         };
         |(left, _), (right, right_tangent)| {
-            let left_wins = left.compare(&right, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
+            let left_wins = left.compare(&right, ComparisonDirection::GreaterThanOrEqual)?;
             C::Value::select(&left_wins, &right_tangent.zero_like(), &right_tangent)?
         };
     },

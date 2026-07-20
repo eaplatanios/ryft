@@ -29,7 +29,7 @@ use crate::operations::constants::{
     ConstantOperation, Fill, FillOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation, WhilePredicate};
+use crate::operations::control_flow::{Select, SelectOperation, WhileOperation, WhilePredicate};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
@@ -2136,30 +2136,16 @@ impl Compare for Scalar {
 }
 
 impl Select for Scalar {
-    type Condition = bool;
-
-    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the broadcasting
-    /// [`SelectOperation`] type-inference contract: the selected
-    /// branch is promoted to the promotion of the two branch data types, so `select(condition, f32, f64)` yields an
-    /// `f64` like `jnp.where`. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before
-    /// reaching here, so this only needs the resolved `bool`.
+    /// Selects between `on_true` and `on_false` after decoding the in-band `condition` through [`BooleanLike`],
+    /// mirroring the broadcasting [`SelectOperation`] type-inference contract. The selected branch is promoted to the
+    /// promotion of the two branch data types, so `select(condition, f32, f64)` yields an `f64` like `jnp.where`.
     #[inline]
-    fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+    fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let condition = condition.boolean()?;
         let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
             .map_err(|error| TypeError { message: error.to_string() })?;
-        let selected = if *condition { on_true } else { on_false };
+        let selected = if condition { on_true } else { on_false };
         selected.convert_element_type(target)
-    }
-}
-
-impl SelectCondition for Scalar {
-    type Condition = bool;
-
-    /// Extracts the selection condition carried by this [`Scalar`], decoding its in-band Boolean payload through
-    /// [`BooleanLike::boolean`].
-    #[inline]
-    fn select_condition(&self) -> Result<bool, ProgramError> {
-        self.boolean()
     }
 }
 
@@ -2998,12 +2984,18 @@ mod tests {
     #[test]
     fn test_scalar_select() {
         // Selection promotes the selected branch to the promotion of the two branch data types, like `jnp.where`.
-        assert_eq!(Select::select(&true, &Scalar::from(1.5f32), &Scalar::from(2.5f64)), Ok(Scalar::from(1.5f64)));
-        assert_eq!(Select::select(&false, &Scalar::from(1.5f32), &Scalar::from(2.5f64)), Ok(Scalar::from(2.5f64)));
+        assert_eq!(
+            Select::select(&Scalar::from(true), &Scalar::from(1.5f32), &Scalar::from(2.5f64)),
+            Ok(Scalar::from(1.5f64)),
+        );
+        assert_eq!(
+            Select::select(&Scalar::from(false), &Scalar::from(1.5f32), &Scalar::from(2.5f64)),
+            Ok(Scalar::from(2.5f64)),
+        );
 
-        // Selection conditions decode the in-band Boolean payloads of scalar values.
-        assert_eq!(Scalar::from(true).select_condition(), Ok(true));
-        assert_eq!(Scalar::from(0.0).select_condition(), Ok(false));
-        assert!(Scalar::Token.select_condition().is_err());
+        // Scalar selection decodes the condition's in-band Boolean payload.
+        assert_eq!(Select::select(&Scalar::from(1.0), &Scalar::from(1), &Scalar::from(2)), Ok(Scalar::from(1)));
+        assert_eq!(Select::select(&Scalar::from(0.0), &Scalar::from(1), &Scalar::from(2)), Ok(Scalar::from(2)));
+        assert!(Select::select(&Scalar::Token, &Scalar::from(1), &Scalar::from(2)).is_err());
     }
 }

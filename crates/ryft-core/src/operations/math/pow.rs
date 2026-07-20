@@ -5,7 +5,7 @@ use crate::macros::{
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{OneLike, ZeroLike};
-use crate::operations::control_flow::{Select, SelectCondition};
+use crate::operations::control_flow::Select;
 
 use super::Log;
 
@@ -36,8 +36,7 @@ impl_differentiable_elementwise_operation! {
         C::Value: Pow
             + Log
             + Compare<Output = C::Value>
-            + Select<Condition = <C::Value as SelectCondition>::Condition>
-            + SelectCondition
+            + Select
             + OneLike
             + ZeroLike
             + StandardMul<Output = C::Value>
@@ -50,7 +49,7 @@ impl_differentiable_elementwise_operation! {
             right * left.pow(&exponent)? * left_tangent
         };
         |(left, _), (right, right_tangent)| {
-            let base_is_zero = left.compare(&left.zero_like(), ComparisonDirection::Equal)?.select_condition()?;
+            let base_is_zero = left.compare(&left.zero_like(), ComparisonDirection::Equal)?;
             let safe_base = C::Value::select(&base_is_zero, &left.one_like(), &left)?;
             left.pow(&right)? * safe_base.log()? * right_tangent
         };

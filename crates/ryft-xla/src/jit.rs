@@ -3357,7 +3357,7 @@ mod tests {
             + Dot
             + Reduce
             + Compare<Output = V>
-            + Select<Condition = V>
+            + Select
             + TopK
             + ArgMax
             + DynamicSlice
