@@ -15,6 +15,9 @@ use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this file.
 
+/// Scaled dot-product attention operation and capability trait.
+pub mod attention;
+
 /// Named-axis collective operations (e.g., `psum`, `pmean`, `pmax`, and `axis_index`) and capability traits.
 pub mod collectives;
 
