@@ -26,8 +26,8 @@ pub const CONSTANT_OPERATION_NAME: &str = "constant";
 
 /// [`Operation`] that has no inputs and produces a single output equal to a captured typed value. [`ConstantOperation`]
 /// is a true literal constant. It carries a `V` value that is [`Typed`], and so its output type is exactly the value's
-/// type, and interpreting it simply clones the captured value. Unlike [`FillOperation`](super::FillOperation), it does
-/// not synthesize a value from a scalar; it returns the value the caller already provided when constructing it.
+/// type, and interpreting it simply clones the captured value. Unlike [`FillOperation`](crate::FillOperation), it does
+/// not synthesize a value from a scalar. It instead returns the value the caller already provided when constructing it.
 ///
 /// The `Payload` type parameter is a zero-sized semantic tag that tells interpretation how the stored value should be
 /// treated. The default [`Captured`] payload means the value is a literal carried by the operation, such as an eager
