@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the Triton `tt` dialect.
 - Added support for the Mosaic GPU dialect.
 - Added support for the Mosaic TPU dialect.
+- Added support for the `erf` operation from the `chlo` dialect.
 - Added StableHLO mesh and sub-axis attribute wrappers.
 - Added signless and unsigned integer `Context` constructors for widths `1`, `2`, `4`, `8`, `16`, `32`, `64`, and
   `128`, plus `bool_type` as an alias for `i1_type`.

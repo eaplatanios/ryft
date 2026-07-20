@@ -24,8 +24,9 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::constants::{FillOperation, IotaOperation};
+use crate::operations::constants::{FillOperation, IotaOperation, ZeroLike};
 use crate::operations::manipulation::slicing::resized_output_sharding;
+use crate::operations::manipulation::{Broadcast, Concatenate, Reshape, Slice, Transpose};
 use crate::operations::math::{Reduce, ReductionKind};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -35,6 +36,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -641,34 +643,56 @@ fn interpret_degenerate_collective<V: Clone>(
     Ok(vec![inputs[0].clone()])
 }
 
-/// Rejects consuming a shape-changing collective at a matching `batch` level (materializing gathered axes for
-/// batched bindings is not supported yet) and forwards non-matching collectives to the parent context.
-fn batch_shape_changing_collective<C>(
+/// Shared operand preparation for the shape-changing collective batching rules at a matching `batch` level. It
+/// validates the single-operand contract, realigns the mapped batch axis to the leading physical axis, and returns
+/// the packed physical value together with its static dimensions (whose leading entry is the batch size).
+///
+/// A replicated operand is first materialized as `axis_size` identical batch items via [`ArrayBatch::broadcast`],
+/// which yields the degenerate collective-of-a-replicated-value semantics for free: an `all_gather` of a replicated
+/// value concatenates `axis_size` copies, a `psum_scatter` scatters the `axis_size`-fold sum, and so on. A mapped
+/// batch axis whose size disagrees with the operation's resolved `axis_size` reports an error; the staging
+/// capabilities resolve both from the same binder, so a mismatch indicates a hand-constructed operation.
+fn shape_changing_collective_batch_operand<V>(
     operation_name: &str,
     axis_name: &str,
-    context: &BatchingContext<C>,
-    parent_operation: C::Operation,
-    inputs: &[ArrayBatch<<C as Domain>::Value>],
-) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
+    axis_size: usize,
+    inputs: &[ArrayBatch<V>],
+) -> Result<(V, Vec<usize>), BatchingError>
 where
-    C: Context<Type = ArrayType>,
+    V: Value<Type = ArrayType> + Broadcast + Transpose,
 {
-    if context.axis_name() == Some(axis_name) {
+    check_count!("input", inputs, 1, ProgramError);
+    let input = if inputs[0].batch_axis().is_replicated() {
+        inputs[0].broadcast(0, axis_size, ShardingDimension::Replicated)?
+    } else {
+        inputs[0].move_axis(0)?
+    };
+    // The operand is mapped at axis 0 by construction (a replicated operand was just broadcast onto a mapped axis),
+    // so a missing batch size is impossible here; a dynamic batch axis errors through `batch_size` itself.
+    let batch_size = input.batch_size()?.unwrap();
+    if batch_size != axis_size {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
-                "'{operation_name}' over the batched axis '{axis_name}' is not yet supported; bind the axis to a \
-                 device mesh with shard_map instead",
+                "'{operation_name}' over axis '{axis_name}' resolved axis size {axis_size} but the mapped batch \
+                 axis has size {batch_size}",
             ),
         });
     }
-    forward_collective_to_parent(context, parent_operation, inputs)
+    let Some(shape) = input.value().r#type().static_shape() else {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!("'{operation_name}' batching requires statically shaped operands"),
+        });
+    };
+    let dimensions = shape.dimensions().to_vec();
+    Ok((input.into_value(), dimensions))
 }
 
 /// Implements the shared structure of the shape-changing collectives: the operation struct with its accessors, the
 /// `Display`/`Operation` implementations (with payload-dependent output-shape inference provided as a closure over
 /// the operand dimensions), degenerate interpretation, default partial evaluation, the linear forward-mode rule
-/// (the tangent rides the same collective), the batching rule (forward or reject), and the value-level staging
-/// capability that resolves the named axis size from the active [`NamedAxes`] environment.
+/// (the tangent rides the same collective), and the value-level staging capability that resolves the named axis size
+/// from the active [`NamedAxes`] environment. The batching rules are hand-written below the macro invocations
+/// because each collective materializes the mapped batch axis differently.
 macro_rules! shape_changing_collective {
     (
         $(#[$operation_documentation:meta])*
@@ -800,30 +824,6 @@ macro_rules! shape_changing_collective {
             }
         }
 
-        /// Batching rule: a matching `batch` level is rejected (bind the axis to a device mesh with `shard_map`
-        /// instead), and a non-matching level forwards the collective to the parent context untouched via
-        /// [`forward_collective_to_parent`].
-        impl<C> BatchableOperation<C> for $operation
-        where
-            C: Context<Type = ArrayType>,
-            C::Operation: From<$operation>,
-        {
-            fn batch<D: BatchingDriver<C>>(
-                &self,
-                context: &BatchingContext<C>,
-                _driver: &D,
-                inputs: &[ArrayBatch<<C as Domain>::Value>],
-            ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-                batch_shape_changing_collective(
-                    $name_literal,
-                    &self.axis_name,
-                    context,
-                    C::Operation::from(self.clone()),
-                    inputs,
-                )
-            }
-        }
-
         $(#[$capability_documentation])*
         pub trait $capability: Sized {
             /// Stages this collective over axis `axis_name`, resolving the axis size from the active [`NamedAxes`]
@@ -858,7 +858,9 @@ shape_changing_collective! {
     /// [JAX's `all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) with `tiled = True`
     /// and [StableHLO's `all_gather`](https://openxla.org/stablehlo/spec#all_gather). The output extends
     /// `concat_axis` by the axis size; all other dimensions are unchanged. The collective is linear and its
-    /// transpose is [`PSumScatterOperation`] over the same axis and dimension.
+    /// transpose is [`PSumScatterOperation`] over the same axis and dimension. A matching `batch` level consumes the
+    /// mapped batch axis by merging it item-major into `concat_axis`, replicating the gathered value across the
+    /// batch items.
     operation = AllGatherOperation,
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
     /// Value-level entry point for staging an [`AllGatherOperation`]. Refer to its documentation for the semantics
@@ -898,7 +900,9 @@ shape_changing_collective! {
     /// [JAX's `psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) with
     /// `tiled = True` and [StableHLO's `reduce_scatter`](https://openxla.org/stablehlo/spec#reduce_scatter) with a
     /// sum reduction. The output shrinks `scatter_axis` by the axis size (the dimension must be divisible by it).
-    /// The collective is linear and its transpose is [`AllGatherOperation`] over the same axis and dimension.
+    /// The collective is linear and its transpose is [`AllGatherOperation`] over the same axis and dimension. A
+    /// matching `batch` level consumes the mapped batch axis by summing over it and re-mapping the chunks of
+    /// `scatter_axis` onto it, so batch item `i` receives chunk `i` of the sum.
     operation = PSumScatterOperation,
     name = PSUM_SCATTER_OPERATION_NAME = "psum_scatter",
     /// Value-level entry point for staging a [`PSumScatterOperation`]. Refer to its documentation for the semantics
@@ -948,7 +952,8 @@ shape_changing_collective! {
     /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
     /// [StableHLO's `collective_permute`](https://openxla.org/stablehlo/spec#collective_permute). Participants that
     /// no pair targets receive zeros. The output shape is unchanged. The collective is linear and its transpose is
-    /// the permutation with every pair inverted.
+    /// the permutation with every pair inverted. A matching `batch` level consumes the mapped batch axis by
+    /// reassembling it in target order from per-item slices, with zero slices at untargeted positions.
     operation = PpermuteOperation,
     name = PPERMUTE_OPERATION_NAME = "ppermute",
     /// Value-level entry point for staging a [`PpermuteOperation`]. Refer to its documentation for the semantics
@@ -998,7 +1003,9 @@ shape_changing_collective! {
     /// [JAX's `all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html) and
     /// [StableHLO's `all_to_all`](https://openxla.org/stablehlo/spec#all_to_all). The output shrinks `split_axis`
     /// by the axis size (the dimension must be divisible by it) and extends `concat_axis` by it. The collective is
-    /// linear and its transpose is the exchange with the split and concatenation axes swapped.
+    /// linear and its transpose is the exchange with the split and concatenation axes swapped. A matching `batch`
+    /// level consumes the mapped batch axis with a reshape/transpose block exchange: batch item `i` receives every
+    /// item's chunk `i` of `split_axis`, concatenated item-major along `concat_axis`.
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
     /// Value-level entry point for staging an [`AllToAllOperation`]. Refer to its documentation for the semantics
@@ -1050,6 +1057,246 @@ impl AllToAllOperation {
     #[inline]
     pub fn concat_axis(&self) -> usize {
         self.concat_axis
+    }
+}
+
+/// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
+/// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
+/// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
+/// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
+/// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
+impl<C> BatchableOperation<C> for AllGatherOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<AllGatherOperation>,
+    <C as Domain>::Value: Broadcast + Reshape + Transpose,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+        }
+        let (value, dimensions) = shape_changing_collective_batch_operand(
+            ALL_GATHER_OPERATION_NAME,
+            &self.axis_name,
+            self.axis_size,
+            inputs,
+        )?;
+        let per_item_rank = dimensions.len() - 1;
+        if self.concat_axis >= per_item_rank {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'all_gather' concat axis {} is out of bounds for rank {per_item_rank}",
+                    self.concat_axis,
+                ),
+            });
+        }
+        // The physical layout is `[b, d_0, ..., d_{r-1}]`. Moving the leading batch axis to position `concat_axis`
+        // places it immediately before the per-item `concat_axis` dimension (which shifts one position left as the
+        // batch axis moves past it), so the row-major merge of `(b, d_c)` into `b * d_c` concatenates the batch
+        // items item-major along `concat_axis`.
+        let moved = value.move_axis(0, self.concat_axis)?;
+        let mut output_dimensions = dimensions[1..].to_vec();
+        output_dimensions[self.concat_axis] *= dimensions[0];
+        let gathered = moved.reshape(Shape::new(output_dimensions.into_iter().map(Size::Static).collect()))?;
+        Ok(vec![ArrayBatch::replicated(gathered)])
+    }
+}
+
+/// Batching rule for [`PSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by summing
+/// over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into
+/// `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i`
+/// of the sum. A non-matching level forwards the collective untouched to the parent context via
+/// [`forward_collective_to_parent`].
+impl<C> BatchableOperation<C> for PSumScatterOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<PSumScatterOperation>,
+    <C as Domain>::Value: Broadcast + Reduce + Reshape + Transpose,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+        }
+        let (value, dimensions) = shape_changing_collective_batch_operand(
+            PSUM_SCATTER_OPERATION_NAME,
+            &self.axis_name,
+            self.axis_size,
+            inputs,
+        )?;
+        let batch_size = dimensions[0];
+        let per_item_rank = dimensions.len() - 1;
+        if self.scatter_axis >= per_item_rank {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'psum_scatter' scatter axis {} is out of bounds for rank {per_item_rank}",
+                    self.scatter_axis,
+                ),
+            });
+        }
+        let scatter_dimension = dimensions[self.scatter_axis + 1];
+        if scatter_dimension % batch_size != 0 {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'psum_scatter' scatter axis {} size {scatter_dimension} is not divisible by axis size \
+                     {batch_size}",
+                    self.scatter_axis,
+                ),
+            });
+        }
+        // Sum over the mapped batch axis, split the per-item `scatter_axis` into `(b, d_s / b)` chunks (the
+        // row-major split makes the leading factor index the chunks), and map the chunk axis at the front.
+        let summed = value.reduce(&[0], ReductionKind::Sum);
+        let mut split_dimensions = dimensions[1..].to_vec();
+        split_dimensions[self.scatter_axis] = batch_size;
+        split_dimensions.insert(self.scatter_axis + 1, scatter_dimension / batch_size);
+        let split = summed.reshape(Shape::new(split_dimensions.into_iter().map(Size::Static).collect()))?;
+        let scattered = split.move_axis(self.scatter_axis, 0)?;
+        let physical_type = scattered.r#type().into_owned();
+        Ok(vec![ArrayBatch::new(physical_type, scattered, Some(0))?])
+    }
+}
+
+/// Batching rule for [`PpermuteOperation`]. A matching `batch` level consumes the mapped batch axis by reassembling
+/// it in target order: for each position `t` along the batch axis, the output receives the slice of the source item
+/// that sends to `t`, or a zero slice when no pair targets `t`. A non-matching level forwards the collective
+/// untouched to the parent context via [`forward_collective_to_parent`].
+impl<C> BatchableOperation<C> for PpermuteOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<PpermuteOperation>,
+    <C as Domain>::Value: Broadcast + Concatenate + Slice + Transpose + ZeroLike,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+        }
+        let (value, dimensions) =
+            shape_changing_collective_batch_operand(PPERMUTE_OPERATION_NAME, &self.axis_name, self.axis_size, inputs)?;
+        let batch_size = dimensions[0];
+        // Map each target position along the batch axis to the source item that sends to it; positions that no pair
+        // targets receive zeros. Pair uniqueness is enforced by output type inference, so it is not revalidated here.
+        let mut sources = vec![None; batch_size];
+        for (source, target) in &self.source_target_pairs {
+            if *source >= batch_size || *target >= batch_size {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "'ppermute' pair ({source}, {target}) is out of bounds for axis size {batch_size}",
+                    ),
+                });
+            }
+            sources[*target] = Some(*source);
+        }
+        // Slice each item `[i, i + 1)` from the leading batch axis and concatenate the slices back in target order.
+        let rank = dimensions.len();
+        let strides = vec![1; rank];
+        let slice_item = |item: usize| -> Result<<C as Domain>::Value, ProgramError> {
+            let mut start_indices = vec![0; rank];
+            let mut limit_indices = dimensions.clone();
+            start_indices[0] = item;
+            limit_indices[0] = item + 1;
+            value.slice(&start_indices, &limit_indices, &strides)
+        };
+        let mut zero_item = None;
+        let mut items = Vec::with_capacity(batch_size);
+        for source in sources {
+            match source {
+                Some(source) => items.push(slice_item(source)?),
+                None => {
+                    if zero_item.is_none() {
+                        zero_item = Some(slice_item(0)?.zero_like());
+                    }
+                    // The zero slice was materialized right above when absent.
+                    items.push(zero_item.clone().unwrap());
+                }
+            }
+        }
+        let permuted = Concatenate::concatenate(&items, 0)?;
+        let physical_type = permuted.r#type().into_owned();
+        Ok(vec![ArrayBatch::new(physical_type, permuted, Some(0))?])
+    }
+}
+
+/// Batching rule for [`AllToAllOperation`]. A matching `batch` level consumes the mapped batch axis with a
+/// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis
+/// is swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is
+/// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
+/// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
+/// via [`forward_collective_to_parent`].
+impl<C> BatchableOperation<C> for AllToAllOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<AllToAllOperation>,
+    <C as Domain>::Value: Broadcast + Reshape + Transpose,
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+        }
+        let (value, dimensions) = shape_changing_collective_batch_operand(
+            ALL_TO_ALL_OPERATION_NAME,
+            &self.axis_name,
+            self.axis_size,
+            inputs,
+        )?;
+        let batch_size = dimensions[0];
+        let per_item_rank = dimensions.len() - 1;
+        if self.split_axis >= per_item_rank || self.concat_axis >= per_item_rank {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {per_item_rank}",
+                    self.split_axis,
+                    self.concat_axis,
+                ),
+            });
+        }
+        let split_dimension = dimensions[self.split_axis + 1];
+        if split_dimension % batch_size != 0 {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "'all_to_all' split axis {} size {split_dimension} is not divisible by axis size {batch_size}",
+                    self.split_axis,
+                ),
+            });
+        }
+        // Split the per-item `split_axis` (physical position `split_axis + 1`) into `(b, d_p / b)` so its leading
+        // factor indexes the chunks, then swap the chunk axis with the leading sender axis: afterwards the leading
+        // axis indexes the *receiving* item and the axis at `split_axis + 1` indexes the sender.
+        let mut split_dimensions = dimensions.clone();
+        split_dimensions[self.split_axis + 1] = batch_size;
+        split_dimensions.insert(self.split_axis + 2, split_dimension / batch_size);
+        let split = value.reshape(Shape::new(split_dimensions.into_iter().map(Size::Static).collect()))?;
+        let exchanged = split.swap_axes(0, self.split_axis + 1)?;
+        // Move the sender axis to sit immediately before the per-item `concat_axis` and merge it in row-major, which
+        // concatenates the received chunks sender-major along `concat_axis`. When `split_axis == concat_axis` the
+        // sender axis already sits immediately before the chunk axis and the merge restores the per-item split-axis
+        // size (shrunk by the split, extended back by the concatenation).
+        let moved = exchanged.move_axis(self.split_axis + 1, self.concat_axis + 1)?;
+        let mut output_dimensions = dimensions;
+        output_dimensions[self.split_axis + 1] /= batch_size;
+        output_dimensions[self.concat_axis + 1] *= batch_size;
+        let received = moved.reshape(Shape::new(output_dimensions.into_iter().map(Size::Static).collect()))?;
+        let physical_type = received.r#type().into_owned();
+        Ok(vec![ArrayBatch::new(physical_type, received, Some(0))?])
     }
 }
 
@@ -1610,27 +1857,162 @@ mod tests {
     }
 
     #[test]
-    fn test_all_gather_over_batched_axis_is_rejected() {
+    fn test_all_gather_over_batched_axis_materializes_the_gather() {
         use crate::batching::BatchingTracer;
 
-        // The batch binds the axis `"x"` that the `all_gather` names, but materializing gathered axes for batched
-        // bindings is not supported, so the matching batching rule rejects the collective with a pointer at
-        // `shard_map`.
-        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-            BatchAxis::new(0),
-            BatchAxis::replicated(),
-            BatchAxisSpecification::named("x"),
-        );
+        // The batch binds the axis `"x"` that the `all_gather` names, so the matching batching rule consumes the
+        // mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
+        // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
+        // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)])));
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_all_gather_of_replicated_input_concatenates_copies() {
+        // A replicated operand at a matching level is first materialized as `axis_size` identical batch items, so
+        // the gather degenerates to the item-major concatenation of that many copies of the shared value.
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let outputs = AllGatherOperation::new("x".to_string(), 2, 0)
+            .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]))])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_psum_scatter_over_batched_axis_sums_and_scatters() {
+        use crate::batching::BatchingTracer;
+
+        // The batch binds the axis `"x"` that the `psum_scatter` names, so the matching batching rule sums over the
+        // mapped axis and re-maps the chunks of `scatter_axis` onto it. With items `[1, 2, 3, 4]` and
+        // `[10, 20, 30, 40]` the sum is `[11, 22, 33, 44]`, so item 0 receives `[11, 22]` and item 1 receives
+        // `[33, 44]`, matching the verified cross-device `shard_map` execution semantics of StableHLO's
+        // `reduce_scatter`.
+        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.psum_scatter("x", 0),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
         assert_eq!(
-            result.unwrap_err(),
-            BatchingError::UnsupportedOperation {
-                message: "'all_gather' over the batched axis 'x' is not yet supported; bind the axis to a device \
-                          mesh with shard_map instead"
-                    .to_string(),
-            },
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
+        assert_eq!(output.to_f64s(), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_ppermute_over_batched_axis_permutes_the_items() {
+        use crate::batching::BatchingTracer;
+
+        // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
+        // receives item 0's `[1, 2]`.
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                    item.ppermute("x", vec![(0, 1), (1, 0)])
+                },
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(output.to_f64s(), vec![3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_ppermute_over_batched_axis_zeros_untargeted_items() {
+        use crate::batching::BatchingTracer;
+
+        // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
+        // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.ppermute("x", vec![(0, 1)]),
+                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_all_to_all_over_batched_axis_exchanges_chunks() {
+        use crate::batching::BatchingTracer;
+
+        // Block exchange with `split_axis == concat_axis == 0`: each item splits its vector into two chunks and
+        // receives its own chunk index from every item, concatenated item-major. With items `[1, 2, 3, 4]` and
+        // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
+        // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
+        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 0),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)])),
+        );
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_all_to_all_over_batched_axis_with_distinct_axes_exchanges_chunks() {
+        use crate::batching::BatchingTracer;
+
+        // Distinct split and concatenation axes over per-item `[2, 2]` matrices: each item splits its rows across
+        // the items and receives its own row index from every item, concatenated item-major along the columns. With
+        // item 0 = `[[1, 2], [3, 4]]` and item 1 = `[[5, 6], [7, 8]]`, item 0 receives `[[1, 2, 5, 6]]` and item 1
+        // receives `[[3, 4, 7, 8]]` (per-item shape `[1, 4]`).
+        let x = Array::from_f64s(
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]),
+            ),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        );
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 1),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(4)])),
+        );
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
     #[test]

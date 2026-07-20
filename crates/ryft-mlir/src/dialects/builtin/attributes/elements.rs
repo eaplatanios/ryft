@@ -8,7 +8,7 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::{
-    Attribute, AttributeRef, Context, Error, ShapedType, StringRef, TryFromWithContext, TypeId, VectorTypeDimension,
+    Attribute, AttributeRef, Context, Error, ShapedType, Size, StringRef, TryFromWithContext, TypeId,
     mlir_subtype_trait_impls,
 };
 
@@ -618,9 +618,10 @@ mlir_dense_elements_attribute_from_elements!(DenseIntegerElementsAttributeRef, m
 impl<'c, 't> TryFromWithContext<'c, 't, &[usize]> for DenseIntegerElementsAttributeRef<'c, 't> {
     fn try_from_with_context(value: &[usize], context: &'c Context<'t>) -> Result<Self, Error> {
         context.dense_integer_elements_attribute(
-            context.vector_type(
+            context.tensor_type(
                 context.index_type(),
-                &[VectorTypeDimension::Fixed(value.len())],
+                &[Size::Static(value.len())],
+                None,
                 context.unknown_location(),
             )?,
             &value

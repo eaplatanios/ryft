@@ -15,6 +15,7 @@ use ryft_core::differentiation::{
 };
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
+use ryft_core::operations::attention::DotProductAttentionOperation;
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
@@ -31,10 +32,10 @@ use ryft_core::operations::manipulation::{
     SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ExpOperation,
-    FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation, NegOperation,
-    PowOperation, ReduceOperation, RemainderOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
+    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
+    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation,
+    NegOperation, PowOperation, ReduceOperation, RemainderOperation, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::random::RngBitGeneratorOperation;
@@ -103,6 +104,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Rsqrt(RsqrtOperation),
     Tanh(TanhOperation),
     Logistic(LogisticOperation),
+    Erf(ErfOperation),
     Pow(PowOperation),
     Sign(SignOperation),
     Floor(FloorOperation),
@@ -123,6 +125,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     TransferToMemory(TransferToMemoryOperation),
     Dot(DotOperation),
     ScaledDot(ScaledDotOperation),
+    DotProductAttention(DotProductAttentionOperation),
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
     Reshard(ReshardOperation),
@@ -209,6 +212,7 @@ where
             ArrayOperation::Rsqrt(operation) => Self::Rsqrt(operation),
             ArrayOperation::Tanh(operation) => Self::Tanh(operation),
             ArrayOperation::Logistic(operation) => Self::Logistic(operation),
+            ArrayOperation::Erf(operation) => Self::Erf(operation),
             ArrayOperation::Pow(operation) => Self::Pow(operation),
             ArrayOperation::Sign(operation) => Self::Sign(operation),
             ArrayOperation::Floor(operation) => Self::Floor(operation),
@@ -229,6 +233,7 @@ where
             ArrayOperation::TransferToMemory(operation) => Self::TransferToMemory(operation),
             ArrayOperation::Dot(operation) => Self::Dot(operation),
             ArrayOperation::ScaledDot(operation) => Self::ScaledDot(operation),
+            ArrayOperation::DotProductAttention(operation) => Self::DotProductAttention(operation),
             ArrayOperation::Transpose(operation) => Self::Transpose(operation),
             ArrayOperation::Reshape(operation) => Self::Reshape(operation),
             ArrayOperation::Reshard(operation) => Self::Reshard(operation),

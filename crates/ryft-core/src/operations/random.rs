@@ -6,14 +6,17 @@ use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::operations::constants::{Fill, ZeroLike};
-use crate::operations::manipulation::{Concatenate, ConvertElementType, Slice};
+use crate::operations::control_flow::ScanOperation;
+use crate::operations::manipulation::{Concatenate, ConvertElementType, Slice, Transpose};
 use crate::operations::math::{Add, Cos, Div, Log, Mul, Neg, Sqrt, Sub};
 use crate::operations::sort::ArgMax;
+use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
+use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -29,13 +32,15 @@ pub enum RandomAlgorithm {
     /// with a `ui64[2]` state holding `[key, counter]`.
     ThreeFry,
 
-    /// The Philox-4x32 counter-based generator from the same paper, with a `ui64[3]` state.
+    /// The Philox-4x32 counter-based generator from the same paper, with a `ui64[3]` state holding `[key, counter]`
+    /// where the 128-bit counter is split into its low and high `u64` halves.
     Philox,
 }
 
 impl RandomAlgorithm {
     /// Returns the state type consumed and produced by this algorithm: `ui64[2]` (holding `[key, counter]`) for
-    /// [`ThreeFry`](Self::ThreeFry) and `ui64[3]` for [`Philox`](Self::Philox).
+    /// [`ThreeFry`](Self::ThreeFry) and `ui64[3]` (holding `[key, counter]` with the 128-bit counter split into its
+    /// low and high `u64` halves) for [`Philox`](Self::Philox).
     pub fn state_type(self) -> ArrayType {
         let size = match self {
             Self::ThreeFry => 2,
@@ -69,10 +74,11 @@ impl Display for RandomAlgorithm {
 /// derive per-shard states inside `shard_map` instead).
 ///
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
-/// Batching is rejected: batch items would all see the same state, so callers derive one state per batch item with
-/// [`split_key`] and map over the states explicitly. The reference array backend implements
-/// [`ThreeFry`](RandomAlgorithm::ThreeFry) bit-exactly with XLA's implementation;
-/// [`Philox`](RandomAlgorithm::Philox) is currently reference-unimplemented and reports an error there.
+/// Batching a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages one carry-free
+/// [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state; batching a
+/// *replicated* state is rejected because every batch item would see the same state and draw identical bits. The
+/// reference array backend implements both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
+/// [`Philox`](RandomAlgorithm::Philox) bit-exactly with XLA's implementation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RngBitGeneratorOperation {
     /// Algorithm generating the bits.
@@ -191,21 +197,63 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RngBitGe
 impl_non_differentiable_operation!(RngBitGeneratorOperation);
 impl_non_transposable_operation!(RngBitGeneratorOperation);
 
-/// Random bits are a function of the whole generator state, so mapping one state over a batch would hand every
-/// batch item identical bits: batching reports an error and callers derive one state per batch item with
-/// [`split_key`] instead.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for RngBitGeneratorOperation {
+/// Batching rule for [`RngBitGeneratorOperation`]. A state mapped at some batch axis is realigned to batch axis 0
+/// (a `[b, state_width]` stack of per-item states for both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
+/// [`Philox`](RandomAlgorithm::Philox)) and one carry-free [`ScanOperation`] is staged over it, whose body binds this
+/// same operation on a single per-item state: iteration `i` consumes state row `i` and yields that item's advanced
+/// state and bits, and the scan stacks them into the mapped `[b, state_width]` advanced states and `[b, ...]` bits,
+/// both at batch axis 0. Each batch item therefore draws exactly the bits its own state would produce unbatched, the
+/// staged program's size stays independent of the batch size, and the rule composes with nested batching because the
+/// scan is bound through the parent context (an enclosing batching context batches the staged scan structurally).
+///
+/// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
+/// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for RngBitGeneratorOperation
+where
+    C::Value: Transpose,
+    C::Operation: From<RngBitGeneratorOperation> + From<ScanOperation<C::Constant>>,
+{
     fn batch<D: BatchingDriver<C>>(
         &self,
-        _context: &BatchingContext<C>,
+        context: &BatchingContext<C>,
         _driver: &D,
-        _inputs: &[ArrayBatch<C::Value>],
+        inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation {
-            message: "'rng_bit_generator' has no batching rule because every batch item would see the same state; \
-                      derive one state per batch item with `split_key` and map over the states explicitly"
-                .to_string(),
-        })
+        check_count!("input", inputs, 1, ProgramError);
+        if inputs[0].batch_axis().is_replicated() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
+                          the same state; derive one state per batch item with `split_key` and map over the states \
+                          explicitly"
+                    .to_string(),
+            });
+        }
+
+        // Realign the mapped states to batch axis 0, so the scan consumes one per-item state row per iteration.
+        let states = inputs[0].move_axis(0)?;
+
+        // Build the scan body: one application of this same operation mapping a single per-item state to that
+        // item's advanced state and bits.
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        let state_input = builder.add_input(self.algorithm.state_type());
+        let outputs = builder.add_instruction(self.clone(), Vec::new(), vec![state_input])?.to_vec();
+        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            outputs,
+            vec![Placeholder],
+            vec![Placeholder, Placeholder],
+        )?;
+
+        // Stage one carry-free scan over the per-item states; its stacked outputs are the mapped advanced states
+        // and the mapped bits, both at batch axis 0.
+        let scan = ScanOperation::<C::Constant>::new(0, context.axis_size());
+        let mut outputs = context.parent().bind(scan, vec![body], std::slice::from_ref(states.value()))?;
+        check_count!("output", outputs, 2, ProgramError);
+        let bits = outputs.remove(1);
+        let advanced_states = outputs.remove(0);
+        Ok(vec![
+            ArrayBatch::new(advanced_states.r#type().into_owned(), advanced_states, Some(0))?,
+            ArrayBatch::new(bits.r#type().into_owned(), bits, Some(0))?,
+        ])
     }
 }
 
@@ -446,6 +494,85 @@ pub fn threefry_u64_words(key: u64, counter: u64, count: usize) -> (Vec<u64>, u6
     (words, counter.wrapping_add(count as u64))
 }
 
+/// Applies the 10-round Philox-4x32 block cipher to one counter quad under the provided key pair, following
+/// Salmon et al., ["Parallel Random Numbers: As Easy as 1, 2, 3"](https://doi.org/10.1145/2063384.2063405) and
+/// matching [XLA's implementation](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) bit for
+/// bit (per-round `u32` multiplier constants `0xD2511F53` and `0xCD9E8D57` producing 64-bit products, and per-round
+/// key increments `0x9E3779B9` and `0xBB67AE85`).
+pub fn philox4x32(key: [u32; 2], counter: [u32; 4]) -> [u32; 4] {
+    const MULTIPLIERS: [u32; 2] = [0xD2511F53, 0xCD9E8D57];
+    const KEY_INCREMENTS: [u32; 2] = [0x9E3779B9, 0xBB67AE85];
+    let mut key = key;
+    let mut x = counter;
+    for _ in 0..10 {
+        let product0 = u64::from(x[0]) * u64::from(MULTIPLIERS[0]);
+        let product1 = u64::from(x[2]) * u64::from(MULTIPLIERS[1]);
+        x = [
+            (product1 >> 32) as u32 ^ x[1] ^ key[0],
+            product1 as u32,
+            (product0 >> 32) as u32 ^ x[3] ^ key[1],
+            product0 as u32,
+        ];
+        key = [key[0].wrapping_add(KEY_INCREMENTS[0]), key[1].wrapping_add(KEY_INCREMENTS[1])];
+    }
+    x
+}
+
+/// Generates `count` uniformly distributed `u32` words from a Philox `[key, counter]` state, returning the words
+/// together with the advanced 128-bit counter. The word layout matches XLA's `rng_bit_generator` expansion for
+/// 32-bit outputs: `ceil(count / 4)` counters `counter + i` are split into their four `u32` limbs (least
+/// significant first), each counter is encrypted with [`philox4x32`] under the key's low and high `u32` halves,
+/// and each counter's four cipher words land in adjacent output positions (truncated to `count` for sizes that are
+/// not multiples of four). The counter advances by the `ceil(count / 4)` cipher invocations that actually ran,
+/// matching XLA.
+pub fn philox_u32_words(key: u64, counter: u128, count: usize) -> (Vec<u32>, u128) {
+    let key = [key as u32, (key >> 32) as u32];
+    let quad_count = count.div_ceil(4);
+    let mut words = Vec::with_capacity(quad_count * 4);
+    for index in 0..quad_count {
+        let quad_counter = counter.wrapping_add(index as u128);
+        let output = philox4x32(
+            key,
+            [
+                quad_counter as u32,
+                (quad_counter >> 32) as u32,
+                (quad_counter >> 64) as u32,
+                (quad_counter >> 96) as u32,
+            ],
+        );
+        words.extend_from_slice(&output);
+    }
+    words.truncate(count);
+    (words, counter.wrapping_add(quad_count as u128))
+}
+
+/// Generates `count` uniformly distributed `u64` words from a Philox `[key, counter]` state, returning the words
+/// together with the advanced 128-bit counter. The word layout matches XLA's `rng_bit_generator` expansion for
+/// 64-bit outputs: each of the `ceil(count / 2)` cipher invocations combines its four cipher words into the two
+/// adjacent output words `first | (second << 32)` and `third | (fourth << 32)` (truncated to `count` for odd
+/// sizes), and the counter advances by the `ceil(count / 2)` cipher invocations that actually ran, matching XLA.
+pub fn philox_u64_words(key: u64, counter: u128, count: usize) -> (Vec<u64>, u128) {
+    let key = [key as u32, (key >> 32) as u32];
+    let quad_count = count.div_ceil(2);
+    let mut words = Vec::with_capacity(quad_count * 2);
+    for index in 0..quad_count {
+        let quad_counter = counter.wrapping_add(index as u128);
+        let output = philox4x32(
+            key,
+            [
+                quad_counter as u32,
+                (quad_counter >> 32) as u32,
+                (quad_counter >> 64) as u32,
+                (quad_counter >> 96) as u32,
+            ],
+        );
+        words.push(u64::from(output[0]) | (u64::from(output[1]) << 32));
+        words.push(u64::from(output[2]) | (u64::from(output[3]) << 32));
+    }
+    words.truncate(count);
+    (words, counter.wrapping_add(quad_count as u128))
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -508,6 +635,67 @@ mod tests {
             u64::from(output[0]) | (u64::from(output[1]) << 32)
         };
         assert_eq!(words, vec![word(7), word(8), word(9)]);
+    }
+
+    #[test]
+    fn test_philox4x32_known_answers() {
+        // The Random123 known-answer vectors for Philox-4x32 with 10 rounds.
+        assert_eq!(philox4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
+        assert_eq!(
+            philox4x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]),
+            [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd],
+        );
+        assert_eq!(
+            philox4x32([0xa4093822, 0x299f31d0], [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]),
+            [0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1],
+        );
+    }
+
+    #[test]
+    fn test_philox_words() {
+        // A key with a nonzero high half exercises the `u64 -> [u32; 2]` key split, low half first, and a counter
+        // just below the 64-bit boundary exercises the carry into the high `u64` half of the 128-bit counter.
+        let key = (1u64 << 32) | 42;
+        let key_pair = [42u32, 1u32];
+        let counter = u128::from(u64::MAX - 1);
+        let quad = |quad_counter: u128| {
+            philox4x32(
+                key_pair,
+                [
+                    quad_counter as u32,
+                    (quad_counter >> 32) as u32,
+                    (quad_counter >> 64) as u32,
+                    (quad_counter >> 96) as u32,
+                ],
+            )
+        };
+
+        // 32-bit words: each counter's four cipher words land in adjacent positions, non-multiple-of-four counts
+        // truncate the final quad, and the counter advances by the `ceil(count / 4)` cipher invocations that
+        // actually ran (carrying into the high half here).
+        let (words, advanced) = philox_u32_words(key, counter, 9);
+        assert_eq!(words.len(), 9);
+        assert_eq!(advanced, counter + 3);
+        assert_eq!(advanced >> 64, 1);
+        assert_eq!(words[0..4], quad(counter));
+        assert_eq!(words[4..8], quad(counter + 1));
+        assert_eq!(words[8], quad(counter + 2)[0]);
+
+        // 64-bit words: each cipher invocation yields the two adjacent words `first | (second << 32)` and
+        // `third | (fourth << 32)`, odd counts truncate the final pair, and the counter advances by the
+        // `ceil(count / 2)` cipher invocations.
+        let (words, advanced) = philox_u64_words(key, counter, 3);
+        assert_eq!(advanced, counter + 2);
+        let first_quad = quad(counter);
+        let second_quad = quad(counter + 1);
+        assert_eq!(
+            words,
+            vec![
+                u64::from(first_quad[0]) | (u64::from(first_quad[1]) << 32),
+                u64::from(first_quad[2]) | (u64::from(first_quad[3]) << 32),
+                u64::from(second_quad[0]) | (u64::from(second_quad[1]) << 32),
+            ],
+        );
     }
 
     #[test]
@@ -603,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rng_bit_generator_rejects_batching_and_differentiation() {
+    fn test_rng_bit_generator_rejects_replicated_batching_and_differentiation() {
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(4));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(RandomAlgorithm::ThreeFry.state_type());
@@ -612,11 +800,12 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
             .unwrap();
 
-        // Batching is rejected because every batch item would see the same state.
+        // Batching a replicated state is rejected because every batch item would see the same state and draw
+        // identical bits.
         let batched = program.batched(
             2,
             ShardingDimension::Replicated,
-            &[BatchAxis::new(0)],
+            &[BatchAxis::replicated()],
             ProgramBatchingOutputAxesPolicy::Natural,
         );
         assert!(matches!(
@@ -639,16 +828,176 @@ mod tests {
         );
     }
 
+    /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
+    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>> {
+        BatchingContext::new(EagerContext::new(), axis_size)
+    }
+
     #[test]
-    fn test_philox_is_rejected_by_the_reference_backend() {
-        let state =
-            Array::new(RandomAlgorithm::Philox.state_type(), vec![Scalar::U64(1), Scalar::U64(2), Scalar::U64(3)])
-                .unwrap();
+    fn test_rng_bit_generator_batching_threefry() {
+        // Two distinct ThreeFry states stacked at batch axis 1 (`u64[2, b]` holding `[[k0, k1], [c0, c1]]`) exercise
+        // the realignment to batch axis 0 before the scan consumes one state row per iteration.
+        let states = Array::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            vec![Scalar::U64(42), Scalar::U64(3), Scalar::U64(7), Scalar::U64(11)],
+        )
+        .unwrap();
+        let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(1)).unwrap();
+        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
+        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));
+
+        // Each batch item's advanced state and bits equal the unbatched per-state results exactly.
+        let (first_state, first_bits) =
+            state(42, 7).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(5)).unwrap();
+        let (second_state, second_bits) =
+            state(3, 11).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(5)).unwrap();
+        let expected_states = [first_state.values(), second_state.values()].concat();
+        let expected_bits = [first_bits.values(), second_bits.values()].concat();
+        assert_eq!(outputs[0].value().values(), expected_states);
+        assert_eq!(outputs[1].value().values(), expected_bits);
+    }
+
+    #[test]
+    fn test_rng_bit_generator_batching_philox() {
+        // Two distinct Philox `u64[3]` states stacked at batch axis 0 (`u64[2, 3]`).
+        let states = Array::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            vec![
+                Scalar::U64(42),
+                Scalar::U64(7),
+                Scalar::U64(9),
+                Scalar::U64(3),
+                Scalar::U64(11),
+                Scalar::U64(0),
+            ],
+        )
+        .unwrap();
+        let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(0)).unwrap();
+        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::Philox, bits_type(5));
+        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));
+
+        // Each batch item's advanced state and bits equal the unbatched per-state results exactly.
+        let philox_state = |key: u64, counter_low: u64, counter_high: u64| {
+            Array::new(
+                RandomAlgorithm::Philox.state_type(),
+                vec![Scalar::U64(key), Scalar::U64(counter_low), Scalar::U64(counter_high)],
+            )
+            .unwrap()
+        };
+        let (first_state, first_bits) =
+            philox_state(42, 7, 9).rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
+        let (second_state, second_bits) =
+            philox_state(3, 11, 0).rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
+        let expected_states = [first_state.values(), second_state.values()].concat();
+        let expected_bits = [first_bits.values(), second_bits.values()].concat();
+        assert_eq!(outputs[0].value().values(), expected_states);
+        assert_eq!(outputs[1].value().values(), expected_bits);
+    }
+
+    #[test]
+    fn test_rng_bit_generator_batching_rejects_replicated_state() {
+        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
+        let input = ArrayBatch::replicated(state(42, 7));
+        let result = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]);
         assert!(matches!(
-            state.rng_bit_generator(RandomAlgorithm::Philox, &bits_type(4)),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "the reference array backend does not implement the philox algorithm",
+            result,
+            Err(BatchingError::UnsupportedOperation { message })
+                if message.contains("derive one state per batch item with `split_key`"),
         ));
+    }
+
+    #[test]
+    fn test_rng_bit_generator_batching_stages_a_scan() {
+        // Under a staging parent, batching a mapped state stages one carry-free scan over the per-item states, so
+        // the batched program's size stays independent of the batch size.
+        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(4));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(RandomAlgorithm::ThreeFry.state_type());
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
+            .unwrap();
+        let (batched, output_axes) = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:u64[3, 2] .
+                let %1:u64[3, 2], %2:u32[3, 4] = scan [carry_count=0, length=3, reverse=false] %0 [
+                    body={
+                        lambda %0:u64[2] .
+                        let %1:u64[2], %2:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+
+        // The batched program computes each batch item's unbatched result exactly.
+        let states = Array::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            vec![
+                Scalar::U64(42),
+                Scalar::U64(7),
+                Scalar::U64(3),
+                Scalar::U64(11),
+                Scalar::U64(5),
+                Scalar::U64(0),
+            ],
+        )
+        .unwrap();
+        let outputs = batched.interpret(vec![states]).unwrap();
+        let mut expected_states = Vec::new();
+        let mut expected_bits = Vec::new();
+        for (key, counter) in [(42, 7), (3, 11), (5, 0)] {
+            let (advanced, bits) =
+                state(key, counter).rng_bit_generator(RandomAlgorithm::ThreeFry, &bits_type(4)).unwrap();
+            expected_states.extend_from_slice(advanced.values());
+            expected_bits.extend_from_slice(bits.values());
+        }
+        assert_eq!(outputs[0].values(), expected_states);
+        assert_eq!(outputs[1].values(), expected_bits);
+    }
+
+    #[test]
+    fn test_philox_rng_bit_generator() {
+        // The reference backend maps the `ui64[3]` state to `[key, counter]` with the 128-bit counter split into
+        // its low and high `u64` halves.
+        let state =
+            Array::new(RandomAlgorithm::Philox.state_type(), vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(9)])
+                .unwrap();
+        let counter = 7u128 | (9u128 << 64);
+
+        // Five `u32` words run two cipher invocations, and the counter advances by that invocation count.
+        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
+        let (expected_words, expected_counter) = philox_u32_words(42, counter, 5);
+        assert_eq!(expected_counter, counter + 2);
+        assert_eq!(
+            advanced.values(),
+            &[Scalar::U64(42), Scalar::U64(expected_counter as u64), Scalar::U64((expected_counter >> 64) as u64)],
+        );
+        assert_eq!(bits.values(), expected_words.into_iter().map(Scalar::U32).collect::<Vec<_>>());
+
+        // Three `u64` words also run two cipher invocations (two words per invocation, truncated).
+        let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_bits_type).unwrap();
+        let (expected_words, expected_counter) = philox_u64_words(42, counter, 3);
+        assert_eq!(expected_counter, counter + 2);
+        assert_eq!(
+            advanced.values(),
+            &[Scalar::U64(42), Scalar::U64(expected_counter as u64), Scalar::U64((expected_counter >> 64) as u64)],
+        );
+        assert_eq!(bits.values(), expected_words.into_iter().map(Scalar::U64).collect::<Vec<_>>());
     }
 
     #[test]

@@ -27,6 +27,9 @@ use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
+use crate::operations::attention::{
+    AttentionMask, DotProductAttention, DotProductAttentionOperation, dot_product_attention_composition,
+};
 use crate::operations::collectives::{
     AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveOperation, PSumScatterOperation,
     PpermuteOperation,
@@ -54,20 +57,22 @@ use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::reduce_evaluate;
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
-    DivOperation, Dot, DotDimensionNumbers, DotOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation,
-    Logistic, LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg,
-    NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Remainder, RemainderOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign, SignOperation, Sin, SinOperation,
-    Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation, scaled_dot_composition,
+    DivOperation, Dot, DotDimensionNumbers, DotOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation,
+    Log, LogOperation, Logistic, LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul,
+    MulOperation, Neg, NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Remainder,
+    RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign,
+    SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
+    scaled_dot_composition,
 };
 use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::random::{
-    RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, threefry_u32_words, threefry_u64_words,
+    RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, philox_u32_words, philox_u64_words,
+    threefry_u32_words, threefry_u64_words,
 };
 use crate::operations::sort::{
     ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_evaluate,
-    top_k_from_index_passenger,
+    top_k_from_index_passenger, top_k_via_squeezed_view,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -118,6 +123,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Rsqrt(RsqrtOperation),
     Tanh(TanhOperation),
     Logistic(LogisticOperation),
+    Erf(ErfOperation),
     Pow(PowOperation),
     Sign(SignOperation),
     Floor(FloorOperation),
@@ -136,6 +142,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Imaginary(ImaginaryOperation),
     Dot(DotOperation),
     ScaledDot(ScaledDotOperation),
+    DotProductAttention(DotProductAttentionOperation),
     Reduce(ReduceOperation),
     Sort(SortOperation),
     RngBitGenerator(RngBitGeneratorOperation),
@@ -674,6 +681,12 @@ impl Logistic for Array {
     }
 }
 
+impl Erf for Array {
+    fn erf(&self) -> Result<Self, ProgramError> {
+        self.unary(|value| value.erf())
+    }
+}
+
 impl Pow for Array {
     fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
         self.binary(exponent, |base, exponent| base.pow(exponent))
@@ -723,10 +736,26 @@ impl Remainder for Array {
 }
 
 impl Sort for Array {
-    fn sort(operands: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
+    fn sort_with_key_count(
+        operands: &[Self],
+        axis: usize,
+        direction: SortDirection,
+        key_count: usize,
+    ) -> Result<Vec<Self>, ProgramError> {
         let Some(key) = operands.first() else {
             return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() });
         };
+        if key_count == 0 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "'sort' key_count must be at least 1".to_string(),
+            });
+        }
+        if key_count > operands.len() {
+            return Err(TypeError {
+                message: format!("'sort' key_count {key_count} exceeds operand count {}", operands.len()),
+            }
+            .into());
+        }
         let shape = key.r#type.static_shape().unwrap();
         if axis >= shape.rank() {
             return Err(TypeError {
@@ -746,19 +775,25 @@ impl Sort for Array {
                 .into());
             }
         }
-        let key_ranks = key
-            .values
+        let key_ranks = operands[..key_count]
             .iter()
-            .map(|value| {
-                value.total_order_rank().ok_or_else(|| {
-                    ProgramError::from(TypeError {
-                        message: format!("'sort' does not support key data type {}", key.r#type.data_type()),
+            .map(|key| {
+                key.values
+                    .iter()
+                    .map(|value| {
+                        value.total_order_rank().ok_or_else(|| {
+                            ProgramError::from(TypeError {
+                                message: format!("'sort' does not support key data type {}", key.r#type.data_type()),
+                            })
+                        })
                     })
-                })
+                    .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let key_rank_slices = key_ranks.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let operand_values = operands.iter().map(|operand| operand.values()).collect::<Vec<_>>();
-        let outputs = sort_evaluate(key_ranks.as_slice(), operand_values.as_slice(), shape.dimensions(), axis, direction);
+        let outputs =
+            sort_evaluate(key_rank_slices.as_slice(), operand_values.as_slice(), shape.dimensions(), axis, direction);
         operands.iter().zip(outputs).map(|(operand, values)| Array::new(operand.r#type.clone(), values)).collect()
     }
 }
@@ -787,6 +822,9 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
 
 impl TopK for Array {
     fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError> {
+        if let Some(outputs) = top_k_via_squeezed_view(self, k, axis)? {
+            return Ok(outputs);
+        }
         let (indices, dimensions) = eager_index_passenger(self, axis)?;
         top_k_from_index_passenger(self, indices, dimensions.as_slice(), k, axis)
     }
@@ -815,7 +853,31 @@ impl ScaledDot for Array {
         block_size: usize,
         accumulation_type: DataType,
     ) -> Result<Self, ProgramError> {
-        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, block_size, accumulation_type)
+        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, None, block_size, accumulation_type)
+    }
+
+    fn scaled_dot_with_global_scale(
+        &self,
+        lhs_scales: &Self,
+        rhs: &Self,
+        rhs_scales: &Self,
+        global_scale: &Self,
+        block_size: usize,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, Some(global_scale), block_size, accumulation_type)
+    }
+}
+
+impl DotProductAttention for Array {
+    fn dot_product_attention(
+        &self,
+        key: &Self,
+        value: &Self,
+        scale: f64,
+        mask: AttentionMask,
+    ) -> Result<Self, ProgramError> {
+        dot_product_attention_composition(&self.dispatch_domain(), self, key, value, scale, mask)
     }
 }
 
@@ -825,20 +887,6 @@ impl RngBitGenerator for Array {
         algorithm: RandomAlgorithm,
         output_type: &ArrayType,
     ) -> Result<(Self, Self), ProgramError> {
-        if algorithm != RandomAlgorithm::ThreeFry {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("the reference array backend does not implement the {algorithm} algorithm"),
-            });
-        }
-        let [Scalar::U64(key), Scalar::U64(counter)] = self.values() else {
-            return Err(TypeError {
-                message: format!(
-                    "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[2] state but got {}",
-                    self.r#type,
-                ),
-            }
-            .into());
-        };
         let Some(output_shape) = output_type.static_shape() else {
             return Err(TypeError {
                 message: "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
@@ -846,31 +894,72 @@ impl RngBitGenerator for Array {
             .into());
         };
         let count = output_shape.dimensions().iter().product::<usize>();
-        let (values, new_counter) = match output_type.data_type() {
-            DataType::U64 => {
-                let (words, new_counter) = threefry_u64_words(*key, *counter, count);
-                (words.into_iter().map(Scalar::U64).collect::<Vec<_>>(), new_counter)
+        let data_type = output_type.data_type();
+        // Narrower-than-32-bit outputs keep the low bits of each 32-bit word, matching XLA.
+        let narrow = |word: u32| match data_type {
+            DataType::U32 => Scalar::U32(word),
+            DataType::U16 => Scalar::U16(word as u16),
+            _ => Scalar::U8(word as u8),
+        };
+        if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
+            return Err(TypeError {
+                message: format!("'rng_bit_generator' does not support output data type {data_type}"),
             }
-            DataType::U32 => {
-                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
-                (words.into_iter().map(Scalar::U32).collect::<Vec<_>>(), new_counter)
-            }
-            DataType::U16 => {
-                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
-                (words.into_iter().map(|word| Scalar::U16(word as u16)).collect::<Vec<_>>(), new_counter)
-            }
-            DataType::U8 => {
-                let (words, new_counter) = threefry_u32_words(*key, *counter, count);
-                (words.into_iter().map(|word| Scalar::U8(word as u8)).collect::<Vec<_>>(), new_counter)
-            }
-            data_type => {
-                return Err(TypeError {
-                    message: format!("'rng_bit_generator' does not support output data type {data_type}"),
+            .into());
+        }
+        let (state_values, values) = match algorithm {
+            RandomAlgorithm::ThreeFry => {
+                let [Scalar::U64(key), Scalar::U64(counter)] = self.values() else {
+                    return Err(TypeError {
+                        message: format!(
+                            "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[2] state but got {}",
+                            self.r#type,
+                        ),
+                    }
+                    .into());
+                };
+                if data_type == DataType::U64 {
+                    let (words, new_counter) = threefry_u64_words(*key, *counter, count);
+                    (
+                        vec![Scalar::U64(*key), Scalar::U64(new_counter)],
+                        words.into_iter().map(Scalar::U64).collect::<Vec<_>>(),
+                    )
+                } else {
+                    let (words, new_counter) = threefry_u32_words(*key, *counter, count);
+                    (
+                        vec![Scalar::U64(*key), Scalar::U64(new_counter)],
+                        words.into_iter().map(narrow).collect::<Vec<_>>(),
+                    )
                 }
-                .into());
+            }
+            RandomAlgorithm::Philox => {
+                let [Scalar::U64(key), Scalar::U64(counter_low), Scalar::U64(counter_high)] = self.values() else {
+                    return Err(TypeError {
+                        message: format!(
+                            "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[3] state but got {}",
+                            self.r#type,
+                        ),
+                    }
+                    .into());
+                };
+                let counter = u128::from(*counter_low) | (u128::from(*counter_high) << 64);
+                let advanced_state = |new_counter: u128| {
+                    vec![
+                        Scalar::U64(*key),
+                        Scalar::U64(new_counter as u64),
+                        Scalar::U64((new_counter >> 64) as u64),
+                    ]
+                };
+                if data_type == DataType::U64 {
+                    let (words, new_counter) = philox_u64_words(*key, counter, count);
+                    (advanced_state(new_counter), words.into_iter().map(Scalar::U64).collect::<Vec<_>>())
+                } else {
+                    let (words, new_counter) = philox_u32_words(*key, counter, count);
+                    (advanced_state(new_counter), words.into_iter().map(narrow).collect::<Vec<_>>())
+                }
             }
         };
-        let state = Array::new(self.r#type.clone(), vec![Scalar::U64(*key), Scalar::U64(new_counter)])?;
+        let state = Array::new(self.r#type.clone(), state_values)?;
         Ok((state, Array::new(output_type.clone(), values)?))
     }
 }

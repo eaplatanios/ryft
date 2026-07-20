@@ -238,8 +238,8 @@ mod tests {
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
     };
     use ryft_core::operations::math::{
-        Abs, Atan2, Ceil, Cos, Dot, Exp, Floor, Log, Logistic, Maximum, Minimum, Pow, Reduce, ReductionKind, Remainder,
-        Round, Rsqrt, Sign, Sin, Sqrt, Tanh,
+        Abs, Atan2, Ceil, Cos, Dot, Erf, Exp, Floor, Log, Logistic, Maximum, Minimum, Pow, Reduce, ReductionKind,
+        Remainder, Round, Rsqrt, Sign, Sin, Sqrt, Tanh,
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
@@ -465,6 +465,7 @@ mod tests {
         assert_parity(&left.rsqrt().unwrap(), &reference_left.rsqrt().unwrap());
         assert_parity(&left.tanh().unwrap(), &reference_left.tanh().unwrap());
         assert_parity(&left.logistic().unwrap(), &reference_left.logistic().unwrap());
+        assert_parity(&left.erf().unwrap(), &reference_left.erf().unwrap());
         assert_parity(&left.pow(&right).unwrap(), &reference_left.pow(&reference_right).unwrap());
         assert_parity(&right.sign().unwrap(), &reference_right.sign().unwrap());
         assert_parity(&right.floor().unwrap(), &reference_right.floor().unwrap());
@@ -498,8 +499,39 @@ mod tests {
             &Select::select(&reference_condition, &reference_left, &reference_right).unwrap(),
         );
 
-        // Reduction agrees.
+        // Reductions agree, including the divide-by-count semantics of `Mean`.
         assert_parity(&left.reduce(&[0], ReductionKind::Sum), &reference_left.reduce(&[0], ReductionKind::Sum));
+        assert_parity(&left.reduce(&[0], ReductionKind::Mean), &reference_left.reduce(&[0], ReductionKind::Mean));
+        assert_parity(&left.reduce(&[0], ReductionKind::Max), &reference_left.reduce(&[0], ReductionKind::Max));
+        assert_parity(&left.reduce(&[0], ReductionKind::Min), &reference_left.reduce(&[0], ReductionKind::Min));
+
+        // Integer reductions agree exactly, including the truncating integer division of `Mean`.
+        let integer_values = [5i32, -2, 7, 0];
+        let integer = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[integer_values.len()]),
+            mesh.clone(),
+            values_to_bytes::<i32>(&integer_values).as_slice(),
+        )
+        .unwrap();
+        let reference_integer = CpuArray::new(
+            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(integer_values.len())])),
+            integer_values.iter().copied().map(Scalar::I32).collect(),
+        )
+        .unwrap();
+        for kind in [ReductionKind::Sum, ReductionKind::Mean, ReductionKind::Max, ReductionKind::Min] {
+            let device_values = read_i32s(&integer.reduce(&[0], kind));
+            let reference_values = reference_integer
+                .reduce(&[0], kind)
+                .values()
+                .iter()
+                .map(|value| match value {
+                    Scalar::I32(value) => *value,
+                    other => panic!("expected an i32 reduction result but got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(device_values, reference_values, "integer '{kind}' reduction disagrees");
+        }
 
         // Complex multiplication agrees.
         let complex_left_value = num_complex::Complex::new(1.5f32, -2.0);
@@ -513,6 +545,45 @@ mod tests {
             panic!("expected a c64 reference product");
         };
         assert!((device_product - reference_product).norm() < 1e-5);
+    }
+
+    /// The error function agrees between the XLA-backed eager array backend (which lowers to `chlo.erf` and relies
+    /// on the XLA compiler legalizing it to a StableHLO polynomial approximation) and the reference backend's
+    /// double-precision FDLIBM evaluation. The grid covers every rational-approximation regime of the reference
+    /// implementation on both signs — the small-argument series, the primary interval, the interval around one,
+    /// both complementary-function tail regimes — plus zero and the saturated |x| ≥ 6 regime.
+    #[test]
+    fn test_eager_erf_parity_with_reference_backend() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let values = [
+            -6.5f32, -4.0, -3.0, -2.0, -1.5, -1.0, -0.9, -0.5, -0.1, -1e-3, -1e-10, 0.0, 1e-10, 1e-3, 0.1, 0.5, 0.9,
+            1.0, 1.2, 1.25, 2.0, 2.9, 3.0, 4.0, 6.5,
+        ];
+        let device_values = read_f32s(&f32_vector(&client, &mesh, &values).erf().unwrap());
+        let reference_values = CpuArray::vector(values.to_vec()).erf().unwrap().to_f64s();
+        assert_eq!(device_values.len(), reference_values.len());
+        for ((input, device_value), reference_value) in
+            values.iter().zip(device_values.iter()).zip(reference_values.iter())
+        {
+            // Both backends compute at `f32` precision (the device through XLA's polynomial legalization of
+            // `chlo.erf` and the reference through a rounded double-precision evaluation), so agreement is checked
+            // within an `f32`-scale relative tolerance with an absolute floor for the near-zero inputs.
+            let tolerance = 1e-6f64.max(1e-6 * reference_value.abs());
+            assert!(
+                (f64::from(*device_value) - reference_value).abs() < tolerance,
+                "erf({input}) disagrees: XLA computed {device_value} but the reference backend computed \
+                 {reference_value}",
+            );
+        }
+
+        // Both backends saturate exactly at the extremes.
+        assert_eq!(device_values[0], -1.0);
+        assert_eq!(*device_values.last().unwrap(), 1.0);
+        assert_eq!(reference_values[0], -1.0);
+        assert_eq!(*reference_values.last().unwrap(), 1.0);
     }
 
     /// The traced custom-call operation executes a registered XLA FFI handler through the eager capability path:
@@ -628,6 +699,84 @@ mod tests {
         assert_eq!(reference_nan_keys.argmin(0).unwrap().to_f64s(), vec![0.0]);
     }
 
+    /// A two-key lexicographic sort agrees between the XLA-backed eager array backend and the reference array
+    /// backend: duplicates in the `i32` primary key fall through to the `f32` secondary key (compared with
+    /// `TOTALORDER` semantics), full ties keep their original order (the sort is stable), and the passenger
+    /// co-permutes.
+    #[test]
+    fn test_eager_multi_key_sort_parity_with_reference_backend() {
+        use ryft_core::operations::sort::{Sort, SortDirection};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let primary_values = [2i32, 1, 2, 1, 2, 1];
+        let secondary_values = [0.5f32, 3.0, -1.0, 1.0, 0.5, 2.0];
+        let passenger_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let primary_type = replicated_type(&mesh, DataType::I32, &[primary_values.len()]);
+        let primary = Array::from_host_buffer(
+            &client,
+            primary_type,
+            mesh.clone(),
+            values_to_bytes::<i32>(&primary_values).as_slice(),
+        )
+        .unwrap();
+        let secondary = f32_vector(&client, &mesh, &secondary_values);
+        let passenger = f32_vector(&client, &mesh, &passenger_values);
+        let reference_primary = CpuArray::new(
+            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(primary_values.len())])),
+            primary_values.iter().copied().map(Scalar::I32).collect(),
+        )
+        .unwrap();
+        let reference_secondary = CpuArray::vector(secondary_values.iter().map(|value| f64::from(*value)).collect());
+        let reference_passenger = CpuArray::vector(passenger_values.iter().map(|value| f64::from(*value)).collect());
+
+        let cases = [
+            // Ascending: primary 1s precede 2s, ties resolve by the secondary key, and the full `(2, 0.5)` tie
+            // keeps element 0 before element 4 (the passenger shows the stable order).
+            (
+                SortDirection::Ascending,
+                vec![1, 1, 1, 2, 2, 2],
+                vec![1.0f32, 2.0, 3.0, -1.0, 0.5, 0.5],
+                vec![40.0f32, 60.0, 20.0, 30.0, 10.0, 50.0],
+            ),
+            // Descending reverses both key comparisons while keeping the full tie in its original order.
+            (
+                SortDirection::Descending,
+                vec![2, 2, 2, 1, 1, 1],
+                vec![0.5f32, 0.5, -1.0, 3.0, 2.0, 1.0],
+                vec![10.0f32, 50.0, 30.0, 20.0, 60.0, 40.0],
+            ),
+        ];
+        for (direction, expected_primary, expected_secondary, expected_passenger) in cases {
+            let sorted = Sort::sort_with_key_count(
+                &[primary.clone(), secondary.clone(), passenger.clone()],
+                0,
+                direction,
+                2,
+            )
+            .unwrap();
+            assert_eq!(read_i32s(&sorted[0]), expected_primary);
+            assert_eq!(read_f32s(&sorted[1]), expected_secondary);
+            assert_eq!(read_f32s(&sorted[2]), expected_passenger);
+
+            let reference_sorted = Sort::sort_with_key_count(
+                &[reference_primary.clone(), reference_secondary.clone(), reference_passenger.clone()],
+                0,
+                direction,
+                2,
+            )
+            .unwrap();
+            let expected_primary_f64s = expected_primary.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+            let expected_secondary_f64s = expected_secondary.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+            let expected_passenger_f64s = expected_passenger.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+            assert_eq!(reference_sorted[0].to_f64s(), expected_primary_f64s);
+            assert_eq!(reference_sorted[1].to_f64s(), expected_secondary_f64s);
+            assert_eq!(reference_sorted[2].to_f64s(), expected_passenger_f64s);
+        }
+    }
+
     /// The reference backend's ThreeFry implementation is bit-exact with XLA's `rng_bit_generator` expansion:
     /// the same `[key, counter]` state produces identical `u32` and `u64` bits and identical advanced states on
     /// both backends.
@@ -685,6 +834,90 @@ mod tests {
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
+        let device_state_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        assert_eq!(
+            device_state_words,
+            reference_new_state
+                .values()
+                .iter()
+                .map(|value| match value {
+                    Scalar::U64(word) => *word,
+                    _ => panic!("expected a u64 reference state"),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let device_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        let reference_words = reference_bits
+            .values()
+            .iter()
+            .map(|value| match value {
+                Scalar::U64(word) => *word,
+                _ => panic!("expected u64 reference bits"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(device_words, reference_words);
+    }
+
+    /// The reference backend's Philox implementation is bit-exact with XLA's `rng_bit_generator` expansion:
+    /// the same `[key, counter]` state (with the 128-bit counter split into its low and high `u64` halves)
+    /// produces identical `u32` and `u64` bits and identical advanced states on both backends.
+    #[test]
+    fn test_eager_philox_rng_bit_generator_matches_reference_backend() {
+        use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let state_values = [42u64, 7u64, 9u64];
+        let state_type = replicated_type(&mesh, DataType::U64, &[3]);
+        let state = Array::from_host_buffer(
+            &client,
+            state_type,
+            mesh.clone(),
+            values_to_bytes::<u64>(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state =
+            CpuArray::new(
+                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])),
+                state_values.iter().copied().map(Scalar::U64).collect(),
+            )
+            .unwrap();
+
+        // An odd `u32` element count exercises the padded counter quad and the truncated word layout.
+        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
+        let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
+        let (reference_new_state, reference_bits) =
+            reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
+        let device_words = values_from_bytes::<u32>(
+            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        let reference_words = reference_bits
+            .values()
+            .iter()
+            .map(|value| match value {
+                Scalar::U32(word) => *word,
+                _ => panic!("expected u32 reference bits"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(device_words, reference_words);
+        // Generating five `u32` words runs two cipher invocations, and the low counter half advances by that
+        // invocation count (`7 + 2 = 9`) while the key and high counter half are unchanged.
+        let device_state_words = values_from_bytes::<u64>(
+            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+        );
+        assert_eq!(device_state_words, vec![42u64, 9u64, 9u64]);
+        assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(9), Scalar::U64(9)]);
+
+        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
+        let (reference_new_state, reference_bits) =
+            reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
         let device_state_words = values_from_bytes::<u64>(
             shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
         );
@@ -873,6 +1106,57 @@ mod tests {
         assert_eq!(device_product.r#type().data_type(), DataType::F32);
         let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
         assert_eq!(device_value_f64s, reference_product.to_f64s());
+    }
+
+    /// Dot-product attention agrees between the XLA-backed eager array backend and the reference array backend on
+    /// CPU, where the operation lowers to the portable StableHLO composition (the CUDA fast path emits the
+    /// `__cudnn$fmhaSoftmax` custom call instead), for both the unmasked and the causal variants.
+    #[test]
+    fn test_eager_dot_product_attention_parity_with_reference_backend() {
+        use ryft_core::operations::attention::{AttentionMask, DotProductAttention};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        // Small `BTNH` shape `[1, 4, 2, 3]` in `f32` with deterministic pseudo-random operand values.
+        let dimensions = [1usize, 4, 2, 3];
+        let operand_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect()),
+        );
+        let device_type = replicated_type(&mesh, DataType::F32, &dimensions);
+        let query_values: Vec<f64> = (0..24).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
+        let key_values: Vec<f64> = (0..24).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
+        let value_values: Vec<f64> = (0..24).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
+        let device = |values: &[f64]| {
+            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
+            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+                .unwrap()
+        };
+        let reference = |values: &[f64]| CpuArray::from_f64s(operand_type.clone(), values.to_vec());
+        let scale = 0.5;
+
+        for mask in [AttentionMask::None, AttentionMask::Causal] {
+            let device_output = device(&query_values)
+                .dot_product_attention(&device(&key_values), &device(&value_values), scale, mask)
+                .unwrap();
+            let reference_output = reference(&query_values)
+                .dot_product_attention(&reference(&key_values), &reference(&value_values), scale, mask)
+                .unwrap();
+            assert_eq!(device_output.r#type().data_type(), DataType::F32);
+            assert_eq!(device_output.shape().dimensions(), &dimensions);
+            for (device_value, reference_value) in read_f32s(&device_output)
+                .iter()
+                .map(|value| f64::from(*value))
+                .zip(reference_output.to_f64s())
+            {
+                assert!(
+                    (device_value - reference_value).abs() < 1e-5,
+                    "mask {mask}: expected {reference_value} but got {device_value}",
+                );
+            }
+        }
     }
 
     #[test]

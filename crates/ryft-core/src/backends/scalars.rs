@@ -26,7 +26,8 @@ use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{
-    ConstantOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, FillOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation, WhilePredicate};
 use crate::operations::debugging::PrintOperation;
@@ -35,10 +36,10 @@ use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOpe
 use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
-    DivOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation, Logistic, LogisticOperation, Maximum,
-    MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation, Pow, PowOperation, Remainder,
-    RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign, SignOperation, Sin, SinOperation, Sqrt,
-    SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
+    DivOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation, Logistic,
+    LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation,
+    Pow, PowOperation, Remainder, RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign,
+    SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -64,6 +65,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
+    Fill(FillOperation<DataType, Scalar>),
     Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),
@@ -79,6 +81,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Rsqrt(RsqrtOperation),
     Tanh(TanhOperation),
     Logistic(LogisticOperation),
+    Erf(ErfOperation),
     Pow(PowOperation),
     Sign(SignOperation),
     Floor(FloorOperation),
@@ -756,6 +759,16 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
     }
 }
 
+impl<O: Operation<DataType>> Fill<Scalar, Scalar> for EagerContext<Scalar, O> {
+    #[inline]
+    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
+        // Mirroring the array backend's fill, the fill element must be losslessly representable in the target data
+        // type, so this uses the promotion-checked conversion rather than an unchecked cast: filling a real scalar
+        // slot with a complex value (or any other narrowing fill) is rejected instead of silently discarding payload.
+        value.promote_element_type(*r#type)
+    }
+}
+
 impl OneLike for Scalar {
     #[inline]
     fn one_like(&self) -> Self {
@@ -1362,6 +1375,180 @@ impl Logistic for Scalar {
             other => {
                 return Err(TypeError {
                     message: format!("cannot compute the logistic of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+/// Evaluates a polynomial at `x` with the provided coefficients ordered from the highest-degree term down to the
+/// constant term, using Horner's scheme.
+fn evaluate_polynomial(x: f64, coefficients: &[f64]) -> f64 {
+    coefficients.iter().fold(0.0, |accumulator, coefficient| accumulator * x + coefficient)
+}
+
+/// Computes the Gauss error function `erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt` in double precision.
+///
+/// This is the rational Chebyshev approximation from FDLIBM 5.3 (`s_erf.c`, developed at SunSoft and also used by
+/// musl), split by argument magnitude: a short odd series below `2⁻²⁸`, a primary rational approximation on
+/// `|x| < 0.84375`, a rational correction around `erf(1)` on `[0.84375, 1.25)`, two rational tail regimes evaluated
+/// through the complementary function `1 − erfc(x)` on `[1.25, 6)`, and saturation to `±1` for `|x| ≥ 6` (where
+/// `1 − erf(|x|) < 2⁻⁵⁶` is not representable next to one). The expected accuracy is about 1 ulp in double precision.
+/// NaN inputs propagate and the sign symmetry `erf(−x) = −erf(x)` is exact, including for signed zeros. All
+/// polynomial coefficient arrays below list the FDLIBM constants from the highest-degree term down to the constant
+/// term, matching the [`evaluate_polynomial`] contract.
+fn erf(x: f64) -> f64 {
+    /// `erf(1)` rounded toward zero, used as the base value of the `[0.84375, 1.25)` regime.
+    const ERX: f64 = 8.45062911510467529297e-01;
+
+    /// Coefficient of the short odd series below `2⁻²⁸`, equal to `8 · (2/√π − 1)`.
+    const EFX8: f64 = 1.02703333676410069053e+00;
+
+    /// Numerator coefficients of the primary regime `erf(x) = x + x · PP(x²)/QQ(x²)` on `|x| < 0.84375`.
+    const PP: [f64; 5] = [
+        -2.37630166566501626084e-05,
+        -5.77027029648944159157e-03,
+        -2.84817495755985104766e-02,
+        -3.25042107247001499370e-01,
+        1.28379167095512558561e-01,
+    ];
+
+    /// Denominator coefficients of the primary regime on `|x| < 0.84375`.
+    const QQ: [f64; 6] = [
+        -3.96022827877536812320e-06,
+        1.32494738004321644526e-04,
+        5.08130628187576562776e-03,
+        6.50222499887672944485e-02,
+        3.97917223959155352819e-01,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the regime `erf(x) = sign(x) · (ERX + PA(|x|−1)/QA(|x|−1))` on `[0.84375, 1.25)`.
+    const PA: [f64; 7] = [
+        -2.16637559486879084300e-03,
+        3.54783043256182359371e-02,
+        -1.10894694282396677476e-01,
+        3.18346619901161753674e-01,
+        -3.72207876035701323847e-01,
+        4.14856118683748331666e-01,
+        -2.36211856075265944077e-03,
+    ];
+
+    /// Denominator coefficients of the `[0.84375, 1.25)` regime.
+    const QA: [f64; 7] = [
+        1.19844998467991074170e-02,
+        1.36370839120290507362e-02,
+        1.26171219808761642112e-01,
+        7.18286544141962662868e-02,
+        5.40397917702171048937e-01,
+        1.06420880400844228286e-01,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the complementary-function tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+    const RA: [f64; 8] = [
+        -9.81432934416914548592e+00,
+        -8.12874355063065934246e+01,
+        -1.84605092906711035994e+02,
+        -1.62396669462573470355e+02,
+        -6.23753324503260060396e+01,
+        -1.05586262253232909814e+01,
+        -6.93858572707181764372e-01,
+        -9.86494403484714822705e-03,
+    ];
+
+    /// Denominator coefficients of the complementary-function tail on `[1.25, 1/0.35)`, in the variable `1/x²`.
+    const SA: [f64; 9] = [
+        -6.04244152148580987438e-02,
+        6.57024977031928170135e+00,
+        1.08635005541779435134e+02,
+        4.29008140027567833386e+02,
+        6.45387271733267880336e+02,
+        4.34565877475229228821e+02,
+        1.37657754143519042600e+02,
+        1.96512716674392571292e+01,
+        1.0,
+    ];
+
+    /// Numerator coefficients of the complementary-function tail on `[1/0.35, 6)`, in the variable `1/x²`.
+    const RB: [f64; 7] = [
+        -4.83519191608651397019e+02,
+        -1.02509513161107724954e+03,
+        -6.37566443368389627722e+02,
+        -1.60636384855821916062e+02,
+        -1.77579549177547519889e+01,
+        -7.99283237680523006574e-01,
+        -9.86494292470009928597e-03,
+    ];
+
+    /// Denominator coefficients of the complementary-function tail on `[1/0.35, 6)`, in the variable `1/x²`.
+    const SB: [f64; 8] = [
+        -2.24409524465858183362e+01,
+        4.74528541206955367215e+02,
+        2.55305040643316442583e+03,
+        3.19985821950859553908e+03,
+        1.53672958608443695994e+03,
+        3.25792512996573918826e+02,
+        3.03380607434824582924e+01,
+        1.0,
+    ];
+
+    if x.is_nan() {
+        return x;
+    }
+    let negative = x.is_sign_negative();
+    let magnitude = x.abs();
+    if magnitude < 0.84375 {
+        if magnitude < 3.725290298461914e-09 {
+            // For |x| < 2⁻²⁸ the series truncates to its leading odd term `x · 2/√π`, evaluated in a
+            // scaled form that avoids intermediate underflow and preserves signed zeros.
+            return 0.125 * (8.0 * x + EFX8 * x);
+        }
+        let squared = x * x;
+        return x + x * (evaluate_polynomial(squared, &PP) / evaluate_polynomial(squared, &QQ));
+    }
+    if magnitude < 1.25 {
+        let shifted = magnitude - 1.0;
+        let correction = evaluate_polynomial(shifted, &PA) / evaluate_polynomial(shifted, &QA);
+        return if negative { -ERX - correction } else { ERX + correction };
+    }
+    if magnitude >= 6.0 {
+        // Covers |x| ≥ 6 and infinities: 1 − erf(6) < 2⁻⁵⁶ already rounds to zero next to one.
+        return if negative { -1.0 } else { 1.0 };
+    }
+    // On [1.25, 6) the error function is evaluated through its complement as `erf(x) = sign(x) · (1 − erfc(|x|))`
+    // with `erfc(y) = exp(−z² − 0.5625) · exp((z − y)(z + y) + R(1/y²)/S(1/y²)) / y`, where `z` is `y` with the low
+    // half of its mantissa cleared so that `z²` is exact and the argument reduction stays accurate.
+    let inverse_squared = 1.0 / (magnitude * magnitude);
+    let quotient = if magnitude < 1.0 / 0.35 {
+        evaluate_polynomial(inverse_squared, &RA) / evaluate_polynomial(inverse_squared, &SA)
+    } else {
+        evaluate_polynomial(inverse_squared, &RB) / evaluate_polynomial(inverse_squared, &SB)
+    };
+    let truncated = f64::from_bits(magnitude.to_bits() & 0xffff_ffff_0000_0000);
+    let complement = (-truncated * truncated - 0.5625).exp()
+        * ((truncated - magnitude) * (truncated + magnitude) + quotient).exp()
+        / magnitude;
+    if negative { complement - 1.0 } else { 1.0 - complement }
+}
+
+impl Erf for Scalar {
+    /// Computes the elementwise Gauss error function of this [`Scalar`]. Only the real floating-point variants
+    /// support the error function; any other variant returns a [`TypeError`]. Every variant evaluates through the
+    /// double-precision [`erf`] approximation and rounds the result to its own precision.
+    fn erf(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, erf(Self::decode_low_precision_float(r#type, bits)));
+        }
+        Ok(match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f64(erf(value.to_f64()))),
+            Scalar::F16(value) => Scalar::F16(f16::from_f64(erf(value.to_f64()))),
+            Scalar::F32(value) => Scalar::F32(erf(f64::from(*value)) as f32),
+            Scalar::F64(value) => Scalar::F64(erf(*value)),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the error function of a scalar of data type {}", other.r#type()),
                 }
                 .into());
             }

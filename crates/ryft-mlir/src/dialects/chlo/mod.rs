@@ -9,6 +9,10 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__chlo__;
 
 use crate::{DialectHandle, Error};
 
+pub mod operations;
+
+pub use operations::*;
+
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `chlo` [`Dialect`](crate::Dialect).
     pub fn chlo() -> Result<Self, Error> {

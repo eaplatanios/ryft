@@ -1861,7 +1861,7 @@ mod tests {
                       backend_config = \"status_returning_attribute\", \
                       called_computations = [@add_0, @add_1], \
                       has_side_effect = true, \
-                      operand_layouts = [dense<[0, 1]> : vector<2xindex>, dense<[1, 0]> : vector<2xindex>], \
+                      operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>], \
                       output_operand_aliases = [\
                         #stablehlo.output_operand_alias<\
                           output_tuple_indices = [], \
@@ -1874,8 +1874,8 @@ mod tests {
                           operand_tuple_indices = []\
                         >\
                       ], \
-                      result_layouts = [dense<[1, 0]> : vector<2xindex>], \
-                      result_tilings = [[dense<[2, 4]> : vector<2xindex>, dense<[1, 2]> : vector<2xindex>]]\
+                      result_layouts = [dense<[1, 0]> : tensor<2xindex>], \
+                      result_tilings = [[dense<[2, 4]> : tensor<2xindex>, dense<[1, 2]> : tensor<2xindex>]]\
                     } : (tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x2xf32>
                     %1 = stablehlo.custom_call @CreateBuffer() {api_version = 4 : i32} : () -> memref<4x2xf32>
                     %2 = stablehlo.custom_call @Pin(%0) {api_version = 4 : i32} : (tensor<4x2xf32>) -> memref<4x2xf32>

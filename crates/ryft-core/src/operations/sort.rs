@@ -46,33 +46,49 @@ impl Display for SortDirection {
     }
 }
 
-/// [`Operation`] that sorts one or more same-shaped operands along one axis by the values of its first operand (the
-/// key): the key is ordered by [`SortDirection`] and every other operand is co-permuted by the key's order, like
-/// [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) with `num_keys = 1`. The sort
-/// is always stable, so elements with equal keys keep their original relative order (which is what routes
-/// [`argmax`](ArgMax::argmax)-style ties to the lowest index). Floating-point keys are ordered by the IEEE 754
-/// total order (`-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < NaN`), matching
+/// [`Operation`] that sorts one or more same-shaped operands along one axis by the values of its first `key_count`
+/// operands (the keys): elements are ordered lexicographically by the keys in operand order — key 0 decides, ties on
+/// key 0 fall through to key 1, and so on — with every key ordered in the same [`SortDirection`], and every other
+/// operand is co-permuted as a passenger, like
+/// [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) with `num_keys = key_count`.
+/// The sort is always stable, so elements that are equal on every key keep their original relative order (which is
+/// what routes [`argmax`](ArgMax::argmax)-style ties to the lowest index). Floating-point keys are ordered by the
+/// IEEE 754 total order (`-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < NaN`), matching
 /// [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare); complex keys are unordered
 /// and rejected. Operands must agree on shape (element types may differ), the sorted axis must not be sharded
 /// (sorting across shards would require communication), and operands that still carry partial sums are rejected.
 ///
-/// There is no user-provided comparator: the fixed key-ordering policy covers the ranking use cases
-/// ([`top_k`](TopK::top_k), [`argmax`](ArgMax::argmax), [`argmin`](ArgMin::argmin)) without carrying a comparator
-/// region through every program transform.
+/// There is no user-provided comparator: the fixed lexicographic key-ordering policy covers the ranking use cases
+/// ([`top_k`](TopK::top_k), [`argmax`](ArgMax::argmax), [`argmin`](ArgMin::argmin)) and multi-key sorts without
+/// carrying a comparator region through every program transform.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SortOperation {
     /// Axis along which the operands are sorted.
     axis: usize,
 
-    /// Direction in which the key operand is ordered.
+    /// Direction in which the key operands are ordered.
     direction: SortDirection,
+
+    /// Number of leading operands that act as lexicographic sort keys (always at least one).
+    key_count: usize,
 }
 
 impl SortOperation {
-    /// Creates a new [`SortOperation`] sorting along `axis` in the provided `direction`.
+    /// Creates a new [`SortOperation`] sorting along `axis` in the provided `direction` with a single key operand.
     #[inline]
     pub fn new(axis: usize, direction: SortDirection) -> Self {
-        Self { axis, direction }
+        Self { axis, direction, key_count: 1 }
+    }
+
+    /// Returns this [`SortOperation`] with the provided `key_count` leading key operands compared
+    /// lexicographically, rejecting `key_count == 0` because a sort needs at least one key.
+    pub fn with_key_count(self, key_count: usize) -> Result<Self, ProgramError> {
+        if key_count == 0 {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "'sort' key_count must be at least 1".to_string(),
+            });
+        }
+        Ok(Self { key_count, ..self })
     }
 
     /// Returns the axis along which the operands are sorted.
@@ -81,10 +97,16 @@ impl SortOperation {
         self.axis
     }
 
-    /// Returns the direction in which the key operand is ordered.
+    /// Returns the direction in which the key operands are ordered.
     #[inline]
     pub fn direction(&self) -> SortDirection {
         self.direction
+    }
+
+    /// Returns the number of leading operands that act as lexicographic sort keys.
+    #[inline]
+    pub fn key_count(&self) -> usize {
+        self.key_count
     }
 }
 
@@ -100,10 +122,16 @@ impl Operation<ArrayType> for SortOperation {
         SORT_OPERATION_NAME
     }
 
+    /// Renders as `sort [axis=..., direction=...]` for the default single-key sort, adding a `key_count=N` field
+    /// only when `N > 1` so single-key renderings (the overwhelmingly common case) stay unchanged.
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, SORT_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis", &self.axis)?;
-            operation.field("direction", &self.direction)
+            operation.field("direction", &self.direction)?;
+            if self.key_count > 1 {
+                operation.field("key_count", &self.key_count)?;
+            }
+            Ok(())
         })
     }
 
@@ -115,10 +143,17 @@ impl Operation<ArrayType> for SortOperation {
         let Some(key_type) = input_types.first() else {
             return Err(TypeError { message: "'sort' needs at least one input".to_string() });
         };
-        if matches!(key_type.data_type(), DataType::Token | DataType::Zero | DataType::C64 | DataType::C128) {
+        if self.key_count > input_types.len() {
             return Err(TypeError {
-                message: format!("'sort' does not support key data type {}", key_type.data_type()),
+                message: format!("'sort' key_count {} exceeds operand count {}", self.key_count, input_types.len()),
             });
+        }
+        for input_type in &input_types[..self.key_count] {
+            if matches!(input_type.data_type(), DataType::Token | DataType::Zero | DataType::C64 | DataType::C128) {
+                return Err(TypeError {
+                    message: format!("'sort' does not support key data type {}", input_type.data_type()),
+                });
+            }
         }
         if self.axis >= key_type.rank() {
             return Err(TypeError {
@@ -155,7 +190,7 @@ impl<C: Domain<Type = ArrayType, Value: Sort>> InterpretableOperation<C> for Sor
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        C::Value::sort(inputs, self.axis, self.direction)
+        C::Value::sort_with_key_count(inputs, self.axis, self.direction, self.key_count)
     }
 }
 
@@ -166,10 +201,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SortOper
 {
 }
 
-/// Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the key's order, so the
-/// live tangents ride one staged sort as extra passenger operands after the primals — the first half of the outputs
-/// are the primal outputs and the rest are the co-permuted tangents (the same trick JAX's sort JVP uses).
-/// Structural-zero tangents stay symbolic because any permutation of zeros is zero.
+/// Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys' lexicographic
+/// order, so the live tangents ride one staged sort as extra passenger operands after the primals — the first half
+/// of the outputs are the primal outputs and the rest are the co-permuted tangents (the same trick JAX's sort JVP
+/// uses). The staged sort carries the original `key_count`, and because the tangents append after every primal
+/// operand they always land in the passenger positions. Structural-zero tangents stay symbolic because any
+/// permutation of zeros is zero.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for SortOperation
 where
     C::Operation: From<SortOperation>,
@@ -211,7 +248,7 @@ impl_non_transposable_operation!(SortOperation);
 
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the
-/// sort axis lifts past the inserted leading batch dimension.
+/// sort axis lifts past the inserted leading batch dimension while the `key_count` carries through unchanged.
 impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for SortOperation
 where
     SortOperation: InterpretableOperation<C>,
@@ -246,7 +283,7 @@ where
                 ArrayBatch::new(physical_type, broadcasted, 0)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let lifted = SortOperation::new(self.axis + 1, self.direction);
+        let lifted = SortOperation { axis: self.axis + 1, ..*self };
         lifted.interpret_with_batch_axes(
             context,
             batched_inputs.as_slice(),
@@ -255,13 +292,25 @@ where
     }
 }
 
-/// Represents the ability to sort same-shaped operands along one axis by the first operand's values. [`Sort`]
-/// stages or executes a [`SortOperation`]; refer to its documentation for the ordering policy and the transform
-/// rules. The capability method dispatches through the first operand's context.
+/// Represents the ability to sort same-shaped operands along one axis by the values of its leading key operands.
+/// [`Sort`] stages or executes a [`SortOperation`]; refer to its documentation for the lexicographic ordering
+/// policy and the transform rules. The capability methods dispatch through the first operand's context.
 pub trait Sort: Sized {
     /// Sorts `operands` along `axis` by the first operand's values in the provided `direction`, co-permuting every
     /// other operand by the key's order, and returning a [`ProgramError`] if something goes wrong.
-    fn sort(operands: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError>;
+    fn sort(operands: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
+        Self::sort_with_key_count(operands, axis, direction, 1)
+    }
+
+    /// Sorts `operands` along `axis` lexicographically by the first `key_count` operands' values in the provided
+    /// `direction` (ties on earlier keys fall through to later keys), co-permuting every remaining operand by that
+    /// order, and returning a [`ProgramError`] if something goes wrong.
+    fn sort_with_key_count(
+        operands: &[Self],
+        axis: usize,
+        direction: SortDirection,
+        key_count: usize,
+    ) -> Result<Vec<Self>, ProgramError>;
 }
 
 /// Any context-carrying value sorts by binding a [`SortOperation`] through its own context. The
@@ -272,21 +321,28 @@ impl<V: Value<Type = ArrayType>> Sort for V
 where
     V::DispatchDomain: Context<Operation: From<SortOperation>>,
 {
-    fn sort(operands: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
+    fn sort_with_key_count(
+        operands: &[Self],
+        axis: usize,
+        direction: SortDirection,
+        key_count: usize,
+    ) -> Result<Vec<Self>, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() });
         };
-        first.dispatch_domain().bind(SortOperation::new(axis, direction), Vec::new(), operands)
+        let operation = SortOperation::new(axis, direction).with_key_count(key_count)?;
+        first.dispatch_domain().bind(operation, Vec::new(), operands)
     }
 }
 
 /// Applies the permutation computed from precomputed key ranks to every operand's values, sorting along `axis` of
 /// an array with the provided static `dimensions`. This is the shared reference-backend evaluator behind the
-/// concrete [`Sort`] implementations: `key_ranks` holds one order-preserving `u64` rank per key element (in
-/// row-major order), the sort is stable, and [`SortDirection::Descending`] reverses the key comparison while
-/// keeping equal-rank elements in their original order.
+/// concrete [`Sort`] implementations: `key_ranks` holds one order-preserving `u64` rank slice per key operand (each
+/// slice with one rank per element in row-major order), elements are compared lexicographically across the key
+/// slices in order (ties on earlier keys fall through to later keys), the sort is stable (elements equal on every
+/// key keep their original relative order), and [`SortDirection::Descending`] reverses every key comparison.
 pub fn sort_evaluate<T: Clone>(
-    key_ranks: &[u64],
+    key_ranks: &[&[u64]],
     operand_values: &[&[T]],
     dimensions: &[usize],
     axis: usize,
@@ -305,14 +361,20 @@ pub fn sort_evaluate<T: Clone>(
             let base = outer * axis_size * inner_stride + inner;
             permutation.clear();
             permutation.extend(0..axis_size);
-            match direction {
-                SortDirection::Ascending => {
-                    permutation.sort_by_key(|&position| key_ranks[base + position * inner_stride]);
-                }
-                SortDirection::Descending => {
-                    permutation.sort_by_key(|&position| std::cmp::Reverse(key_ranks[base + position * inner_stride]));
-                }
-            }
+            permutation.sort_by(|&left, &right| {
+                key_ranks
+                    .iter()
+                    .map(|ranks| {
+                        let left_rank = ranks[base + left * inner_stride];
+                        let right_rank = ranks[base + right * inner_stride];
+                        match direction {
+                            SortDirection::Ascending => left_rank.cmp(&right_rank),
+                            SortDirection::Descending => right_rank.cmp(&left_rank),
+                        }
+                    })
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for (operand, output) in operand_values.iter().zip(outputs.iter_mut()) {
                 for (target_position, &source_position) in permutation.iter().enumerate() {
                     output[base + target_position * inner_stride] =
@@ -325,25 +387,71 @@ pub fn sort_evaluate<T: Clone>(
 }
 
 /// Value-level top-k capability, selecting the `k` largest elements along one axis together with their indices.
-/// [`TopK`] is not a primitive operation: it is provided for every sortable, sliceable value as a stable descending
-/// [`Sort`] of the value and an index [`iota`](IotaOperation) followed by a [`Slice`] of the leading `k` entries.
-/// This staged form is exactly the sort-plus-slice idiom that XLA's top-k rewriter recognizes and replaces with its
-/// fast top-k implementation. Ties select the lowest index (the sort is stable), NaNs order above `+∞` (the IEEE
-/// 754 total order), and the returned indices are `i32`.
+/// [`TopK`] is not a primitive operation: it is provided for every sortable, sliceable, reshapeable value as a stable
+/// descending [`Sort`] of the value and an index [`iota`](IotaOperation) followed by a [`Slice`] of the leading `k`
+/// entries. This staged form is exactly the sort-plus-slice idiom that XLA's top-k rewriter recognizes and replaces
+/// with its fast top-k implementation. When the ranked axis is the trailing axis, leading size-1 dimensions are
+/// reshaped away before the composition and reinserted afterward (refer to the documentation of
+/// [`top_k_via_squeezed_view`] for why). Ties select the lowest index (the sort is stable), NaNs order above `+∞`
+/// (the IEEE 754 total order), and the returned indices are `i32`.
 pub trait TopK: Sized {
     /// Returns the `k` largest elements of this value along `axis` together with their `i32` indices, both with the
     /// `axis` dimension resized to `k`, returning a [`ProgramError`] if something goes wrong.
     fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError>;
 }
 
-impl<V: Value<Type = ArrayType> + Sort + Slice> TopK for V
+impl<V: Value<Type = ArrayType> + Sort + Slice + Reshape> TopK for V
 where
     V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
 {
     fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError> {
+        if let Some(outputs) = top_k_via_squeezed_view(self, k, axis)? {
+            return Ok(outputs);
+        }
         let (indices, dimensions) = sorted_index_passenger(self, axis)?;
         top_k_from_index_passenger(self, indices, dimensions.as_slice(), k, axis)
     }
+}
+
+/// Computes [`top_k`](TopK::top_k) through a squeezed view of `value` that strips the leading size-1 dimensions in
+/// front of a trailing ranked axis, reshaping both outputs back to the original rank afterward. The squeeze exists
+/// for XLA: its top-k rewriter only accepts `iota` or `broadcast(iota)` index passengers, and the StableHLO-to-HLO
+/// import canonicalizes the degenerate higher-rank index iota of a batch-size-1 operand (e.g. `f32[1, 32000]`) into
+/// `reshape(iota)`, so without the squeeze such operands never reach XLA's fast top-k implementation. The index iota
+/// must therefore be created at the squeezed shape (reshaping the higher-rank iota would stage the same rejected
+/// `reshape(iota)` pattern), which is why the squeeze recurses into [`top_k`](TopK::top_k) on the squeezed value
+/// instead of reshaping around [`top_k_from_index_passenger`]. Values and indices are identical to the unsqueezed
+/// composition.
+///
+/// Returns `Ok(None)` when no squeeze applies: the ranked axis is not the trailing axis, some dimension is dynamic,
+/// there are no leading size-1 dimensions in front of the ranked axis, a leading size-1 dimension is sharded, or `k`
+/// exceeds the ranked axis size (so the canonical error names the caller's axis).
+pub(crate) fn top_k_via_squeezed_view<V: Typed<Type = ArrayType> + TopK + Reshape>(
+    value: &V,
+    k: usize,
+    axis: usize,
+) -> Result<Option<(V, V)>, ProgramError> {
+    let value_type = value.r#type();
+    let dimensions = value_type.shape().dimensions();
+    if axis + 1 != dimensions.len() || !dimensions.iter().all(|size| matches!(size, Size::Static(_))) {
+        return Ok(None);
+    }
+    let squeezed_count = dimensions[..axis].iter().take_while(|size| matches!(size, Size::Static(1))).count();
+    if squeezed_count == 0 || matches!(dimensions[axis], Size::Static(size) if k > size) {
+        return Ok(None);
+    }
+    if let Some(sharding) = value_type.sharding() {
+        let squeezed_dimensions = &sharding.dimensions()[..squeezed_count];
+        if squeezed_dimensions.iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_))) {
+            return Ok(None);
+        }
+    }
+    let squeezed = value.reshape(Shape::new(dimensions[squeezed_count..].to_vec()))?;
+    let (values, indices) = squeezed.top_k(k, axis - squeezed_count)?;
+    let mut output_dimensions = dimensions.to_vec();
+    output_dimensions[axis] = Size::Static(k);
+    let output_shape = Shape::new(output_dimensions);
+    Ok(Some((values.reshape(output_shape.clone())?, indices.reshape(output_shape)?)))
 }
 
 /// Selects the `k` leading entries of a descending ranking sort with a prebuilt index passenger. This is the shared
@@ -500,9 +608,21 @@ mod tests {
         let operation = SortOperation::new(0, SortDirection::Ascending);
         assert_eq!(operation.axis(), 0);
         assert_eq!(operation.direction(), SortDirection::Ascending);
+        assert_eq!(operation.key_count(), 1);
         assert_eq!(operation.name(), SORT_OPERATION_NAME);
         assert_eq!(operation.to_string(), "sort [axis=0, direction=ascending]");
         assert_eq!(SortOperation::new(1, SortDirection::Descending).to_string(), "sort [axis=1, direction=descending]",);
+
+        // A multi-key sort renders its `key_count`, the single-key rendering stays unchanged, and a zero `key_count`
+        // is rejected because a sort needs at least one key.
+        let multi_key = operation.with_key_count(2).unwrap();
+        assert_eq!(multi_key.key_count(), 2);
+        assert_eq!(multi_key.to_string(), "sort [axis=0, direction=ascending, key_count=2]");
+        assert_eq!(multi_key.with_key_count(1).unwrap().to_string(), "sort [axis=0, direction=ascending]");
+        assert!(matches!(
+            operation.with_key_count(0),
+            Err(ProgramError::UnsupportedOperation { message }) if message == "'sort' key_count must be at least 1",
+        ));
 
         // An ascending key-value sort co-permutes the passenger by the key's order, and the sort is stable: both
         // `3.0` keys keep their original relative order, so the first one's payload `10.0` precedes `30.0`.
@@ -581,6 +701,31 @@ mod tests {
                 error = "'sort' axis 1 is out of bounds for rank 1",
             }],
         );
+
+        // A multi-key sort validates that every key operand is sortable: the `key_count` must not exceed the operand
+        // count, every key data type must be sortable (a complex second key is rejected), and passengers still pass
+        // through unchanged.
+        let multi_key = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap();
+        let complex = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(4)]));
+        let passenger = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
+        check_operation_type_inference!(
+            operation = multi_key,
+            cases = [
+                {
+                    type = ArrayType,
+                    input_types = [vector_type(4)],
+                    error = "'sort' key_count 2 exceeds operand count 1",
+                },
+                {
+                    input_types = [vector_type(4), complex],
+                    error = "'sort' does not support key data type c64",
+                },
+                {
+                    input_types = [vector_type(4), vector_type(4), passenger.clone()],
+                    output_types = [vector_type(4), vector_type(4), passenger],
+                },
+            ],
+        );
     }
 
     #[test]
@@ -605,6 +750,37 @@ mod tests {
         assert!(values[1].is_sign_negative());
         assert_eq!(values[2].to_bits(), 0.0f64.to_bits());
         assert!(values[3].is_nan());
+    }
+
+    #[test]
+    fn test_sort_multi_key() {
+        // Two keys compare lexicographically: ties on key 0 fall through to key 1, and the passenger co-permutes.
+        let key0 = Array::vector(vec![2.0, 1.0, 2.0, 1.0]);
+        let key1 = Array::vector(vec![5.0, 9.0, 4.0, 9.0]);
+        let passenger = Array::vector(vec![10.0, 20.0, 30.0, 40.0]);
+        let operands = [key0, key1, passenger];
+        let sorted = Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 2).unwrap();
+        assert_eq!(sorted[0], Array::vector(vec![1.0, 1.0, 2.0, 2.0]));
+        // The full tie `(1.0, 9.0)` keeps its original order (element 1 before element 3), which the passenger shows.
+        assert_eq!(sorted[1], Array::vector(vec![9.0, 9.0, 4.0, 5.0]));
+        assert_eq!(sorted[2], Array::vector(vec![20.0, 40.0, 30.0, 10.0]));
+
+        // Descending reverses every key comparison while keeping full ties in their original order, so the result is
+        // not simply the ascending result reversed.
+        let sorted = Sort::sort_with_key_count(&operands, 0, SortDirection::Descending, 2).unwrap();
+        assert_eq!(sorted[0], Array::vector(vec![2.0, 2.0, 1.0, 1.0]));
+        assert_eq!(sorted[1], Array::vector(vec![5.0, 4.0, 9.0, 9.0]));
+        assert_eq!(sorted[2], Array::vector(vec![10.0, 30.0, 20.0, 40.0]));
+
+        // The eager implementation validates the key count like type inference does.
+        assert!(matches!(
+            Sort::sort_with_key_count(&operands[..1], 0, SortDirection::Ascending, 2),
+            Err(ProgramError::Type(TypeError { message })) if message == "'sort' key_count 2 exceeds operand count 1",
+        ));
+        assert!(matches!(
+            Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 0),
+            Err(ProgramError::UnsupportedOperation { message }) if message == "'sort' key_count must be at least 1",
+        ));
     }
 
     #[test]
@@ -637,6 +813,23 @@ mod tests {
                 ],
             }],
         );
+        // A multi-key sort carries its `key_count` through batching unchanged: each batch item resolves its key-0
+        // tie through its own key-1 values (item 0 ties on key 0 and reorders by key 1; item 1 has distinct keys).
+        check_operation_batching!(
+            @exact,
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 5.0, 2.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 0.0, 9.0, 8.0])),
+                ],
+                outputs = [
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![3.0, 3.0, 2.0, 5.0])),
+                    (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 8.0, 9.0])),
+                ],
+            }],
+        );
     }
 
     #[test]
@@ -654,6 +847,41 @@ mod tests {
                     lambda %0:f64[3], %1:f64[3] .
                     let %2:f64[3], %3:f64[3] = sort [axis=0, direction=ascending] %0 %1
                     in (%2, %3)
+                "},
+            }],
+        );
+        // A multi-key sort keeps its `key_count` on the staged jvp sort, so the tangents (appended after every
+        // primal operand) ride as passengers permuted by the lexicographic order: the key-0 tie between elements 0
+        // and 2 is resolved by key 1. The tied key-0 elements carry equal tangents so the tie survives the
+        // finite-difference perturbation.
+        check_operation_differentiation!(
+            @approx(step = 1e-3, epsilon = 1e-6),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            cases = [{
+                primals = [
+                    Array::vector(vec![2.0, 1.0, 2.0]),
+                    Array::vector(vec![5.0, 9.0, 4.0]),
+                    Array::vector(vec![7.0, 8.0, 9.0]),
+                ],
+                tangents = [
+                    Array::vector(vec![10.0, 20.0, 10.0]),
+                    Array::vector(vec![100.0, 200.0, 300.0]),
+                    Array::vector(vec![1000.0, 2000.0, 3000.0]),
+                ],
+                primal_outputs = [
+                    Array::vector(vec![1.0, 2.0, 2.0]),
+                    Array::vector(vec![9.0, 4.0, 5.0]),
+                    Array::vector(vec![8.0, 9.0, 7.0]),
+                ],
+                tangent_outputs = [
+                    Array::vector(vec![20.0, 10.0, 10.0]),
+                    Array::vector(vec![200.0, 300.0, 100.0]),
+                    Array::vector(vec![2000.0, 3000.0, 1000.0]),
+                ],
+                jvp = indoc! {"
+                    lambda %0:f64[3], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[3], %5:f64[3] .
+                    let %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3], %10:f64[3], %11:f64[3] = sort [axis=0, direction=ascending, key_count=2] %0 %1 %2 %3 %4 %5
+                    in (%6, %7, %8, %9, %10, %11)
                 "},
             }],
         );
@@ -676,6 +904,38 @@ mod tests {
                         replay = Array::vector(vec![3.0, 1.0, 2.0])
                     ))],
                     outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        // A multi-key sort folds and residualizes like the single-key sort, resolving key-0 ties through key 1.
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, Array::vector(vec![2.0, 1.0, 2.0])),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@known, Array::vector(vec![1.0, 2.0, 2.0])),
+                        (@known, Array::vector(vec![9.0, 4.0, 5.0])),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),
+                            replay = Array::vector(vec![2.0, 1.0, 2.0])
+                        )),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@residual, Array::vector(vec![1.0, 2.0, 2.0])),
+                        (@residual, Array::vector(vec![9.0, 4.0, 5.0])),
+                    ],
                     residual_instructions = 1,
                 },
             ],
@@ -708,6 +968,54 @@ mod tests {
         assert!(matches!(
             input.top_k(7, 0),
             Err(ProgramError::UnsupportedOperation { message }) if message == "'top_k' k 7 exceeds axis 0 size 6",
+        ));
+    }
+
+    #[test]
+    fn test_top_k_with_leading_unit_dimensions() {
+        /// Returns the static `f64` array of the provided dimensions holding `values`.
+        fn f64_array(dimensions: Vec<usize>, values: Vec<f64>) -> Array {
+            let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+            Array::new(ArrayType::new(DataType::F64, shape), values.into_iter().map(Scalar::F64).collect()).unwrap()
+        }
+
+        /// Returns the static `i32` array of the provided dimensions holding `indices`.
+        fn i32_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
+            let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+            Array::new(ArrayType::new(DataType::I32, shape), indices.into_iter().map(Scalar::I32).collect()).unwrap()
+        }
+
+        // A trailing ranked axis behind leading size-1 dimensions squeezes those dimensions away before the
+        // composition and reinserts them afterward, so values and indices match the rank-1 results with the leading
+        // size-1 dimensions restored.
+        let input = f64_array(vec![1, 6], vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]);
+        let (values, indices) = input.top_k(3, 1).unwrap();
+        assert_eq!(values, f64_array(vec![1, 3], vec![3.0, 3.0, 2.0]));
+        assert_eq!(indices, i32_array(vec![1, 3], vec![0, 2, 5]));
+
+        // Several leading size-1 dimensions squeeze away together.
+        let input = f64_array(vec![1, 1, 6], vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]);
+        let (values, indices) = input.top_k(2, 2).unwrap();
+        assert_eq!(values, f64_array(vec![1, 1, 2], vec![3.0, 3.0]));
+        assert_eq!(indices, i32_array(vec![1, 1, 2], vec![0, 2]));
+
+        // A non-trailing ranked axis does not squeeze and ranks along the requested axis unchanged.
+        let input = f64_array(vec![1, 2], vec![4.0, 7.0]);
+        let (values, indices) = input.top_k(1, 0).unwrap();
+        assert_eq!(values, f64_array(vec![1, 2], vec![4.0, 7.0]));
+        assert_eq!(indices, i32_array(vec![1, 2], vec![0, 0]));
+
+        // A non-unit leading dimension does not squeeze and ranks every batch item independently.
+        let input = f64_array(vec![2, 3], vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]);
+        let (values, indices) = input.top_k(2, 1).unwrap();
+        assert_eq!(values, f64_array(vec![2, 2], vec![3.0, 2.0, 5.0, 4.0]));
+        assert_eq!(indices, i32_array(vec![2, 2], vec![0, 2, 1, 2]));
+
+        // The out-of-bounds `k` error names the caller's axis, not the squeezed axis.
+        let input = f64_array(vec![1, 6], vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]);
+        assert!(matches!(
+            input.top_k(7, 1),
+            Err(ProgramError::UnsupportedOperation { message }) if message == "'top_k' k 7 exceeds axis 1 size 6",
         ));
     }
 
@@ -757,6 +1065,35 @@ mod tests {
                     %4:f64[2] = slice [start_indices=[0], limit_indices=[2]] %2
                     %5:i32[2] = slice [start_indices=[0], limit_indices=[2]] %3
                 in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_top_k_squeezes_leading_unit_dimensions_when_staging() {
+        // Staging `top_k` along the trailing axis of a batch-size-1 operand squeezes the leading size-1 dimension
+        // away before the composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that XLA's
+        // top-k rewriter rejects) and both outputs reshape back to the original rank afterward.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]));
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.top_k(2, 1)?.0),
+            input_type,
+        )
+        .unwrap();
+        let program = program.to_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[1, 4] .
+                let %1:f64[4] = reshape [shape=[4]] %0
+                    %2:i32[4] = iota [type=i32[4], dimension=0]
+                    %3:f64[4], %4:i32[4] = sort [axis=0, direction=descending] %1 %2
+                    %5:f64[2] = slice [start_indices=[0], limit_indices=[2]] %3
+                    %6:i32[2] = slice [start_indices=[0], limit_indices=[2]] %4
+                    %7:f64[1, 2] = reshape [shape=[1, 2]] %5
+                    %8:i32[1, 2] = reshape [shape=[1, 2]] %6
+                in (%7)
             "}
             .trim_end(),
         );

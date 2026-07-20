@@ -6,6 +6,7 @@ pub mod clamp;
 pub mod cos;
 pub mod div;
 pub mod dot;
+pub mod erf;
 pub mod exp;
 pub mod floor;
 pub mod log;
@@ -32,11 +33,13 @@ pub use ceil::{CEIL_OPERATION_NAME, Ceil, CeilOperation};
 pub use clamp::Clamp;
 pub use cos::{COS_OPERATION_NAME, Cos, CosOperation};
 pub use div::{DIV_OPERATION_NAME, Div, DivOperation};
-pub use dot::{
-    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, SCALED_DOT_OPERATION_NAME, ScaledDot,
-    ScaledDotOperation,
-};
+// TODO(eaplatanios): What is going on with this one? Where else in this crate is it referenced from?
 pub(crate) use dot::scaled_dot_composition;
+pub use dot::{
+    BlockQuantize, DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, SCALED_DOT_OPERATION_NAME,
+    ScaledDot, ScaledDotOperation,
+};
+pub use erf::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use exp::{EXP_OPERATION_NAME, Exp, ExpOperation};
 pub use floor::{FLOOR_OPERATION_NAME, Floor, FloorOperation};
 pub use log::{LOG_OPERATION_NAME, Log, LogOperation};

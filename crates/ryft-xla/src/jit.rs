@@ -883,12 +883,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    use ryft_core::backends::arrays::{Array as CpuArray, ArrayOperation};
+    use ryft_core::backends::scalars::Scalar;
+    use ryft_core::contexts::{Context, EagerContext};
     use ryft_core::differentiation::DifferentiableType;
+    use ryft_core::operations::compare::{Compare, ComparisonDirection};
+    use ryft_core::operations::constants::{Fill, Iota, OneLike, ZeroLike};
+    use ryft_core::operations::control_flow::{Select, WhileOperation};
+    use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::math::{Atan2, Cos, Mul, Sin};
+    use ryft_core::operations::manipulation::{Broadcast, DynamicSlice, DynamicUpdateSlice, Reshape};
+    use ryft_core::operations::math::{
+        Add, Atan2, Cos, Div, Dot, DotDimensionNumbers, Exp, Logistic, Mul, Reduce, ReductionKind, Sin, Sub, Tanh,
+    };
+    use ryft_core::operations::random::Random;
+    use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::programs::types::Typed;
+    use ryft_core::programs::{ProgramError, Value};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use ryft_core::tracing::DomainTracingContext;
     use ryft_core::tracing_v2::{
         DenseDifferentiate, ForwardModeDifferentiate, Hessian, Jacobian, ReverseModeDifferentiate,
     };
@@ -3248,5 +3262,550 @@ mod tests {
                 observed[0],
             );
         }
+    }
+
+    /// Tracing context that stages the decode-loop demo's `While` condition and body region programs in the XLA
+    /// domain universe: its tracers are exactly [`XlaCompileTracer`]s, so the shared [`decode_step`] model runs
+    /// unchanged inside the staged regions and in the eager reference loop.
+    type DecodeTraceContext<'c> = DomainTracingContext<XlaDomain<'c>, Array<'c>>;
+
+    /// Shape and sampling hyperparameters of the tiny decode-loop demo model.
+    #[derive(Copy, Clone)]
+    struct DecodeConfiguration {
+        /// Vocabulary size (the number of token embeddings and output logits).
+        vocabulary: usize,
+
+        /// Model dimension shared by the embeddings, the attention cache rows, and the gated MLP.
+        dimension: usize,
+
+        /// Number of decode steps performed by the loop (also the key/value cache capacity).
+        steps: usize,
+
+        /// Number of highest-probability logits retained by [`DecodeSampling::TopK`] sampling.
+        top_k: usize,
+    }
+
+    /// Token-selection strategy of one decode step.
+    #[derive(Copy, Clone, PartialEq)]
+    enum DecodeSampling {
+        /// Deterministically selects the highest-scoring logit.
+        Greedy,
+
+        /// Restricts the logits to their top-k entries and draws one categorically using the threaded ThreeFry
+        /// generator state.
+        TopK,
+    }
+
+    /// Attention implementation used by one decode step.
+    #[derive(Copy, Clone, PartialEq)]
+    enum DecodeAttention {
+        /// Masked scaled dot-product attention composed from `ryft` operations.
+        Composed,
+
+        /// A registered [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] XLA FFI kernel computing the same attention.
+        CustomCall,
+    }
+
+    /// Returns a static [`Shape`] with the provided dimensions.
+    fn static_shape(dimensions: &[usize]) -> Shape {
+        Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect())
+    }
+
+    /// Returns `count` deterministic pseudo-random weight values in `[-0.5, 0.5)` derived from `seed` with an
+    /// xorshift generator, so the demo model is reproducible without carrying literal weight tables in the test.
+    fn decode_weight_values(seed: u32, count: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// One decode step of the tiny gated-attention language model shared by the compiled decode-loop demo and its
+    /// eager reference loop. The step is written once against `ryft`'s value-level capability traits, so the same
+    /// function executes eagerly over reference [`CpuArray`]s and stages symbolically over [`XlaCompileTracer`]s
+    /// inside the compiled `While` body.
+    ///
+    /// The decode state is a thirteen-value vector: the current position and token (`i32` scalars), the `[steps,
+    /// dimension]` key and value caches, the `[steps]` decoded-token record, the `ui64[2]` ThreeFry generator
+    /// state, and the seven loop-invariant weight matrices (embeddings, query/key/value projections, the hidden
+    /// and gate MLP projections, and the output projection). One step embeds the current token, appends its
+    /// projected key/value row to the caches at `position`, attends over the visible cache prefix, applies the
+    /// `tanh`/`logistic` gated MLP and output projection, selects the next token per `sampling`, records it, and
+    /// advances the position.
+    fn decode_step<C, V>(
+        context: &C,
+        state: &[V],
+        configuration: &DecodeConfiguration,
+        sampling: DecodeSampling,
+        attention: DecodeAttention,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: Clone
+            + Value<Type = ArrayType>
+            + Add
+            + Sub
+            + Mul
+            + Div
+            + Exp
+            + Tanh
+            + Logistic
+            + Dot
+            + Reduce
+            + Compare<Output = V>
+            + Select<Condition = V>
+            + TopK
+            + ArgMax
+            + DynamicSlice
+            + DynamicUpdateSlice
+            + Reshape
+            + Broadcast
+            + Random
+            + CustomCall
+            + OneLike
+            + ZeroLike,
+        C: Fill<Scalar, V> + Iota<V>,
+    {
+        let dimension = configuration.dimension;
+        let position = state[0].clone();
+        let token = state[1].clone();
+        let tokens = state[4].clone();
+        let generator = state[5].clone();
+        let embeddings = &state[6];
+        let query_weights = &state[7];
+        let key_weights = &state[8];
+        let value_weights = &state[9];
+        let hidden_weights = &state[10];
+        let gate_weights = &state[11];
+        let output_weights = &state[12];
+
+        // Embed the current token and append its projected key/value row to the caches at `position`.
+        let zero_index = position.zero_like();
+        let embedding = embeddings
+            .dynamic_slice(&[token, zero_index.clone()], &[1, dimension])?
+            .reshape(static_shape(&[dimension]))?;
+        let vector_times_matrix = DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new());
+        let query = embedding.dot(query_weights, &vector_times_matrix);
+        let key = embedding.dot(key_weights, &vector_times_matrix);
+        let value = embedding.dot(value_weights, &vector_times_matrix);
+        let cache_keys = state[2].dynamic_update_slice(
+            &key.reshape(static_shape(&[1, dimension]))?,
+            &[position.clone(), zero_index.clone()],
+        )?;
+        let cache_values = state[3].dynamic_update_slice(
+            &value.reshape(static_shape(&[1, dimension]))?,
+            &[position.clone(), zero_index],
+        )?;
+
+        // Masked scaled dot-product attention over the visible cache prefix `[0, position]`.
+        let attended = match attention {
+            DecodeAttention::Composed => {
+                let scores =
+                    cache_keys.dot(&query, &DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()));
+                let scores_type = scores.r#type().into_owned();
+                let scale = context.fill(&scores_type, Scalar::F32(1.0 / (dimension as f32).sqrt()))?;
+                let scores = scores.mul(&scale)?;
+                let positions_type = tokens.r#type().into_owned();
+                let positions = context.iota(&positions_type, 0)?;
+                let visible = positions
+                    .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
+                let masked = V::select(&visible, &scores, &context.fill(&scores_type, Scalar::F32(-1.0e30))?)?;
+                let stabilized =
+                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).broadcast(scores_type.clone(), &[])?)?;
+                let exponentials = stabilized.exp()?;
+                let weights =
+                    exponentials.div(&exponentials.reduce(&[0], ReductionKind::Sum).broadcast(scores_type, &[])?)?;
+                weights.dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
+            }
+            DecodeAttention::CustomCall => {
+                let operation = CustomCallOperation::new(
+                    DECODE_ATTENTION_CUSTOM_CALL_TARGET,
+                    vec![query.r#type().into_owned()],
+                );
+                let inputs = [cache_keys.clone(), cache_values.clone(), query, position.clone()];
+                V::custom_call(&operation, &inputs)?.remove(0)
+            }
+        };
+
+        // Gated multilayer perceptron, output projection, and next-token selection.
+        let hidden = attended.dot(hidden_weights, &vector_times_matrix).tanh()?;
+        let gate = attended.dot(gate_weights, &vector_times_matrix).logistic()?;
+        let logits = hidden.mul(&gate)?.dot(output_weights, &vector_times_matrix);
+        let (generator, next_token) = match sampling {
+            DecodeSampling::Greedy => (generator, logits.argmax(0)?),
+            DecodeSampling::TopK => {
+                let (top_logits, top_indices) = logits.top_k(configuration.top_k, 0)?;
+                let (generator, choice) = generator.categorical(&top_logits, 0)?;
+                let next_token = top_indices.dynamic_slice(&[choice], &[1])?.reshape(static_shape(&[]))?;
+                (generator, next_token)
+            }
+        };
+        let tokens = tokens.dynamic_update_slice(&next_token.reshape(static_shape(&[1]))?, &[position.clone()])?;
+        let position = position.add(&position.one_like())?;
+        Ok(vec![
+            position,
+            next_token,
+            cache_keys,
+            cache_values,
+            tokens,
+            generator,
+            embeddings.clone(),
+            query_weights.clone(),
+            key_weights.clone(),
+            value_weights.clone(),
+            hidden_weights.clone(),
+            gate_weights.clone(),
+            output_weights.clone(),
+        ])
+    }
+
+    /// Stages the decode-loop demo as a `While` operation over the thirteen-value decode state: both regions are
+    /// traced with [`decode_step`] and a `position < steps` condition through the public tracing API, and the
+    /// staged loop returns the decoded tokens together with the final key/value caches.
+    fn build_decode_loop<'c>(
+        inputs: Vec<XlaCompileTracer<'c>>,
+        configuration: &DecodeConfiguration,
+        sampling: DecodeSampling,
+        attention: DecodeAttention,
+    ) -> Vec<XlaCompileTracer<'c>> {
+        let context = inputs[0].context().clone();
+        let carry_types: Vec<ArrayType> = inputs.iter().map(|input| input.r#type().into_owned()).collect();
+        let steps = configuration.steps;
+        let (_, condition) = <DecodeTraceContext<'c>>::trace(
+            |state: Vec<XlaCompileTracer<'c>>| {
+                let position = &state[0];
+                let limit = position.context().fill(&position.r#type().into_owned(), Scalar::I32(steps as i32))?;
+                Ok(vec![position.compare(&limit, ComparisonDirection::LessThan)?])
+            },
+            carry_types.clone(),
+        )
+        .unwrap();
+        let (_, body) = <DecodeTraceContext<'c>>::trace(
+            |state: Vec<XlaCompileTracer<'c>>| {
+                let context = state[0].context().clone();
+                decode_step(&context, &state, configuration, sampling, attention)
+            },
+            carry_types,
+        )
+        .unwrap();
+        let outputs =
+            context.bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &inputs).unwrap();
+        vec![outputs[4].clone(), outputs[2].clone(), outputs[3].clone()]
+    }
+
+    /// Runs the decode-loop demo's eager reference: the same [`decode_step`] executed over reference [`CpuArray`]
+    /// values in a plain Rust loop, with no `While` staging, compilation, or XLA involvement.
+    fn reference_decode_loop(
+        initial_state: Vec<CpuArray>,
+        configuration: &DecodeConfiguration,
+        sampling: DecodeSampling,
+    ) -> Vec<CpuArray> {
+        let context = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new();
+        let mut state = initial_state;
+        for _ in 0..configuration.steps {
+            state = decode_step(&context, &state, configuration, sampling, DecodeAttention::Composed).unwrap();
+        }
+        state
+    }
+
+    /// Name of the XLA custom call target registered by [`ensure_decode_attention_handler_registered`]: a masked
+    /// scaled dot-product attention kernel over `(keys [steps, dimension], values [steps, dimension],
+    /// query [dimension], position i32[])` producing the attended `[dimension]` vector, used to exercise a foreign
+    /// FFI kernel inside a compiled decode loop.
+    const DECODE_ATTENTION_CUSTOM_CALL_TARGET: &str = "ryft.test.decode_attention";
+
+    /// Registers the [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] XLA FFI handler with the plugin backing the provided
+    /// client. Registration is idempotent and process-global (re-registering the same target name is rejected by
+    /// the XLA runtime), so the outcome is cached in a [`OnceLock`](std::sync::OnceLock).
+    fn ensure_decode_attention_handler_registered(client: &ryft_pjrt::Client<'_>) -> Result<(), ryft_pjrt::Error> {
+        use std::sync::OnceLock;
+
+        use ryft_pjrt::extensions::ffi::{FfiHandler, FfiHandlerTraits, XLA_FFI_Handler};
+
+        static DECODE_ATTENTION_HANDLER_REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+        DECODE_ATTENTION_HANDLER_REGISTRATION
+            .get_or_init(|| {
+                let platform_name = client.platform_name()?.into_owned();
+                client.register_ffi_handler(
+                    DECODE_ATTENTION_CUSTOM_CALL_TARGET,
+                    platform_name,
+                    FfiHandler::from(decode_attention_handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+    }
+
+    /// XLA FFI handler for [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] custom calls: computes masked scaled
+    /// dot-product attention over the cache prefix `[0, position]`, matching the composed attention staged by
+    /// [`decode_step`].
+    unsafe extern "C" fn decode_attention_handler(
+        call_frame: *mut ryft_pjrt::extensions::ffi::XLA_FFI_CallFrame,
+    ) -> *mut ryft_pjrt::extensions::ffi::XLA_FFI_Error {
+        use ryft_pjrt::extensions::ffi::{FfiCallFrame, FfiExecutionStage, FfiTypeId};
+
+        // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
+        // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and
+        // `handle_decode_attention_call_frame`.
+        unsafe {
+            match FfiCallFrame::from_c_api(call_frame) {
+                Err(_) => std::ptr::null_mut(),
+                Ok(call_frame) if call_frame.register_metadata(FfiTypeId::default()) => std::ptr::null_mut(),
+                Ok(call_frame) if call_frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
+                Ok(call_frame) => match call_frame.api() {
+                    Err(_) => std::ptr::null_mut(),
+                    Ok(api) => match handle_decode_attention_call_frame(&call_frame) {
+                        Ok(()) => std::ptr::null_mut(),
+                        Err(error) => error.to_c_api(api),
+                    },
+                },
+            }
+        }
+    }
+
+    /// Decodes a [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] call frame and fills its `[dimension]` output buffer with
+    /// the masked scaled dot-product attention of the query over the `[0, position]` cache prefix, using the same
+    /// `-1e30` mask value and max-stabilized softmax as the composed attention in [`decode_step`].
+    fn handle_decode_attention_call_frame(
+        call_frame: &ryft_pjrt::extensions::ffi::FfiCallFrame<'_>,
+    ) -> Result<(), ryft_pjrt::extensions::ffi::FfiError> {
+        use ryft_pjrt::extensions::ffi::{FfiBufferType, FfiError, FfiInput, FfiOutput};
+
+        let mut inputs = call_frame.inputs();
+        let mut next_buffer = |name: &str| match inputs.next() {
+            Some(Ok(FfiInput::Buffer { buffer })) => Ok(buffer),
+            _ => Err(FfiError::invalid_argument(format!(
+                "expected the '{name}' input buffer of the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call"
+            ))),
+        };
+        let keys = next_buffer("keys")?;
+        let values = next_buffer("values")?;
+        let query = next_buffer("query")?;
+        let position = next_buffer("position")?;
+        let mut outputs = call_frame.outputs();
+        let Some(Ok(FfiOutput::Buffer { buffer: output })) = outputs.next() else {
+            return Err(FfiError::invalid_argument(format!(
+                "expected the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call to have one output buffer"
+            )));
+        };
+        let &[steps, dimension] = keys.dimensions() else {
+            return Err(FfiError::invalid_argument(format!(
+                "expected the 'keys' input of the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call to have rank 2"
+            )));
+        };
+        if keys.element_type() != FfiBufferType::F32
+            || values.element_type() != FfiBufferType::F32
+            || query.element_type() != FfiBufferType::F32
+            || position.element_type() != FfiBufferType::I32
+            || values.dimensions() != [steps, dimension]
+            || query.dimensions() != [dimension]
+            || !position.dimensions().is_empty()
+            || output.dimensions() != [dimension]
+        {
+            return Err(FfiError::invalid_argument(format!(
+                "unexpected '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call buffer types or shapes"
+            )));
+        }
+        let steps = steps.max(0) as usize;
+        let dimension = dimension.max(0) as usize;
+        // SAFETY: All data pointers are provided by the XLA runtime, are valid for the duration of the handler
+        // invocation, and (per the element type and shape checks above) are backed by allocations of the checked
+        // sizes. The runtime allocates inputs and outputs separately so they do not overlap.
+        unsafe {
+            let keys = std::slice::from_raw_parts(keys.data() as *const f32, steps * dimension);
+            let values = std::slice::from_raw_parts(values.data() as *const f32, steps * dimension);
+            let query = std::slice::from_raw_parts(query.data() as *const f32, dimension);
+            let position = *(position.data() as *const i32);
+            let output = std::slice::from_raw_parts_mut(output.data() as *mut f32, dimension);
+
+            let scale = 1.0f32 / (dimension as f32).sqrt();
+            let mut scores = vec![0.0f32; steps];
+            for step in 0..steps {
+                let row = &keys[step * dimension..(step + 1) * dimension];
+                let score = row.iter().zip(query).map(|(key, query)| key * query).sum::<f32>() * scale;
+                scores[step] = if step as i32 <= position { score } else { -1.0e30 };
+            }
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exponentials: Vec<f32> = scores.iter().map(|score| (score - maximum).exp()).collect();
+            let denominator: f32 = exponentials.iter().sum();
+            output.fill(0.0);
+            for step in 0..steps {
+                let weight = exponentials[step] / denominator;
+                let row = &values[step * dimension..(step + 1) * dimension];
+                for (accumulator, value) in output.iter_mut().zip(row) {
+                    *accumulator += weight * value;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a replicated `i32` array back from the single test device.
+    fn read_i32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<i32> {
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let shard_bytes = array
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        values_from_bytes::<i32>(shard_bytes.as_slice())
+    }
+
+    /// Shared driver of the decode-loop demo tests: traces the decode loop through the public API, compiles and
+    /// executes it on the CPU plugin, runs the same model eagerly over the reference backend, and cross-checks the
+    /// decoded token sequence exactly (the ThreeFry draws are bit-exact across backends) and the final key/value
+    /// caches within floating-point tolerance.
+    fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        if attention == DecodeAttention::CustomCall {
+            ensure_decode_attention_handler_registered(&client).unwrap();
+        }
+
+        let configuration = DecodeConfiguration { vocabulary: 16, dimension: 8, steps: 6, top_k: 4 };
+        let DecodeConfiguration { vocabulary, dimension, steps, .. } = configuration;
+        let weight_dimensions: [&[usize]; 7] = [
+            &[vocabulary, dimension],
+            &[dimension, dimension],
+            &[dimension, dimension],
+            &[dimension, dimension],
+            &[dimension, dimension],
+            &[dimension, dimension],
+            &[dimension, vocabulary],
+        ];
+        let weights: Vec<Vec<f32>> = weight_dimensions
+            .iter()
+            .enumerate()
+            .map(|(index, dimensions)| decode_weight_values(index as u32 + 1, dimensions.iter().product()))
+            .collect();
+
+        let replicated = |data_type: DataType, dimensions: &[usize]| {
+            ArrayType::new(data_type, static_shape(dimensions))
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+                .unwrap()
+        };
+        let mut input_types = vec![
+            replicated(DataType::I32, &[]),
+            replicated(DataType::I32, &[]),
+            replicated(DataType::F32, &[steps, dimension]),
+            replicated(DataType::F32, &[steps, dimension]),
+            replicated(DataType::I32, &[steps]),
+            replicated(DataType::U64, &[2]),
+        ];
+        input_types.extend(weight_dimensions.iter().map(|dimensions| replicated(DataType::F32, dimensions)));
+
+        let compiled: CompiledXlaFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile(
+            |inputs| build_decode_loop(inputs, &configuration, sampling, attention),
+            input_types.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let device_input = |index: usize, bytes: Vec<u8>| {
+            Array::from_host_buffer(&client, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
+        };
+        let mut device_inputs = vec![
+            device_input(0, values_to_bytes::<i32>(&[0])),
+            device_input(1, values_to_bytes::<i32>(&[3])),
+            device_input(2, values_to_bytes::<f32>(&vec![0.0; steps * dimension])),
+            device_input(3, values_to_bytes::<f32>(&vec![0.0; steps * dimension])),
+            device_input(4, values_to_bytes::<i32>(&vec![0; steps])),
+            device_input(5, values_to_bytes::<u64>(&[42, 0])),
+        ];
+        device_inputs
+            .extend(weights.iter().enumerate().map(|(index, values)| device_input(index + 6, values_to_bytes(values))));
+        let outputs = engine.interpret(&compiled.executable_program(), device_inputs).unwrap();
+        assert_eq!(outputs.len(), 3);
+        let device_tokens = read_i32_array(&client, &outputs[0]);
+        let device_cache_keys = read_f32_array(&client, &outputs[1]);
+        let device_cache_values = read_f32_array(&client, &outputs[2]);
+
+        let unsharded = |data_type: DataType, dimensions: &[usize]| ArrayType::new(data_type, static_shape(dimensions));
+        let mut reference_state = vec![
+            CpuArray::new(unsharded(DataType::I32, &[]), vec![Scalar::I32(0)]).unwrap(),
+            CpuArray::new(unsharded(DataType::I32, &[]), vec![Scalar::I32(3)]).unwrap(),
+            CpuArray::new(unsharded(DataType::F32, &[steps, dimension]), vec![Scalar::F32(0.0); steps * dimension])
+                .unwrap(),
+            CpuArray::new(unsharded(DataType::F32, &[steps, dimension]), vec![Scalar::F32(0.0); steps * dimension])
+                .unwrap(),
+            CpuArray::new(unsharded(DataType::I32, &[steps]), vec![Scalar::I32(0); steps]).unwrap(),
+            CpuArray::new(unsharded(DataType::U64, &[2]), vec![Scalar::U64(42), Scalar::U64(0)]).unwrap(),
+        ];
+        reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
+            CpuArray::new(
+                unsharded(DataType::F32, dimensions),
+                values.iter().map(|&value| Scalar::F32(value)).collect(),
+            )
+            .unwrap()
+        }));
+        let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
+        let reference_tokens: Vec<i32> = reference_state[4]
+            .values()
+            .iter()
+            .map(|value| match value {
+                Scalar::I32(token) => *token,
+                value => panic!("expected an i32 reference token but got {value:?}"),
+            })
+            .collect();
+
+        // The decoded token sequences must agree exactly: greedy selection and the categorical draws (over
+        // bit-identical ThreeFry bits) are only sensitive to floating-point differences at exact logit ties,
+        // which the deterministic pseudo-random weights avoid.
+        assert_eq!(device_tokens, reference_tokens);
+        assert!(reference_tokens.iter().all(|&token| (0..vocabulary as i32).contains(&token)));
+        // The decoded sequences are pinned as fixtures: they are deterministic functions of the pseudo-random
+        // weights and the ThreeFry seed, and pinning them guards against both backends drifting together. The
+        // greedy and sampled sequences differ, demonstrating that the categorical draws actually steer decoding.
+        let expected_tokens: &[i32] = match sampling {
+            DecodeSampling::Greedy => &[12, 8, 12, 8, 12, 8],
+            DecodeSampling::TopK => &[10, 15, 10, 10, 15, 15],
+        };
+        assert_eq!(device_tokens, expected_tokens);
+        for (state_index, device_cache) in [(2, &device_cache_keys), (3, &device_cache_values)] {
+            let reference_cache = reference_state[state_index].to_f64s();
+            assert_eq!(device_cache.len(), reference_cache.len());
+            for (index, (&device_value, &reference_value)) in
+                device_cache.iter().zip(reference_cache.iter()).enumerate()
+            {
+                assert!(
+                    (device_value as f64 - reference_value).abs() < 1e-4,
+                    "cache element {index}: device {device_value} vs reference {reference_value}",
+                );
+            }
+        }
+    }
+
+    /// End-to-end greedy decode-loop demo: a compiled `While` loop maintaining a `DynamicUpdateSlice` key/value
+    /// cache with composed masked attention, a gated `tanh`/`logistic` MLP, and greedy `argmax` sampling, traced
+    /// through the public API and cross-checked against the eager reference backend.
+    #[test]
+    fn test_jit_decode_loop_greedy_matches_eager_reference() {
+        run_decode_loop_demo(DecodeSampling::Greedy, DecodeAttention::Composed);
+    }
+
+    /// End-to-end sampling decode-loop demo: like the greedy demo, but selecting tokens with `top_k` plus a
+    /// categorical draw from the ThreeFry generator state threaded through the loop carry, exercising
+    /// `RngBitGenerator` inside a compiled `While` region with bit-exact cross-backend token parity.
+    #[test]
+    fn test_jit_decode_loop_top_k_sampling_matches_eager_reference() {
+        run_decode_loop_demo(DecodeSampling::TopK, DecodeAttention::Composed);
+    }
+
+    /// End-to-end decode-loop demo with the attention body swapped for a registered XLA FFI custom-call kernel,
+    /// exercising `custom_call` inside a compiled `While` region against the composed eager reference.
+    #[test]
+    fn test_jit_decode_loop_custom_call_attention_matches_eager_reference() {
+        run_decode_loop_demo(DecodeSampling::Greedy, DecodeAttention::CustomCall);
     }
 }

@@ -9,6 +9,7 @@ use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
+use ryft_core::operations::attention::{AttentionMask, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveKind, CollectiveOperation,
     PSumScatterOperation, PpermuteOperation,
@@ -24,9 +25,9 @@ use ryft_core::operations::manipulation::{
     ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
-    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ExpOperation,
-    FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation, NegOperation,
-    PowOperation, ReductionKind, RemainderOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
+    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation,
+    NegOperation, PowOperation, ReductionKind, RemainderOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
     SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
@@ -38,8 +39,8 @@ use ryft_core::programs::types::Typed;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::types::{ArrayType, DataType, Memory, Shape, Size};
-use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
-use ryft_mlir::dialects::{func, shardy, stable_hlo};
+use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
+use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
     Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, SymbolVisibility, TensorTypeRef, Type,
@@ -916,6 +917,22 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogisticO
     }
 }
 
+/// [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
+/// over StableHLO operations during compilation.
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ErfOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _regions: &[Program<V, XlaOperation<V>, Vec<V>, Vec<V>>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(chlo::erf(input_values[0], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("chlo.erf should return one result").as_ref()])
+    }
+}
+
 impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for PowOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1751,6 +1768,14 @@ where
                 mode,
                 lowerer,
             ),
+            Self::Erf(operation) => <ErfOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                regions,
+                output_types,
+                mode,
+                lowerer,
+            ),
             Self::Pow(operation) => <PowOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -2045,6 +2070,19 @@ where
             Self::ScaledDot(operation) => {
                 let collective_state = lowerer.collective_state.clone();
                 lower_scaled_dot_to_mlir(
+                    operation,
+                    &collective_state,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            Self::DotProductAttention(operation) => {
+                let collective_state = lowerer.collective_state.clone();
+                lower_dot_product_attention_to_mlir(
                     operation,
                     &collective_state,
                     input_values,
@@ -2436,10 +2474,14 @@ fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one traced sort to a `stablehlo.sort` with a synthesized comparator region: two scalar block arguments
-/// per operand, comparing the first operand pair with the sort's direction (`LT` for ascending and `GT` for
-/// descending) so that non-key operands ride along as passengers. Floating-point keys compare with `TOTALORDER`
-/// semantics, Boolean and unsigned-integer keys compare `UNSIGNED`, and signed-integer keys compare `SIGNED`. The
-/// emitted sort is always stable, which is what routes ranking ties to the lowest index.
+/// per operand, comparing the first `key_count` operand pairs lexicographically with the sort's direction (`LT`
+/// for ascending and `GT` for descending) so that non-key operands ride along as passengers. For keys `0..N` the
+/// synthesized result is `cmp_0 OR (eq_0 AND (cmp_1 OR (eq_1 AND … cmp_{N-1})))`, built right to left, where
+/// `cmp_i` is the direction comparison of key pair `i` and `eq_i` its equality comparison. Each key derives its
+/// own comparison type from that key's data type: floating-point keys compare with `TOTALORDER` semantics (for
+/// both the direction and the equality comparison, so NaN ties fall through deterministically, matching XLA's
+/// `num_keys` comparator), Boolean and unsigned-integer keys compare `UNSIGNED`, and signed-integer keys compare
+/// `SIGNED`. The emitted sort is always stable, which is what routes ranking ties to the lowest index.
 fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &SortOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -2448,10 +2490,10 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let Some(key_type) = output_types.first() else {
+    if output_types.is_empty() {
         return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() }
             .into());
-    };
+    }
     let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
     for output_type in output_types {
         let scalar_type = lower_tensor_type(&ArrayType::scalar(output_type.data_type()), context, location)?;
@@ -2461,27 +2503,51 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     let comparator_block = context.block(comparator_arguments.as_slice());
     let mut comparator = context.region();
     let mut comparator_block = comparator.append_block(comparator_block)?;
-    let left_key = comparator_block.argument(0)?.as_ref();
-    let right_key = comparator_block.argument(1)?.as_ref();
     let comparison_direction = match operation.direction() {
         SortDirection::Ascending => stable_hlo::ComparisonDirection::LessThan,
         SortDirection::Descending => stable_hlo::ComparisonDirection::GreaterThan,
     };
-    let comparison_type = match key_type.data_type() {
-        DataType::Boolean | DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16
-        | DataType::U32 | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
-        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32
-        | DataType::I64 => stable_hlo::ComparisonType::Signed,
-        _ => stable_hlo::ComparisonType::TotalOrder,
-    };
-    let compared = comparator_block.append_operation(stable_hlo::compare(
-        left_key,
-        right_key,
-        comparison_direction,
-        comparison_type,
-        location,
-    )?)?;
-    let compared = compared.result(0).expect("stablehlo.compare should return one result").as_ref();
+    // The lexicographic chain builds right to left: the innermost term is the last key's direction comparison, and
+    // every earlier key wraps the accumulated tail as `cmp_i OR (eq_i AND tail)`.
+    let mut compared = None;
+    for key_index in (0..operation.key_count()).rev() {
+        let left_key = comparator_block.argument(2 * key_index)?.as_ref();
+        let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
+        let comparison_type = match output_types[key_index].data_type() {
+            DataType::Boolean | DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16
+            | DataType::U32 | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
+            DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32
+            | DataType::I64 => stable_hlo::ComparisonType::Signed,
+            _ => stable_hlo::ComparisonType::TotalOrder,
+        };
+        let directed = comparator_block.append_operation(stable_hlo::compare(
+            left_key,
+            right_key,
+            comparison_direction,
+            comparison_type,
+            location,
+        )?)?;
+        let directed = directed.result(0).expect("stablehlo.compare should return one result").as_ref();
+        compared = Some(match compared {
+            None => directed,
+            Some(tail) => {
+                let equal = comparator_block.append_operation(stable_hlo::compare(
+                    left_key,
+                    right_key,
+                    stable_hlo::ComparisonDirection::Equal,
+                    comparison_type,
+                    location,
+                )?)?;
+                let equal = equal.result(0).expect("stablehlo.compare should return one result").as_ref();
+                let tied = comparator_block.append_operation(stable_hlo::and(equal, tail, location)?)?;
+                let tied = tied.result(0).expect("stablehlo.and should return one result").as_ref();
+                let chained = comparator_block.append_operation(stable_hlo::or(directed, tied, location)?)?;
+                chained.result(0).expect("stablehlo.or should return one result").as_ref()
+            }
+        });
+    }
+    // A `SortOperation` always carries at least one key, so the chain is never empty.
+    let compared = compared.unwrap();
     comparator_block.append_operation(stable_hlo::r#return(&[compared], location)?)?;
     let sorted = block.append_operation(stable_hlo::sort(
         input_values,
@@ -2509,10 +2575,12 @@ fn block_scaled_formats_qualify(elements: DataType, scales: DataType, block_size
 
 /// Lowers one traced block-scaled dot. On CUDA targets whose formats and block size qualify (see
 /// [`block_scaled_formats_qualify`]), it emits the `__op$block_scaled_dot` custom call — operand order
-/// `(lhs, rhs, lhs_scales, rhs_scales)` with the contracting dimension last on both element operands — which
+/// `(lhs, rhs, lhs_scales, rhs_scales)` plus the optional trailing scalar global scale, with the contracting
+/// dimension last on both element operands and rank-3 operands carrying one shared leading batch dimension — which
 /// XLA's GPU block-scaling rewriter lowers to cuDNN's native block-scaled tensor-core dot (cuDNN 9.10+) or to
 /// expanded reference HLO. Everywhere else it emits the portable dequantization composition (upcast, expand the
-/// scales across their blocks, multiply, and contract), which XLA fuses like any other dequantized dot.
+/// scales across their blocks, multiply, contract, and multiply in a present global scale), which XLA fuses like
+/// any other dequantized dot.
 fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ScaledDotOperation,
     collective_state: &CollectiveLoweringState,
@@ -2523,8 +2591,10 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    check_count!("input", input_values, 4, ProgramError);
-    check_count!("input", input_types, 4, ProgramError);
+    if input_values.len() != 4 && input_values.len() != 5 {
+        return Err(ProgramError::InvalidInputCount { expected: 4, actual: input_values.len() }.into());
+    }
+    check_count!("input", input_types, input_values.len(), ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let is_cuda_target = collective_state.target_platform().is_some_and(|platform| platform == "cuda");
     if is_cuda_target
@@ -2541,7 +2611,8 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     {
         let custom_call =
             CustomCallOperation::new("__op$block_scaled_dot", vec![output_types[0].clone()]);
-        let reordered_inputs = [input_values[0], input_values[2], input_values[1], input_values[3]];
+        let mut reordered_inputs = vec![input_values[0], input_values[2], input_values[1], input_values[3]];
+        reordered_inputs.extend(input_values.get(4).copied());
         return lower_custom_call_to_mlir(
             &custom_call,
             reordered_inputs.as_slice(),
@@ -2553,8 +2624,9 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 
     // Portable fallback: dequantize both operands (upcast the elements and scales to the accumulation type,
-    // expand each scale across its block along the trailing contracting dimension, and multiply), then contract
-    // over the last dimension of both sides.
+    // expand each scale across its block along the trailing contracting dimension, and multiply), contract over
+    // the last dimension of both sides (batching over the shared leading dimension for rank-3 operands), and
+    // multiply in a present global scale.
     let accumulation_type = output_types[0].data_type();
     let mut dequantized = Vec::with_capacity(2);
     for (elements_index, scales_index) in [(0usize, 1usize), (2, 3)] {
@@ -2574,11 +2646,13 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         );
         let expanded_type = ArrayType::new(
             accumulation_type,
-            Shape::new(vec![
-                Size::Static(scale_dimensions[0]),
-                Size::Static(scale_dimensions[1]),
-                Size::Static(operation.block_size()),
-            ]),
+            Shape::new(
+                scale_dimensions
+                    .iter()
+                    .map(|&size| Size::Static(size))
+                    .chain(std::iter::once(Size::Static(operation.block_size())))
+                    .collect(),
+            ),
         );
         let element_tensor_type = lower_tensor_type(&element_type, context, location)?;
         let scale_tensor_type = lower_tensor_type(
@@ -2600,8 +2674,14 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             .result(0)
             .expect("stablehlo.convert should return one result")
             .as_ref();
+        let scale_axes = (0..scale_dimensions.len()).collect::<Vec<_>>();
         let broadcasted_scales = block
-            .append_operation(stable_hlo::broadcast(converted_scales, expanded_tensor_type, &[0, 1], location)?)?
+            .append_operation(stable_hlo::broadcast(
+                converted_scales,
+                expanded_tensor_type,
+                scale_axes.as_slice(),
+                location,
+            )?)?
             .result(0)
             .expect("stablehlo.broadcast_in_dim should return one result")
             .as_ref();
@@ -2617,7 +2697,11 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             .as_ref();
         dequantized.push(product);
     }
-    let dimensions = context.stable_hlo_dot_dimensions(&[], &[], &[1], &[1])?;
+    let rank = input_types[0].rank();
+    let dimensions = match rank {
+        3 => context.stable_hlo_dot_dimensions(&[0], &[0], &[2], &[2])?,
+        _ => context.stable_hlo_dot_dimensions(&[], &[], &[1], &[1])?,
+    };
     let output_tensor_type = lower_tensor_type(&output_types[0], context, location)?;
     let result = block.append_operation(stable_hlo::dot_general(
         dequantized[0],
@@ -2628,7 +2712,238 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         output_tensor_type,
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+    let mut result = result.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+    if let Some(global_scale) = input_values.get(4) {
+        let broadcasted_global_scale = block
+            .append_operation(stable_hlo::broadcast(*global_scale, output_tensor_type, &[], location)?)?
+            .result(0)
+            .expect("stablehlo.broadcast_in_dim should return one result")
+            .as_ref();
+        result = block
+            .append_operation(stable_hlo::multiply(result, broadcasted_global_scale, location)?)?
+            .result(0)
+            .expect("stablehlo.multiply should return one result")
+            .as_ref();
+    }
+    Ok(vec![result])
+}
+
+/// Lowers one traced dot-product attention. On CUDA targets with `bf16`/`f16` operands and a head dimension that is
+/// a multiple of 8 (cuDNN's compile-time gate), it emits the `__cudnn$fmhaSoftmax` custom call — the fused
+/// flash-attention path behind XLA's cuDNN custom-call compiler and
+/// `jax.nn.dot_product_attention(implementation="cudnn")` — whose first result is the attention output in the
+/// physical `[batch, heads, q_seq, head_dim]` layout (transposed back to the logical `BTNH` layout, which compiles
+/// to a pure bitcast given the declared result layout) and whose second result is a kernel workspace that is
+/// declared at size zero and never read. Everywhere else it inlines the portable StableHLO composition matching the
+/// reference semantics of [`DotProductAttentionOperation`]: scores at the operand type, a softmax running at `f32`
+/// for operand types narrower than `f32` (`f64` stays `f64`), optional causal masking, and max stabilization.
+fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &DotProductAttentionOperation,
+    collective_state: &CollectiveLoweringState,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 3, ProgramError);
+    check_count!("input", input_types, 3, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    let data_type = input_types[0].data_type();
+    let static_dimensions = |input_type: &ArrayType| -> Result<[usize; 4], LoweringError> {
+        input_type
+            .static_shape()
+            .and_then(|shape| <[usize; 4]>::try_from(shape.dimensions()).ok())
+            .ok_or_else(|| LoweringError::UnsupportedOp { op: "dynamically shaped dot_product_attention".to_string() })
+    };
+    let array_type = |data_type: DataType, dimensions: &[usize]| -> ArrayType {
+        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect()))
+    };
+    let [batch, query_sequence, heads, head_dimension] = static_dimensions(&input_types[0])?;
+    let key_value_sequence = static_dimensions(&input_types[1])?[1];
+    let is_cuda_target = collective_state.target_platform().is_some_and(|platform| platform == "cuda");
+    if is_cuda_target && matches!(data_type, DataType::BF16 | DataType::F16) && head_dimension % 8 == 0 {
+        // The backend configuration is the `GpuBackendConfig` proto-JSON that XLA's cuDNN custom-call compiler
+        // parses: the score scale, the mask kind (the operation's causal mask is top-left aligned, matching cuDNN),
+        // the fixed `BTNH` dot dimension numbers of the two attention matrix products, and the
+        // `[batch, heads, q_seq, kv_seq]` intermediate score shape. Everything else is constant for the
+        // inference-only forward call (no bias, no dropout, no sliding window, no paging).
+        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
+        let mask_type = match operation.mask() {
+            AttentionMask::None => "NO_MASK",
+            AttentionMask::Causal => "CAUSAL",
+        };
+        let scale = operation.scale();
+        let backend_config = format!(
+            "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
+             \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
+             {{\"17\":\"1\",\"24\":\"0\"}},\"is_cudnn_frontend\":true,\"workspace_size\":\"0\"}},\
+             \"fmha_scale\":{scale},\"intermediate_tensor_shape\":{{\"element_type\":\"{element_type}\",\
+             \"dimensions\":[\"{batch}\",\"{heads}\",\"{query_sequence}\",\"{key_value_sequence}\"],\
+             \"tuple_shapes\":[],\"layout\":{{\"dim_level_types\":[],\"dim_unique\":[],\"dim_ordered\":[],\
+             \"minor_to_major\":[\"3\",\"2\",\"1\",\"0\"],\"tiles\":[],\"element_size_in_bits\":\"0\",\
+             \"memory_space\":\"0\",\"index_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+             \"pointer_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+             \"dynamic_shape_metadata_prefix_bytes\":\"0\"}},\
+             \"is_dynamic_dimension\":[false,false,false,false]}},\
+             \"is_flash_attention\":true,\"mask_type\":\"{mask_type}\",\
+             \"bmm1_dot_dimension_numbers\":{{\"lhs_contracting_dimensions\":[\"3\"],\
+             \"rhs_contracting_dimensions\":[\"3\"],\"lhs_batch_dimensions\":[\"0\",\"2\"],\
+             \"rhs_batch_dimensions\":[\"0\",\"2\"]}},\
+             \"bmm2_dot_dimension_numbers\":{{\"lhs_contracting_dimensions\":[\"3\"],\
+             \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+             \"rhs_batch_dimensions\":[\"0\",\"2\"]}},\
+             \"dropout_rate\":0.0,\"seed\":42,\"sliding_window_length\":0,\"max_seg_per_batch\":1,\
+             \"is_paged_attention\":false}}}}",
+        );
+        let attended_type = array_type(data_type, &[batch, heads, query_sequence, head_dimension]);
+        let custom_call_output_types = [
+            lower_tensor_type(&attended_type, context, location)?,
+            lower_tensor_type(&array_type(DataType::U8, &[0]), context, location)?,
+        ];
+        let custom_call = block.append_operation(stable_hlo::custom_call(
+            input_values,
+            "__cudnn$fmhaSoftmax",
+            false,
+            Some(context.string_attribute(backend_config.as_str()).as_ref()),
+            CustomCallApiVersion::StatusReturning,
+            &[],
+            Some(CustomCallMemoryLayouts {
+                operands: vec![vec![3, 2, 1, 0]; 3],
+                results: vec![vec![3, 1, 2, 0], vec![0]],
+            }),
+            &[],
+            None,
+            &custom_call_output_types,
+            location,
+        )?)?;
+        let attended =
+            custom_call.result(0).expect("stablehlo.custom_call should return the attention output").as_ref();
+        let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
+        return Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()]);
+    }
+
+    // Portable fallback mirroring the reference composition: scores per batch item and head at the operand type,
+    // converted to the softmax type, scaled, optionally masked causally, passed through a max-stabilized softmax
+    // over the key/value sequence axis, converted back, contracted with the values, and transposed back to `BTNH`.
+    let softmax_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    let score_dimensions = [batch, heads, query_sequence, key_value_sequence];
+    let scores_tensor_type = lower_tensor_type(&array_type(data_type, &score_dimensions), context, location)?;
+    let softmax_scores_type = array_type(softmax_type, &score_dimensions);
+    let softmax_scores_tensor_type = lower_tensor_type(&softmax_scores_type, context, location)?;
+    // Scores over `[batch, heads]`: `query [b, t, n, h] · key [b, s, n, h]` contracting `h` -> `[b, n, t, s]`.
+    let scores = block.append_operation(stable_hlo::dot_general(
+        input_values[0],
+        input_values[1],
+        context.stable_hlo_dot_dimensions(&[0, 2], &[0, 2], &[3], &[3])?,
+        Some((Precision::Default, Precision::Default)),
+        None,
+        scores_tensor_type,
+        location,
+    )?)?;
+    let mut scores = scores.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+    if data_type != softmax_type {
+        scores = block
+            .append_operation(stable_hlo::convert(scores, softmax_scores_tensor_type, location)?)?
+            .result(0)
+            .expect("stablehlo.convert should return one result")
+            .as_ref();
+    }
+    let scale = lower_f64_constant_splat(
+        operation.scale(),
+        &softmax_scores_type,
+        softmax_scores_tensor_type,
+        block,
+        context,
+        location,
+    )?;
+    scores = block
+        .append_operation(stable_hlo::multiply(scores, scale, location)?)?
+        .result(0)
+        .expect("stablehlo.multiply should return one result")
+        .as_ref();
+    if operation.mask() == AttentionMask::Causal {
+        // A score position is visible when its column (key/value) index does not exceed its row (query) index.
+        let index_tensor_type = lower_tensor_type(&array_type(DataType::I32, &score_dimensions), context, location)?;
+        let rows = block
+            .append_operation(stable_hlo::iota(index_tensor_type, 2, location)?)?
+            .result(0)
+            .expect("stablehlo.iota should return one result")
+            .as_ref();
+        let columns = block
+            .append_operation(stable_hlo::iota(index_tensor_type, 3, location)?)?
+            .result(0)
+            .expect("stablehlo.iota should return one result")
+            .as_ref();
+        let visible = lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, columns, rows, block, location)?;
+        let masked = lower_f64_constant_splat(
+            -1.0e30,
+            &softmax_scores_type,
+            softmax_scores_tensor_type,
+            block,
+            context,
+            location,
+        )?;
+        scores = block
+            .append_operation(stable_hlo::select(visible, scores, masked, location)?)?
+            .result(0)
+            .expect("stablehlo.select should return one result")
+            .as_ref();
+    }
+    // Max-stabilized softmax over the key/value sequence (last) axis.
+    let reduced_type = array_type(softmax_type, &[batch, heads, query_sequence]);
+    let score_axes: &[usize] = &[0, 1, 2];
+    let maxima = lower_reduce_to_mlir(ReductionKind::Max, &[3], scores, &reduced_type, block, context, location)?;
+    let maxima = block
+        .append_operation(stable_hlo::broadcast(maxima, softmax_scores_tensor_type, score_axes, location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    let shifted = block
+        .append_operation(stable_hlo::subtract(scores, maxima, location)?)?
+        .result(0)
+        .expect("stablehlo.subtract should return one result")
+        .as_ref();
+    let exponentials = block
+        .append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?
+        .result(0)
+        .expect("stablehlo.exponential should return one result")
+        .as_ref();
+    let sums = lower_reduce_to_mlir(ReductionKind::Sum, &[3], exponentials, &reduced_type, block, context, location)?;
+    let sums = block
+        .append_operation(stable_hlo::broadcast(sums, softmax_scores_tensor_type, score_axes, location)?)?
+        .result(0)
+        .expect("stablehlo.broadcast_in_dim should return one result")
+        .as_ref();
+    let mut weights = block
+        .append_operation(stable_hlo::divide(exponentials, sums, location)?)?
+        .result(0)
+        .expect("stablehlo.divide should return one result")
+        .as_ref();
+    if data_type != softmax_type {
+        weights = block
+            .append_operation(stable_hlo::convert(weights, scores_tensor_type, location)?)?
+            .result(0)
+            .expect("stablehlo.convert should return one result")
+            .as_ref();
+    }
+    // Context values: `weights [b, n, t, s] · value [b, s, n, h]` contracting `s` -> `[b, n, t, h]`, then
+    // transposed back to the `BTNH` output layout `[b, t, n, h]`.
+    let attended_tensor_type =
+        lower_tensor_type(&array_type(data_type, &[batch, heads, query_sequence, head_dimension]), context, location)?;
+    let attended = block.append_operation(stable_hlo::dot_general(
+        weights,
+        input_values[2],
+        context.stable_hlo_dot_dimensions(&[0, 1], &[0, 2], &[3], &[1])?,
+        Some((Precision::Default, Precision::Default)),
+        None,
+        attended_tensor_type,
+        location,
+    )?)?;
+    let attended = attended.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+    let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
+    Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
 }
 
 /// Lowers one traced custom call to a `stablehlo.custom_call` using the typed FFI calling convention
@@ -2853,6 +3168,14 @@ where
                 lowerer,
             ),
             ArrayOperation::Logistic(operation) => <LogisticOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                regions,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Erf(operation) => <ErfOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -3143,6 +3466,19 @@ where
             ArrayOperation::ScaledDot(operation) => {
                 let collective_state = lowerer.collective_state.clone();
                 lower_scaled_dot_to_mlir(
+                    operation,
+                    &collective_state,
+                    input_values,
+                    &lowerer.input_types,
+                    output_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            ArrayOperation::DotProductAttention(operation) => {
+                let collective_state = lowerer.collective_state.clone();
+                lower_dot_product_attention_to_mlir(
                     operation,
                     &collective_state,
                     input_values,
@@ -3832,6 +4168,10 @@ where
         module.body()?.append_operation(mesh_operation)?;
     }
 
+    // Module-scoped collective lowering state, shared between the entry function body and the deduplicated callee
+    // functions below so channel ids stay unique module-wide and the target platform reaches nested callee bodies.
+    let collective_state = CollectiveLoweringState::new().with_target_platform(target_platform);
+
     // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
     // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
@@ -3841,7 +4181,14 @@ where
         let mut module_block = module.body()?;
         for key in &nested_functions.order {
             let function = nested_functions.functions.get(key).expect("ordered keys are present in the map");
-            emit_jit_call_function(&mut module_block, function, &nested_functions, &context, location.as_ref())?;
+            emit_jit_call_function(
+                &mut module_block,
+                function,
+                &nested_functions,
+                &collective_state,
+                &context,
+                location.as_ref(),
+            )?;
         }
     }
 
@@ -3958,7 +4305,7 @@ where
                 &context,
                 location.as_ref(),
                 Some(&nested_functions),
-                &CollectiveLoweringState::new().with_target_platform(target_platform),
+                &collective_state,
             )?;
             let physical_outputs = signature.project_outputs(logical_outputs.as_slice());
             function_block_ref.append_operation(func::r#return(physical_outputs.as_slice(), location)?)?;
@@ -5357,11 +5704,15 @@ where
 /// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
 ///
 /// The body is lowered with `nested_functions` in scope so that any repeated `jit_call`s inside this callee also
-/// lower to `func.call`s (calls between shared functions are resolved by symbol, so emission order does not matter).
+/// lower to `func.call`s (calls between shared functions are resolved by symbol, so emission order does not matter),
+/// and with the module's `collective_state` so module-scoped lowering state — the shared channel-id counter and the
+/// target platform that gates platform-specific fast paths such as the block-scaled dot custom call — reaches the
+/// callee body exactly like inlined callees (the mesh/manual-region state intentionally resets per function).
 fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
     module_block: &mut BlockRef<'b, 'c, 't>,
     function: &JitCallFunction,
     nested_functions: &Rc<JitCallFunctionMap>,
+    collective_state: &CollectiveLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
@@ -5400,7 +5751,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
             &[],
             false,
             Some(nested_functions),
-            &CollectiveLoweringState::new(),
+            collective_state,
             &mut token,
         )?;
         function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
@@ -6258,6 +6609,10 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.logistic should return one result").as_ref()])
         }
+        XlaOperation::Erf(_) => {
+            let result = lowerer.block.append_operation(chlo::erf(input_values[0], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("chlo.erf should return one result").as_ref()])
+        }
         XlaOperation::Pow(_) => {
             let [left, right] = normalize_binary_elementwise_operands(
                 input_values,
@@ -6587,6 +6942,19 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::ScaledDot(operation) => {
             let collective_state = lowerer.collective_state.clone();
             lower_scaled_dot_to_mlir(
+                operation,
+                &collective_state,
+                input_values,
+                &lowerer.input_types,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )
+        }
+        XlaOperation::DotProductAttention(operation) => {
+            let collective_state = lowerer.collective_state.clone();
+            lower_dot_product_attention_to_mlir(
                 operation,
                 &collective_state,
                 input_values,
@@ -7394,6 +7762,7 @@ fn build_reduce_body_region<'c, 't>(
 
 /// Lowers an [`ArrayOperation::Reduce`] dispatch to `stablehlo.reduce` with the appropriate
 /// scalar body region and an initial-value constant matching the reduction's identity element.
+/// A [`ReductionKind::Mean`] reduction lowers as the sum divided by the number of reduced elements.
 fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: ReductionKind,
     axes: &[usize],
@@ -7408,14 +7777,34 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     let body_region = build_reduce_body_region(kind, element_type, context, location)?;
     let reduce_op = stable_hlo::reduce(&[input_value], &[initial_value], axes, body_region, location)?;
     let result = block.append_operation(reduce_op)?;
-    let sum_result = result.result(0).expect("stablehlo.reduce should return one result").as_ref();
-    if matches!(kind, ReductionKind::Mean) {
-        // Mean = Sum / axis_size_product. Stage a constant divisor of the right element type and
-        // divide. Skip if any reduced axis has a dynamic size; the caller's `infer_output_types`
-        // would have rejected that earlier.
-        return Err(LoweringError::UnsupportedOp { op: "reduce_mean".to_string() });
+    let reduced = result.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    if !matches!(kind, ReductionKind::Mean) {
+        return Ok(reduced);
     }
-    Ok(sum_result)
+    // `Mean` is the sum divided by the number of reduced elements. The divisor is staged as a splatted constant of
+    // the output type, clamped to one so that a zero-sized reduction yields zero rather than NaN, mirroring the
+    // eager reference backend.
+    let input_type = input_value.r#type()?;
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
+        op: format!("'reduce' operand has non-tensor MLIR type '{input_type}'"),
+    })?;
+    let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
+    let mut count = 1usize;
+    for axis in axes {
+        match dimensions.get(*axis) {
+            Some(MlirSize::Static(size)) => count *= size,
+            _ => {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("'reduce' mean over dynamically sized axis {axis}"),
+                });
+            }
+        }
+    }
+    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
+    let divisor =
+        lower_f64_constant_splat(count.max(1) as f64, output_array_type, output_tensor_type, block, context, location)?;
+    let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
+    Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
 }
 
 /// Lowers an [`ArrayOperation::Gather`] dispatch to `stablehlo.gather`. StableHLO `gather` clamps out-of-bounds start
@@ -7565,44 +7954,40 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Builds a dense-elements attribute holding the identity element of the given reduction kind at
-/// the given element type.
+/// the given element type. `Sum` and `Mean` use zero; `Max` and `Min` use the bound returned by
+/// [`float_reduction_identity_bound`] (negated for `Max`) at float element types and the bounds returned by
+/// [`integer_reduction_identity_bounds`] at integer element types; Boolean `Any` and `All` use `false` and `true`.
+/// Every other combination — including all reductions over [`DataType::F8E8M0FNU`], whose unsigned, zero-free
+/// encoding has no representable identity — fails with [`LoweringError::UnsupportedDataType`].
 fn build_reduction_identity_attribute<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+    if let Some(bound) = float_reduction_identity_bound(element_type) {
+        let identity = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => 0.0,
+            ReductionKind::Max => -bound,
+            ReductionKind::Min => bound,
+            ReductionKind::Any | ReductionKind::All => {
+                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+            }
+        };
+        return lower_f64_scalar_elements_attribute(element_type, tensor_type, identity, context);
+    }
+    if let Some((minimum, maximum)) = integer_reduction_identity_bounds(element_type) {
+        let identity = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => 0,
+            ReductionKind::Max => minimum,
+            ReductionKind::Min => maximum,
+            ReductionKind::Any | ReductionKind::All => {
+                return Err(LoweringError::UnsupportedDataType { data_type: element_type });
+            }
+        };
+        return lower_constant_elements_attribute(element_type, tensor_type, identity, context);
+    }
     match (kind, element_type) {
-        (ReductionKind::Sum | ReductionKind::Mean, DataType::F32) => context
-            .dense_f32_elements_attribute(tensor_type, &[0.0])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::Sum | ReductionKind::Mean, DataType::F64) => context
-            .dense_f64_elements_attribute(tensor_type, &[0.0])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::Max, DataType::F32) => context
-            .dense_f32_elements_attribute(tensor_type, &[f32::NEG_INFINITY])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::Max, DataType::F64) => context
-            .dense_f64_elements_attribute(tensor_type, &[f64::NEG_INFINITY])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::Min, DataType::F32) => context
-            .dense_f32_elements_attribute(tensor_type, &[f32::INFINITY])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
-        (ReductionKind::Min, DataType::F64) => context
-            .dense_f64_elements_attribute(tensor_type, &[f64::INFINITY])
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
         (ReductionKind::Any, DataType::Boolean) => context
             .dense_bool_elements_attribute(tensor_type, &[false])
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: element_type })?
@@ -7614,6 +7999,49 @@ fn build_reduction_identity_attribute<'c, 't>(
             .cast::<DenseElementsAttributeRef>()
             .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: element_type }),
         _ => Err(LoweringError::UnsupportedDataType { data_type: element_type }),
+    }
+}
+
+/// Returns the `Min` reduction identity of the given float data type: positive infinity for formats with
+/// infinities and the greatest finite value for the finite-only `f8`/`f6`/`f4` formats (for example, `448` for
+/// [`DataType::F8E4M3FN`]). The `Max` identity is its negation, which every supported format represents because
+/// its value range is sign-symmetric. Returns `None` for non-float data types and for [`DataType::F8E8M0FNU`],
+/// whose unsigned, zero-free exponent-only encoding represents neither zero nor a sign-symmetric ordering bound.
+fn float_reduction_identity_bound(data_type: DataType) -> Option<f64> {
+    match data_type {
+        DataType::BF16
+        | DataType::F16
+        | DataType::F32
+        | DataType::F64
+        | DataType::F8E3M4
+        | DataType::F8E4M3
+        | DataType::F8E5M2 => Some(f64::INFINITY),
+        DataType::F4E2M1FN => Some(6.0),
+        DataType::F6E2M3FN => Some(7.5),
+        DataType::F6E3M2FN => Some(28.0),
+        DataType::F8E4M3FN => Some(448.0),
+        DataType::F8E4M3FNUZ => Some(240.0),
+        DataType::F8E4M3B11FNUZ => Some(30.0),
+        DataType::F8E5M2FNUZ => Some(57344.0),
+        _ => None,
+    }
+}
+
+/// Returns the (minimum, maximum) values representable by the given integer data type, used as the `Max` and `Min`
+/// reduction identities. The values are raw `i64` payloads for [`lower_constant_elements_attribute`], which encodes
+/// them at the type's width and signedness — [`DataType::U64`]'s maximum therefore wraps to `-1`, whose
+/// two's-complement bits are exactly `u64::MAX`. Returns `None` for non-integer data types.
+fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> {
+    match data_type {
+        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
+            let width = signed_integer_width(data_type).unwrap();
+            Some((i64::MIN >> (64 - width), i64::MAX >> (64 - width)))
+        }
+        DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
+            let width = unsigned_integer_width(data_type).unwrap();
+            Some((0, (u64::MAX >> (64 - width)) as i64))
+        }
+        _ => None,
     }
 }
 
@@ -7774,6 +8202,10 @@ where
     lower_f64_constant_splat(value, output_type, output_tensor_type, block, context, location)
 }
 
+/// Builds a splatted dense-elements attribute holding `factor` converted to the given `data_type`. Boolean splats
+/// hold `factor != 0.0`, integer splats truncate `factor`, and float splats round `factor` to the nearest
+/// representable value of the element type (covering every float format that [`lower_element_type`] supports,
+/// including the `f8`/`f6`/`f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
 fn lower_f64_scalar_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -7810,50 +8242,42 @@ fn lower_f64_scalar_elements_attribute<'c, 't>(
                 )
                 .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
         }
-        DataType::BF16 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.bfloat16_type(), factor),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F16 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float16_type(), factor),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F32 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float32_type(), factor),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F64 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float64_type(), factor),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        unsupported => Err(LoweringError::InvalidDenseElementsAttribute { data_type: unsupported }),
+        DataType::BF16
+        | DataType::F16
+        | DataType::F32
+        | DataType::F64
+        | DataType::F4E2M1FN
+        | DataType::F6E2M3FN
+        | DataType::F6E3M2FN
+        | DataType::F8E3M4
+        | DataType::F8E4M3
+        | DataType::F8E4M3FN
+        | DataType::F8E4M3FNUZ
+        | DataType::F8E4M3B11FNUZ
+        | DataType::F8E5M2
+        | DataType::F8E5M2FNUZ
+        | DataType::F8E8M0FNU => {
+            let element_type = lower_element_type(data_type, context)?
+                .cast::<FloatTypeRef>()
+                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })?;
+            context
+                .splatted_dense_attribute_elements_attribute(tensor_type, context.float_attribute(element_type, factor))
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
+        }
+        DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
     }
 }
 
+/// Builds a splatted dense-elements attribute holding `integer_value` converted to the given `data_type`. Integer
+/// splats hold the exact `i64` value; every other data type routes through
+/// [`lower_f64_scalar_elements_attribute`] after a lossless widening of `integer_value` to `f64`.
 fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     integer_value: i64,
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-    let float_value = integer_value as f64;
-
     match data_type {
-        DataType::Zero if integer_value == 0 => context
-            .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(false))
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::Zero => Err(LoweringError::UnsupportedDataType { data_type }),
-        DataType::Boolean => context
-            .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(integer_value != 0))
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
             context
                 .splatted_dense_attribute_elements_attribute(
@@ -7876,97 +8300,7 @@ fn lower_constant_elements_attribute<'c, 't>(
                 )
                 .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })
         }
-        DataType::BF16 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.bfloat16_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F16 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float16_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F32 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float32_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F64 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float64_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F4E2M1FN => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float4e2m1fn_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F6E2M3FN => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float6e2m3fn_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F6E3M2FN => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float6e3m2fn_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E3M4 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e3m4_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E4M3 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e4m3_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E4M3FN => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e4m3fn_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E4M3FNUZ => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e4m3fnuz_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E4M3B11FNUZ => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e4m3b11fnuz_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E5M2 => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e5m2_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E5M2FNUZ => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e5m2fnuz_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::F8E8M0FNU => context
-            .splatted_dense_attribute_elements_attribute(
-                tensor_type,
-                context.float_attribute(context.float8e8m0fnu_type(), float_value),
-            )
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
-        DataType::Token | DataType::C64 | DataType::C128 => Err(LoweringError::UnsupportedDataType { data_type }),
+        _ => lower_f64_scalar_elements_attribute(data_type, tensor_type, integer_value as f64, context),
     }
 }
 
@@ -8017,7 +8351,9 @@ mod tests {
         BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation,
         SliceOperation, Transpose, UpdateSliceOperation,
     };
-    use ryft_core::operations::math::{Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, Sin};
+    use ryft_core::operations::math::{
+        Atan2Operation, Cos, DivOperation, Dot, DotDimensionNumbers, ReduceOperation, Sin,
+    };
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -8979,6 +9315,266 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
     }
 
+    /// Builds a one-instruction program reducing an input of the given data type and dimensions, and returns the
+    /// result of lowering it to a rendered StableHLO module.
+    fn lowered_reduce_module(
+        data_type: DataType,
+        kind: ReductionKind,
+        axes: Vec<usize>,
+        dimensions: Vec<usize>,
+    ) -> Result<String, LoweringError> {
+        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Size::Static).collect()));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(XlaOperation::Reduce(ReduceOperation::new(axes, kind)), Vec::new(), vec![input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        to_mlir_module_for_plain_program(&program, "main")
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_max() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Max, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
+                    %cst = stablehlo.constant dense<0xFF80> : tensor<bf16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [1] : (tensor<2x3xbf16>, tensor<bf16>) -> tensor<2xbf16>
+                    return %0 : tensor<2xbf16>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Sum, vec![0], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<2x3xbf16>, tensor<bf16>) -> tensor<3xbf16>
+                    return %0 : tensor<3xbf16>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_mean() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<2x3xbf16>, tensor<bf16>) -> tensor<2xbf16>
+                    %cst_0 = stablehlo.constant dense<3.000000e+00> : tensor<bf16>
+                    %1 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<bf16>) -> tensor<2xbf16>
+                    %2 = stablehlo.divide %0, %1 : tensor<2xbf16>
+                    return %2 : tensor<2xbf16>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_full_reduce_mean_without_broadcast() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F32, ReductionKind::Mean, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<f32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                    %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                    %1 = stablehlo.divide %0, %cst_0 : tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_f16_reduce_min() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F16, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf16>) -> tensor<f16> {
+                    %cst = stablehlo.constant dense<0x7C00> : tensor<f16>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.minimum across dimensions = [0] : (tensor<4xf16>, tensor<f16>) -> tensor<f16>
+                    return %0 : tensor<f16>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_f8e5m2_reduce_max_with_infinite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E5M2, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E5M2>) -> tensor<f8E5M2> {
+                    %cst = stablehlo.constant dense<0xFC> : tensor<f8E5M2>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [0] : (tensor<4xf8E5M2>, tensor<f8E5M2>) -> tensor<f8E5M2>
+                    return %0 : tensor<f8E5M2>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_f8e4m3fn_reduce_max_with_finite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
+                    %cst = stablehlo.constant dense<-4.480000e+02> : tensor<f8E4M3FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.maximum across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
+                    return %0 : tensor<f8E4M3FN>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_f8e4m3fn_reduce_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f8E4M3FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
+                    return %0 : tensor<f8E4M3FN>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_f4e2m1fn_reduce_min_with_finite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F4E2M1FN, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf4E2M1FN>) -> tensor<f4E2M1FN> {
+                    %cst = stablehlo.constant dense<6.000000e+00> : tensor<f4E2M1FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.minimum across dimensions = [0] : (tensor<4xf4E2M1FN>, tensor<f4E2M1FN>) -> tensor<f4E2M1FN>
+                    return %0 : tensor<f4E2M1FN>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_max_with_minimum_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I32, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi32>) -> tensor<i32> {
+                    %c = stablehlo.constant dense<-2147483648> : tensor<i32>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<4xi32>, tensor<i32>) -> tensor<i32>
+                    return %0 : tensor<i32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_i64_reduce_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I64, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
+                    return %0 : tensor<i64>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_mean_with_integer_division() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I32, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xi32>) -> tensor<2xi32> {
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [1] : (tensor<2x3xi32>, tensor<i32>) -> tensor<2xi32>
+                    %c_0 = stablehlo.constant dense<3> : tensor<i32>
+                    %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<2xi32>
+                    %2 = stablehlo.divide %0, %1 : tensor<2xi32>
+                    return %2 : tensor<2xi32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_u8_reduce_min_with_maximum_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::U8, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xui8>) -> tensor<ui8> {
+                    %c = stablehlo.constant dense<255> : tensor<ui8>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui8>, tensor<ui8>) -> tensor<ui8>
+                    return %0 : tensor<ui8>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_u64_reduce_min_with_maximum_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::U64, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xui64>) -> tensor<ui64> {
+                    %c = stablehlo.constant dense<18446744073709551615> : tensor<ui64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui64>, tensor<ui64>) -> tensor<ui64>
+                    return %0 : tensor<ui64>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_rejects_f8e8m0fnu_reduce() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
+            LoweringError::UnsupportedDataType { data_type: DataType::F8E8M0FNU },
+        );
+    }
+
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_zero_sized_coordinate_basis() {
         let leaf_type =
@@ -9528,6 +10124,54 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_lowers_multi_key_sort_with_lexicographic_comparator() {
+        use ryft_core::operations::sort::{SortDirection, SortOperation};
+
+        // A two-key ascending sort lowers to a stable `stablehlo.sort` whose synthesized comparator chains the key
+        // comparisons lexicographically as `cmp_0 OR (eq_0 AND cmp_1)`, with each key's comparison type derived from
+        // that key's data type (`TOTALORDER` for the `f32` primary key, including its equality comparison so NaN
+        // ties fall through deterministically, and `SIGNED` for the `i32` secondary key), while the passenger rides
+        // along unexamined.
+        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
+        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let mut builder = XlaProgramBuilder::new();
+        let primary = builder.add_input(primary_type.clone());
+        let secondary = builder.add_input(secondary_type.clone());
+        let passenger = builder.add_input(passenger_type.clone());
+        let operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap();
+        let outputs =
+            builder.add_instruction(operation, Vec::new(), vec![primary, secondary, passenger]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+        let input_types = vec![primary_type.clone(), secondary_type.clone(), passenger_type.clone()];
+        let output_types = vec![primary_type, secondary_type, passenger_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xi32>, %arg2: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xi32>, tensor<4xf32>) {
+                    %0:3 = "stablehlo.sort"(%arg0, %arg1, %arg2) <{dimension = 0 : i64, is_stable = true}> ({
+                    ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>, %arg5: tensor<i32>, %arg6: tensor<i32>, %arg7: tensor<f32>, %arg8: tensor<f32>):
+                      %1 = stablehlo.compare LT, %arg5, %arg6, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                      %2 = stablehlo.compare LT, %arg3, %arg4, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %3 = stablehlo.compare EQ, %arg3, %arg4, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.and %3, %1 : tensor<i1>
+                      %5 = stablehlo.or %2, %4 : tensor<i1>
+                      stablehlo.return %5 : tensor<i1>
+                    }) : (tensor<4xf32>, tensor<4xi32>, tensor<4xf32>) -> (tensor<4xf32>, tensor<4xi32>, tensor<4xf32>)
+                    return %0#0, %0#1, %0#2 : tensor<4xf32>, tensor<4xi32>, tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_lowers_accumulation_typed_dot() {
         use ryft_core::operations::math::{DotDimensionNumbers, DotOperation};
 
@@ -9644,6 +10288,349 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    /// Builds a rank-3 NVFP4 scaled-dot program with a scalar global scale: `f4e2m1fn [2, 2, 16]` operands with
+    /// `f8e4m3fn [2, 2, 1]` scales over blocks of 16 and an `f32` global scale.
+    fn scaled_dot_rank_3_global_scale_fixture_program()
+    -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
+        use ryft_core::operations::math::ScaledDotOperation;
+
+        let element_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(16)]),
+        );
+        let scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(1)]),
+        );
+        let global_scale_type = ArrayType::scalar(DataType::F32);
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = vec![
+            builder.add_input(element_type.clone()),
+            builder.add_input(scale_type.clone()),
+            builder.add_input(element_type.clone()),
+            builder.add_input(scale_type.clone()),
+            builder.add_input(global_scale_type.clone()),
+        ];
+        let output =
+            builder.add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), inputs).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 5], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![element_type.clone(), scale_type.clone(), element_type, scale_type, global_scale_type];
+        (program, input_types, vec![output_type])
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_rank_3_scaled_dot_with_global_scale_composition() {
+        // Without target information the rank-3 form with a global scale lowers to the portable dequantization
+        // composition: batched contraction plus a broadcast global-scale multiply.
+        let (program, input_types, output_types) = scaled_dot_rank_3_global_scale_fixture_program();
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x2x16xf4E2M1FN>, %arg1: tensor<2x2x1xf8E4M3FN>, %arg2: tensor<2x2x16xf4E2M1FN>, %arg3: tensor<2x2x1xf8E4M3FN>, %arg4: tensor<f32>) -> tensor<2x2x2xf32> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x2x16xf4E2M1FN>) -> tensor<2x2x16xf32>
+                    %1 = stablehlo.convert %arg1 : (tensor<2x2x1xf8E4M3FN>) -> tensor<2x2x1xf32>
+                    %2 = stablehlo.broadcast_in_dim %1, dims = [0, 1, 2] : (tensor<2x2x1xf32>) -> tensor<2x2x1x16xf32>
+                    %3 = stablehlo.reshape %2 : (tensor<2x2x1x16xf32>) -> tensor<2x2x16xf32>
+                    %4 = stablehlo.multiply %0, %3 : tensor<2x2x16xf32>
+                    %5 = stablehlo.convert %arg2 : (tensor<2x2x16xf4E2M1FN>) -> tensor<2x2x16xf32>
+                    %6 = stablehlo.convert %arg3 : (tensor<2x2x1xf8E4M3FN>) -> tensor<2x2x1xf32>
+                    %7 = stablehlo.broadcast_in_dim %6, dims = [0, 1, 2] : (tensor<2x2x1xf32>) -> tensor<2x2x1x16xf32>
+                    %8 = stablehlo.reshape %7 : (tensor<2x2x1x16xf32>) -> tensor<2x2x16xf32>
+                    %9 = stablehlo.multiply %5, %8 : tensor<2x2x16xf32>
+                    %10 = stablehlo.dot_general %4, %9, batching_dims = [0] x [0], contracting_dims = [2] x [2], precision = [DEFAULT, DEFAULT] : (tensor<2x2x16xf32>, tensor<2x2x16xf32>) -> tensor<2x2x2xf32>
+                    %11 = stablehlo.broadcast_in_dim %arg4, dims = [] : (tensor<f32>) -> tensor<2x2x2xf32>
+                    %12 = stablehlo.multiply %10, %11 : tensor<2x2x2xf32>
+                    return %12 : tensor<2x2x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_rank_3_block_scaled_dot_with_global_scale_on_cuda() {
+        // With a CUDA target the rank-3 form with a global scale lowers to the `__op$block_scaled_dot` custom call
+        // with the scalar global scale appended as its fifth operand.
+        let (program, input_types, output_types) = scaled_dot_rank_3_global_scale_fixture_program();
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x2x16xf4E2M1FN>, %arg1: tensor<2x2x1xf8E4M3FN>, %arg2: tensor<2x2x16xf4E2M1FN>, %arg3: tensor<2x2x1xf8E4M3FN>, %arg4: tensor<f32>) -> tensor<2x2x2xf32> {
+                    %0 = stablehlo.custom_call @__op$block_scaled_dot(%arg0, %arg2, %arg1, %arg3, %arg4) {api_version = 4 : i32, backend_config = {}} : (tensor<2x2x16xf4E2M1FN>, tensor<2x2x16xf4E2M1FN>, tensor<2x2x1xf8E4M3FN>, tensor<2x2x1xf8E4M3FN>, tensor<f32>) -> tensor<2x2x2xf32>
+                    return %0 : tensor<2x2x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_block_scaled_dot_in_shared_jit_call_callee() {
+        // The module's target platform reaches deduplicated `jit_call` callee functions, so a qualifying NVFP4
+        // scaled dot inside a shared callee still lowers to the `__op$block_scaled_dot` custom call on CUDA.
+        use ryft_core::operations::math::ScaledDotOperation;
+
+        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(16)]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let mut callee_builder = XlaProgramBuilder::new();
+        let callee_inputs = vec![
+            callee_builder.add_input(element_type.clone()),
+            callee_builder.add_input(scale_type.clone()),
+            callee_builder.add_input(element_type.clone()),
+            callee_builder.add_input(scale_type.clone()),
+        ];
+        let callee_output = callee_builder
+            .add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), callee_inputs)
+            .unwrap()[0];
+        let callee: std::rc::Rc<FlatXlaProgram> = std::rc::Rc::new(
+            callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
+        );
+
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = vec![
+            builder.add_input(element_type.clone()),
+            builder.add_input(scale_type.clone()),
+            builder.add_input(element_type.clone()),
+            builder.add_input(scale_type.clone()),
+        ];
+        let first = add_xla_jit_call(&mut builder, &callee, inputs.clone());
+        let second = add_xla_jit_call(&mut builder, &callee, inputs);
+        let output = builder.add_instruction(AddOperation, Vec::new(), vec![first, second]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![element_type.clone(), scale_type.clone(), element_type, scale_type];
+        let output_types = vec![output_type];
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x1xf8E4M3FN>, %arg2: tensor<2x16xf4E2M1FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.custom_call @__op$block_scaled_dot(%arg0, %arg2, %arg1, %arg3) {api_version = 4 : i32, backend_config = {}} : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    return %0 : tensor<2x2xf32>
+                  }
+                  func.func @main(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x1xf8E4M3FN>, %arg2: tensor<2x16xf4E2M1FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
+                    %0 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    %1 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<2x2xf32>
+                    return %2 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    /// Builds the dot-product attention program shared by the platform-gated lowering fixtures below: `BTNH`
+    /// operands `query`/`key`/`value` `[1, 4, 2, head_dimension]` at the provided data type with scale `0.125`.
+    fn dot_product_attention_fixture_program(
+        data_type: DataType,
+        head_dimension: usize,
+        mask: AttentionMask,
+    ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
+        let operand_type = ArrayType::new(
+            data_type,
+            Shape::new(vec![Size::Static(1), Size::Static(4), Size::Static(2), Size::Static(head_dimension)]),
+        );
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = vec![
+            builder.add_input(operand_type.clone()),
+            builder.add_input(operand_type.clone()),
+            builder.add_input(operand_type.clone()),
+        ];
+        let output =
+            builder.add_instruction(DotProductAttentionOperation::new(0.125, mask), Vec::new(), inputs).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![operand_type.clone(), operand_type.clone(), operand_type.clone()];
+        (program, input_types, vec![operand_type])
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_softmax_on_cuda() {
+        // With a CUDA target, `bf16` operands, and a head dimension that is a multiple of 8, the dot-product
+        // attention lowers to the `__cudnn$fmhaSoftmax` custom call with the empirically validated legacy custom-call
+        // contract — proto-JSON `backend_config` string, `api_version = 2`, explicit operand/result layouts, and an
+        // unused zero-sized workspace result — followed by the transpose back to the logical `BTNH` layout.
+        let (program, input_types, output_types) =
+            dot_product_attention_fixture_program(DataType::BF16, 8, AttentionMask::Causal);
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x4x2x8xbf16>, %arg1: tensor<1x4x2x8xbf16>, %arg2: tensor<1x4x2x8xbf16>) -> tensor<1x4x2x8xbf16> {
+                    %0:2 = stablehlo.custom_call @__cudnn$fmhaSoftmax(%arg0, %arg1, %arg2) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22BF16\22,\22dimensions\22:[\221\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22CAUSAL\22,\22bmm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.0,\22seed\22:42,\22sliding_window_length\22:0,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>]} : (tensor<1x4x2x8xbf16>, tensor<1x4x2x8xbf16>, tensor<1x4x2x8xbf16>) -> (tensor<1x2x4x8xbf16>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<1x2x4x8xbf16>) -> tensor<1x4x2x8xbf16>
+                    return %1 : tensor<1x4x2x8xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_emits_fmha_softmax_without_mask_on_cuda() {
+        // The unmasked `f16` variant emits `NO_MASK` and `F16` in the backend configuration.
+        let (program, input_types, output_types) =
+            dot_product_attention_fixture_program(DataType::F16, 8, AttentionMask::None);
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x4x2x8xf16>, %arg1: tensor<1x4x2x8xf16>, %arg2: tensor<1x4x2x8xf16>) -> tensor<1x4x2x8xf16> {
+                    %0:2 = stablehlo.custom_call @__cudnn$fmhaSoftmax(%arg0, %arg1, %arg2) {api_version = 2 : i32, backend_config = "{\22operation_queue_id\22:\220\22,\22cudnn_fmha_backend_config\22:{\22algorithm\22:{\22algo_id\22:\220\22,\22math_type\22:\22TENSOR_OP_MATH\22,\22tuning_knobs\22:{\2217\22:\221\22,\2224\22:\220\22},\22is_cudnn_frontend\22:true,\22workspace_size\22:\220\22},\22fmha_scale\22:0.125,\22intermediate_tensor_shape\22:{\22element_type\22:\22F16\22,\22dimensions\22:[\221\22,\222\22,\224\22,\224\22],\22tuple_shapes\22:[],\22layout\22:{\22dim_level_types\22:[],\22dim_unique\22:[],\22dim_ordered\22:[],\22minor_to_major\22:[\223\22,\222\22,\221\22,\220\22],\22tiles\22:[],\22element_size_in_bits\22:\220\22,\22memory_space\22:\220\22,\22index_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22pointer_primitive_type\22:\22PRIMITIVE_TYPE_INVALID\22,\22dynamic_shape_metadata_prefix_bytes\22:\220\22},\22is_dynamic_dimension\22:[false,false,false,false]},\22is_flash_attention\22:true,\22mask_type\22:\22NO_MASK\22,\22bmm1_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\223\22],\22lhs_batch_dimensions\22:[\220\22,\222\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22bmm2_dot_dimension_numbers\22:{\22lhs_contracting_dimensions\22:[\223\22],\22rhs_contracting_dimensions\22:[\221\22],\22lhs_batch_dimensions\22:[\220\22,\221\22],\22rhs_batch_dimensions\22:[\220\22,\222\22]},\22dropout_rate\22:0.0,\22seed\22:42,\22sliding_window_length\22:0,\22max_seg_per_batch\22:1,\22is_paged_attention\22:false}}", operand_layouts = [dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>, dense<[3, 2, 1, 0]> : tensor<4xindex>], result_layouts = [dense<[3, 1, 2, 0]> : tensor<4xindex>, dense<0> : tensor<1xindex>]} : (tensor<1x4x2x8xf16>, tensor<1x4x2x8xf16>, tensor<1x4x2x8xf16>) -> (tensor<1x2x4x8xf16>, tensor<0xui8>)
+                    %1 = stablehlo.transpose %0#0, dims = [0, 2, 1, 3] : (tensor<1x2x4x8xf16>) -> tensor<1x4x2x8xf16>
+                    return %1 : tensor<1x4x2x8xf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_dot_product_attention_composition_without_target_platform() {
+        // Without target information the dot-product attention lowers to the portable StableHLO composition: scores,
+        // scale, causal mask (two iotas, compare, select), max-stabilized softmax, context contraction, and the
+        // transpose back to `BTNH`. The `f32` operands keep the softmax at `f32` with no conversions.
+        let (program, input_types, output_types) =
+            dot_product_attention_fixture_program(DataType::F32, 8, AttentionMask::Causal);
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x4x2x8xf32>, %arg1: tensor<1x4x2x8xf32>, %arg2: tensor<1x4x2x8xf32>) -> tensor<1x4x2x8xf32> {
+                    %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3], precision = [DEFAULT, DEFAULT] : (tensor<1x4x2x8xf32>, tensor<1x4x2x8xf32>) -> tensor<1x2x4x4xf32>
+                    %cst = stablehlo.constant dense<1.250000e-01> : tensor<f32>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
+                    %2 = stablehlo.multiply %0, %1 : tensor<1x2x4x4xf32>
+                    %3 = stablehlo.iota dim = 2 : tensor<1x2x4x4xi32>
+                    %4 = stablehlo.iota dim = 3 : tensor<1x2x4x4xi32>
+                    %5 = stablehlo.compare LE, %4, %3, SIGNED : (tensor<1x2x4x4xi32>, tensor<1x2x4x4xi32>) -> tensor<1x2x4x4xi1>
+                    %cst_0 = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
+                    %6 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
+                    %7 = stablehlo.select %5, %2, %6 : tensor<1x2x4x4xi1>, tensor<1x2x4x4xf32>
+                    %cst_1 = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %8 = stablehlo.reduce(%7 init: %cst_1) applies stablehlo.maximum across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+                    %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1, 2] : (tensor<1x2x4xf32>) -> tensor<1x2x4x4xf32>
+                    %10 = stablehlo.subtract %7, %9 : tensor<1x2x4x4xf32>
+                    %11 = stablehlo.exponential %10 : tensor<1x2x4x4xf32>
+                    %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %12 = stablehlo.reduce(%11 init: %cst_2) applies stablehlo.add across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+                    %13 = stablehlo.broadcast_in_dim %12, dims = [0, 1, 2] : (tensor<1x2x4xf32>) -> tensor<1x2x4x4xf32>
+                    %14 = stablehlo.divide %11, %13 : tensor<1x2x4x4xf32>
+                    %15 = stablehlo.dot_general %14, %arg2, batching_dims = [0, 1] x [0, 2], contracting_dims = [3] x [1], precision = [DEFAULT, DEFAULT] : (tensor<1x2x4x4xf32>, tensor<1x4x2x8xf32>) -> tensor<1x2x4x8xf32>
+                    %16 = stablehlo.transpose %15, dims = [0, 2, 1, 3] : (tensor<1x2x4x8xf32>) -> tensor<1x4x2x8xf32>
+                    return %16 : tensor<1x4x2x8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_lowers_dot_product_attention_composition_for_f32_on_cuda() {
+        // `f32` operands do not qualify for the cuDNN flash-attention call, so even a CUDA target lowers the
+        // portable composition.
+        let (program, input_types, output_types) =
+            dot_product_attention_fixture_program(DataType::F32, 8, AttentionMask::Causal);
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert!(!module.contains("fmhaSoftmax"));
+        assert!(module.contains("stablehlo.dot_general"));
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_lowers_dot_product_attention_composition_for_unaligned_head_dim_on_cuda() {
+        // A head dimension that is not a multiple of 8 fails cuDNN's compile-time gate, so a CUDA target with `bf16`
+        // operands still lowers the portable composition (which upcasts its softmax to `f32`).
+        let (program, input_types, output_types) =
+            dot_product_attention_fixture_program(DataType::BF16, 4, AttentionMask::Causal);
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+        assert!(!module.contains("fmhaSoftmax"));
+        assert!(module.contains("stablehlo.dot_general"));
+        assert!(module.contains("stablehlo.convert"));
     }
 
     #[test]
