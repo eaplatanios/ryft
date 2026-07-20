@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   includes a type system in `ryft_core::programs::types`, that supports modeling data types, array types, layouts,
   memory spaces, and sharding information (along with a new `ryft_core::sharding` module), and an effect system in
   `ryft_core::programs::effects`.
+- Added core abstractions for performing program tracing and transforming program traces in `ryft_core::contexts` and
+  `ryft_core::tracing`.
+- Added program interpretation (i.e., execution or evaluation) machinery in `ryft_core::interpretation`.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
   and `ShardingError`.
 - Added support for the `DataType::F6E3M2FN` and `DataType::F6E2M3FN` 6-bit microscaling floating-point data types.

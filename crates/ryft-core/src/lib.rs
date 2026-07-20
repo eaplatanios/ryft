@@ -2,17 +2,24 @@
 // lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
 extern crate self as ryft;
 
+pub mod axes;
 pub mod broadcasting;
+pub mod contexts;
 pub mod errors;
+pub mod interpretation;
 pub mod macros;
 pub mod parameters;
 pub mod programs;
 pub mod sharding;
+pub mod tracing;
 pub mod types;
 pub mod utilities;
 
+pub use axes::{AxisError, NamedAxis};
 pub use broadcasting::{Broadcastable, BroadcastingError};
+pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 pub use errors::{CustomError, Error, MaybeFallible};
+pub use interpretation::{InterpretableOperation, InterpretationDriver};
 pub use operations::*;
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -21,6 +28,10 @@ pub use parameters::{
 };
 pub use programs::*;
 pub use sharding::*;
+pub use tracing::{
+    DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
+    infer_output_type, trace,
+};
 pub use types::*;
 
 #[cfg(test)]
