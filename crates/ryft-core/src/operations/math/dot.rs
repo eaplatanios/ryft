@@ -760,16 +760,10 @@ where
                 Ok(stage_dot(&convert_to_tangent_type(left)?, &convert_to_tangent_type(right)?))
             }
         };
-        let left_term = left
-            .tangent()
-            .as_value()
-            .map(|tangent| stage_tangent_dot(tangent, right.primal()))
-            .transpose()?;
-        let right_term = right
-            .tangent()
-            .as_value()
-            .map(|tangent| stage_tangent_dot(left.primal(), tangent))
-            .transpose()?;
+        let left_term =
+            left.tangent().as_value().map(|tangent| stage_tangent_dot(tangent, right.primal())).transpose()?;
+        let right_term =
+            right.tangent().as_value().map(|tangent| stage_tangent_dot(left.primal(), tangent)).transpose()?;
         // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
         let tangent = left_term
             .into_iter()
@@ -865,12 +859,11 @@ impl<
                         let adjoint_value = outputs.remove(0);
                         // An accumulation-typed primal contracts its adjoint at the widened cotangent type; convert
                         // the result back to the linear operand's cotangent element type when the two differ.
-                        let adjoint_value =
-                            if adjoint_value.r#type().data_type() == linear_cotangent_type.data_type() {
-                                adjoint_value
-                            } else {
-                                adjoint_value.convert_element_type(linear_cotangent_type.data_type())?
-                            };
+                        let adjoint_value = if adjoint_value.r#type().data_type() == linear_cotangent_type.data_type() {
+                            adjoint_value
+                        } else {
+                            adjoint_value.convert_element_type(linear_cotangent_type.data_type())?
+                        };
                         MaybeZero::Value(adjoint_value)
                     }
                 };
@@ -1282,16 +1275,9 @@ where
             }
         };
         let primal = stage(inputs[0].primal(), inputs[2].primal())?;
-        let left_term = inputs[0]
-            .tangent()
-            .as_value()
-            .map(|tangent| stage(tangent, inputs[2].primal()))
-            .transpose()?;
-        let right_term = inputs[2]
-            .tangent()
-            .as_value()
-            .map(|tangent| stage(inputs[0].primal(), tangent))
-            .transpose()?;
+        let left_term = inputs[0].tangent().as_value().map(|tangent| stage(tangent, inputs[2].primal())).transpose()?;
+        let right_term =
+            inputs[2].tangent().as_value().map(|tangent| stage(inputs[0].primal(), tangent)).transpose()?;
         let tangent = left_term
             .into_iter()
             .chain(right_term)
@@ -1441,8 +1427,7 @@ where
             // Every operand is replicated: the lifted operation is the unbatched operation itself.
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
-        let lhs_primal_rank =
-            inputs[0].r#type().rank() - usize::from(inputs[0].batch_axis_position().is_some());
+        let lhs_primal_rank = inputs[0].r#type().rank() - usize::from(inputs[0].batch_axis_position().is_some());
         if lhs_primal_rank != 2 {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -1464,8 +1449,7 @@ where
             Some(global_scale) => Some(global_scale.move_axis(0)?),
             None => None,
         };
-        let mut outputs =
-            self.interpret_with_batch_axes(context, aligned_inputs.as_slice(), &[BatchAxis::new(0)])?;
+        let mut outputs = self.interpret_with_batch_axes(context, aligned_inputs.as_slice(), &[BatchAxis::new(0)])?;
         let Some(global_scale) = mapped_global_scale else {
             return Ok(outputs);
         };
@@ -1786,8 +1770,7 @@ where
             ArrayType::new(compute_type, Shape::new(scale_dimensions.iter().map(|&size| Size::Static(size)).collect()));
         let domain = self.dispatch_domain();
         let fill = |value: f64| -> Result<V, ProgramError> {
-            let scalar =
-                if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
+            let scalar = if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
             domain.fill(&scale_value_type, scalar)
         };
 
@@ -1803,8 +1786,7 @@ where
             // also absorbs the `exp(-inf) = 0` produced by all-zero blocks).
             DataType::F8E8M0FNU => {
                 let log_2 = fill(std::f64::consts::LN_2)?;
-                let exponent =
-                    block_max.log()?.div(&log_2)?.sub(&fill(element_max_exponent - 1e-4)?)?.floor()?;
+                let exponent = block_max.log()?.div(&log_2)?.sub(&fill(element_max_exponent - 1e-4)?)?.floor()?;
                 (exponent.mul(&log_2)?.exp()?, (-127.0f64).exp2())
             }
             scale_type => {
@@ -2049,7 +2031,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
-    use crate::macros::check_operation_transposition;
+    use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -2131,9 +2113,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[lhs_type.clone(), rhs_type.clone(), rhs_type, scale_type.clone()], &[]),
-            Err(TypeError {
-                message: "'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string(),
-            }),
+            Err(TypeError { message: "'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string() }),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2239,13 +2219,8 @@ mod tests {
         let mismatched_batch_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)]));
         assert_eq!(
-            operation.infer_output_types(
-                &[element_type, scale_type.clone(), mismatched_batch_type, scale_type],
-                &[],
-            ),
-            Err(TypeError {
-                message: "'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string(),
-            }),
+            operation.infer_output_types(&[element_type, scale_type.clone(), mismatched_batch_type, scale_type], &[],),
+            Err(TypeError { message: "'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string() }),
         );
     }
 
@@ -2291,7 +2266,9 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError { message: "'scaled_dot' global scale must be a static scalar but got shape [2]".to_string() }),
+            Err(TypeError {
+                message: "'scaled_dot' global scale must be a static scalar but got shape [2]".to_string()
+            }),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2337,8 +2314,7 @@ mod tests {
         let expected_item_1 = element(&item_rhs)
             .scaled_dot(&scales(&item_rhs_scales), &element(&item_lhs), &scales(&item_lhs_scales), 2, DataType::F32)
             .unwrap();
-        let expected: Vec<f64> =
-            expected_item_0.to_f64s().into_iter().chain(expected_item_1.to_f64s()).collect();
+        let expected: Vec<f64> = expected_item_0.to_f64s().into_iter().chain(expected_item_1.to_f64s()).collect();
 
         let stacked_element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(4)]));
@@ -2412,10 +2388,8 @@ mod tests {
 
         // A mapped global scale is multiplied into the result per batch item instead of riding the lifted
         // operation's scalar operand.
-        let mapped_global_scales = Array::from_f64s(
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-            vec![2.0, 0.5],
-        );
+        let mapped_global_scales =
+            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])), vec![2.0, 0.5]);
         let outputs = operation
             .batch(
                 &context,
@@ -2425,8 +2399,7 @@ mod tests {
                     stack(false, &item_lhs_scales, &item_rhs_scales),
                     stack(true, &item_rhs, &item_lhs),
                     stack(false, &item_rhs_scales, &item_lhs_scales),
-                    ArrayBatch::new(mapped_global_scales.r#type().into_owned(), mapped_global_scales, Some(0))
-                        .unwrap(),
+                    ArrayBatch::new(mapped_global_scales.r#type().into_owned(), mapped_global_scales, Some(0)).unwrap(),
                 ],
             )
             .unwrap();
@@ -2487,8 +2460,7 @@ mod tests {
             builder.add_input(element_type.clone()),
             builder.add_input(scale_type.clone()),
         ];
-        let output =
-            builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
+        let output = builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
                 vec![output],
@@ -2578,8 +2550,7 @@ mod tests {
             builder.add_input(element_type),
             builder.add_input(scale_type),
         ];
-        let output =
-            builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
+        let output = builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
                 vec![output],
@@ -2675,10 +2646,7 @@ mod tests {
             scales.r#type().as_ref(),
             &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
-        assert_eq!(
-            scales.to_f64s(),
-            vec![(-6.0f64).exp2(), (-8.0f64).exp2(), (-5.0f64).exp2(), (-127.0f64).exp2()],
-        );
+        assert_eq!(scales.to_f64s(), vec![(-6.0f64).exp2(), (-8.0f64).exp2(), (-5.0f64).exp2(), (-127.0f64).exp2()],);
         assert_eq!(
             elements.to_f64s(),
             vec![256.0, 128.0, 64.0, 32.0, 448.0, 128.0, -256.0, 64.0, -256.0, 128.0, 64.0, 32.0, 0.0, 0.0, 0.0, 0.0],
@@ -2732,8 +2700,9 @@ mod tests {
 
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let builder = context.builder().clone();
-        let input_atom =
-            builder.borrow_mut().add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)])));
+        let input_atom = builder
+            .borrow_mut()
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)])));
         let input = context.tracer(input_atom, None);
         let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(
@@ -2754,32 +2723,40 @@ mod tests {
         assert_eq!(operation.accumulation_type(), Some(DataType::F32));
         let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
         let rhs = lhs.clone();
-        assert_eq!(
-            operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
-        );
         let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Size::Static(2), Size::Static(2)]));
-        assert_eq!(
-            operation.infer_output_types(&[bf16_operand.clone(), bf16_operand.clone()], &[]),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [lhs.clone(), rhs.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [bf16_operand.clone(), bf16_operand],
+                    output_types = [output_type],
+                },
+            ],
         );
         let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
         let f32_operand = plain_array(&[2, 2]);
-        assert_eq!(
-            narrowing.infer_output_types(&[f32_operand.clone(), f32_operand.clone()], &[]),
-            Err(TypeError { message: "'dot' operand data type f32 cannot accumulate at data type f16".to_string() }),
+        check_operation_type_inference!(
+            operation = narrowing,
+            cases = [{
+                input_types = [f32_operand.clone(), f32_operand],
+                error = "'dot' operand data type f32 cannot accumulate at data type f16",
+            }],
         );
         let mesh = test_mesh();
         let sharded = DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(
             Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]).unwrap(),
         );
-        assert_eq!(
-            sharded.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
-            Err(TypeError {
-                message: "'dot' does not support combining an accumulation type with a requested output sharding \
-                          yet"
-                .to_string(),
-            }),
+        check_operation_type_inference!(
+            operation = sharded,
+            cases = [{
+                input_types = [lhs.clone(), rhs.clone()],
+                error = "'dot' does not support combining an accumulation type with a requested output sharding yet",
+            }],
         );
 
         // The eager reference backend upcasts the operands and accumulates at the accumulation type: every value

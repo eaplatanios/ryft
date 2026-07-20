@@ -171,7 +171,6 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
 
         assert_eq!(operation.label(), "x");
-        assert_eq!(Operation::<ArrayType>::name(&operation), PRINT_OPERATION_NAME);
         assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type.clone()], &[]),

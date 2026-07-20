@@ -5126,7 +5126,7 @@ mod tests {
         {
             let builder = context.builder().borrow();
             assert_eq!(builder.instructions().len(), 1);
-            assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "neg");
+            assert_eq!(builder.instructions()[0].operation().name(), "neg");
         }
 
         // Both coefficients of a `[@negative, @negative]` rule stage negations.
@@ -5151,8 +5151,8 @@ mod tests {
         }
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 2);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "neg");
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[1].operation()), "neg");
+        assert_eq!(builder.instructions()[0].operation().name(), "neg");
+        assert_eq!(builder.instructions()[1].operation().name(), "neg");
     }
 
     #[test]
@@ -5294,7 +5294,7 @@ mod tests {
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
-        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), "sin");
+        assert_eq!(builder.instructions()[0].operation().name(), "sin");
     }
 
     #[test]

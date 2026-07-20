@@ -869,8 +869,10 @@ mod tests {
         let operation = ReduceOperation::new(vec![1], ReductionKind::Sum);
         let input = array_type(&[3, 2], DataType::F64);
         assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![array_type(&[3], DataType::F64)]));
-        let rank_one_input = array_type(&[3], DataType::F64);
-        assert!(operation.infer_output_types(&[rank_one_input], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[array_type(&[3], DataType::F64)], &[]),
+            Err(TypeError { message: "'reduce_sum' axis 1 is out of bounds for rank 1".to_string() }),
+        );
     }
 
     #[test]

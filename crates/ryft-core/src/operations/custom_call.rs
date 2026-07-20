@@ -363,12 +363,9 @@ mod tests {
             ],
         );
         assert!(operation.has_side_effect());
-        assert_eq!(Operation::<ArrayType>::name(&operation), CUSTOM_CALL_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::effects(&operation), Effects::single(Effect::OrderedIo));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[vector_type()], &[]),
-            Ok(vec![vector_type()]),
-        );
+        assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(operation.infer_output_types(&[vector_type()], &[]), Ok(vec![vector_type()]),);
         // Long attribute lists wrap onto one line per field.
         assert_eq!(
             operation.to_string(),

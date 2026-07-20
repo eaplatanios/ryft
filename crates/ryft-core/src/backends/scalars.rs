@@ -37,9 +37,9 @@ use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOper
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
     DivOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation, Logistic,
-    LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation,
-    Pow, PowOperation, Remainder, RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign,
-    SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
+    LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation, Pow,
+    PowOperation, Remainder, RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign, SignOperation,
+    Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;

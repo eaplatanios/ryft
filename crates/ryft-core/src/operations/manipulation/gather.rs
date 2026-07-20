@@ -1089,8 +1089,10 @@ mod tests {
 
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
-        let output = operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).unwrap();
-        assert_eq!(output, vec![float_type(vec![2, 2])]);
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
+            Ok(vec![float_type(vec![2, 2])])
+        );
 
         assert_eq!(
             format!("{operation}"),
@@ -1111,19 +1113,39 @@ mod tests {
 
         // Non-integer indices are rejected.
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), float_type(vec![2, 1])], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), float_type(vec![2, 1])], &[]),
+            Err(TypeError { message: "'gather' indices must be integer-typed but have type f32[2, 1]".to_string() }),
+        );
 
         // start_index_map length must equal the index vector extent (here 1, not 2).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
+            Err(TypeError {
+                message: "'gather' start_index_map has length 2 but the index vector extent is 1".to_string(),
+            }),
+        );
 
         // A collapsed axis must have slice size 1.
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![2, 2]);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone()], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
+            Err(TypeError {
+                message: "'gather' collapsed slice dimension 0 must have slice size 1 but has 2".to_string(),
+            }),
+        );
 
         // offset_dimensions count must equal the non-collapsed, non-batching operand axes (here 1).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1, 2], vec![0], vec![0]), vec![1, 2]);
-        assert!(operation.infer_output_types(&[operand, indices], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand, indices], &[]),
+            Err(TypeError {
+                message: "'gather' offset_dimensions has length 2 but the operand has 1 non-collapsed, non-batching \
+                          axes"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]

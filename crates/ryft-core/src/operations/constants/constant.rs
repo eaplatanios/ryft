@@ -180,10 +180,10 @@ mod tests {
     fn test_constant() {
         // Verify the operation's captured value, identity, and rendering.
         let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
-        assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
+        assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &Scalar::from(3.5));
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![DataType::F64]));
 
         // Eager interpretation returns the captured value unchanged.
         assert_eq!(

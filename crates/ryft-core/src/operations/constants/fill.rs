@@ -197,11 +197,11 @@ mod tests {
 
         // Verify the operation's stored type and value, identity, and rendering.
         let operation = FillOperation::new(r#type.clone(), Scalar::from(3.5));
-        assert_eq!(Operation::<ArrayType>::name(&operation), FILL_OPERATION_NAME);
+        assert_eq!(operation.name(), FILL_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
         assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.value(), &Scalar::from(3.5));
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![r#type.clone()]));
 
         // Eager interpretation fills every element with the stored scalar value.
         let expected = Array::from_f64s(r#type.clone(), vec![3.5, 3.5]);

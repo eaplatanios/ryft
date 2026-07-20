@@ -628,11 +628,7 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
             return Err(TypeError {
-                message: format!(
-                    "{} expects 1 attached region but got {}",
-                    Operation::<T>::name(self),
-                    region_interfaces.len(),
-                ),
+                message: format!("{} expects 1 attached region but got {}", self.name(), region_interfaces.len(),),
             });
         }
         let backward_interface = &region_interfaces[0];
@@ -702,9 +698,7 @@ where
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation {
-            message: format!("operation `{}` cannot be batched", Operation::<ArrayType>::name(self)),
-        })
+        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
     }
 }
 
@@ -720,10 +714,7 @@ impl<C: Context> DifferentiableOperation<C> for CustomVjpTangentOperation<C::Typ
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only",
-                Operation::<C::Type>::name(self),
-            ),
+            message: format!("{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only", self.name(),),
         }
         .into())
     }

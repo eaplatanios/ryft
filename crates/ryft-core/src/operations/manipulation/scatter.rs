@@ -1081,8 +1081,10 @@ mod tests {
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
         let updates = float_type(vec![2, 2]);
-        let output = operation.infer_output_types(&[operand.clone(), indices.clone(), updates.clone()], &[]).unwrap();
-        assert_eq!(output, vec![operand.clone()]);
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone(), updates.clone()], &[]),
+            Ok(vec![operand.clone()]),
+        );
 
         assert_eq!(
             format!("{operation}"),
@@ -1105,19 +1107,28 @@ mod tests {
 
         // updates dtype must match operand dtype.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(
-            operation
-                .infer_output_types(&[operand.clone(), indices.clone(), indices_type(vec![2, 2])], &[])
-                .is_err()
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone(), indices_type(vec![2, 2])], &[]),
+            Err(TypeError {
+                message: "'scatter' updates data type i32 does not match operand data type f32".to_string(),
+            }),
         );
 
         // updates rank must equal (indices rank - 1) + update window count.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])], &[]),
+            Err(TypeError {
+                message: "'scatter' update_window_dimensions entry 1 is out of range for bound 1".to_string(),
+            }),
+        );
 
         // A non-integer index operand is rejected.
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
-        assert!(operation.infer_output_types(&[operand, float_type(vec![2, 1]), updates], &[]).is_err());
+        assert_eq!(
+            operation.infer_output_types(&[operand, float_type(vec![2, 1]), updates], &[]),
+            Err(TypeError { message: "'scatter' indices must be integer-typed but have type f32[2, 1]".to_string() }),
+        );
     }
 
     #[test]

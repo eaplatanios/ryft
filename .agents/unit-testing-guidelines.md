@@ -40,6 +40,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 
 - Keep setup local and explicit. A single test may cover a normal path plus nearby edge cases when they share the same
   setup and read better together.
+- In a test that covers several related behavior groups, use concise comments to identify what each group verifies.
+  Explain the semantic contract or edge case rather than restating individual assertions.
 - Use `pub(crate) mod tests` only when the module intentionally exposes shared test helpers to sibling modules.
 - Put local test helpers near the top of the test module, before the first `#[test]`.
 - Define test-only types inside the single test that uses them; keep module-level test types for shared test fixtures.
@@ -95,6 +97,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use our operation testing macros wherever possible/applicable: `check_operation_type_inference!`,
   `check_operation_partial_evaluation!`, `check_operation_batching!`, `check_operation_differentiation!`,
   and `check_operation_transposition!`.
+- Use `check_operation_differentiation!` only when the operation's declared derivative must agree with a finite
+  difference estimate of its primal semantics. Keep explicit transform tests for gradient barriers, discrete outputs,
+  custom derivatives, and other intentionally overridden differentiation rules.
 - Use `check_operation_type_inference!` for exact regionless operation type-inference cases. Keep explicit assertions
   for field-level metadata projections and operations whose inference contract depends on attached region interfaces.
 - Use the `@elementwise @unary` and `@elementwise @binary` selectors of `check_operation_type_inference!` for

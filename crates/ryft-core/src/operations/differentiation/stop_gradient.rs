@@ -259,7 +259,8 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_differentiation() {
-        // The JVP passes the primal through and severs the tangent.
+        // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
+        // derivative of the identity primal function, so the finite-difference operation helper does not apply.
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal, tangent) = context.jvp(|x| Ok(x.stop_gradient()), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, 2.0);

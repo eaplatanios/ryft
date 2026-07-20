@@ -1255,7 +1255,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for IotaOpera
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let result = lowerer.block.append_operation(stable_hlo::iota(
             output_tensor_type,
-            self.iota_dimension(),
+            self.dimension(),
             lowerer.location,
         )?)?;
         let result = result.result(0).expect("stablehlo.iota should return one result").as_ref();
@@ -2289,10 +2289,7 @@ where
             // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
             // slipped through, which is reverse-mode-only.
             Self::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` cannot be lowered to StableHLO",
-                    Operation::<ArrayType>::name(operation),
-                ),
+                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name(),),
             }
             .into()),
             Self::Rematerialize(_) => lower_nested_program_inline(
@@ -4168,10 +4165,7 @@ where
             // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
             // slipped through, which is reverse-mode-only.
             ArrayOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "operation `{}` cannot be lowered to StableHLO",
-                    Operation::<ArrayType>::name(operation),
-                ),
+                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name(),),
             }
             .into()),
             ArrayOperation::Rematerialize(_) => lower_nested_program_inline(
@@ -7604,7 +7598,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         // lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp` slipped
         // through, which is reverse-mode-only.
         XlaOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` cannot be lowered to StableHLO", Operation::<ArrayType>::name(operation)),
+            message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
         }
         .into()),
         XlaOperation::Rematerialize(_) => lower_nested_program_inline(
@@ -7680,7 +7674,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let result = lowerer.block.append_operation(stable_hlo::iota(
                 output_tensor_type,
-                iota.iota_dimension(),
+                iota.dimension(),
                 lowerer.location,
             )?)?;
             let result = result.result(0).expect("stablehlo.iota should return one result").as_ref();

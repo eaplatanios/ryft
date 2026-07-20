@@ -249,7 +249,6 @@ where
 impl_non_differentiable_operation!(CoordinateBasisOperation<ArrayType>);
 impl_nullary_transposable_operation!(CoordinateBasisOperation<ArrayType>);
 
-/// Partial evaluation preserves the operation as an input-independent residual instruction.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CoordinateBasisOperation<ArrayType> where
     C::Operation: From<CoordinateBasisOperation<ArrayType>>
 {

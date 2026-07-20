@@ -2270,7 +2270,7 @@ mod tests {
         let interfaces = vec![region_interface(&body)];
 
         // Operation identity, declared region slots, output provenance, and accessors.
-        assert_eq!(Operation::<ArrayType>::name(&operation), SCAN_OPERATION_NAME);
+        assert_eq!(operation.name(), SCAN_OPERATION_NAME);
         assert_eq!(Operation::<ArrayType>::region_names(&operation), &["body"]);
         assert_eq!(
             Operation::<ArrayType>::output_region_provenance(&operation, 1),

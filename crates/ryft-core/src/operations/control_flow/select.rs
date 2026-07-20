@@ -2,20 +2,24 @@ use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext};
+use crate::differentiation::DifferentiableType;
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
-use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::differentiation::forward::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`SelectOperation`].
 pub const SELECT_OPERATION_NAME: &str = "select";
@@ -318,7 +322,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::macros::check_operation_transposition;
+    use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::operations::BooleanLike;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
@@ -354,36 +358,27 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), SELECT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), SELECT_OPERATION_NAME);
 
-        // Scalar (`DataType`) type inference validates the Boolean condition and promotes the two branch data types.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(
-                &operation,
-                &[DataType::Boolean, DataType::F64, DataType::F64],
-                &[]
-            ),
-            Ok(vec![DataType::F64]),
-        );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64, DataType::F64], &[]),
-            Err(TypeError { message: "'select' condition data type f64 is not bool".to_string() }),
-        );
-        // Mixed-but-promotable branch data types promote to their common type (`jnp.where`-style).
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(
-                &operation,
-                &[DataType::Boolean, DataType::F32, DataType::F64],
-                &[]
-            ),
-            Ok(vec![DataType::F64]),
-        );
-        // Non-promotable branch data types are rejected.
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(
-                &operation,
-                &[DataType::Boolean, DataType::F8E3M4, DataType::F32],
-                &[]
-            ),
-            Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
+        // Scalar (`DataType`) type inference validates the Boolean condition and promotes compatible branch types.
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [DataType::Boolean, DataType::F64, DataType::F64],
+                    output_types = [DataType::F64],
+                },
+                {
+                    input_types = [DataType::F64, DataType::F64, DataType::F64],
+                    error = "'select' condition data type f64 is not bool",
+                },
+                {
+                    input_types = [DataType::Boolean, DataType::F32, DataType::F64],
+                    output_types = [DataType::F64],
+                },
+                {
+                    input_types = [DataType::Boolean, DataType::F8E3M4, DataType::F32],
+                    error = "'select' input types are not broadcast-compatible",
+                },
+            ],
         );
 
         // Scalar interpretation treats the in-band condition as true exactly when it is nonzero.
@@ -417,36 +412,61 @@ mod tests {
         // Type inference validates the condition and branch types and returns the branch type.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
         let branch_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[condition_type.clone(), branch_type.clone(), branch_type.clone()],
-                &[],
-            ),
-            Ok(vec![branch_type.clone()]),
-        );
-
         // Type inference broadcasts the three operand shapes together (like the other elementwise operations),
         // keeping the branch data type: a size-1 branch broadcasts up to the condition/other-branch shape, and a
         // size-1 condition broadcasts up to the branch shape. The Boolean condition never promotes into the output
         // data type.
         let scalar_branch = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]));
         let scalar_condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(1)]));
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[condition_type.clone(), scalar_branch.clone(), branch_type.clone()],
-                &[],
-            ),
-            Ok(vec![branch_type.clone()]),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[scalar_condition, branch_type.clone(), branch_type.clone()],
-                &[],
-            ),
-            Ok(vec![branch_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [condition_type.clone(), branch_type.clone(), branch_type.clone()],
+                    output_types = [branch_type.clone()],
+                },
+                {
+                    input_types = [condition_type.clone(), scalar_branch.clone(), branch_type.clone()],
+                    output_types = [branch_type.clone()],
+                },
+                {
+                    input_types = [scalar_condition, branch_type.clone(), branch_type.clone()],
+                    output_types = [branch_type.clone()],
+                },
+                {
+                    type = ArrayType,
+                    input_types = [],
+                    error = "expected 3 inputs but got 0",
+                },
+                {
+                    input_types = [branch_type.clone(), branch_type.clone(), branch_type.clone()],
+                    error = "'select' condition data type f64 is not bool",
+                },
+                {
+                    input_types = [
+                        ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])),
+                        branch_type.clone(),
+                        branch_type.clone(),
+                    ],
+                    error = "'select' input types are not broadcast-compatible",
+                },
+                {
+                    input_types = [
+                        condition_type.clone(),
+                        branch_type.clone(),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
+                    ],
+                    error = "'select' input types are not broadcast-compatible",
+                },
+                {
+                    input_types = [
+                        condition_type.clone(),
+                        branch_type.clone(),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                    ],
+                    output_types = [branch_type.clone()],
+                },
+            ],
         );
 
         // Interpretation picks per-element between the two branches.
@@ -483,10 +503,7 @@ mod tests {
         assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
 
         // The scalar implementation selects on in-band Boolean scalar conditions.
-        assert_eq!(
-            Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0)),
-            Ok(Scalar::from(2.0)),
-        );
+        assert_eq!(Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0)), Ok(Scalar::from(2.0)),);
         assert_eq!(
             Scalar::select(&Scalar::from(false), &Scalar::from(2.0f32), &Scalar::from(3.0f32)),
             Ok(Scalar::from(3.0f32)),
@@ -508,56 +525,6 @@ mod tests {
         );
 
         // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 3 inputs but got 0".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[branch_type.clone(), branch_type.clone(), branch_type.clone()],
-                &[],
-            ),
-            Err(TypeError { message: "'select' condition data type f64 is not bool".to_string() }),
-        );
-        // Genuinely incompatible shapes (neither dimension is 1) are rejected by the elementwise broadcast.
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[
-                    ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])),
-                    branch_type.clone(),
-                    branch_type.clone(),
-                ],
-                &[]
-            ),
-            Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[
-                    condition_type.clone(),
-                    branch_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-                ],
-                &[]
-            ),
-            Err(TypeError { message: "'select' input types are not broadcast-compatible".to_string() }),
-        );
-        // Mixed-but-promotable branch data types promote to their common type at the broadcast shape.
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(
-                &operation,
-                &[
-                    condition_type.clone(),
-                    branch_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
-                ],
-                &[]
-            ),
-            Ok(vec![branch_type.clone()]),
-        );
         assert_eq!(
             InterpretableOperation::<crate::EagerContext<Array>>::interpret(
                 &operation,
