@@ -1,6 +1,7 @@
 /// Checks that `values` contains exactly `expected` entries and, if not, returns an error of the specified type.
 #[macro_export]
 macro_rules! check_count {
+    // This branch reports a program input-count mismatch with the dedicated input error variant.
     ("input", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
@@ -8,6 +9,8 @@ macro_rules! check_count {
             return Err($crate::ProgramError::InvalidInputCount { expected, actual: values.len() }.into());
         }
     }};
+
+    // This branch reports a program output-count mismatch with the dedicated output error variant.
     ("output", $values:expr, $expected:expr, ProgramError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
@@ -15,6 +18,8 @@ macro_rules! check_count {
             return Err($crate::ProgramError::InvalidOutputCount { expected, actual: values.len() }.into());
         }
     }};
+
+    // This branch reports a type-level count mismatch using the caller's singular descriptor.
     ($descriptor:expr, $values:expr, $expected:expr, TypeError $(,)?) => {{
         let values = &$values;
         let expected = $expected;
@@ -60,6 +65,7 @@ macro_rules! check_count {
 ///   - `$signatures`: Bracketed pair containing the expected and actual flat type signatures checked by `@same`.
 #[macro_export]
 macro_rules! check_types {
+    // This branch checks exact equality between two complete flat type signatures.
     (@same, $descriptor:expr, [$expected:expr, $actual:expr $(,)?] $(,)?) => {{
         let expected = &$expected[..];
         let actual = &$actual[..];
@@ -75,6 +81,7 @@ macro_rules! check_types {
         }
     }};
 
+    // This branch rejects array types that still carry unreduced mesh axes.
     (@no_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -85,6 +92,7 @@ macro_rules! check_types {
         }
     }};
 
+    // This branch requires a binary operation's operands to carry identical unreduced-axis sets.
     (@same_unreduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -99,6 +107,7 @@ macro_rules! check_types {
         }
     }};
 
+    // This branch requires a binary operation's operands to carry identical reduced-axis sets.
     (@same_reduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -113,6 +122,7 @@ macro_rules! check_types {
         }
     }};
 
+    // This branch applies one or more composable data-type predicates to every input type.
     ($(@$selector:ident)+, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -188,6 +198,7 @@ macro_rules! check_types {
 ///   - `$sharding`: Expression evaluating to a [`Sharding`](crate::Sharding) or a reference to one.
 #[macro_export]
 macro_rules! check_sharding {
+    // This branch compares the runtime mesh with the sharding's logical mesh and returns the canonical mismatch error.
     ($mesh:expr, $sharding:expr $(,)?) => {{
         let mesh = &$mesh;
         let sharding = &$sharding;
@@ -212,6 +223,7 @@ macro_rules! check_sharding {
 ///     handles.
 #[macro_export]
 macro_rules! check_builders {
+    // This branch checks every builder handle yielded by a caller-provided collection.
     ($reference:expr, [$others:expr] $(,)?) => {{
         let reference = $reference;
         let mut result = ::std::result::Result::Ok(());
@@ -223,6 +235,8 @@ macro_rules! check_builders {
         }
         result
     }};
+
+    // This branch checks one builder handle directly against the reference handle.
     ($reference:expr, $other:expr $(,)?) => {{
         let reference = $reference;
         let other = $other;
@@ -300,6 +314,7 @@ macro_rules! check_builders {
 ///     input types before array broadcasting.
 #[macro_export]
 macro_rules! define_elementwise_operation {
+    // This public branch defines a unary elementwise operation and its shared interpretation and inference machinery.
     (
         @unary
         $(#[$documentation:meta])*
@@ -403,6 +418,7 @@ macro_rules! define_elementwise_operation {
         }
     };
 
+    // This public branch defines the corresponding binary elementwise operation machinery.
     (
         @binary
         $(#[$documentation:meta])*
@@ -510,17 +526,17 @@ macro_rules! define_elementwise_operation {
         }
     };
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch invokes caller-provided data-type inference for either operation arity.
     (@infer_data_types [$infer_data_types:expr] @$arity:ident $input_types:expr $(, $name:ident)?) => {
         ($infer_data_types)($input_types)
     };
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch supplies the default type-preserving inference for unary operations.
     (@infer_data_types [] @unary $input_types:expr) => {
         Ok(vec![$input_types[0]])
     };
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch supplies the default broadcasting inference for binary data types.
     (@infer_data_types [] @binary $input_types:expr, $name:ident) => {
         $crate::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
             .map(|output| vec![output])
@@ -529,7 +545,7 @@ macro_rules! define_elementwise_operation {
             })
     };
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch invokes caller-provided array-type inference instead of structural lifting.
     (
         @infer_array_types [$infer_array_types:expr] [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr $(, $name:ident)?
@@ -537,7 +553,7 @@ macro_rules! define_elementwise_operation {
         ($infer_array_types)($input_types)
     };
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch prepares unary element data types for the default array-structure lifting path.
     (
         @infer_array_types [] [$($infer_data_types:expr)?] @unary
         $operation:expr, $input_types:expr
@@ -549,7 +565,7 @@ macro_rules! define_elementwise_operation {
         )
     }};
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch prepares both binary element data types for the default array-structure lifting path.
     (
         @infer_array_types [] [$($infer_data_types:expr)?] @binary
         $operation:expr, $input_types:expr, $name:ident
@@ -561,7 +577,7 @@ macro_rules! define_elementwise_operation {
         )
     }};
 
-    // Internal branch used for this macro's implementation.
+    // This internal branch combines inferred element types with the operation's broadcast output structure.
     (
         @infer_default_array_types [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr, $input_data_types:expr $(, $name:ident)?
@@ -618,6 +634,7 @@ macro_rules! define_elementwise_operation {
 ///   - `$operation`: Unit-struct operation bound through the value's dispatch domain (e.g., `SinOperation`).
 #[macro_export]
 macro_rules! define_elementwise_capability {
+    // This branch defines a receiver capability and binds its unary operation through each value's dispatch domain.
     (
         @unary
         $(#[$capability_documentation:meta])*
@@ -648,6 +665,7 @@ macro_rules! define_elementwise_capability {
         }
     };
 
+    // This branch defines a two-operand capability using the caller-provided name for the right operand.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -1943,20 +1961,47 @@ macro_rules! impl_differentiable_elementwise_operation {
 /// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs carry
 /// no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier. The primal operation is replayed
 /// on the input primals, and each output is paired with a structural zero tangent, which stays symbolic and stages
-/// nothing. Because such a rule stages no live tangent, the operation can never appear on a linear operand in a valid
-/// tangent program, and so it is typically paired with [`impl_non_transposable_operation!`].
+/// nothing. Because such a rule stages no live tangent, an input-bearing operation can never appear on a linear operand
+/// in a valid tangent program and is typically paired with [`impl_non_transposable_operation!`]. A regionless nullary
+/// operation should instead use [`impl_nullary_transposable_operation!`] so that transposition accepts its outputs and
+/// returns its empty operand-cotangent list. The optional leading generic list declares operation-specific type
+/// parameters, and an optional `where` clause can provide any bounds needed to make the operation type well-formed.
 ///
 /// # Parameters
 ///
+///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
 ///   - `$operation`: The operation type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_non_differentiable_operation {
+    // This branch accepts a generic operation with additional well-formedness bounds.
+    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_non_differentiable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts a generic operation whose `Operation` implementation supplies all required bounds.
+    (<$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_non_differentiable_operation!(@impl [$($generic),+] ($operation) {});
+    };
+
+    // This branch accepts a non-generic operation with additional well-formedness bounds.
+    ($operation:ty where $($bounds:tt)+) => {
+        $crate::impl_non_differentiable_operation!(@impl [] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts the common non-generic operation form.
     ($operation:ty $(,)?) => {
-        impl<C: $crate::Context> $crate::DifferentiableOperation<C> for $operation
+        $crate::impl_non_differentiable_operation!(@impl [] ($operation) {});
+    };
+
+    // This internal helper emits the implementation shared by every public invocation form.
+    (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<C: $crate::Context $(, $generic)*> $crate::DifferentiableOperation<C> for $operation
         where
             C::Type: $crate::DifferentiableType,
             C::Operation: ::std::convert::From<$operation>,
             $operation: $crate::Operation<C::Type>,
+            $($bounds)*
         {
             #[inline]
             fn jvp<D: $crate::DifferentiationDriver<C>>(
@@ -1995,6 +2040,7 @@ macro_rules! impl_non_differentiable_operation {
 ///   - `$operation`: The operation type for which the implementation is generated.
 #[macro_export]
 macro_rules! impl_non_transposable_operation {
+    // This branch generates the standard unsupported-transposition diagnostic for the selected operation.
     ($operation:ty $(,)?) => {
         impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T>> $crate::TransposableOperation<V, O>
             for $operation
@@ -2035,18 +2081,27 @@ macro_rules! impl_non_transposable_operation {
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_nullary_transposable_operation {
+    // This branch accepts a generic nullary operation with additional well-formedness bounds.
     (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
         $crate::impl_nullary_transposable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
     };
+
+    // This branch accepts a generic nullary operation whose `Operation` implementation supplies all required bounds.
     (<$($generic:ident),+> $operation:ty $(,)?) => {
         $crate::impl_nullary_transposable_operation!(@impl [$($generic),+] ($operation) {});
     };
+
+    // This branch accepts a non-generic nullary operation with additional well-formedness bounds.
     ($operation:ty where $($bounds:tt)+) => {
         $crate::impl_nullary_transposable_operation!(@impl [] ($operation) { $($bounds)+ });
     };
+
+    // This branch accepts the common non-generic nullary operation form.
     ($operation:ty $(,)?) => {
         $crate::impl_nullary_transposable_operation!(@impl [] ($operation) {});
     };
+
+    // This internal helper emits the transposition implementation shared by every public invocation form.
     (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
         impl<T: $crate::Type, V: $crate::Value<Type = T>, O: $crate::Operation<T> $(, $generic)*>
             $crate::TransposableOperation<V, O> for $operation
@@ -2091,18 +2146,27 @@ macro_rules! impl_nullary_transposable_operation {
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_nullary_batchable_operation {
+    // This branch accepts a generic replicated operation with additional well-formedness bounds.
     (@replicated <$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) { $($bounds)+ });
     };
+
+    // This branch accepts a generic replicated operation whose interpretation supplies all required bounds.
     (@replicated <$($generic:ident),+> $operation:ty $(,)?) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [$($generic),+] ($operation) {});
     };
+
+    // This branch accepts a non-generic replicated operation with additional well-formedness bounds.
     (@replicated $operation:ty where $($bounds:tt)+) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [] ($operation) { $($bounds)+ });
     };
+
+    // This branch accepts the common non-generic replicated operation form.
     (@replicated $operation:ty $(,)?) => {
         $crate::impl_nullary_batchable_operation!(@impl_replicated [] ($operation) {});
     };
+
+    // This internal helper emits the replicated batching implementation shared by every public invocation form.
     (@impl_replicated [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
         impl<C: $crate::Context<Type = $crate::ArrayType> $(, $generic)*> $crate::BatchableOperation<C> for $operation
         where
@@ -2158,6 +2222,7 @@ macro_rules! impl_nullary_batchable_operation {
 ///   - `$message`: Panic message used when an eager tracer's bind fails.
 #[macro_export]
 macro_rules! define_tracer_operator {
+    // This branch implements receiver-only operator syntax for every transform tracer family.
     (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
         impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
@@ -2213,6 +2278,8 @@ macro_rules! define_tracer_operator {
             }
         }
     };
+
+    // This branch implements two-operand operator syntax for every transform tracer family.
     (@binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
         impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
@@ -2697,6 +2764,7 @@ macro_rules! check_operation_type_inference {
 ///     for downstream operation families.
 #[macro_export]
 macro_rules! check_operation_partial_evaluation {
+    // This branch checks the standard fold-or-residualize contract using the scalar reference backend.
     (
         operation = $operation:expr,
         inputs = [$($input:expr),+ $(,)?],
@@ -2776,6 +2844,7 @@ macro_rules! check_operation_partial_evaluation {
         }
     }};
 
+    // This branch forwards explicit cases to the scalar reference backend form.
     (
         operation = $operation:expr,
         cases = $cases:tt $(,)?
@@ -2790,6 +2859,7 @@ macro_rules! check_operation_partial_evaluation {
         )
     };
 
+    // This branch executes explicit known/residual cases against a caller-selected backend family.
     (
         backend = ($value:ty, $operation_family:ty),
         operation = $operation:expr,
@@ -2853,24 +2923,24 @@ macro_rules! check_operation_partial_evaluation {
         )*
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch converts one known input declaration into its partial value and no replay input.
     (@partial_input $value:ty, (@known, $input:expr)) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::partial::PartialValue::Known(input), Option::<$value>::None)
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch converts one unknown input declaration and retains its concrete replay value.
     (@partial_input $value:ty, (@unknown(type = $r#type:expr, replay = $input:expr))) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::partial::PartialValue::Unknown($r#type), Some(input))
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch records that an expected output should fold to a known value.
     (@partial_output (@known, $output:expr)) => {
         (true, ::core::convert::Into::into($output))
     };
 
-    // Internal implementation branch of this macro.
+    // This internal branch records that an expected output should remain in the residual program.
     (@partial_output (@residual, $output:expr)) => {
         (false, ::core::convert::Into::into($output))
     };
@@ -2924,6 +2994,7 @@ macro_rules! check_operation_partial_evaluation {
 ///   - `cases = $cases`: Batching cases declaring their inputs and expected outputs.
 #[macro_export]
 macro_rules! check_operation_batching {
+    // This branch runs exact comparisons with the default eager array context and replicated axis sharding.
     (
         @exact,
         operation = $operation:expr,
@@ -2944,6 +3015,7 @@ macro_rules! check_operation_batching {
         )
     };
 
+    // This branch runs approximate comparisons with the default eager array context and replicated axis sharding.
     (
         @approx(epsilon = $epsilon:expr),
         operation = $operation:expr,
@@ -2964,6 +3036,7 @@ macro_rules! check_operation_batching {
         )
     };
 
+    // This branch accepts an explicit context, driver, and axis sharding for exact comparisons.
     (
         @exact,
         context = $context:expr,
@@ -2984,6 +3057,7 @@ macro_rules! check_operation_batching {
         )
     };
 
+    // This branch accepts an explicit context, driver, and axis sharding for approximate comparisons.
     (
         @approx(epsilon = $epsilon:expr),
         context = $context:expr,
@@ -3004,7 +3078,7 @@ macro_rules! check_operation_batching {
         )
     };
 
-    // Internal implementation branch of this macro.
+    // This internal branch constructs the batching context, executes every case, and dispatches output comparison.
     (
         @run $comparison:tt,
         context = $context:expr,
@@ -3041,24 +3115,24 @@ macro_rules! check_operation_batching {
         )*
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch converts a mapped value declaration into an `ArrayBatch` at the requested physical axis.
     (@batch_value (@mapped(axis = $axis:expr), $value:expr)) => {{
         let value = $value;
         let r#type = $crate::programs::types::Typed::r#type(&value).into_owned();
         $crate::batching::ArrayBatch::new(r#type, value, $crate::batching::BatchAxis::new($axis)).unwrap()
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch converts a replicated value declaration into a replicated `ArrayBatch`.
     (@batch_value (@replicated, $value:expr)) => {
         $crate::batching::ArrayBatch::replicated($value)
     };
 
-    // Internal implementation branch of this macro.
+    // This internal branch compares complete batched values exactly.
     (@compare_batches (@exact), $actual:expr, $expected:expr) => {{
         assert_eq!($actual, $expected);
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch compares batch metadata exactly and numerical payloads within the requested tolerance.
     (@compare_batches (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {{
         let actual = $actual;
         let expected = $expected;
@@ -3137,6 +3211,7 @@ macro_rules! check_operation_batching {
 ///     for a downstream operation family.
 #[macro_export]
 macro_rules! check_operation_differentiation {
+    // This branch selects the eager array reference backend for a finite-difference differentiation check.
     (
         @approx(step = $step:expr, epsilon = $epsilon:expr),
         operation = $operation:expr,
@@ -3153,6 +3228,7 @@ macro_rules! check_operation_differentiation {
         )
     };
 
+    // This branch builds, differentiates, interprets, and numerically checks every case for the selected backend.
     (
         @approx(step = $step:expr, epsilon = $epsilon:expr),
         backend = ($value:ty, $operation_family:ty),
@@ -3293,6 +3369,7 @@ macro_rules! check_operation_differentiation {
 ///     transposition program for a downstream operation family.
 #[macro_export]
 macro_rules! check_operation_transposition {
+    // This branch runs exact supported-transposition cases against the eager array reference backend.
     (
         @exact,
         operation = $operation:expr,
@@ -3309,6 +3386,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+    // This branch runs approximate supported-transposition cases against the eager array reference backend.
     (
         @approx(epsilon = $epsilon:expr),
         operation = $operation:expr,
@@ -3325,6 +3403,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+    // This branch accepts a caller-selected backend for exact supported-transposition cases.
     (
         @exact,
         backend = ($value:ty, $operation_family:ty),
@@ -3338,6 +3417,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+    // This branch accepts a caller-selected backend for approximate supported-transposition cases.
     (
         @approx(epsilon = $epsilon:expr),
         backend = ($value:ty, $operation_family:ty),
@@ -3351,6 +3431,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+    // This internal branch builds and executes each pullback, then dispatches the selected cotangent comparison.
     (
         @run $comparison:tt,
         backend = ($value:ty, $operation_family:ty),
@@ -3412,6 +3493,7 @@ macro_rules! check_operation_transposition {
         )+
     }};
 
+    // This branch checks the standard unsupported-transposition diagnostic using the eager array reference backend.
     (
         @rejected,
         operation = $operation:expr,
@@ -3428,6 +3510,7 @@ macro_rules! check_operation_transposition {
         )
     };
 
+    // This branch checks unsupported transposition for a caller-selected backend family.
     (
         @rejected,
         backend = ($value:ty, $operation_family:ty),
@@ -3461,23 +3544,23 @@ macro_rules! check_operation_transposition {
         ));
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch represents one linear input by type without supplying a known primal value.
     (@input $value:ty, (@linear(type = $r#type:expr))) => {
         ($r#type, true, Option::<$value>::None)
     };
 
-    // Internal implementation branch of this macro.
+    // This internal branch retains one known primal input for pullback interpretation.
     (@input $value:ty, (@known, $input:expr)) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::programs::types::Typed::r#type(&input).into_owned(), false, Some(input))
     }};
 
-    // Internal implementation branch of this macro.
+    // This internal branch compares one interpreted cotangent exactly.
     (@assert (@exact), $actual:expr, $expected:expr) => {
         assert_eq!($actual, $expected)
     };
 
-    // Internal implementation branch of this macro.
+    // This internal branch compares one interpreted cotangent within the requested tolerance.
     (@assert (@approx($epsilon:expr)), $actual:expr, $expected:expr) => {
         ::approx::assert_abs_diff_eq!($actual, $expected, epsilon = $epsilon)
     };
@@ -3516,6 +3599,7 @@ macro_rules! check_operation_transposition {
 ///     truncation error of the central difference.
 #[macro_export]
 macro_rules! check_gradient {
+    // This branch configures the shared finite-difference check for scalar-valued execution.
     (@scalar, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
@@ -3527,6 +3611,7 @@ macro_rules! check_gradient {
         )
     };
 
+    // This branch configures the shared finite-difference check for array-valued execution.
     (@array, $function:expr, at = $input:expr, step = $step:expr, tolerance = $tolerance:expr $(,)?) => {
         $crate::check_gradient!(
             @check(
@@ -4034,6 +4119,7 @@ mod tests {
         }
     }
 
+    impl_non_differentiable_operation!(TestWhereNullaryOperation where DataType: Type);
     impl_nullary_transposable_operation!(TestWhereNullaryOperation where DataType: Type);
     impl_nullary_batchable_operation!(@replicated TestWhereNullaryOperation where DataType: Type);
 
@@ -4085,6 +4171,7 @@ mod tests {
         }
     }
 
+    impl_non_differentiable_operation!(<Marker> TestGenericNullaryOperation<Marker>);
     impl_nullary_transposable_operation!(<Marker> TestGenericNullaryOperation<Marker>);
     impl_nullary_batchable_operation!(@replicated <Marker> TestGenericNullaryOperation<Marker>);
 
@@ -4136,6 +4223,7 @@ mod tests {
         }
     }
 
+    impl_non_differentiable_operation!(<Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
     impl_nullary_transposable_operation!(<Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
     impl_nullary_batchable_operation!(@replicated <Marker> TestBoundedNullaryOperation<Marker> where Marker: Clone);
 
@@ -5211,6 +5299,7 @@ mod tests {
 
     #[test]
     fn test_impl_non_differentiable_operation() {
+        // The basic form replays the primal operation and replaces its live tangent with a structural zero.
         let inputs = [DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(1.0f32)).unwrap()];
         let outputs = TestUnaryOperation
             .jvp(&EagerContext::<Scalar, TestUnaryOperation>::new(), &EmptyRegionDriver, &inputs)
@@ -5225,6 +5314,25 @@ mod tests {
         let outputs = TestUnaryOperation.jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(DataType::F32)));
+
+        // The generic form produces the same implementation shape without constraining its marker parameter.
+        let operation = TestGenericNullaryOperation::<()>(PhantomData);
+        let outputs = operation
+            .jvp(&EagerContext::<Array, TestGenericNullaryOperation<()>>::new(), &EmptyRegionDriver, &[])
+            .unwrap();
+        assert!(outputs.is_empty());
+
+        // The `where` forms remain usable for both non-generic and generic operation types.
+        fn assert_differentiable<O>()
+        where
+            O: Operation<ArrayType>
+                + InterpretableOperation<EagerContext<Array, O>>
+                + DifferentiableOperation<EagerContext<Array, O>>,
+        {
+        }
+
+        assert_differentiable::<TestWhereNullaryOperation>();
+        assert_differentiable::<TestBoundedNullaryOperation<()>>();
     }
 
     #[test]

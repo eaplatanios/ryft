@@ -4,9 +4,11 @@ use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDriver, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_nullary_batchable_operation, impl_nullary_transposable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation,
+};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
@@ -21,11 +23,11 @@ use crate::types::ArrayType;
 pub const FILL_OPERATION_NAME: &str = "fill";
 
 /// [`Operation`] that has no inputs and that produces a single output equal to the [`Type`] it holds (i.e., its
-/// `r#type` field) filled with a captured scalar `V` value. [`FillOperation`] is the scalar-broadcast counterpart of
-/// [`ConstantOperation`](super::ConstantOperation). Rather than carrying a fully typed value, it carries a target
+/// `r#type` field) filled with a captured scalar `V` value. [`FillOperation`] is the scalar-broadcast counterpart
+/// of [`ConstantOperation`](crate::ConstantOperation). Rather than carrying a fully typed value, it carries a target
 /// [`Type`] plus a scalar `V` and synthesizes its output value through the [`Fill`] trait when interpreted. For arrays,
 /// this corresponds to an array of the held type and shape with every element set to the captured scalar. It mirrors
-/// [`ZeroOperation`](crate::ZeroOperation) and [`OneOperation`](super::OneOperation), generalizing the fixed `zero` or
+/// [`ZeroOperation`](crate::ZeroOperation) and [`OneOperation`](crate::OneOperation), generalizing the fixed `zero` or
 /// `one` value to an arbitrary captured scalar value.
 #[derive(Copy, Clone, Debug)]
 pub struct FillOperation<T: Type, V> {
@@ -57,6 +59,7 @@ impl<T: Type, V> FillOperation<T, V> {
 }
 
 impl<T: Type, V: Clone + Display> Display for FillOperation<T, V> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -107,30 +110,7 @@ impl<T: Type, Constant: Clone + Display, C: Context<Type = T, Operation: From<Fi
 {
 }
 
-/// Forward-mode rule for [`FillOperation`]: the nullary constant is replayed to synthesize the filled primal
-/// value and paired with a typed zero tangent, since constants carry no tangent.
-impl<C: Context, F: Clone + Display> DifferentiableOperation<C> for FillOperation<C::Type, F>
-where
-    C::Type: DifferentiableType,
-    C::Operation: From<FillOperation<C::Type, F>>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
-        // with a structural zero tangent, which stays symbolic and stages nothing.
-        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-        Ok(context
-            .bind(self.clone(), Vec::new(), &primal_inputs)?
-            .into_iter()
-            .map(DifferentiationDual::new_with_zero_tangent)
-            .collect())
-    }
-}
-
+impl_non_differentiable_operation!(<F> FillOperation<C::Type, F>);
 impl_nullary_transposable_operation!(<F> FillOperation<T, F>);
 impl_nullary_batchable_operation!(@replicated <F> FillOperation<ArrayType, F>);
 
@@ -139,7 +119,7 @@ impl_nullary_batchable_operation!(@replicated <F> FillOperation<ArrayType, F>);
 /// implementation. It sits alongside [`Zero`](crate::Zero) and [`One`](crate::One) in the same type-driven family, but
 /// generalizes the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
 pub trait Fill<S, V: Typed> {
-    /// Returns a value of `type` with every element set to `value`.
+    /// Returns a value of [`Type`] `type` with every element it holds set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
 }
 
@@ -195,6 +175,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
+    use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
@@ -207,9 +188,8 @@ mod tests {
     fn test_fill() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         let context = EagerContext::<Array, FillOperation<ArrayType, Scalar>>::new();
-        assert_eq!(context.fill(&r#type, Scalar::from(3.5)), Ok(Array::from_f64s(r#type.clone(), vec![3.5, 3.5])));
 
-        // Filling a dynamically sized type cannot materialize element data and surfaces an error.
+        // Dynamically sized outputs cannot be materialized by the eager array backend.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
             context.fill(&dynamic_type, Scalar::from(3.5)),
@@ -218,36 +198,33 @@ mod tests {
             })),
         );
 
+        // Verify the operation's stored type and value, identity, rendering, and inferred result type.
         let operation = FillOperation::new(r#type.clone(), Scalar::from(3.5));
-
         assert_eq!(Operation::<ArrayType>::name(&operation), FILL_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
         assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
+
+        // Eager interpretation fills every element with the stored scalar value.
+        let expected = Array::from_f64s(r#type.clone(), vec![3.5, 3.5]);
         assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
+            InterpretableOperation::<EagerContext<Array, FillOperation<ArrayType, Scalar>>>::interpret(
                 &operation,
-                &EagerContext::new(),
+                &context,
                 &EmptyRegionDriver,
-                &[]
+                &[],
             ),
-            Ok(vec![Array::from_f64s(r#type.clone(), vec![3.5, 3.5])]),
-        );
-        assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()], &[]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::from_f64s(r#type.clone(), vec![0.0, 0.0])],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
+            Ok(vec![expected.clone()]),
         );
 
+        // Differentiation replays that primal value but assigns it a structural-zero tangent.
+        let outputs = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &expected);
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(tangent_type) if tangent_type == &r#type));
+
+        // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, FillOperation<ArrayType, Scalar>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
         let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();

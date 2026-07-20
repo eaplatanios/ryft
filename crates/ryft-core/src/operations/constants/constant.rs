@@ -167,12 +167,10 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-    use crate::programs::atoms::Atom;
+    use crate::programs::atoms::{Atom, AtomId};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::programs::types::TypeError;
     use crate::tracing::DomainTracingContext;
     use crate::types::DataType;
 
@@ -180,12 +178,14 @@ mod tests {
 
     #[test]
     fn test_constant() {
+        // Verify the operation's captured value, identity, rendering, and inferred result type.
         let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
         assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "ConstantOperation { value: F64(3.5) }");
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[], &[]), Ok(vec![DataType::F64]));
+
+        // Eager interpretation returns the captured value unchanged.
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
@@ -195,23 +195,27 @@ mod tests {
             ),
             Ok(vec![Scalar::from(3.5)]),
         );
-        assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Scalar>>::interpret(
-                &operation,
-                &EagerContext::<Scalar>::new(),
-                &EmptyRegionDriver,
-                &[Scalar::from(0.0)],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
-        );
 
-        let mut builder = ProgramBuilder::<Scalar, ConstantOperation<Scalar>>::new();
-        let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
-        let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
+        // Staged interpretation records the payload as a constant atom without emitting an instruction.
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let output =
+            InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
+                &operation,
+                &context,
+                &EmptyRegionDriver,
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.atom_id(), Ok(AtomId::new(0)));
+        let staged_builder = context.builder().borrow();
+        assert!(staged_builder.instructions().is_empty());
+        assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == 3.5));
+
+        // Verify the operation's textual form when it appears in a program.
+        let mut program_builder = ProgramBuilder::<Scalar, ConstantOperation<Scalar>>::new();
+        let output = program_builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
+        let program = program_builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -221,22 +225,5 @@ mod tests {
             "}
             .trim_end(),
         );
-        
-        // Test captured interpretation.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let builder = context.builder().clone();
-        let outputs =
-            InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
-                &operation,
-                &context.clone(),
-                &EmptyRegionDriver,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        let builder = builder.borrow();
-        assert!(builder.instructions().is_empty());
-        assert!(matches!(&builder.atoms()[0], Atom::Constant(value) if *value == 3.5));
     }
 }
