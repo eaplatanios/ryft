@@ -5,10 +5,12 @@ use dyn_eq::DynEq;
 use dyn_hash::DynHash;
 use thiserror::Error;
 
+use crate::axes::AxisError;
 use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
+use crate::programs::types::TypeError;
 use crate::sharding::ShardingError;
-use crate::types::{DataTypeError, LayoutError, TypeError};
+use crate::types::{DataTypeError, LayoutError};
 
 /// Represents errors that can occur in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -30,6 +32,9 @@ pub enum Error {
 
     #[error(transparent)]
     Sharding(#[from] ShardingError),
+
+    #[error(transparent)]
+    Axis(#[from] AxisError),
 
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),

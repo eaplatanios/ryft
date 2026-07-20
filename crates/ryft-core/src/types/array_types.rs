@@ -6,13 +6,14 @@ use std::ops::Index;
 use ryft_macros::Parameter;
 
 use crate::broadcasting::Broadcastable;
-use crate::errors::Error;
+use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
+use crate::programs::Value;
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::types::data_types::DataType;
 use crate::types::layouts::Layout;
 use crate::types::memories::Memory;
-use crate::types::{Type, TypeError, Typed};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -162,10 +163,14 @@ impl Shape {
         }
     }
 
-    /// Returns the number of elements in arrays with this [`Shape`] or `Ok(None)` if any of its dimensions is
-    /// dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays with this [`Shape`]. A statically zero dimension makes the result
+    /// exactly zero even when another dimension is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
+    /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+    pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
+        if self.dimensions.contains(&Size::Static(0)) {
+            return Ok(Some(0));
+        }
         let mut count = 1usize;
         for size in &self.dimensions {
             match size {
@@ -574,10 +579,11 @@ impl ArrayType {
         self.shape.dimension(index)
     }
 
-    /// Returns the number of elements in arrays of this [`ArrayType`] or `Ok(None)` if any dimension in [`Self::shape`]
-    /// is dynamic. Returns an [`Error`] wrapping a [`TypeError`] if the static element count does not fit in [`usize`].
+    /// Returns the number of elements in arrays of this [`ArrayType`]. A statically zero dimension makes the result
+    /// exactly zero even when another dimension is dynamic. Otherwise, a dynamic dimension produces `Ok(None)`.
+    /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
-    pub fn element_count(&self) -> Result<Option<usize>, Error> {
+    pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
         self.shape.element_count()
     }
 
@@ -617,14 +623,12 @@ impl ArrayType {
         let Some(sharding) = &self.sharding else {
             return self.clone();
         };
-        let stripped = Sharding::with_manual_axes(
-            sharding.mesh().clone(),
-            sharding.dimensions().to_vec(),
-            Vec::<String>::new(),
-            Vec::<String>::new(),
-            sharding.varying_manual_axes().clone(),
-        )
-        .expect("clearing reduction-state axes preserves a valid sharding");
+        let stripped = sharding
+            .clone()
+            .with_unreduced_axes(Vec::<String>::new())
+            .expect("clearing unreduced axes preserves a valid sharding")
+            .with_reduced_axes(Vec::<String>::new())
+            .expect("clearing reduced axes preserves a valid sharding");
         self.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
     }
 
@@ -648,7 +652,7 @@ impl ArrayType {
         dimensions.insert(index, size);
 
         // The inserted array dimension is replicated. Reuse the sharding-level insertion so that this method stays a
-        // thin wrapper. For more information, refer to the documentation of [`Sharding::with_inserted_dimension`].
+        // thin wrapper. For more information, refer to the documentation of `Sharding::with_inserted_dimension`.
         let sharding = self
             .sharding
             .as_ref()
@@ -683,7 +687,7 @@ impl ArrayType {
 
         // Delegate the per-dimension sharding bookkeeping (i.e., manual axes become varying and non-manual sharded
         // dimensions cannot be dropped) to the sharding itself. For more information, refer to the documentation of
-        // [`Sharding::without_dimension`].
+        // `Sharding::without_dimension`.
         let sharding = self
             .sharding
             .as_ref()
@@ -769,6 +773,15 @@ impl Type for ArrayType {
     }
 }
 
+// `ArrayType` describes itself. This fixed point (rather than a dummy unit-like type) is deliberate and load-bearing
+// for metadata-only programs. The whole value of tracing with `ArrayType` as the carrier is that it inhabits the same
+// type universe as real arrays, so every piece of machinery it reuses (e.g., `Operation<ArrayType>` type inference,
+// lowering bounds such as `MlirLowerableValue: Value<Type = ArrayType>` in `ryft-xla`, and tracing and staging code
+// pinned on `V: Value<Type = ArrayType>`) accepts it anywhere a concrete array value would slot in. A dummy `Type`
+// would place the carrier in a fresh operation universe with no operations or inference rules and an opaque unit type
+// would additionally discard the shape, element-type, and sharding payload that `r#type()` feeds to type inference
+// during a metadata trace. This is the standard abstract-interpretation move (e.g., JAX's `eval_shape` traces with
+// `ShapeDtypeStruct` standing in for arrays, and an abstract value's abstract value is itself).
 impl Typed for ArrayType {
     type Type = ArrayType;
 
@@ -778,13 +791,32 @@ impl Typed for ArrayType {
     }
 }
 
+// Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
+// because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
+// self-describing: its type is itself. This is not a type-theoretic universe claim (i.e., `ArrayType : ArrayType`).
+// It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program storage, lowering, and
+// transformation. Refer to the comment above the `Typed` implementation for `ArrayType` for more information.
+impl Value for ArrayType {
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
+
+    #[inline]
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use pretty_assertions::assert_eq;
 
-    use crate::Error;
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
@@ -877,13 +909,22 @@ mod tests {
         assert_eq!(Shape::scalar().element_count(), Ok(Some(1)));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]).element_count(), Ok(Some(336)),);
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Static(0)]).element_count(), Ok(Some(0)));
+        assert_eq!(Shape::new(vec![Size::Static(0), Size::Static(usize::MAX)]).element_count(), Ok(Some(0)));
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(0), Size::Static(usize::MAX)]).element_count(),
+            Ok(Some(0)),
+        );
+        assert_eq!(
+            Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]).element_count(),
+            Ok(Some(0)),
+        );
+        assert_eq!(Shape::new(vec![Size::Static(usize::MAX), Size::Static(0)]).element_count(), Ok(Some(0)));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(None)]).element_count(), Ok(None));
         assert_eq!(Shape::new(vec![Size::Static(42), Size::Dynamic(Some(8))]).element_count(), Ok(None));
+        assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(Some(0)));
         assert_eq!(
             Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
-            Err(Error::from(TypeError {
-                message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
-            })),
+            Err(TypeError { message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX) }),
         );
     }
 
@@ -1066,8 +1107,14 @@ mod tests {
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let sharding =
-            Sharding::with_manual_axes(mesh, vec![ShardingDimension::sharded(["a"])], ["x"], ["y"], ["m"]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap()
+            .with_reduced_axes(["y"])
+            .unwrap()
+            .with_varying_manual_axes(["m"])
+            .unwrap();
         let sharded = ArrayType::new(F32, Shape::new(vec![Size::Static(8)])).with_sharding(sharding.clone()).unwrap();
 
         // `sharding` exposes the attached sharding, and the accessors surface its reduction-axis sets.
@@ -1142,14 +1189,10 @@ mod tests {
         assert_eq!(t5.shape, Shape::new(vec![2.into(), 3.into()]));
 
         let m0 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let s0 = Sharding::with_manual_axes(
-            m0.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            ["x"],
-        )
-        .unwrap();
+        let s0 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
         let t6 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s0).unwrap();
         let t7 = t6.with_inserted_dimension(0, 2.into()).unwrap();
         let s1 = t7.sharding().unwrap();
@@ -1223,13 +1266,12 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])));
         let t8 = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(
-                Sharding::with_manual_axes(
+                Sharding::new(
                     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
                     vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    ["x"],
                 )
+                .unwrap()
+                .with_varying_manual_axes(["x"])
                 .unwrap(),
             )
             .unwrap();
@@ -1242,7 +1284,7 @@ mod tests {
         assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
-        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying_manual={'x'}}]");
+        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}], varying_manual={'x'}}]");
     }
 
     #[test]
