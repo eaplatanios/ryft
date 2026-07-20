@@ -371,7 +371,7 @@ pub(crate) trait WhilePartialEvaluation<C: Context>: Type {
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>;
 }
 
-/// Partial-evaluation rule for a [`Captured`]-payload [`WhileOperation`] over [`ArrayType`].
+/// Partial-evaluation rule for a [`WhileOperation`] over [`ArrayType`].
 ///
 /// A while's inputs are the initial loop state and its outputs are the final loop state (the same arity). Partial
 /// evaluation folds the known value of every *loop-invariant-known* state element into both nested programs: a state
@@ -2758,7 +2758,7 @@ mod tests {
         }
     }
 
-    impl<Payload> crate::operations::constants::Constant<Array, Array, Payload> for StagedDispatchTestDomain {
+    impl crate::operations::constants::Constant<Array, Array> for StagedDispatchTestDomain {
         fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }
@@ -2842,7 +2842,7 @@ mod tests {
         }
     }
 
-    impl<Payload> crate::operations::constants::Constant<Array, Array, Payload> for CountingPrintContext {
+    impl crate::operations::constants::Constant<Array, Array> for CountingPrintContext {
         fn constant(&self, value: Array) -> Result<Array, ProgramError> {
             Ok(value)
         }

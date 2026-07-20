@@ -724,7 +724,7 @@ where
     accumulator.update_slice(&expanded, start_indices.as_slice())
 }
 
-/// Partial-evaluation override for a [`Captured`](crate::operations::payloads::Captured)-payload [`ScanOperation`] over [`ArrayType`].
+/// Partial-evaluation override for a [`ScanOperation`] over [`ArrayType`].
 ///
 /// A scan's inputs are `[carry_init..., stacked_xs...]` and its body maps `[carry..., x_slice...]` to
 /// `[next_carry..., y_slice...]`. Partial evaluation folds the known value of every *loop-invariant-known* carry into

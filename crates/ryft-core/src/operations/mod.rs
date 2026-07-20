@@ -54,9 +54,6 @@ pub mod math;
 /// Memory-placement operations (moving values between memory spaces) and capability traits.
 pub mod memory;
 
-/// Shared marker types for operations with payload-dependent interpretation.
-pub mod payloads;
-
 /// Deterministic counter-based random bit generation and the distributions composed from it.
 pub mod random;
 

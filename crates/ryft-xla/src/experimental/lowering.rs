@@ -1283,7 +1283,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Coordinat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike, Payload: Clone> LowerableXlaOperation<V> for ConstantOperation<V, Payload> {
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConstantOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],

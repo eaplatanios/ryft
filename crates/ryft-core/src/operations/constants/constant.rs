@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
-use std::marker::PhantomData;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
@@ -8,11 +7,10 @@ use crate::differentiation::forward::{DifferentiationContext, DifferentiationDua
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
-    check_builders, check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
+    check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
     impl_nullary_transposable_operation,
 };
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::payloads::{Captured, Input};
 use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -28,30 +26,17 @@ pub const CONSTANT_OPERATION_NAME: &str = "constant";
 /// is a true literal constant. It carries a `V` value that is [`Typed`], and so its output type is exactly the value's
 /// type, and interpreting it simply clones the captured value. Unlike [`FillOperation`](crate::FillOperation), it does
 /// not synthesize a value from a scalar. It instead returns the value the caller already provided when constructing it.
-///
-/// The `Payload` type parameter is a zero-sized semantic tag that tells interpretation how the stored value should be
-/// treated. The default [`Captured`] payload means the value is a literal carried by the operation, such as an eager
-/// array stored in a program. The [`Input`] payload is used when the value is already part of the active runtime or
-/// staging context, such as a [`Tracer`] captured while rewriting a program. In that case, interpretation forwards the
-/// existing value after validating that it belongs to the same builder. Keeping this distinction in the operation type
-/// lets both forms share the same operation struct without adding runtime fields or ambiguous interpretation
-/// implementations.
 #[derive(Copy, Clone)]
-pub struct ConstantOperation<V: Clone + Typed, Payload = Captured> {
+pub struct ConstantOperation<V: Clone + Typed> {
     /// Captured value produced by this [`Operation`] when interpreted.
     value: V,
-
-    /// [`PhantomData`] marker tying the captured value to its payload role. The `fn() -> ...` form indexes by type
-    /// without owning one, and so this operation's `Send` and `Sync` depend only on the captured value (as well as
-    /// any trait implementations derived using `#[derive]`).
-    marker: PhantomData<fn() -> Payload>,
 }
 
-impl<V: Clone + Typed, Payload> ConstantOperation<V, Payload> {
+impl<V: Clone + Typed> ConstantOperation<V> {
     /// Creates a new [`ConstantOperation`] capturing the provided typed value.
     #[inline]
     pub fn new(value: V) -> Self {
-        Self { value, marker: PhantomData }
+        Self { value }
     }
 
     /// Returns the type of the value produced by this operation.
@@ -67,20 +52,21 @@ impl<V: Clone + Typed, Payload> ConstantOperation<V, Payload> {
     }
 }
 
-impl<V: Clone + Debug + Typed, Payload> Debug for ConstantOperation<V, Payload> {
+impl<V: Clone + Debug + Typed> Debug for ConstantOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
     }
 }
 
-impl<V: Clone + Display + Typed, Payload: Clone> Display for ConstantOperation<V, Payload> {
+impl<V: Clone + Display + Typed> Display for ConstantOperation<V> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<V: Clone + Display + Typed, Payload: Clone> Operation<V::Type> for ConstantOperation<V, Payload> {
+impl<V: Clone + Display + Typed> Operation<V::Type> for ConstantOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         CONSTANT_OPERATION_NAME
@@ -103,11 +89,8 @@ impl<V: Clone + Display + Typed, Payload: Clone> Operation<V::Type> for Constant
     }
 }
 
-impl<
-    Stored: Clone + Display + Typed,
-    Payload: Clone,
-    C: Domain<Type = Stored::Type> + Constant<C::Value, Stored, Payload>,
-> InterpretableOperation<C> for ConstantOperation<Stored, Payload>
+impl<Stored: Clone + Display + Typed, C: Domain<Type = Stored::Type> + Constant<C::Value, Stored>>
+    InterpretableOperation<C> for ConstantOperation<Stored>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -121,60 +104,46 @@ impl<
     }
 }
 
-impl<V: Clone + Typed, Payload: Clone, C: Context<Type = V::Type, Operation: From<ConstantOperation<V, Payload>>>>
-    PartiallyEvaluatableOperation<C> for ConstantOperation<V, Payload>
+impl<V: Clone + Typed, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>>
+    PartiallyEvaluatableOperation<C> for ConstantOperation<V>
 {
 }
 
 impl_non_differentiable_operation!(ConstantOperation<C::Constant>);
-impl_nullary_transposable_operation!(<F, Mode> ConstantOperation<F, Mode> where F: Clone + Typed);
+impl_nullary_transposable_operation!(<F> ConstantOperation<F> where F: Clone + Typed);
 impl_nullary_batchable_operation!(@replicated <Stored> ConstantOperation<Stored> where Stored: Clone + Typed);
 
-/// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented
-/// by [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero),
-/// [`One`](crate::One), and [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing
-/// a runtime value from a captured payload can be context-dependent. For example, [`EagerContext`]s can return the
-/// value directly, ordinary [`StagingContext`]s record a builder constant, and nested [`StagingContext`]s may receive
-/// an already-staged [`Tracer`] that should be forwarded after builder validation.
-///
-/// The `Payload` parameter mirrors [`ConstantOperation`]'s payload tag and selects the context-specific materialization
-/// path. [`Captured`] payloads are values carried by the operation and may need to be inserted into the context, while
-/// [`Input`] payloads are already context values and should be reused rather than re-materialized. This type-level tag
-/// keeps those semantics explicit even when the payload value type itself is otherwise the same.
-pub trait Constant<V, C, Payload = Captured> {
+/// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented by
+/// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
+/// [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing a runtime value from a captured payload
+/// can be context-dependent. For example, [`EagerContext`]s can return the value directly while [`StagingContext`]s
+/// record a builder constant.
+pub trait Constant<V, C> {
     /// Returns the runtime value represented by `value`.
     fn constant(&self, value: C) -> Result<V, ProgramError>;
 }
 
-impl<V: Value, O: Operation<V::Type>, Payload> Constant<V, V, Payload> for EagerContext<V, O> {
+impl<V: Value, O: Operation<V::Type>> Constant<V, V> for EagerContext<V, O> {
     #[inline]
     fn constant(&self, value: V) -> Result<V, ProgramError> {
         Ok(value)
     }
 }
 
-impl<C: StagingContext> Constant<Tracer<C>, C::Constant, Captured> for C {
+impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<Tracer<C>, ProgramError> {
         Ok(StagingContext::constant(self, value))
     }
 }
 
-impl<C: StagingContext> Constant<Tracer<C>, Tracer<C>, Input> for C {
-    #[inline]
-    fn constant(&self, value: Tracer<C>) -> Result<Tracer<C>, ProgramError> {
-        check_builders!(self.builder(), value.context().builder()).map_err(|error| self.error(error))?;
-        Ok(value)
-    }
-}
-
-impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored, Payload>, Stored, Payload>
-    Constant<BatchingTracer<C>, Stored, Payload> for BatchingContext<C>
+impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored> Constant<BatchingTracer<C>, Stored>
+    for BatchingContext<C>
 {
     fn constant(&self, value: Stored) -> Result<BatchingTracer<C>, ProgramError> {
-        let parent_value = self.parent().constant(value)?;
-        let physical_type = parent_value.r#type().into_owned();
-        let batch = ArrayBatch::new(physical_type, parent_value, BatchAxis::replicated())?;
+        let value = self.parent().constant(value)?;
+        let r#type = value.r#type().into_owned();
+        let batch = ArrayBatch::new(r#type, value, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }
@@ -195,7 +164,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -204,7 +173,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::tracing::{DomainTracingContext, Tracer};
+    use crate::tracing::DomainTracingContext;
     use crate::types::DataType;
 
     use super::*;
@@ -212,7 +181,6 @@ mod tests {
     #[test]
     fn test_constant() {
         let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
-
         assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "ConstantOperation { value: F64(3.5) }");
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
@@ -253,13 +221,10 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_constant_captured_interpretation() {
+        
+        // Test captured interpretation.
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
-        let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
         let outputs =
             InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
                 &operation,
@@ -273,42 +238,5 @@ mod tests {
         let builder = builder.borrow();
         assert!(builder.instructions().is_empty());
         assert!(matches!(&builder.atoms()[0], Atom::Constant(value) if *value == 3.5));
-    }
-
-    #[test]
-    fn test_constant_input_interpretation() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let builder = context.builder().clone();
-        let input = context.input(DataType::F64);
-        let operation = ConstantOperation::<
-            Tracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
-            Input,
-        >::new(input.clone());
-        let outputs =
-            InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
-                &operation,
-                &context.clone(),
-                &EmptyRegionDriver,
-                &[],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].atom_id(), input.atom_id());
-        assert!(builder.borrow().instructions().is_empty());
-
-        // Test that interpretation rejects a foreign builder.
-        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let foreign_builder = foreign_context.builder().clone();
-        assert!(matches!(
-            InterpretableOperation::<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>::interpret(
-                &operation,
-                &foreign_context.clone(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::MismatchedProgramBuilders),
-        ));
-        assert_eq!(builder.borrow().error().cloned(), None);
-        assert_eq!(foreign_builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
     }
 }

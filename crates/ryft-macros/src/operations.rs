@@ -1036,7 +1036,6 @@ impl OperationEnum {
                 __Context: #ryft::Constant<
                     #interpretation_value_type,
                     #program_constant_type,
-                    #ryft::payloads::Captured,
                 >
             });
         }

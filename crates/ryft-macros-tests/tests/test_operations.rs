@@ -149,18 +149,12 @@ trait Zero<V: Value> {}
 
 impl<V: Value, O: Operation<V::Type>> Zero<V> for TestContext<V, O> {}
 
-/// Stand-in for `ryft_core::payloads`.
-mod payloads {
-    /// Stand-in for `ryft_core::payloads::Captured`.
-    pub struct Captured;
-}
-
 /// Stand-in for `ryft_core::Constant`.
-trait Constant<V: Value, Stored, Payload = payloads::Captured> {
+trait Constant<V: Value, Stored> {
     fn constant(&self, value: Stored) -> Result<V, ProgramError>;
 }
 
-impl<V: Value, O: Operation<V::Type>, Stored: Clone, Payload> Constant<V, Stored, Payload> for TestContext<V, O>
+impl<V: Value, O: Operation<V::Type>, Stored: Clone> Constant<V, Stored> for TestContext<V, O>
 where
     V: From<Stored>,
 {
