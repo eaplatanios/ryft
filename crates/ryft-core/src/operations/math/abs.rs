@@ -1,4 +1,4 @@
-use std::ops::{Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg};
+use std::ops::{Div as StandardDiv, Mul as StandardMul};
 
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -21,16 +21,18 @@ pub const ABS_OPERATION_NAME: &str = "abs";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|`
-    /// on complex operands with a real result) while preserving all other type metadata. Inputs that still represent
+    /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
+    /// for complex operands with a real result) while preserving all other type metadata. Inputs that still represent
     /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve
     /// partial-sum semantics. Matching the operand constraints of
-    /// [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs), signed-integer (including the sub-byte `si2` and
-    /// `si4` types, with the minimum value wrapping to itself), floating-point, and complex inputs are supported,
-    /// while unsigned-integer, Boolean, token, structural-zero, and single-bit `si1` inputs (whose only negative value
-    /// `-1` has no representable absolute value) are rejected.
-    AbsOperation, ABS_OPERATION_NAME,
-    Abs, abs,
+    /// [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs), signed-integer (including the sub-byte
+    /// [`DataType::I2`] and [`DataType::I4`] types, with the minimum value wrapping to itself), floating-point,
+    /// and complex inputs are supported, while unsigned-integer, Boolean, token, structural-zero, and single-bit
+    /// [`DataType::I1`] inputs (whose only negative value `-1` has no representable absolute value) are rejected.
+    AbsOperation,
+    ABS_OPERATION_NAME,
+    Abs,
+    abs,
     infer_data_types = |input_types: &[DataType]| {
         let input_type = input_types[0];
         let output_type = match input_type {
@@ -84,24 +86,24 @@ impl_differentiable_elementwise_operation! {
             + SelectCondition
             + ZeroLike
             + OneLike
-            + StandardNeg<Output = C::Value>
-            + StandardMul<Output = C::Value>
-            + StandardDiv<Output = C::Value>
+            + std::ops::Neg<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Div<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
     {
         |_operation, _context, _driver, inputs| {
-            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a
-            // ℂ → ℝ map with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return
-            // `dx`; at the complex origin, replace the zero denominator with one so the zero numerator yields zero.
-            // These conventions keep the rule finite and stable under higher-order transforms. A structural zero
-            // tangent stays symbolic, retyped to the real output's tangent type.
+            // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
+            // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
+            // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
+            // conventions keep the rule finite and stable under higher-order transforms. A structural zero tangent
+            // stays symbolic, retyped to the real output's tangent type.
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().abs()?;
-            let target = primal.r#type().tangent();
+            let primal_tangent_type = primal.r#type().tangent();
             let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(target),
-                MaybeZero::Value(_) if target.is_zero_space() => {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
+                MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!("'abs' output type {} has no tangent space", primal.r#type()),
                     }
@@ -109,7 +111,7 @@ impl_differentiable_elementwise_operation! {
                 }
                 MaybeZero::Value(tangent) => {
                     if input.primal().r#type().is_complex() {
-                        let denominator = primal.align_tangent(&target)?;
+                        let denominator = primal.align_tangent(&primal_tangent_type)?;
                         let zero = denominator.zero_like();
                         let one = denominator.one_like();
                         let denominator_is_zero =
@@ -119,19 +121,19 @@ impl_differentiable_elementwise_operation! {
                         // algebraically equivalent but can overflow even when the final directional derivative is
                         // finite.
                         let conjugate = input.primal().conjugate()?;
-                        let coefficient =
-                            (conjugate.real()? / denominator.clone()).complex(&(conjugate.imaginary()? / denominator))?;
-                        let input_target = input.primal().r#type().tangent();
-                        MaybeZero::Value(
-                            (tangent.align_tangent(&input_target)? * coefficient).real()?.align_tangent(&target)?,
-                        )
+                        let real = conjugate.real()? / denominator.clone();
+                        let imaginary = conjugate.imaginary()? / denominator.clone();
+                        let coefficient = real.complex(&imaginary)?;
+                        let input_tangent_type = input.primal().r#type().tangent();
+                        let tangent = tangent.align_tangent(&input_tangent_type)?;
+                        MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type)?)
                     } else {
-                        let input = input.primal().align_tangent(&target)?;
-                        let tangent = tangent.align_tangent(&target)?;
+                        let input = input.primal().align_tangent(&primal_tangent_type)?;
+                        let tangent = tangent.align_tangent(&primal_tangent_type)?;
                         let zero = input.zero_like();
-                        let nonnegative =
+                        let non_negative =
                             input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?.select_condition()?;
-                        MaybeZero::Value(C::Value::select(&nonnegative, &tangent, &-tangent.clone())?)
+                        MaybeZero::Value(C::Value::select(&non_negative, &tangent, &-tangent.clone())?)
                     }
                 }
             };
