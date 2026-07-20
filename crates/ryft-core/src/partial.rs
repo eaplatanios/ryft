@@ -59,8 +59,8 @@
 //!
 //! [`PartialTracer`] is the flowing value exposed to interpreted or traced closures. It contains a
 //! [`PartialEvaluationValue`] while live and propagates poisoning after an error. Known values can participate in
-//! host control flow only when the parent context resolves them as concrete; symbolic or opaque knowns require a
-//! conservative residual rewrite.
+//! host control flow only when the parent context resolves them to a program constant that supports the required
+//! concretizing extraction. Symbolic or opaque knowns require a conservative residual rewrite.
 //!
 //! # Effects and Nested Programs
 //!
@@ -74,7 +74,7 @@
 //! input is known and to residualize otherwise, but control flow, loops, scans, and other higher-order operations can
 //! preserve more known work with a dedicated rule. Use the supplied context's materialization and residualization APIs
 //! rather than constructing duplicate boundary atoms manually. Rules inspecting known payloads must first establish a
-//! concrete [`ValueResolution`] and fall back conservatively otherwise.
+//! [`Constant`](ValueResolution::Constant) resolution and fall back conservatively otherwise.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -701,12 +701,14 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///
     /// There are situations where overriding this function can result in improved performance and better partitioning
     /// of a computation into known and unknown parts. For example, a `condition` instruction whose predicate is
-    /// [`Known`](PartialValue::Known) and concretizable may ask the context to inline the selected branch and return
-    /// that branch's output trace values, so that the condition disappears from the residual program and only the taken
-    /// branch's work survives. Rules that inspect known *payloads* must gate that inspection on a
-    /// [`Concrete`](ValueResolution::Concrete) [`Context::resolve`] resolution because a known value under a staging
-    /// known-side context is a [`Tracer`](crate::Tracer) into the outer program rather than a concrete value, and
-    /// partial evaluation should fall back to a conservative rewrite otherwise.
+    /// [`Known`](PartialValue::Known) and Boolean-concretizable may ask the context to inline the selected branch and
+    /// return that branch's output trace values, so that the condition disappears from the residual program and only
+    /// the taken branch's work survives. Rules that inspect known *payloads* must gate that inspection on a
+    /// [`Constant`](ValueResolution::Constant) [`Context::resolve`] resolution because a known value under a staging
+    /// known-side context may be a [`Tracer`](crate::Tracer) into the outer program rather than a program constant,
+    /// and partial evaluation should fall back to a conservative rewrite otherwise. Resolving to a constant alone
+    /// does not guarantee that the payload is host-inspectable; rules that inspect it require the corresponding
+    /// capability separately.
     ///
     /// # Parameters
     ///
@@ -758,7 +760,7 @@ pub struct PartialEvaluationContext<C: Context> {
     /// residual input already created for it. This complements the per-value shared [`PartialValueMaterialization`]
     /// slots along the axis that value-identity deduplication cannot reach: two *distinct* known values (with distinct
     /// slots) naming the same outer atom collapse to one residual input, even when rule-produced. It holds only under a
-    /// *staging* known-side context because an eager context resolves knowns as [`Concrete`](ValueResolution::Concrete)
+    /// *staging* known-side context because an eager context resolves knowns as [`Constant`](ValueResolution::Constant)
     /// rather than [`Staged`](ValueResolution::Staged), and so nothing is ever recorded in that case, and inline
     /// constants are excluded because they carry no staged identity.
     staged_feeders: Rc<RefCell<HashMap<AtomId, AtomId>>>,
@@ -934,10 +936,10 @@ impl<C: Context> PartialEvaluationContext<C> {
                     Some(existing) => existing,
                     None => {
                         let atom = if constant {
-                            let constant = self.parent.resolve(known).into_concrete().ok_or_else(|| {
+                            let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
                                 ProgramError::MalformedProgram(
                                     "residual materialization required a constant payload for a known value that is \
-                                     not concretizable in the active known-side context"
+                                     not resolvable to a constant in the active known-side context"
                                         .to_string(),
                                 )
                             })?;
@@ -1135,7 +1137,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 
     /// Recovers the staged-constant payload of the provided known value `value` through [`Context::resolve`], reporting
-    /// a [`ProgramError`] when the known-side [`Context`] cannot prove that the provided value is a concrete constant.
+    /// a [`ProgramError`] when the known-side [`Context`] cannot resolve the provided value to a program constant.
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
     /// folded loop-invariant carry spliced into a rebuilt `scan` body), where only a program constant can represent
     /// it (nested programs cannot reference atoms of the enclosing residual program or of the outer known-side
@@ -1144,9 +1146,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// to a conservative alternative.
     #[inline]
     pub fn known_constant(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
-        self.parent.resolve(value).into_concrete().ok_or_else(|| {
+        self.parent.resolve(value).into_constant().ok_or_else(|| {
             ProgramError::MalformedProgram(
-                "a known value crossing into a nested residual program is not concretizable in the active \
+                "a known value crossing into a nested residual program does not resolve to a constant in the active \
                  known-side context"
                     .to_string(),
             )
@@ -1154,32 +1156,32 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 
     /// Returns `true` if every [`Known`](PartialEvaluationInput::Known) residual input and
-    /// [`Known`](PartialEvaluationOutput::Known) output of the provided [`PartialEvaluation`] resolves to a concrete
+    /// [`Known`](PartialEvaluationOutput::Known) output of the provided [`PartialEvaluation`] resolves to a program
     /// constant in the known-side [`Context`] of this [`PartialEvaluationContext`] (i.e., if a nested program rebuild
     /// that embeds those knowns as inline program constants through [`Self::known_constant`] can succeed). Under a
     /// staging known-side context, a probe's folds can produce known values that are genuine tracers into the live
     /// trace (e.g., a constant-only chain staged by the fold). Rules that rebuild nested programs from a live context
     /// probe must check this and fall back to a conservative rewrite when it returns `false`.
     #[inline]
-    pub fn all_knowns_are_concrete(&self, evaluation: &PartialEvaluation<C>) -> bool {
+    pub fn all_knowns_are_constants(&self, evaluation: &PartialEvaluation<C>) -> bool {
         evaluation.inputs.iter().all(|input| match input {
-            PartialEvaluationInput::Known(value) => self.parent.resolve(value).is_concrete(),
+            PartialEvaluationInput::Known(value) => self.parent.resolve(value).is_constant(),
             PartialEvaluationInput::Unknown(_) => true,
         }) && evaluation.outputs.iter().all(|output| match output {
-            PartialEvaluationOutput::Known(value) => self.parent.resolve(value).is_concrete(),
+            PartialEvaluationOutput::Known(value) => self.parent.resolve(value).is_constant(),
             PartialEvaluationOutput::Unknown(_) => true,
         })
     }
 
     /// Returns `true` when any of the provided `inputs` is known but does not [`resolve`](Context::resolve)
-    /// to a [`Concrete`](ValueResolution::Concrete) constant in the known-side [`Context`] of this
+    /// to a [`Constant`](ValueResolution::Constant) in the known-side [`Context`] of this
     /// [`PartialEvaluationContext`] (i.e., it is a genuine [`Tracer`](crate::Tracer) into a live outer trace). This
-    /// is the signal online boundary rules split on: all-concrete knowledge keeps the default fold-or-residualize
+    /// is the signal online boundary rules split on: all-constant knowledge keeps the default fold-or-residualize
     /// behavior.
     #[inline]
     pub fn any_known_is_symbolic(&self, inputs: &[PartialEvaluationValue<C::Value>]) -> bool {
         inputs.iter().any(|input| match input.value() {
-            PartialValue::Known(value) => !self.parent.resolve(value).is_concrete(),
+            PartialValue::Known(value) => !self.parent.resolve(value).is_constant(),
             PartialValue::Unknown(_) => false,
         })
     }
@@ -1317,9 +1319,9 @@ where
 
     #[inline]
     fn resolve(&self, value: &PartialTracer<C>) -> ValueResolution<C::Constant> {
-        // A known value resolves exactly as the known-side inner context resolves its payload (concrete under an eager
-        // inner context, staged for live tracers of an enclosing trace), while an unknown value is opaque: it names a
-        // residual program variable whose value does not exist until the residual program runs.
+        // A known value resolves exactly as the known-side inner context resolves its payload (a constant under an
+        // eager inner context, staged for live tracers of an enclosing trace), while an unknown value is opaque: it
+        // names a residual program variable whose value does not exist until the residual program runs.
         match &value.state {
             PartialTracerState::Live(value) => match value.value() {
                 PartialValue::Known(known) => self.parent.resolve(known),
@@ -1925,8 +1927,8 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&Scalar::from(2.0f64.sin())));
 
-        // `known_constant` recovers a known value's staged-constant payload. An eager known value is always concrete,
-        // while under a staging known-side context only literal-backed tracers concretize.
+        // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
+        // constant, while under a staging known-side context only literal-backed tracers do.
         assert_eq!(context.known_constant(&Scalar::from(5.0)), Ok(Scalar::from(5.0)));
         let staging = ScalarTracingContext::new();
         let staging_context = PartialEvaluationContext::new(staging.clone());
@@ -1936,33 +1938,35 @@ mod tests {
         assert!(matches!(
             staging_context.known_constant(&symbolic),
             Err(ProgramError::MalformedProgram(message))
-                if message == "a known value crossing into a nested residual program is not concretizable in the \
-                    active known-side context",
+                if message == "a known value crossing into a nested residual program does not resolve to a constant \
+                    in the active known-side context",
         ));
 
-        // `all_knowns_are_concrete` checks every known feeder and folded output of a partial evaluation, which is only
+        // `all_knowns_are_constants` checks every known feeder and folded output of a partial evaluation, which is only
         // non-trivial under a staging known-side context where knowns can be live tracers.
         let empty = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new()
             .build::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap();
-        assert!(context.all_knowns_are_concrete(&PartialEvaluation::<EagerContext<Scalar, ScalarOperation<Scalar>>> {
-            program: empty.clone(),
-            inputs: vec![PartialEvaluationInput::Known(Scalar::from(1.0)), PartialEvaluationInput::Unknown(0)],
-            outputs: vec![PartialEvaluationOutput::Known(Scalar::from(2.0))],
-        }));
-        assert!(!staging_context.all_knowns_are_concrete(&PartialEvaluation::<ScalarTracingContext> {
+        assert!(context.all_knowns_are_constants(
+            &PartialEvaluation::<EagerContext<Scalar, ScalarOperation<Scalar>>> {
+                program: empty.clone(),
+                inputs: vec![PartialEvaluationInput::Known(Scalar::from(1.0)), PartialEvaluationInput::Unknown(0)],
+                outputs: vec![PartialEvaluationOutput::Known(Scalar::from(2.0))],
+            }
+        ));
+        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ScalarTracingContext> {
             program: empty.clone(),
             inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
             outputs: Vec::new(),
         }));
-        assert!(staging_context.all_knowns_are_concrete(&PartialEvaluation::<ScalarTracingContext> {
+        assert!(staging_context.all_knowns_are_constants(&PartialEvaluation::<ScalarTracingContext> {
             program: empty,
             inputs: vec![PartialEvaluationInput::Known(literal.clone())],
             outputs: Vec::new(),
         }));
 
         // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
-        // resolve to a concrete constant counts, and so eager knowns and unknowns never do.
+        // resolve to a program constant counts, and so eager knowns and unknowns never do.
         assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Scalar::from(1.0))]));
         assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
         assert!(staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
@@ -1974,7 +1978,7 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_as_context() {
         // Over an eager known-side inner context, the partial-evaluation context is itself eager: lifted constants
-        // and all-known binds fold to concrete known values that resolve `Concrete` and support concretizing
+        // and all-known binds fold to known values that resolve `Constant` and support concretizing
         // extractions such as `boolean`, which is what lets host control flow branch on known values mid-evaluation.
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         assert!(context.is_eager());
@@ -1983,7 +1987,7 @@ mod tests {
             lifted.value().unwrap().materialization(),
             PartialValueMaterialization::Constant { residual_atom: None },
         ));
-        assert!(matches!(context.resolve(&lifted), ValueResolution::Concrete(value) if value == Scalar::from(2.0)));
+        assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Scalar::from(2.0)));
         let folded = context.bind(AddOperation, Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Scalar::from(4.0)));

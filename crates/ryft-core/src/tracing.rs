@@ -485,7 +485,7 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
             return ValueResolution::Opaque;
         };
         match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
-            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
     }
@@ -674,7 +674,7 @@ impl<C: Context> Context for NestedTracingContext<C> {
             return ValueResolution::Opaque;
         };
         match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
-            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
     }
@@ -1077,7 +1077,7 @@ mod tests {
         assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
         assert_eq!(format!("{tracing_context:?}"), "TracingContext { .. }");
 
-        // Test creating a concrete constant in the staged program.
+        // Test creating a program constant in the staged program.
         let constant = tracing_context.constant(Scalar::from(2.5));
         assert_eq!(constant.r#type().into_owned(), DataType::F64);
         let constant_atom = constant.atom_id().expect("constant tracer should remain live");
@@ -1194,7 +1194,7 @@ mod tests {
                 if message == "'add' input types are not broadcast-compatible",
         ));
 
-        // Test staging concrete constants through the context without requiring the context itself to be a domain.
+        // Test staging program constants through the context without requiring the context itself to be a domain.
         let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context.constant(

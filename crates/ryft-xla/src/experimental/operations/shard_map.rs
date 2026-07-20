@@ -241,8 +241,8 @@ where
 /// [`JitCallOperation`](crate::experimental::ops::JitCallOperation) call rule: it splits the local body against the
 /// caller's known-ness while preserving the `shard_map` boundary, its mesh, and its shardings on both sides.
 ///
-/// The split fires only when some known input does *not* [`resolve`](Context::resolve) to a concrete constant in
-/// the known-side context — a genuine tracer into a live outer trace. All-known, all-unknown, and concrete-known
+/// The split fires only when some known input does *not* [`resolve`](Context::resolve) to a program constant in
+/// the known-side context — a genuine tracer into a live outer trace. All-known, all-unknown, and constant-resolved
 /// calls defer to the default fold-or-residualize behavior, which preserves the original boundary exactly.
 ///
 /// When the split fires, the *local* body program is split through the shared

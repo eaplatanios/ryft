@@ -741,7 +741,7 @@ where
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate) directly, so the rule
 /// carries no operation-enum semantic bounds), and a carry survives the round only if its next-carry output is
 /// known and equal to its init. A carry init that is known but does not [`resolve`](Context::resolve) to a
-/// [`Concrete`](crate::ValueResolution::Concrete) constant in the known-side context is never an invariance
+/// [`Constant`](crate::ValueResolution::Constant) in the known-side context is never an invariant
 /// candidate: its value could not be embedded into the rebuilt body as a
 /// constant, and skipping it also keeps the fixed point's probe rounds from folding symbolic known work into a live
 /// staging context. Under a staging known-side context, the surviving equality check is [`Tracer`]
@@ -815,12 +815,12 @@ where
             return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs);
         }
 
-        // A carry can only fold if its init input is known *and* concretizable in the known-side context: the folded
-        // value must be embeddable as a rebuilt-body constant, and skipping symbolic knowns also keeps the fixed
-        // point's probe rounds from folding symbolic known work into a live staging context.
+        // A carry can only fold if its init input is known *and* resolves to a constant in the known-side context: the
+        // folded value must be embeddable as a rebuilt-body constant, and skipping symbolic knowns also keeps the
+        // fixed point's probe rounds from folding symbolic known work into a live staging context.
         let carry_inits = (0..carry_count)
             .map(|index| {
-                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_concrete()).cloned()
+                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_constant()).cloned()
             })
             .collect::<Vec<Option<C::Value>>>();
 
@@ -879,11 +879,11 @@ where
         // the default residualize-unchanged behavior otherwise. A loop-invariant-known carry always shrinks the body
         // (its uses fold to constants), so the only way nothing folds is an empty invariant set whose residual body
         // did not shrink either. The rebuild below embeds the probe's known values as inline body constants, which
-        // is only possible when they are all concrete — under a staging known-side context the probe can fold a
-        // constant-only chain into a live-trace tracer — so a non-concrete probe takes the same fallback.
+        // is only possible when they all resolve to constants — under a staging known-side context the probe can fold
+        // a constant-only chain into a live-trace tracer — so a non-constant probe takes the same fallback.
         if (invariant.iter().all(|folded| !folded)
             && body_evaluation.program.instructions().len() >= body.instructions().len())
-            || !context.all_knowns_are_concrete(&body_evaluation)
+            || !context.all_knowns_are_constants(&body_evaluation)
         {
             if time_varying_known {
                 return split_scan_by_knownness(context, self, body, inputs, |input_known| {
@@ -955,7 +955,7 @@ where
 ///
 /// A carry stays known iff the body computes its next value from known values alone (its init must be known); known
 /// stacked inputs are known throughout. Unlike the loop-*invariance* fixed point (which folds a carry once and
-/// therefore requires a concretizable, value-equal init), known-ness needs neither concretizability nor value
+/// therefore requires a constant-resolved, value-equal init), known-ness needs neither constant resolution nor value
 /// equality, so symbolic known inits (tracers into a live outer trace) participate fully. Each fixed-point round
 /// splits the body through a **fresh** staging context whose inputs stand in for the known body inputs, so no probe
 /// or split work can leak into the caller's context.

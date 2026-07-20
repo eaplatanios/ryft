@@ -39,8 +39,8 @@
 //!
 //! [`Context`] is _behavioral_. Its [`Context::bind`] method accepts an operation and flowing values and returns
 //! result values. [`Context::lift`] materializes a staged constant into the flowing value semantics, while
-//! [`Context::resolve`] reports whether a flowing value is concrete, staged, or opaque. Contexts are cloneable
-//! handles. Mutable tracing state is shared behind their internal handles rather than passed as `&mut self`.
+//! [`Context::resolve`] reports whether a flowing value is a program constant, staged, or opaque. Contexts are
+//! cloneable handles. Mutable tracing state is shared behind their internal handles rather than passed as `&mut self`.
 //!
 //! # Eager, Staging, and Transform Contexts
 //!
@@ -87,7 +87,9 @@
 //!
 //! [`ValueResolution`] is the single conservative query used when a rule needs to inspect a flowing value:
 //!
-//! - [`ValueResolution::Concrete`] carries a materialized constant and permits host-side decisions.
+//! - [`ValueResolution::Constant`] carries a program-constant payload that can be embedded in a staged program. The
+//!   payload need not be host-inspectable (e.g., compiled backends may represent constants as abstract capture
+//!   references).
 //! - [`ValueResolution::Staged`] carries the corresponding [`AtomId`] in the active builder.
 //! - [`ValueResolution::Opaque`] means the context cannot safely prove either fact.
 //!
@@ -354,7 +356,7 @@ impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for
 
     #[inline]
     fn resolve(&self, value: &V) -> ValueResolution<V> {
-        ValueResolution::Concrete(value.clone())
+        ValueResolution::Constant(value.clone())
     }
 }
 
@@ -479,11 +481,11 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
 /// It represents what, if anything, the context can prove that the value denotes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueResolution<V> {
-    /// The value denotes this concrete constant payload. This is the strongest outcome. Eager [`Context`]s, whose
-    /// flowing values *are* constants, always resolve to [`ValueResolution::Concrete`]. [`StagingContext`]s resolve
-    /// here only for *literal-backed* [`Tracer`]s, whose staged [`Atom`](crate::Atom) is a constant atom in the
-    /// context's [`ProgramBuilder`].
-    Concrete(V),
+    /// The value denotes this program-constant payload. Eager [`Context`]s whose flowing values and constants use the
+    /// same representation always resolve to [`ValueResolution::Constant`]. [`StagingContext`]s resolve here only for
+    /// *literal-backed* [`Tracer`]s whose staged [`Atom`](crate::Atom) is a constant atom in the context's
+    /// [`ProgramBuilder`]. This resolution guarantees that the payload can be embedded as a program constant.
+    Constant(V),
 
     /// The value is a live, staged, value identified by this [`AtomId`] in the resolving context's [`Program`], with no
     /// concrete payload until the traced program runs. The carried [`AtomId`] is a stable identity for the value within
@@ -496,18 +498,18 @@ pub enum ValueResolution<V> {
 }
 
 impl<V> ValueResolution<V> {
-    /// Returns `true` if this [`ValueResolution`] is [`Concrete`](Self::Concrete).
+    /// Returns `true` if this [`ValueResolution`] is [`Constant`](Self::Constant).
     #[inline]
-    pub fn is_concrete(&self) -> bool {
-        matches!(self, Self::Concrete(_))
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant(_))
     }
 
-    /// Returns the concrete constant payload of this [`ValueResolution`] if it is a [`Concrete`](Self::Concrete)
+    /// Returns the program-constant payload of this [`ValueResolution`] if it is a [`Constant`](Self::Constant)
     /// resolution, and [`None`] otherwise.
     #[inline]
-    pub fn into_concrete(self) -> Option<V> {
+    pub fn into_constant(self) -> Option<V> {
         match self {
-            Self::Concrete(constant) => Some(constant),
+            Self::Constant(constant) => Some(constant),
             _ => None,
         }
     }
@@ -674,10 +676,10 @@ mod tests {
         let mut add_outputs = context.stage_operation(AddOperation, Vec::new(), &[&input, &constant]).unwrap();
         let sum = add_outputs.remove(0);
 
-        // Literal-backed tracers resolve to their concrete constant payload, while inputs and operation outputs
+        // Literal-backed tracers resolve to their program-constant payload, while inputs and operation outputs
         // resolve to their staged atoms.
         assert_eq!(context.resolve(&input), ValueResolution::Staged(AtomId::new(0)));
-        assert_eq!(context.resolve(&constant), ValueResolution::Concrete(Scalar::from(2.5)));
+        assert_eq!(context.resolve(&constant), ValueResolution::Constant(Scalar::from(2.5)));
         assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
 
         // Tracers belonging to a different builder are opaque, in both directions.

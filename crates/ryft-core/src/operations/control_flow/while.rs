@@ -462,12 +462,12 @@ where
             ),
         };
 
-        // A state element can only fold if its init input is known *and* concretizable in the known-side context:
-        // the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic knowns also keeps
-        // the fixed point's probe rounds from folding symbolic known work into a live staging context.
+        // A state element can only fold if its init input is known *and* resolves to a constant in the known-side
+        // context: the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic knowns
+        // also keeps the fixed point's probe rounds from folding symbolic known work into a live staging context.
         let state_inits = (0..state_count)
             .map(|index| {
-                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_concrete()).cloned()
+                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_constant()).cloned()
             })
             .collect::<Vec<Option<C::Value>>>();
 
@@ -532,13 +532,14 @@ where
         // the body (its uses fold to constants), so the only way nothing folds is an empty invariant set whose
         // residual condition and body did not shrink either — a time-varying known chain lands here and is what the
         // closed-knownness split recovers. The rebuild below embeds the probes' known values as inline program
-        // constants, which is only possible when they are all concrete — under a staging known-side context a probe
-        // can fold a constant-only chain into a live-trace tracer — so a non-concrete probe takes the same fallback.
+        // constants, which is only possible when they all resolve to constants — under a staging known-side context a
+        // probe can fold a constant-only chain into a live-trace tracer — so a non-constant probe takes the same
+        // fallback.
         if (invariant.iter().all(|folded| !folded)
             && body_evaluation.program.instructions().len() >= body.instructions().len()
             && condition_evaluation.program.instructions().len() >= condition.instructions().len())
-            || !context.all_knowns_are_concrete(&body_evaluation)
-            || !context.all_knowns_are_concrete(&condition_evaluation)
+            || !context.all_knowns_are_constants(&body_evaluation)
+            || !context.all_knowns_are_constants(&condition_evaluation)
         {
             return split_or_residualize(context);
         }
@@ -663,8 +664,8 @@ fn rebuild_while_program<C: Context<Type = ArrayType>>(
 /// [scan known-ness split](super::scan)'s: a state element stays known iff its init is known and the body computes
 /// its next value from known state alone, with each round partitioning the body through a **fresh** staging context
 /// (via [`PartialEvaluationDriver::partition_program`]) so no probe work leaks into the caller's context. Unlike the
-/// loop-*invariance* rewrite, known-ness needs neither concretizability nor value equality, so symbolic known inits
-/// (tracers into a live outer trace) participate fully — this is what makes the split fire under
+/// loop-*invariance* rewrite, known-ness needs neither constant resolution nor value equality, so symbolic known
+/// inits (tracers into a live outer trace) participate fully — this is what makes the split fire under
 /// [`Program::linearize`]. After convergence the split additionally requires the *predicate* to fold from the known
 /// state alone; only then does the known loop run the original trip count, since its trip decision is byte-for-byte
 /// the original one over state it computes itself.
@@ -2713,7 +2714,7 @@ mod tests {
         }
 
         fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Concrete(value.clone())
+            crate::ValueResolution::Constant(value.clone())
         }
 
         fn is_eager(&self) -> bool {
@@ -2799,7 +2800,7 @@ mod tests {
         }
 
         fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Concrete(value.clone())
+            crate::ValueResolution::Constant(value.clone())
         }
 
         fn is_eager(&self) -> bool {

@@ -181,8 +181,8 @@ where
 /// Partial-evaluation override for [`ConditionOperation`], whose predicate is the operation's first input.
 ///
 /// With a [`Known`](PartialValue::Known) predicate that the known-side context can
-/// [`resolve`](Context::resolve) to a [`Concrete`](crate::ValueResolution::Concrete) constant it selects the taken
-/// branch and inlines it via
+/// [`resolve`](Context::resolve) to a [`Constant`](crate::ValueResolution::Constant) payload whose value can be
+/// concretized as a Boolean, it selects the taken branch and inlines it via
 /// [`PartialEvaluationContext::inline_program`], so the condition disappears from the residual program; the inlined
 /// branch is fed the remaining inputs. A known predicate that is *not* concretizable — under a staging known-side
 /// context, a genuine [`Tracer`] into the outer program — cannot select a branch at
@@ -218,12 +218,12 @@ where
         // region 1 the `false` branch), which keeps its bounds free of the operation family's own semantic traits.
         // Input 0 is the predicate; inputs 1.. feed both branches.
         if let PartialValue::Known(predicate) = inputs[0].value() {
-            // A known predicate selects a branch only when it resolves to a concrete constant: under a staging
+            // A known predicate selects a branch only when it resolves to a program constant: under a staging
             // known-side context "known" means known to the outer program, and a genuine tracer carries no boolean
-            // to branch on. A known-but-symbolic predicate — or a concrete constant payload that exposes no concrete
+            // to branch on. A known-but-symbolic predicate — or a program constant payload that exposes no concrete
             // boolean, such as an abstract backend capture reference — keeps the conditional on both sides of the
             // split instead.
-            if let Some(predicate) = context.parent().resolve(predicate).into_concrete() {
+            if let Some(predicate) = context.parent().resolve(predicate).into_constant() {
                 if let Ok(predicate) = predicate.boolean() {
                     let index = if predicate { 0 } else { 1 };
                     return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());

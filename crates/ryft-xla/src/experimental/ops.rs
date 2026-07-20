@@ -376,9 +376,9 @@ impl Operation<ArrayType> for JitCallOperation {
 /// rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
 /// sides.
 ///
-/// The split fires only when some known call input does *not* [`resolve`](Context::resolve) to a concrete
-/// constant in the known-side context — i.e., a genuine tracer into a live outer trace, the mixed-online case this
-/// rule exists for. All-known, all-unknown, and concrete-known calls defer to the default fold-or-residualize
+/// The split fires only when some known call input does *not* [`resolve`](Context::resolve) to a program constant in
+/// the known-side context — i.e., a genuine tracer into a live outer trace, the mixed-online case this
+/// rule exists for. All-known, all-unknown, and constant-resolved calls defer to the default fold-or-residualize
 /// behavior, which preserves the original boundary (and today's eager behavior) exactly.
 ///
 /// When the split fires, the callee is split through the shared
