@@ -3,17 +3,105 @@
 extern crate self as ryft;
 
 pub mod broadcasting;
-pub mod effects;
 pub mod errors;
 pub mod macros;
 pub mod parameters;
+pub mod programs;
 pub mod sharding;
 pub mod types;
 pub mod utilities;
 
-pub use broadcasting::*;
-pub use effects::{Effect, Effects};
+pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use errors::{CustomError, Error, MaybeFallible};
-pub use parameters::*;
+pub use operations::*;
+pub use parameters::{
+    ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
+    ParameterParameterizedFamily, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+    PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
+};
+pub use programs::*;
 pub use sharding::*;
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::macros::check_count;
+    use crate::programs::effects::{Effect, Effects};
+    use crate::programs::operations::Operation;
+    use crate::programs::regions::RegionInterface;
+    use crate::programs::types::TypeError;
+    use crate::types::DataType;
+
+    /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
+    /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
+    /// splicing, and rebuild paths) in isolation. Production region-carrying operations (e.g., the control-flow family)
+    /// impose their own type invariants such as Boolean predicates and congruent branch outputs, whereas this fixture
+    /// declares arbitrary region slot names with a trivial inference rule, so machinery tests stay three-line fixtures
+    /// whose failures cannot be masked by control-flow inference.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum TestRegionOperation {
+        /// Region-free binary addition stand-in used inside region bodies.
+        Add,
+
+        /// Region-free unary identity stand-in with an observable ordered-IO effect.
+        Effectful,
+
+        /// Region-carrying operation declaring the region slot names. Its inferred output types are the first attached
+        /// region's output types, which pins that region interfaces are derived and delivered during inference.
+        WithRegions(&'static [&'static str]),
+    }
+
+    impl Operation<DataType> for TestRegionOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Add => "add",
+                Self::Effectful => "effectful",
+                Self::WithRegions(_) => "with_regions",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[DataType],
+            region_interfaces: &[RegionInterface<DataType>],
+        ) -> Result<Vec<DataType>, TypeError> {
+            match self {
+                Self::Add => {
+                    check_count!("input", input_types, 2, TypeError);
+                    Ok(vec![input_types[0]])
+                }
+                Self::Effectful => {
+                    check_count!("input", input_types, 1, TypeError);
+                    Ok(vec![input_types[0]])
+                }
+                Self::WithRegions(names) => {
+                    check_count!("input", input_types, 1, TypeError);
+                    if region_interfaces.len() != names.len() {
+                        return Err(TypeError {
+                            message: format!(
+                                "expected {} region interfaces but got {}",
+                                names.len(),
+                                region_interfaces.len(),
+                            ),
+                        });
+                    }
+                    Ok(region_interfaces[0].output_types().to_vec())
+                }
+            }
+        }
+
+        fn region_names(&self) -> &'static [&'static str] {
+            match self {
+                Self::Add | Self::Effectful => &[],
+                Self::WithRegions(names) => names,
+            }
+        }
+
+        fn effects(&self) -> Effects {
+            match self {
+                Self::Add | Self::WithRegions(_) => Effects::PURE,
+                Self::Effectful => Effects::single(Effect::OrderedIo),
+            }
+        }
+    }
+}

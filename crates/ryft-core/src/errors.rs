@@ -5,7 +5,6 @@ use dyn_eq::DynEq;
 use dyn_hash::DynHash;
 use thiserror::Error;
 
-use crate::axes::AxisError;
 use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
 use crate::programs::types::TypeError;
@@ -32,9 +31,6 @@ pub enum Error {
 
     #[error(transparent)]
     Sharding(#[from] ShardingError),
-
-    #[error(transparent)]
-    Axis(#[from] AxisError),
 
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),
