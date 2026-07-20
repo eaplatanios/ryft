@@ -1894,12 +1894,18 @@ dependencies = [
  "half",
  "indoc",
  "ndarray",
+ "num-complex",
  "pretty_assertions",
+ "prost",
  "ryft-core",
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
+ "ryft-xla-sys",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
