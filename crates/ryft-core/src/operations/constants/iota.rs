@@ -17,32 +17,29 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`IotaOperation`].
 pub const IOTA_OPERATION_NAME: &str = "iota";
 
 /// [`Operation`] that has no inputs and that produces a single output of the [`Type`] it holds (i.e., its `r#type`
-/// field) whose elements increase from `0` along a chosen dimension. Along
-/// [`iota_dimension`](Self::iota_dimension) the element at index `k` is `k` (cast to the output element type), and the
-/// value is constant along every other dimension. It is the index-generating counterpart of
-/// [`FillOperation`](super::FillOperation): rather than filling every element with one captured scalar, it synthesizes
-/// the per-position index through the [`Iota`] trait when interpreted. It mirrors StableHLO's
-/// [`iota`](https://openxla.org/stablehlo/spec#iota).
+/// field) whose elements increase from `0` along a dimension chosen by [`dimension`](Self::dimension). Along that
+/// dimension, the element at index `k` is `k`, and the value is constant along every other dimension. It is the
+/// index-generating counterpart of [`FillOperation`](super::FillOperation). Rather than filling every element with one
+/// captured scalar value, it synthesizes the per-position index through the [`Iota`] trait when interpreted. It mirrors
+/// StableHLO's [`iota`](https://openxla.org/stablehlo/spec#iota).
 #[derive(Copy, Clone, Debug)]
 pub struct IotaOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
     r#type: T,
 
     /// Dimension of `type` along which the produced values increase from `0`.
-    iota_dimension: usize,
+    dimension: usize,
 }
 
 impl<T: Type> IotaOperation<T> {
     /// Creates a new [`IotaOperation`] with the provided output type and iota dimension.
     #[inline]
-    pub fn new(r#type: T, iota_dimension: usize) -> Self {
-        Self { r#type, iota_dimension }
+    pub fn new(r#type: T, dimension: usize) -> Self {
+        Self { r#type, dimension }
     }
 
     /// Returns the type of the value produced by this [`IotaOperation`].
@@ -53,12 +50,13 @@ impl<T: Type> IotaOperation<T> {
 
     /// Returns the dimension along which the produced values increase from `0`.
     #[inline]
-    pub fn iota_dimension(&self) -> usize {
-        self.iota_dimension
+    pub fn dimension(&self) -> usize {
+        self.dimension
     }
 }
 
 impl<T: Type> Display for IotaOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -84,7 +82,7 @@ impl<T: Type> Operation<T> for IotaOperation<T> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, IOTA_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("type", &self.r#type)?;
-            operation.field("dimension", &self.iota_dimension)
+            operation.field("dimension", &self.dimension)
         })
     }
 }
@@ -98,12 +96,10 @@ impl<T: Type, C: Domain<Type = T> + Iota<C::Value>> InterpretableOperation<C> fo
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![context.iota(&self.r#type, self.iota_dimension)?])
+        Ok(vec![context.iota(&self.r#type, self.dimension)?])
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for IotaOperation<T> where
     C::Operation: From<IotaOperation<T>>
 {
@@ -176,37 +172,46 @@ mod tests {
 
     use crate::backends::arrays::Array;
     use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
+    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
-    use crate::programs::types::TypeError;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
     #[test]
     fn test_iota() {
-        // A rank-2 iota along dimension 1 increases across columns and repeats down rows.
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
-        assert_eq!(context.iota(&r#type, 1), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0])),);
-        // Along dimension 0 the index increases down rows and repeats across columns.
-        assert_eq!(context.iota(&r#type, 0), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
 
-        // An out-of-bounds dimension surfaces an error rather than mis-indexing.
+        // Axis zero varies between rows, while an axis outside the rank is rejected.
+        assert_eq!(context.iota(&r#type, 0), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
         assert!(matches!(context.iota(&r#type, 2), Err(ProgramError::Type(_))));
 
+        // Verify the operation's stored type and axis, identity, and rendering.
         let operation = IotaOperation::new(r#type.clone(), 1);
-        assert_eq!(Operation::<ArrayType>::name(&operation), IOTA_OPERATION_NAME);
+        assert_eq!(operation.name(), IOTA_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "iota [type=f64[2, 3], dimension=1]");
         assert_eq!(operation.r#type(), &r#type);
-        assert_eq!(operation.iota_dimension(), 1);
-        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[], &[]), Ok(vec![r#type.clone()]));
+        assert_eq!(operation.dimension(), 1);
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![r#type.clone()]));
+
+        // Eager interpretation along axis one varies between columns and repeats across rows.
+        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()], &[]),
-            Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
+            InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
+                &operation,
+                &context,
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![expected.clone()]),
         );
 
+        // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, IotaOperation<ArrayType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
         let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();

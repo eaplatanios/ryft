@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_constant() {
-        // Verify the operation's captured value, identity, rendering, and inferred result type.
+        // Verify the operation's captured value, identity, and rendering.
         let operation = ConstantOperation::<Scalar>::new(Scalar::from(3.5));
         assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "constant [value=3.5]");

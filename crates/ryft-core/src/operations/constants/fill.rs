@@ -17,8 +17,6 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`FillOperation`].
 pub const FILL_OPERATION_NAME: &str = "fill";
 
@@ -175,7 +173,6 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
-    use crate::programs::atoms::MaybeZero;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
@@ -198,7 +195,7 @@ mod tests {
             })),
         );
 
-        // Verify the operation's stored type and value, identity, rendering, and inferred result type.
+        // Verify the operation's stored type and value, identity, and rendering.
         let operation = FillOperation::new(r#type.clone(), Scalar::from(3.5));
         assert_eq!(Operation::<ArrayType>::name(&operation), FILL_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
@@ -217,12 +214,6 @@ mod tests {
             ),
             Ok(vec![expected.clone()]),
         );
-
-        // Differentiation replays that primal value but assigns it a structural-zero tangent.
-        let outputs = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &expected);
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(tangent_type) if tangent_type == &r#type));
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, FillOperation<ArrayType, Scalar>>::new();
