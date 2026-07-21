@@ -19,17 +19,16 @@ use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`SelectOperation`].
 pub const SELECT_OPERATION_NAME: &str = "select";
 
-/// [`Operation`] that performs an elementwise selection between two values driven by a Boolean condition. Refer to the
-/// documentation of [`Select`] for more information.
+/// [`Operation`] that performs an elementwise selection between two values driven by a Boolean condition.
+/// Refer to the documentation of [`Select`] for more information.
 #[derive(Copy, Clone, Debug)]
 pub struct SelectOperation;
 
 impl Display for SelectOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(SELECT_OPERATION_NAME)
     }
@@ -52,14 +51,15 @@ impl Operation<DataType> for SelectOperation {
                 message: format!("'select' condition data type {} is not {}", input_types[0], DataType::Boolean),
             });
         }
+
         // The two branch data types are promoted together (the Boolean condition is a mask, not a value that promotes
-        // into the result), so `select` supports mixed-but-promotable branch data types like `jnp.where`.
-        input_types[1]
-            .broadcast(&input_types[2])
-            .map(|output| vec![output])
-            .map_err(|_| TypeError { message: "'select' input types are not broadcast-compatible".to_string() })
+        // into the result), so `select` supports mixed-but-promotable branch data types like JAX's `jnp.where`.
+        input_types[1].broadcast(&input_types[2]).map(|output| vec![output]).map_err(|_| TypeError {
+            message: format!("'{SELECT_OPERATION_NAME}' input types are not broadcast-compatible"),
+        })
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME).map(|_| ())
     }
@@ -80,20 +80,21 @@ impl Operation<ArrayType> for SelectOperation {
         ElementwiseOperation::infer_output_types(self, input_types)
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, SELECT_OPERATION_NAME).map(|_| ())
     }
 }
 
-/// [`SelectOperation`] is a broadcasting elementwise operation: `select(condition, on_true, on_false)` selects
-/// per element between the two branches under the Boolean `condition`, broadcasting the three operands' shapes
-/// together like [`jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html). Its type inference
-/// therefore overrides the plain elementwise default: the condition must be [`DataType::Boolean`] and the two
-/// branches' [`DataType`]s are promoted together (the condition is a mask, not a value that promotes into the
-/// result, so `select(condition, f32, f64)` yields an `f64` result like `jnp.where`), while the output
-/// [`Shape`](crate::types::Shape) is the broadcast of all three operand shapes and the output [`DataType`] is the
-/// promotion of the two branch data types. Implementing [`ElementwiseOperation`] also gives `select` the standard
-/// elementwise batching rule through the blanket [`BatchableOperation`](crate::BatchableOperation) implementation.
+// [`SelectOperation`] is a broadcasting elementwise operation. `select(condition, on_true, on_false)` selects per
+// element between the two branches under the Boolean `condition`, broadcasting the three operands' shapes together like
+// [JAX's `jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html). Its type inference therefore
+// overrides the plain elementwise default. The condition must be `DataType::Boolean` and the two branches' `DataType`s
+// are promoted together (i.e., the condition is a mask, not a value that promotes into the result, so that
+// `select(condition, f32, f64)` yields an `f64` result like JAX's `jnp.where`), while the output `Shape` is the
+// broadcast of all three operand shapes and the output `DataType` is the promotion of the two branch data types.
+// Implementing `ElementwiseOperation` also gives `select` the standard elementwise batching rule through its blanket
+// `BatchableOperation` implementation.
 impl ElementwiseOperation for SelectOperation {
     #[inline]
     fn input_count(&self) -> usize {
@@ -108,60 +109,60 @@ impl ElementwiseOperation for SelectOperation {
                 message: format!("'select' condition data type {} is not {}", condition.data_type(), DataType::Boolean),
             });
         }
+
         // Broadcast the three operand shapes together and promote the two branch data types, retyping the Boolean
-        // condition to a branch data type first so it acts as a mask rather than a value that promotes into the
-        // result. The output shape and placement are then the standard elementwise broadcast of all three operands
-        // and the output data type is the promotion of the two branch data types.
+        // condition to a branch data type first so it acts as a mask rather than a value that promotes into the result.
+        // The output shape and placement are then the standard elementwise broadcast of all three operands, and the
+        // output data type is the promotion of the two branch data types.
         let condition = condition.clone().with_data_type(on_true.data_type());
         Ok(vec![self.infer_elementwise_broadcast_type(&[condition, on_true.clone(), on_false.clone()])?])
     }
 }
 
-/// Interpretation selects through the value-level [`Select`] capability. The condition is an ordinary value in the
-/// active domain: eager scalar values decode their in-band Boolean payload, eager array values use themselves as the
-/// Boolean mask, and context-carrying values (e.g., staged [`Tracer`]s) bind a [`SelectOperation`] through their own
-/// context.
-impl<C: Domain> InterpretableOperation<C> for SelectOperation
+impl<C: Domain<Value: Select>> InterpretableOperation<C> for SelectOperation
 where
-    C::Value: Select,
     Self: Operation<C::Type>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // Interpretation selects through the value-level `Select` capability. The condition is an ordinary value in the
+        // active domain. Eager scalar values decode their in-band Boolean payload, eager array values use themselves as
+        // the Boolean mask, and context-carrying values (e.g., staged `Tracer`s) bind a `SelectOperation` through their
+        // own context.
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![C::Value::select(&inputs[0], &inputs[1], &inputs[2])?])
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context> PartiallyEvaluatableOperation<C> for SelectOperation where C::Operation: From<SelectOperation> {}
+impl<C: Context<Operation: From<SelectOperation>>> PartiallyEvaluatableOperation<C> for SelectOperation {}
 
 impl_differentiable_elementwise_operation! {
     @custom
     SelectOperation,
-    /// Forward-mode rule for [`SelectOperation`]: the primal output is `select(condition, on_true, on_false)` over
-    /// the input primals, and the tangent selects the branch tangents under the *same* primal condition (a `select` is
-    /// piecewise linear in its branches), with the condition carried as an ordinary primal operand edge. When both
-    /// branch tangents are structural zeros, the output tangent is a structural zero of the output type.
+    /// Forward-mode differentiation rule for [`SelectOperation`]. The primal output is `select(condition, on_true,
+    /// on_false)` over the input primals, and the tangent selects the branch tangents under the *same* primal condition
+    /// (i.e., a `select` is piecewise linear in its branches), with the condition carried as an ordinary primal operand
+    /// edge. When both branch tangents are structural zeros, the output tangent is a structural zero of the output
+    /// type.
     jvp<C>
     where
         C: Zero<C::Value>,
         C::Type: DifferentiableType,
-        C::Operation: From<SelectOperation>,
         C::Value: ElementwiseDerivativeAlignment<C::Type>,
+        C::Operation: From<SelectOperation>,
     {
         |_operation, context, _driver, inputs| {
+            // Bind the primal and tangent `select`s through the context rather than the value-level `Select` capability
+            // because this rule already owns the active differentiation context and must preserve its tracing behavior.
             check_count!("input", inputs, 3, ProgramError);
             let condition = &inputs[0];
             let on_true = &inputs[1];
             let on_false = &inputs[2];
-            // Bind the primal and tangent selects through the context rather than the value-level `Select` capability
-            // because this rule already owns the active differentiation context and must preserve its tracing behavior.
             let mut primal = context.bind(
                 SelectOperation,
                 Vec::new(),
@@ -172,7 +173,7 @@ impl_differentiable_elementwise_operation! {
             let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
                 MaybeZero::Zero(primal.r#type().tangent())
             } else {
-                // A select needs both branch tangents as real values, so materialize the structurally zero side.
+                // A `select` needs both branch tangents as real values, so materialize the structurally zero side.
                 let on_true_tangent = on_true.tangent().clone().materialize(context)?;
                 let on_false_tangent = on_false.tangent().clone().materialize(context)?;
                 let mut tangents = context.bind(
@@ -188,18 +189,17 @@ impl_differentiable_elementwise_operation! {
         }
     },
 
-    /// Partition-aware transpose rule for [`SelectOperation`]. The Boolean condition (operand 0) has no tangent space,
-    /// so in a valid pushforward it is the known operand and the two branches (operands 1 and 2) are the linear ones.
-    /// The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the output cotangent into the
-    /// branch the known condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
-    /// `on_false` cotangent is `select(condition, 0, cotangent)`, each staged as a primal `select` over the condition
-    /// read from the pullback through the known operand's value. The condition receives a structural zero, and a zero
-    /// output cotangent stays a structural zero.
-    ///
-    /// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`),
-    /// the known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It
-    /// therefore applies to both the array [`ArrayOperation::Select`](crate::backends::arrays::ArrayOperation) and the
-    /// scalar [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
+    /// Partition-aware transposition rule for [`SelectOperation`]. The Boolean condition (i.e., operand 0) has no
+    /// tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands 1 and
+    /// 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the
+    /// output cotangent into the branch the known condition selected: the `on_true` cotangent is `select(condition,
+    /// cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`, each staged as a primal
+    /// `select` over the condition read from the pullback through the known operand's value. The condition receives
+    /// a structural zero, and a zero output cotangent stays a structural zero. The rule is generic over the primary
+    /// type `V::Type` because it only reaches the branch type (i.e., `input_types[1]`), the known condition operand
+    /// value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore applies to both the
+    /// array [`ArrayOperation::Select`](crate::arrays::ArrayOperation) and the scalar
+    /// [`ScalarOperation::Select`](crate::scalars::ScalarOperation) backends.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
@@ -212,14 +212,11 @@ impl_differentiable_elementwise_operation! {
             match &outputs[0] {
                 MaybeZero::Zero(_) => Ok(inputs
                     .iter()
-                    .map(|input| {
-                        let input_type = input.r#type();
-                        MaybeZero::Zero(input_type.cotangent())
-                    })
+                    .map(|input| MaybeZero::Zero(input.r#type().cotangent()))
                     .collect()),
                 MaybeZero::Value(cotangent) => {
-                    // The condition is the known operand; the dispatch guarantees a `Known` operand carries its
-                    // pullback value, so read the tracer directly.
+                    // The condition is the known operand. The dispatch guarantees a `Known` operand
+                    // carries its pullback value, so read the tracer directly.
                     let condition = inputs[0]
                         .as_known()
                         .expect("dispatch guarantees a known operand carries its pullback value")
@@ -231,8 +228,11 @@ impl_differentiable_elementwise_operation! {
                         &[condition.clone(), cotangent.clone(), zero.clone()],
                     )?;
                     check_count!("output", on_true, 1, ProgramError);
-                    let on_false =
-                        context.stage_operation(SelectOperation, Vec::new(), &[condition, zero, cotangent.clone()])?;
+                    let on_false = context.stage_operation(
+                        SelectOperation,
+                        Vec::new(),
+                        &[condition, zero, cotangent.clone()],
+                    )?;
                     check_count!("output", on_false, 1, ProgramError);
                     let on_true_type = inputs[1].r#type().cotangent();
                     let on_false_type = inputs[2].r#type().cotangent();
@@ -252,12 +252,11 @@ impl_differentiable_elementwise_operation! {
 /// three-argument form.
 ///
 /// For arrays, `Self::select(condition, on_true, on_false)` returns a value whose `i`-th element equals `on_true`'s
-/// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three
-/// operand shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and
-/// `on_false` need not share a shape and the branches need not share a data type (see [`SelectOperation`]). The
-/// condition is represented by the same value type as the branches. Scalar values decode their in-band condition
-/// through [`Concretizable<bool>`](crate::Concretizable), while arrays use Boolean-typed condition arrays and staged
-/// [`Tracer`]s use Boolean-typed tracer values.
+/// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three operand
+/// shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and `on_false`
+/// need not share a shape and the branches need not share a data type. The condition is represented by the same value
+/// type as the branches. Scalar values decode their condition through [`Concretizable<bool>`](crate::Concretizable),
+/// while arrays use Boolean-typed condition arrays and staged [`Tracer`]s use Boolean-typed tracer values.
 ///
 /// # Example
 ///
@@ -271,7 +270,7 @@ impl_differentiable_elementwise_operation! {
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Scalar values use an in-band Boolean scalar condition.
+/// // Scalar values use a Boolean scalar condition.
 /// assert_eq!(Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(2.0));
 /// assert_eq!(Scalar::select(&Scalar::from(false), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(3.0));
 ///
@@ -291,26 +290,22 @@ pub trait Select: Sized {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
-/// Any context-carrying value selects by binding a [`SelectOperation`] through its own context: a staged tracer
-/// records the operation, a batching tracer selects the packed values under the common batch axis, and a JVP dual
-/// selects the primals and (linearly) the tangents by the same condition. The `From<SelectOperation>` bound makes
-/// this blanket disjoint from the concrete eager value types (whose context operation is
-/// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), which implement [`Select`] directly.
-impl<V: Value> Select for V
-where
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<SelectOperation>,
-{
+// Any context-carrying value selects by binding a [`SelectOperation`] through its own context. A staged tracer records
+// the operation, a batching tracer selects the packed values under the common batch axis, and a differentiation dual
+// selects the primals and (linearly) the tangents by the same condition. The `From<SelectOperation>` bound makes this
+// blanket disjoint from the concrete eager value types (whose context operation is `ConstantOperation`), which
+// implement `Select` directly.
+impl<V: Value<DispatchDomain: Context<Operation: From<SelectOperation>>>> Select for V {
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let mut outputs = condition.dispatch_domain().bind(
-            SelectOperation,
-            Vec::new(),
-            &[condition.clone(), on_true.clone(), on_false.clone()],
-        )?;
-        Ok(outputs.remove(0))
+        Ok(condition
+            .dispatch_domain()
+            .bind(SelectOperation, Vec::new(), &[condition.clone(), on_true.clone(), on_false.clone()])?
+            .remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -321,14 +316,15 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::differentiation::{jvp, value_and_gradient};
+    use crate::differentiation::forward::jvp;
+    use crate::differentiation::reverse::value_and_gradient;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::math::Add;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramBuilder;
     use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
     use crate::programs::values::Concretizable;
     use crate::tracing_v2::{jacfwd, jacrev};
