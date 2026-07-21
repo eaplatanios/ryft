@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableType;
 use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
@@ -13,6 +13,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
 /// Canonical operation name for [`ConvertElementTypeOperation`].
@@ -117,7 +118,7 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Type: DifferentiableType + ElementType,
-        C::Value: ConvertElementType,
+        C::Value: ConvertElementType + ElementwiseDerivativeAlignment<C::Type>,
     {
         |operation, _context, _driver, inputs| {
             check_count!("input", inputs, 1, ProgramError);
@@ -126,36 +127,30 @@ impl_differentiable_elementwise_operation! {
             let tangent = match inputs[0].tangent() {
                 _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
                 MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
-                MaybeZero::Value(tangent) => {
-                    MaybeZero::Value(tangent.convert_element_type(output_tangent_type.element_type())?)
-                }
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.align_tangent(&output_tangent_type)?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
     /// Transposition rule for [`ConvertElementTypeOperation`]. A live output cotangent is converted back to the input's
-    /// cotangent element data type, while a structural zero remains structural. Inputs with no cotangent space cannot
-    /// participate as linear operands.
+    /// complete cotangent type, while a structural zero remains structural. An input with no cotangent space receives
+    /// the structural zero of that space.
     transpose<V, O>
     where
         V::Type: DifferentiableType + ElementType,
         O: From<ConvertElementTypeOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, _context, _driver, inputs, outputs| {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             let input_cotangent_type = inputs[0].r#type().cotangent();
             if input_cotangent_type.is_zero_space() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!("'{CONVERT_ELEMENT_TYPE_OPERATION_NAME}' input 0 has no cotangent space"),
-                }
-                .into());
+                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
             }
             Ok(vec![match &outputs[0] {
                 MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
-                MaybeZero::Value(cotangent) => {
-                    MaybeZero::Value(cotangent.convert_element_type(input_cotangent_type.element_type())?)
-                }
+                MaybeZero::Value(cotangent) => MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?),
             }])
         }
     },
@@ -250,7 +245,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
 
@@ -323,11 +318,18 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = ConvertElementTypeOperation::new(DataType::F32),
-            cases = [{
-                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
-                input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
-            }],
+            cases = [
+                {
+                    inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
+                },
+                {
+                    inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                    input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap()],
+                },
+            ],
         );
 
         // Low-precision primals use their wider differential representations in both conversion directions.
@@ -342,6 +344,51 @@ mod tests {
         let (_, output_tangent) =
             jvp(|value| value.convert_element_type(DataType::F8E8M0FNU), primal, tangent).unwrap();
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
+
+        // When the differential element representation changes, JVP and transposition align the complete derivative
+        // type: byte-level layout metadata is removed when widening away from `F8E8M0FNU` and restored when returning
+        // to a layout-bearing `F32` differential space.
+        let layout = Layout::Strided(StridedLayout::new(vec![1]));
+        let laid_out_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)])).with_layout(layout.clone());
+        let laid_out_f8 =
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(1)])).with_layout(layout.clone());
+        let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]));
+
+        let (_, tangent) = jvp(
+            |value| value.convert_element_type(DataType::F8E8M0FNU),
+            Array::from_f64s(laid_out_f32.clone(), vec![2.0]),
+            Array::from_f64s(laid_out_f32.clone(), vec![3.0]),
+        )
+        .unwrap();
+        assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]));
+
+        let (_, tangent) = jvp(
+            |value| value.convert_element_type(DataType::F32),
+            Array::from_f64s(laid_out_f8.clone(), vec![2.0]),
+            Array::from_f64s(plain_f32.clone(), vec![3.0]),
+        )
+        .unwrap();
+        assert_eq!(tangent, Array::from_f64s(laid_out_f32.clone(), vec![3.0]));
+
+        check_operation_transposition!(
+            @exact,
+            operation = ConvertElementTypeOperation::new(DataType::F8E8M0FNU),
+            cases = [{
+                inputs = [(@linear(type = laid_out_f32.clone()))],
+                output_cotangents = [Array::from_f64s(plain_f32.clone(), vec![3.0])],
+                input_cotangents = [Array::from_f64s(laid_out_f32.clone(), vec![3.0])],
+            }],
+        );
+
+        check_operation_transposition!(
+            @exact,
+            operation = ConvertElementTypeOperation::new(DataType::F32),
+            cases = [{
+                inputs = [(@linear(type = laid_out_f8))],
+                output_cotangents = [Array::from_f64s(laid_out_f32, vec![3.0])],
+                input_cotangents = [Array::from_f64s(plain_f32, vec![3.0])],
+            }],
+        );
 
         // Narrowing real and complex primals also narrows their concrete tangent values.
         let (_, tangent) = jvp(
