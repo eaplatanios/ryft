@@ -15,8 +15,7 @@ use crate::operations::constants::ZeroOperation;
 use crate::operations::differentiation::CoordinateBasisOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
-use crate::parameters::ParameterizedFamily;
-use crate::parameters::{Parameter, ParameterPath, Parameterized};
+use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::regions::RegionRef;
@@ -26,6 +25,7 @@ use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Shape, Size, StaticShape};
 
+// TODO(eaplatanios): Should we move this?
 use super::DenseDifferentiate;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I`
@@ -49,39 +49,31 @@ pub struct Jacobian<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone
     _type: PhantomData<fn() -> T>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterized<T>> Jacobian<T, V, I, O> {
-    /// Constructs a [`Jacobian`] from its input/output type trees and derivative values.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Type tree of the differentiated inputs.
-    ///   - `output_types`: Type tree of the differentiated outputs.
-    ///   - `values`: Derivative values in output-major/input-minor order. Its length must equal the Cartesian product
-    ///     of the input and output leaf counts.
-    pub(super) fn new(input_types: I, output_types: O, values: Vec<V>) -> Result<Self, ProgramError> {
-        let expected_count =
-            input_types.parameter_count().checked_mul(output_types.parameter_count()).ok_or_else(|| {
-                ProgramError::InvalidArgument { message: "jacobian block count overflows usize".to_string() }
-            })?;
+    /// Creates a new [`Jacobian`].
+    pub fn new(input_type: I, output_type: O, values: Vec<V>) -> Result<Self, ProgramError> {
+        let input_count = input_type.parameter_count();
+        let output_count = output_type.parameter_count();
+        let expected_count = input_count.checked_mul(output_count).ok_or_else(|| ProgramError::InvalidArgument {
+            message: format!("Jacobian block count ({input_count} x {output_count}) overflows usize"),
+        })?;
         if values.len() != expected_count {
             return Err(ProgramError::InvalidArgument {
-                message: format!("jacobian requires {expected_count} derivative values but got {}", values.len()),
+                message: format!("Jacobian requires {} derivative values but got {}", expected_count, values.len()),
             });
         }
-        Ok(Self { input_type: input_types, output_type: output_types, values, _type: PhantomData })
+        Ok(Self { input_type, output_type, values, _type: PhantomData })
     }
 
-    /// Returns the type tree of the differentiated inputs.
+    /// Returns the [`Type`] of the differentiated inputs.
     #[inline]
-    pub fn input_types(&self) -> &I {
+    pub fn input_type(&self) -> &I {
         &self.input_type
     }
 
-    /// Returns the type tree of the differentiated outputs.
+    /// Returns the [`Type`] of the differentiated outputs.
     #[inline]
-    pub fn output_types(&self) -> &O {
+    pub fn output_type(&self) -> &O {
         &self.output_type
     }
 
@@ -97,7 +89,24 @@ impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterize
         self.values
     }
 
-    /// Returns borrowed views of all derivative blocks in output-major/input-minor order.
+    /// Returns the [`JacobianBlock`] of this [`Jacobian`] for the specified output and input [`ParameterPath`]s,
+    /// or `None` if either path is absent.
+    pub fn block(&self, output_path: &ParameterPath, input_path: &ParameterPath) -> Option<JacobianBlock<'_, T, V>> {
+        let input_count = self.input_type.parameter_count();
+        let (output_index, (_, output_type)) =
+            self.output_type.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
+        let (input_index, (_, input_type)) =
+            self.input_type.named_parameters().enumerate().find(|(_, (path, _))| path == input_path)?;
+        Some(JacobianBlock {
+            output_path: output_path.clone(),
+            output_type,
+            input_path: input_path.clone(),
+            input_type,
+            value: &self.values[output_index * input_count + input_index],
+        })
+    }
+
+    /// Returns borrowed views of all [`JacobianBlock`]s of this [`Jacobian`] in output-major/input-minor order.
     pub fn iter_blocks(&self) -> impl Iterator<Item = JacobianBlock<'_, T, V>> {
         let input_count = self.input_type.parameter_count();
         self.output_type
@@ -115,44 +124,63 @@ impl<T: Type, V: Parameter, I: Clone + Parameterized<T>, O: Clone + Parameterize
                 })
             })
     }
-
-    /// Returns the derivative block for the specified output and input paths, or `None` if either path is absent.
-    pub fn block(&self, output_path: &ParameterPath, input_path: &ParameterPath) -> Option<JacobianBlock<'_, T, V>> {
-        let (output_index, (_, output_type)) =
-            self.output_type.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
-        let input_count = self.input_type.parameter_count();
-        let (input_index, (_, input_type)) =
-            self.input_type.named_parameters().enumerate().find(|(_, (path, _))| path == input_path)?;
-        Some(JacobianBlock {
-            output_path: output_path.clone(),
-            output_type,
-            input_path: input_path.clone(),
-            input_type,
-            value: &self.values[output_index * input_count + input_index],
-        })
-    }
 }
 
 /// Borrowed view of one output/input block in a [`Jacobian`].
 #[derive(Debug)]
-pub struct JacobianBlock<'a, T: Type, V> {
-    /// Path of the differentiated output leaf.
+pub struct JacobianBlock<'o, T: Type, V> {
+    /// [`ParameterPath`] of the differentiated output [`Parameter`] that this [`JacobianBlock`] corresponds to.
     output_path: ParameterPath,
 
-    /// Type of the differentiated output leaf.
-    output_type: &'a T,
+    /// [`Type`] of the differentiated output [`Parameter`] that this [`JacobianBlock`] corresponds to.
+    output_type: &'o T,
 
-    /// Path of the differentiated input leaf.
+    /// [`ParameterPath`] of the differentiated input [`Parameter`] that this [`JacobianBlock`] corresponds to.
     input_path: ParameterPath,
 
-    /// Type of the differentiated input leaf.
-    input_type: &'a T,
+    /// [`Type`] of the differentiated input [`Parameter`] that this [`JacobianBlock`] corresponds to.
+    input_type: &'o T,
 
-    /// Derivative value for this output/input pair.
-    value: &'a V,
+    /// Derivative value for this [`JacobianBlock`].
+    value: &'o V,
 }
 
-impl<'a, T: Type, V> Clone for JacobianBlock<'a, T, V> {
+impl<'o, T: Type, V> JacobianBlock<'o, T, V> {
+    /// Returns the [`ParameterPath`] of the differentiated output [`Parameter`] that this [`JacobianBlock`]
+    /// corresponds to.
+    #[inline]
+    pub fn output_path(&self) -> &ParameterPath {
+        &self.output_path
+    }
+
+    /// Returns the [`Type`] of the differentiated output [`Parameter`] that this [`JacobianBlock`] corresponds to.
+    #[inline]
+    pub fn output_type(&self) -> &'o T {
+        self.output_type
+    }
+
+    /// Returns the [`ParameterPath`] of the differentiated input [`Parameter`] that this [`JacobianBlock`]
+    /// corresponds to.
+    #[inline]
+    pub fn input_path(&self) -> &ParameterPath {
+        &self.input_path
+    }
+
+    /// Returns the [`Type`] of the differentiated input [`Parameter`] that this [`JacobianBlock`] corresponds to.
+    #[inline]
+    pub fn input_type(&self) -> &'o T {
+        self.input_type
+    }
+
+    /// Returns the derivative value for this [`JacobianBlock`].
+    #[inline]
+    pub fn value(&self) -> &'o V {
+        self.value
+    }
+}
+
+impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             output_path: self.output_path.clone(),
@@ -164,37 +192,7 @@ impl<'a, T: Type, V> Clone for JacobianBlock<'a, T, V> {
     }
 }
 
-impl<'a, T: Type, V> JacobianBlock<'a, T, V> {
-    /// Returns the path of the differentiated output leaf.
-    #[inline]
-    pub fn output_path(&self) -> &ParameterPath {
-        &self.output_path
-    }
-
-    /// Returns the type of the differentiated output leaf.
-    #[inline]
-    pub fn output_type(&self) -> &'a T {
-        self.output_type
-    }
-
-    /// Returns the path of the differentiated input leaf.
-    #[inline]
-    pub fn input_path(&self) -> &ParameterPath {
-        &self.input_path
-    }
-
-    /// Returns the type of the differentiated input leaf.
-    #[inline]
-    pub fn input_type(&self) -> &'a T {
-        self.input_type
-    }
-
-    /// Returns the derivative value for this output/input pair.
-    #[inline]
-    pub fn value(&self) -> &'a V {
-        self.value
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Type-family capability required to materialize dense derivatives like [`Jacobian`](crate::Jacobian)s and
 /// [`Hessian`](crate::Hessian)s. [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values,
@@ -1294,8 +1292,8 @@ mod tests {
 
         let reparameterized =
             <Jacobian<DataType, f64, _, _>>::from_parameters(jacobian.parameter_structure(), [4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(reparameterized.input_types(), &(F32, vec![F64, F32]));
-        assert_eq!(reparameterized.output_types(), &F64);
+        assert_eq!(reparameterized.input_type(), &(F32, vec![F64, F32]));
+        assert_eq!(reparameterized.output_type(), &F64);
         assert_eq!(reparameterized.values(), &[4.0, 5.0, 6.0]);
     }
 

@@ -242,8 +242,8 @@ where
     I: Clone + Parameterized<C::Type>,
     O: Clone + Parameterized<C::Type>,
 {
-    let input_types = outer.input_types().clone();
-    let output_types = outer.output_types().output_types().clone();
+    let input_types = outer.input_type().clone();
+    let output_types = outer.output_type().output_type().clone();
     let values = outer.into_values();
     let mut value_index = 0;
     for output_type in output_types.parameters() {
