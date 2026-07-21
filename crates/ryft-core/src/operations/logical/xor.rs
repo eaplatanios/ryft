@@ -3,8 +3,6 @@ use crate::macros::{
     impl_differentiable_elementwise_operation,
 };
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &str = "xor";
 
@@ -23,13 +21,13 @@ impl_differentiable_elementwise_operation!(@non_differentiable XorOperation);
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise exclusive-disjunction capability. [`Xor`] is the fallible Ryft counterpart to
-    /// [`std::ops::BitXor`] that [`XorOperation`] interprets through, surfacing a
-    /// [`ProgramError`](crate::ProgramError) when something goes wrong (e.g., when a value's data type does not
-    /// support exclusive disjunction), instead of panicking. Value types additionally provide [`std::ops::BitXor`]
-    /// as ergonomic (albeit panicking) sugar layered on top of this capability.
+    /// [`std::ops::BitXor`] that [`XorOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError)
+    /// when something goes wrong (e.g., when a value's data type does not support exclusive disjunction), instead of
+    /// panicking. Value types additionally provide [`std::ops::BitXor`] as ergonomic (albeit panicking) sugar layered
+    /// on top of this capability.
     Xor,
-    /// Computes [`XorOperation`] elementwise for this value and `right`.
-    xor(right),
+    /// Computes [`XorOperation`] elementwise for this value and `rhs`.
+    xor(rhs),
     XorOperation,
 );
 
@@ -48,14 +46,13 @@ mod tests {
 
     #[test]
     fn test_xor() {
+        // Check elementwise and scalar-broadcast eager value semantics.
         let left = Array::vector(vec![true, true, false, false]);
         let right = Array::vector(vec![true, false, true, false]);
         assert_eq!((left ^ right).values(), &[false, true, true, false]);
         assert_eq!((Array::vector(vec![true, false]) ^ Array::scalar(true)).values(), &[false, true]);
-    }
 
-    #[test]
-    fn test_xor_type_inference() {
+        // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(
             @elementwise @binary,
             operation = XorOperation,
@@ -64,10 +61,8 @@ mod tests {
                 output_data_types = [DataType::Boolean],
             }],
         );
-    }
 
-    #[test]
-    fn test_xor_batching() {
+        // Check mixed mapped/replicated batching.
         check_operation_batching!(
             @exact,
             operation = XorOperation,
@@ -80,10 +75,8 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
             }],
         );
-    }
 
-    #[test]
-    fn test_xor_partial_evaluation() {
+        // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = XorOperation,
             inputs = [Scalar::from(true), Scalar::from(false)],
