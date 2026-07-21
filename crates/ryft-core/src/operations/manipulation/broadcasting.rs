@@ -2,27 +2,27 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
+use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+use crate::operations::manipulation::reshaping::ReshapeOperation;
+use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
-
-use super::{ConvertElementTypeOperation, ReshapeOperation, TransposeOperation};
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -95,6 +95,8 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
+// TODO(eaplatanios): Review this module.
+
 impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> for BroadcastOperation {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -113,13 +115,11 @@ impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> Partiall
 {
 }
 
-/// Forward-mode rule for [`BroadcastOperation`]: `broadcast` is structural-linear, so the tangent is the same
-/// broadcast applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
-/// rule is consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for BroadcastOperation
-where
-    C::Operation: From<BroadcastOperation>,
-    C::Value: Broadcast,
+// Forward-mode differentiation rule for [`BroadcastOperation`]. `broadcast` is structural-linear, so the tangent is
+// the same broadcast applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent
+// before this rule is consulted, so the operand tangent reaching here is always live.
+impl<C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>> DifferentiableOperation<C>
+    for BroadcastOperation
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
