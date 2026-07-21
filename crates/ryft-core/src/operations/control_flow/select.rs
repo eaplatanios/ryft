@@ -6,7 +6,7 @@ use crate::differentiation::DifferentiableType;
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::forward::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -106,7 +106,12 @@ impl ElementwiseOperation for SelectOperation {
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
         if !condition.data_type().is_boolean() {
             return Err(TypeError {
-                message: format!("'select' condition data type {} is not {}", condition.data_type(), DataType::Boolean),
+                message: format!(
+                    "'{}' condition data type {} is not {}",
+                    SELECT_OPERATION_NAME,
+                    condition.data_type(),
+                    DataType::Boolean,
+                ),
             });
         }
 
@@ -141,8 +146,7 @@ where
 
 impl<C: Context<Operation: From<SelectOperation>>> PartiallyEvaluatableOperation<C> for SelectOperation {}
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     SelectOperation,
     /// Forward-mode differentiation rule for [`SelectOperation`]. The primal output is `select(condition, on_true,
     /// on_false)` over the input primals, and the tangent selects the branch tangents under the *same* primal condition
