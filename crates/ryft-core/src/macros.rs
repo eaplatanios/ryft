@@ -676,6 +676,292 @@ macro_rules! define_elementwise_capability {
     };
 }
 
+/// Implements complete forward-mode differentiation (i.e., the Jacobian-Vector Product, or JVP, tranform) and primitive
+/// transposition rules for an [`Operation`](crate::Operation). The caller supplies the operation-specific algorithms
+/// while this macro generates the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
+/// [`TransposableOperation`](crate::TransposableOperation) implementation shells. Reverse-mode differentiation needs no
+/// separate rule because it is derived by linearizing and then transposing the staged tangent program.
+///
+/// Use this macro when a rule needs direct access to the complete input list, an operation's structural metadata, or a
+/// transformation driver. Elementwise operations should generally use [`impl_differentiable_elementwise_operation!`]
+/// instead because it provides lazy tangent contributions, primal alignment, and structured transposition cases. The
+/// closure-like syntax only names the generated method arguments; it does not allocate or dynamically dispatch a
+/// runtime closure.
+///
+/// # Examples
+///
+/// A structural linear operation can provide both algorithms directly. The JVP body receives differentiation duals,
+/// while the transposition body receives partial primal inputs and output cotangents:
+///
+/// ```rust,ignore
+/// impl_differentiable_operation! {
+///     BroadcastOperation,
+///     jvp<C> where C: Context<Type = ArrayType, Value: Broadcast> {
+///         |operation, _context, _driver, inputs| {
+///             broadcast_jvp(operation, inputs)
+///         }
+///     },
+///     transpose<V, O>
+///     where
+///         V: Value<Type = ArrayType>,
+///         O: Operation<ArrayType> + From<BroadcastOperation>,
+///     {
+///         |operation, context, driver, inputs, outputs| {
+///             broadcast_transpose(operation, context, driver, inputs, outputs)
+///         }
+///     },
+/// }
+/// ```
+///
+/// A nonlinear primitive can provide its JVP and request the standard rejecting primitive-transposition rule.
+/// Reverse-mode differentiation remains available when the JVP stages transposable linear primitives:
+///
+/// ```rust,ignore
+/// impl_differentiable_operation! {
+///     Atan2Operation,
+///     jvp<C> where C::Value: Atan2 {
+///         |operation, context, driver, inputs| {
+///             atan2_jvp(operation, context, driver, inputs)
+///         }
+///     },
+///     transpose = @nonlinear,
+/// }
+/// ```
+///
+/// # Parameters
+///
+///   - `@nonlinear`: Selects the standard unsupported primitive transposition rule.
+///   - `$operation`: Operation type for which the rules are generated.
+///   - `$context`: Context parameter declared by `jvp<$context>` and used by the generated differentiation
+///     implementation and its bounds.
+///   - `$value`: Value parameter declared by `transpose<$value, $operations>` and used by the generated transposition
+///     implementation and its bounds.
+///   - `$operations`: Operation-family parameter declared by `transpose<$value, $operations>`.
+///   - `$bounds`: Additional predicates required by a rule, written directly after its `where` using ordinary Rust
+///     `where`-predicate syntax without an additional delimiter.
+///   - `$operation_binding`: Name bound to `self` inside a rule body.
+///   - `$context_binding`: Name bound to the active context inside a rule body.
+///   - `$driver_binding`: Name bound to the instruction-scoped region driver inside a rule body.
+///   - `$inputs`: Name bound to the complete input slice inside a rule body.
+///   - `$outputs`: Name bound to the complete output-cotangent slice inside a transposition body.
+#[macro_export]
+macro_rules! impl_differentiable_operation {
+    // This public branch starts parsing a JVP with an unbraced `where` clause. Token-by-token collection is necessary
+    // because `macro_rules!` cannot otherwise distinguish the final predicate from the brace-delimited rule body.
+    (
+        $operation:ty,
+        $(#[$documentation:meta])*
+        jvp<$context:ident>
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_jvp_where [$context] [$operation] [$(#[$documentation])*] [] $($tail)*
+        }
+    };
+
+    // This public branch accepts the boundless JVP form and forwards it directly to normalized rule parsing.
+    (
+        $operation:ty,
+        $(#[$documentation:meta])*
+        jvp<$context:ident> { $($jvp:tt)* },
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @jvp_ready [$context] [$operation] [$(#[$documentation])*] [] { $($jvp)* } $($tail)*
+        }
+    };
+
+    // This internal helper ends JVP-bound collection when it reaches the rule body and forwards the normalized rule.
+    (
+        @collect_jvp_where
+        [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        { $($jvp:tt)* },
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @jvp_ready [$context] [$operation] [$($documentation)*] [$($bounds)*] { $($jvp)* } $($tail)*
+        }
+    };
+
+    // This internal helper consumes one token tree from a JVP `where` clause while preserving the remaining rule.
+    (
+        @collect_jvp_where
+        [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_jvp_where
+            [$context] [$operation] [$($documentation)*] [$($bounds)* $next] $($rest)*
+        }
+    };
+
+    // This internal helper emits a complete JVP followed by the standard rejecting primitive-transposition rule.
+    (
+        @jvp_ready [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
+        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
+        transpose = @nonlinear $(,)?
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            $($documentation)*
+            impl<$context> $operation
+            where { $($bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_non_transposable_operation!($operation);
+    };
+
+    // This internal helper begins collecting an explicitly bounded transposition rule while retaining the complete
+    // normalized JVP. The transposition body supplies the unambiguous end marker for its predicates.
+    (
+        @jvp_ready [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
+        where
+        $($tail:tt)*
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
+        }
+    };
+
+    // This internal helper accepts a boundless transposition rule and emits both normalized implementations directly.
+    (
+        @jvp_ready [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
+        $(#[$transpose_documentation:meta])*
+        transpose<$value:ident, $operations:ident>
+        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block } $(,)?
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            $($jvp_documentation)*
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_differentiable_operation! {
+            @impl_transpose
+            $(#[$transpose_documentation])*
+            impl<$value, $operations> $operation
+            where {}
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    // This internal helper ends transposition-bound collection and emits the retained JVP and transposition rules.
+    (
+        @collect_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
+            $outputs:ident| $transpose_body:block } $(,)?
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            $($jvp_documentation)*
+            impl<$context> $operation
+            where { $($jvp_bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+        }
+
+        $crate::impl_differentiable_operation! {
+            @impl_transpose
+            $($transpose_documentation)*
+            impl<$value, $operations> $operation
+            where { $($transpose_bounds)* }
+            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+        }
+    };
+
+    // This internal helper consumes one token tree from a transposition `where` clause while retaining the JVP state.
+    (
+        @collect_transpose_where
+        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
+        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
+        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        $next:tt $($rest:tt)+
+    ) => {
+        $crate::impl_differentiable_operation! {
+            @collect_transpose_where
+            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
+            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
+            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
+        }
+    };
+
+    // This internal helper emits the shared `DifferentiableOperation` shell around a complete caller-provided JVP.
+    (
+        @impl_jvp
+        $(#[$documentation:meta])*
+        impl<$context:ident> $operation:ty
+        where { $($bounds:tt)* }
+        |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $body:block
+    ) => {
+        $(#[$documentation])*
+        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
+        where
+            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
+            $($bounds)*
+        {
+            fn jvp<D: $crate::DifferentiationDriver<$context>>(
+                &self,
+                $jvp_context: &$context,
+                $jvp_driver: &D,
+                $inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
+            ) -> Result<
+                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
+                $crate::DifferentiationError,
+            > {
+                let $self = self;
+                $body
+            }
+        }
+    };
+
+    // This internal helper emits the shared `TransposableOperation` shell around a complete caller-provided pullback.
+    (
+        @impl_transpose
+        $(#[$documentation:meta])*
+        impl<$value:ident, $operations:ident> $operation:ty
+        where { $($bounds:tt)* }
+        |$self:ident, $context:ident, $driver:ident, $inputs:ident, $outputs:ident| $body:block
+    ) => {
+        $(#[$documentation])*
+        impl<
+            $value: $crate::Value,
+            $operations: $crate::Operation<<$value as $crate::Typed>::Type>,
+        > $crate::TransposableOperation<$value, $operations> for $operation
+        where
+            $operation: $crate::Operation<<$value as $crate::Typed>::Type>,
+            $($bounds)*
+        {
+            fn transpose<D: $crate::TranspositionDriver<$value, $operations>>(
+                &self,
+                $context: &mut $crate::TracingContext<$value, $operations>,
+                $driver: &D,
+                $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
+                $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
+            ) -> Result<
+                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
+                $crate::DifferentiationError,
+            > {
+                let $self = self;
+                $body
+            }
+        }
+    };
+}
+
 /// Implements the forward-mode differentiation (Jacobian-Vector Product; JVP) and primitive transposition rules for
 /// an elementwise [`Operation`](crate::Operation). The macro keeps the operation-specific mathematical rule at the
 /// invocation site while generating the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
@@ -709,12 +995,9 @@ macro_rules! define_elementwise_capability {
 /// linear rules provide only the supported ordering. Unsupported patterns and missing cotangent spaces receive
 /// diagnostics derived from the operation and operand names.
 ///
-/// `@nonlinear` implements the standard erroring primitive transpose rule: reverse-mode differentiation remains
-/// available by transposing the linear operations produced by the JVP. `@custom` is the escape hatch for elementwise
-/// operations whose tangent or cotangent behavior cannot be represented as independent arithmetic terms. Its generated
-/// shells are fully general [`DifferentiableOperation`](crate::DifferentiableOperation) and
-/// [`TransposableOperation`](crate::TransposableOperation) implementations that do not themselves impose elementwise
-/// structure on the provided bodies (the form exists so that elementwise operation modules keep a single entry point).
+/// `@nonlinear` implements the standard erroring primitive transpose rule. Reverse-mode differentiation remains
+/// available by transposing the linear operations produced by the JVP. Operations whose rules cannot be expressed as
+/// elementwise tangent contributions should use [`impl_differentiable_operation!`] instead.
 ///
 /// # Examples
 ///
@@ -770,26 +1053,6 @@ macro_rules! define_elementwise_capability {
 /// }
 /// ```
 ///
-/// The custom form accepts complete rule bodies when independent contribution expressions cannot represent the
-/// operation efficiently or correctly. The helpers in this example stand in for arbitrary caller-defined logic:
-///
-/// ```rust,ignore
-/// impl_differentiable_elementwise_operation! {
-///     @custom
-///     SelectOperation,
-///     jvp<C> where C::Type: DifferentiableType, C::Operation: From<SelectOperation> {
-///         |operation, context, driver, inputs| {
-///             custom_select_jvp(operation, context, driver, inputs)
-///         }
-///     },
-///     transpose<V, O> where V::Type: DifferentiableType, O: From<SelectOperation> {
-///         |operation, context, driver, inputs, outputs| {
-///             custom_select_transpose(operation, context, driver, inputs, outputs)
-///         }
-///     },
-/// }
-/// ```
-///
 /// Finally, operations with no differential dependence use the compact selectors. `@non_differentiable` gives every
 /// output a structural-zero tangent, while `@constant` also gives its exemplar input a structural-zero cotangent:
 ///
@@ -805,7 +1068,6 @@ macro_rules! define_elementwise_capability {
 ///   - `@linear`: Selects a fully linear unary or binary rule with the provided signed coefficients.
 ///   - `@unary`: Selects a unary JVP with one lazily evaluated tangent term.
 ///   - `@binary`: Selects a binary JVP with one lazily evaluated term per input tangent.
-///   - `@custom`: Selects caller-provided JVP and, optionally, transposition bodies.
 ///   - `@nonlinear`: Selects the standard unsupported primitive transposition rule.
 ///   - `$context`: Context parameter declared by `jvp<$context>` and used by the generated differentiation
 ///     implementation and its bounds.
@@ -871,12 +1133,6 @@ macro_rules! impl_differentiable_elementwise_operation {
     // and either a structured or custom primitive-transposition rule.
     (@binary $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(@public_jvp [binary] $($tail)*);
-    };
-
-    // This branch starts parsing caller-supplied JVP and transposition closures for an operation
-    // whose behavior cannot be expressed by the unary or binary contribution DSLs.
-    (@custom $($tail:tt)*) => {
-        $crate::impl_differentiable_elementwise_operation!(@public_jvp [custom] $($tail)*);
     };
 
     // This branch implements a positive unary linear rule. Both its tangent and cotangent pass through unchanged,
@@ -1047,38 +1303,31 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This internal helper branch emits a unary elementwise JVP after the public parser has normalized its optional
     // bounds. It remains a dedicated branch because unary rules have one tangent contribution and always reject
-    // transposition, unlike the binary and fully custom forms.
+    // transposition, unlike binary rules with structured knownness cases.
     (
         @jvp_ready [unary] [$context:ident] [$operation:ty] [$($documentation:tt)*] [$($bounds:tt)*]
         { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
         transpose = @nonlinear $(,)?
     ) => {
-        $($documentation)*
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <$context as $crate::Domain>::Value:
-                $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-            $($bounds)*
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                context: &$context,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            $($documentation)*
+            impl<$context> $operation
+            where {
+                <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+                <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+                <$context as $crate::Domain>::Value:
+                    $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+                $($bounds)*
+            }
+            |operation, context, _driver, inputs| {
                 $crate::unary_elementwise_jvp(
-                    self,
+                    operation,
                     inputs,
                     |input| {
                         let mut outputs = $crate::Context::bind(
                             context,
-                            self.clone(),
+                            operation.clone(),
                             Vec::new(),
                             ::std::slice::from_ref(input),
                         )?;
@@ -1180,90 +1429,6 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch emits a fully custom JVP whose operation is explicitly nonlinear under transposition,
-    // then adds the standard rejecting transposition implementation. The dedicated terminal form preserves the custom
-    // JVP escape hatch without invoking transposition-bound collection.
-    (
-        @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
-        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
-        transpose = @nonlinear $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_jvp
-            $($jvp_documentation)*
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
-        }
-
-        $crate::impl_non_transposable_operation!($operation);
-    };
-
-    // This internal helper branch recognizes a fully custom rule with a custom transposition implementation and starts
-    // collecting the latter's unbraced bounds. Its larger parser state retains both closures and their documentation
-    // until the transposition body marks the end of the predicates.
-    (
-        @jvp_ready [custom] [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
-        { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
-        $(#[$transpose_documentation:meta])*
-        transpose<$value:ident, $operations:ident>
-        where
-        $($tail:tt)*
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_public_custom_transpose_where
-            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$(#[$transpose_documentation])*] [$value] [$operations] [] $($tail)*
-        }
-    };
-
-    // This internal helper branch finishes custom transposition-bound collection when it reaches the closure body, then
-    // emits the JVP and transposition implementations directly. The closure delimiter is the only reliable end marker
-    // for an unbraced `where` clause, so this terminal collector branch cannot be folded into its recursive companion.
-    (
-        @collect_public_custom_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block } $(,)?
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_jvp
-            $($jvp_documentation)*
-            impl<$context> $operation
-            where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
-        }
-
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_transpose
-            $($transpose_documentation)*
-            impl<$value, $operations> $operation
-            where { $($transpose_bounds)* }
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
-        }
-    };
-
-    // This internal helper branch consumes one token tree from a custom transposition `where` clause and preserves
-    // the two custom closures while recursing. It is separate from the binary collector because the fully custom JVP
-    // carries operation, context, driver, and complete-input bindings instead of contribution expressions.
-    (
-        @collect_public_custom_transpose_where
-        [$context:ident] [$operation:ty] [$($jvp_documentation:tt)*] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$($transpose_documentation:tt)*] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        $next:tt $($rest:tt)+
-    ) => {
-        $crate::impl_differentiable_elementwise_operation! {
-            @collect_public_custom_transpose_where
-            [$context] [$operation] [$($jvp_documentation)*] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$($transpose_documentation)*] [$value] [$operations] [$($transpose_bounds)* $next] $($rest)*
-        }
-    };
-
     // This internal helper branch emits the shared unary linear JVP and transposition algorithms after the public
     // sign-specific arms have supplied their minimal bounds. Keeping the sign as a token lets one shell preserve
     // positive tangents and cotangents or negate negative ones without duplicating both trait implementations.
@@ -1274,26 +1439,19 @@ macro_rules! impl_differentiable_elementwise_operation {
         transpose_type_bound { $($transpose_type_bound:tt)+ }
         transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
     ) => {
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-            $($jvp_bounds)*
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                context: &$context,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            impl<$context> $operation
+            where {
+                <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+                <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+                $($jvp_bounds)*
+            }
+            |operation, context, _driver, inputs| {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 let mut primals = $crate::Context::bind(
                     context,
-                    self.clone(),
+                    operation.clone(),
                     Vec::new(),
                     ::std::slice::from_ref(inputs[0].primal()),
                 )?;
@@ -1343,27 +1501,20 @@ macro_rules! impl_differentiable_elementwise_operation {
         where { $($value_bounds:tt)* }
         transpose_operation_bounds { $($transpose_operation_bounds:tt)* }
     ) => {
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <$context as $crate::Domain>::Value: $($value_bounds)*
-                + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                context: &$context,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            impl<$context> $operation
+            where {
+                <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+                <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+                <$context as $crate::Domain>::Value: $($value_bounds)*
+                    + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+            }
+            |operation, context, _driver, inputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 let mut primals = $crate::Context::bind(
                     context,
-                    self.clone(),
+                    operation.clone(),
                     Vec::new(),
                     &[inputs[0].primal().clone(), inputs[1].primal().clone()],
                 )?;
@@ -1376,7 +1527,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                     return Err($crate::ProgramError::UnsupportedOperation {
                         message: format!(
                             "'{}' output type {} has no tangent space",
-                            $crate::Operation::name(self),
+                            $crate::Operation::name(operation),
                             $crate::Typed::r#type(&primal),
                         ),
                     }
@@ -1532,8 +1683,8 @@ macro_rules! impl_differentiable_elementwise_operation {
             jvp { $($jvp)* }
         }
 
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_transpose
+        $crate::impl_differentiable_operation! {
+            @impl_transpose
             $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
@@ -1663,8 +1814,8 @@ macro_rules! impl_differentiable_elementwise_operation {
             jvp { $($jvp)* }
         }
 
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_transpose
+        $crate::impl_differentiable_operation! {
+            @impl_transpose
             $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
@@ -1751,8 +1902,8 @@ macro_rules! impl_differentiable_elementwise_operation {
             jvp { $($jvp)* }
         }
 
-        $crate::impl_differentiable_elementwise_operation! {
-            @custom_transpose
+        $crate::impl_differentiable_operation! {
+            @impl_transpose
             $(#[$transpose_documentation])*
             impl<$value, $operations> $operation
             where { $($transpose_bounds)* }
@@ -1775,32 +1926,25 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $right_term:expr;
         }
     ) => {
-        $(#[$documentation])*
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            <$context as $crate::Domain>::Type: $crate::DifferentiableType,
-            <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-            <$context as $crate::Domain>::Value: ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
-                + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-            $($bounds)*
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                context: &$context,
-                _driver: &D,
-                inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
+        $crate::impl_differentiable_operation! {
+            @impl_jvp
+            $(#[$documentation])*
+            impl<$context> $operation
+            where {
+                <$context as $crate::Domain>::Type: $crate::DifferentiableType,
+                <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+                <$context as $crate::Domain>::Value: ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
+                    + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
+                $($bounds)*
+            }
+            |operation, context, _driver, inputs| {
                 $crate::binary_elementwise_jvp(
-                    self,
+                    operation,
                     inputs,
                     |left, right| {
                         let mut outputs = $crate::Context::bind(
                             context,
-                            self.clone(),
+                            operation.clone(),
                             Vec::new(),
                             &[left.clone(), right.clone()],
                         )?;
@@ -1870,71 +2014,6 @@ macro_rules! impl_differentiable_elementwise_operation {
         let $right_primal = $operands.right_primal()?;
     };
 
-    // This internal helper branch emits the `DifferentiableOperation` shell for a fully custom JVP closure. It exists
-    // as the common endpoint for custom rules with either nonlinear or custom transposition, keeping trait boilerplate
-    // out of the public DSL while leaving the JVP algorithm entirely under caller control.
-    (
-        @custom_jvp
-        $(#[$documentation:meta])*
-        impl<$context:ident> $operation:ty
-        where { $($bounds:tt)* }
-        |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $body:block
-    ) => {
-        $(#[$documentation])*
-        impl<$context: $crate::Context> $crate::DifferentiableOperation<$context> for $operation
-        where
-            $operation: $crate::Operation<<$context as $crate::Domain>::Type>,
-            $($bounds)*
-        {
-            fn jvp<D: $crate::DifferentiationDriver<$context>>(
-                &self,
-                $jvp_context: &$context,
-                $jvp_driver: &D,
-                $inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
-            ) -> Result<
-                Vec<$crate::DifferentiationDual<<$context as $crate::Domain>::Value>>,
-                $crate::DifferentiationError,
-            > {
-                let $self = self;
-                $body
-            }
-        }
-    };
-
-    // This internal helper branch emits the `TransposableOperation` shell for a fully custom transposition closure.
-    // Structured binary rules also lower through it, which centralizes the trait signature and user-specified bounds
-    // without imposing a second transposition abstraction.
-    (
-        @custom_transpose
-        $(#[$documentation:meta])*
-        impl<$value:ident, $operations:ident> $operation:ty
-        where { $($bounds:tt)* }
-        |$self:ident, $context:ident, $driver:ident, $inputs:ident, $outputs:ident| $body:block
-    ) => {
-        $(#[$documentation])*
-        impl<
-            $value: $crate::Value,
-            $operations: $crate::Operation<<$value as $crate::Typed>::Type>,
-        > $crate::TransposableOperation<$value, $operations> for $operation
-        where
-            $operation: $crate::Operation<<$value as $crate::Typed>::Type>,
-            $($bounds)*
-        {
-            fn transpose<D: $crate::TranspositionDriver<$value, $operations>>(
-                &self,
-                $context: &mut $crate::TracingContext<$value, $operations>,
-                $driver: &D,
-                $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
-                $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
-                $crate::DifferentiationError,
-            > {
-                let $self = self;
-                $body
-            }
-        }
-    };
 }
 
 /// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs carry
@@ -3776,8 +3855,8 @@ pub use crate::{
     check_builders, check_count, check_gradient, check_operation_batching, check_operation_differentiation,
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_nullary_batchable_operation, impl_nullary_transposable_operation,
+    impl_differentiable_elementwise_operation, impl_differentiable_operation, impl_non_differentiable_operation,
+    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
 };
 
 #[cfg(test)]
@@ -3888,6 +3967,37 @@ mod tests {
         test_binary(other),
         TestBinaryOperation,
     );
+
+    const TEST_DIFFERENTIABLE_OPERATION_NAME: &str = "test_differentiable";
+
+    define_elementwise_operation!(
+        @binary
+        /// Binary operation used to test [`impl_differentiable_operation!`].
+        TestDifferentiableOperation, TEST_DIFFERENTIABLE_OPERATION_NAME,
+        Add, add,
+        check_data_types = [@numeric],
+        check_array_types = [@same_unreduced_axes, @same_reduced_axes],
+    );
+
+    impl_differentiable_operation! {
+        TestDifferentiableOperation,
+        jvp<C>
+        where
+            C::Type: crate::DifferentiableType,
+        {
+            |_operation, _context, _driver, inputs| {
+                check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), inputs[0].tangent().clone())?])
+            }
+        },
+        transpose<V, O> {
+            |_operation, _context, _driver, inputs, outputs| {
+                check_count!("input", inputs, 2, ProgramError);
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![outputs[0].clone(), outputs[0].clone()])
+            }
+        },
+    }
 
     const TEST_REVERSED_SUB_OPERATION_NAME: &str = "test_reversed_sub";
     const TEST_NEGATED_ADD_OPERATION_NAME: &str = "test_negated_add";
@@ -5002,6 +5112,40 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_impl_differentiable_operation() {
+        // The generic macro forwards every differentiation dual to the caller-provided JVP body without imposing
+        // elementwise alignment or structural-zero handling.
+        let inputs = [
+            DifferentiationDual::new(Scalar::from(2.0f32), Scalar::from(4.0f32)).unwrap(),
+            DifferentiationDual::new(Scalar::from(3.0f32), Scalar::from(5.0f32)).unwrap(),
+        ];
+        let outputs = TestDifferentiableOperation
+            .jvp(&EagerContext::<Scalar, TestDifferentiableOperation>::new(), &EmptyRegionDriver, &inputs)
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Scalar::from(2.0f32));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Scalar::from(4.0f32)));
+
+        // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
+        // supplied body and preserves the driver's static dispatch.
+        let mut context = TracingContext::<Scalar, TestDifferentiableOperation>::new();
+        let output_cotangent = context.input(DataType::F32);
+        let output_cotangent_id = output_cotangent.atom_id();
+        let input_cotangents = TestDifferentiableOperation
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(DataType::F32), PartialValue::Unknown(DataType::F32)],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert_eq!(input_cotangents.len(), 2);
+        assert!(input_cotangents.iter().all(
+            |cotangent| matches!(cotangent, MaybeZero::Value(cotangent) if cotangent.atom_id() == output_cotangent_id)
+        ));
     }
 
     #[test]
