@@ -1549,7 +1549,7 @@ impl Type for DataType {
 
     #[inline]
     fn is_complex(&self) -> bool {
-        self.is_complex()
+        DataType::is_complex(*self)
     }
 }
 
