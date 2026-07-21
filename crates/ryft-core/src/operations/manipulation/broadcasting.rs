@@ -2,10 +2,11 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
+use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
@@ -21,8 +22,6 @@ use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
-
-// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -95,10 +94,7 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for BroadcastOperation
-where
-    C::Value: Broadcast,
-{
+impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> for BroadcastOperation {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -111,20 +107,16 @@ where
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for BroadcastOperation where
-    C::Operation: From<BroadcastOperation>
+impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
+    for BroadcastOperation
 {
 }
 
-/// Forward-mode differentiation rule for [`BroadcastOperation`]. Broadcasting is structural-linear, so the tangent
-/// follows the same axis mapping as the primal. A structural-zero input tangent remains structural and acquires the
-/// primal output's tangent type.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for BroadcastOperation
-where
-    C::Value: Broadcast,
-    C::Operation: From<BroadcastOperation>,
+// Forward-mode differentiation rule for [`BroadcastOperation`]. Broadcasting is structural-linear, so the tangent
+// follows the same axis mapping as the primal. A structural-zero input tangent remains structural and acquires the
+// primal output's tangent type.
+impl<C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>> DifferentiableOperation<C>
+    for BroadcastOperation
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -142,6 +134,8 @@ where
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
