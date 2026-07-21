@@ -1,9 +1,8 @@
-//! Contains the named-axis collective operations: [`CollectiveOperation`], which reduces a value across a named
-//! axis (`psum` / `pmean` / `pmax`), and [`AxisIndexOperation`], which produces the current batch item's or device
-//! shard's index along a named axis, together with their interpretation, partial-evaluation, batching, forward-mode
-//! differentiation, and transposition rules. These are the analogues of
+//! Contains the named-axis [`CollectiveOperation`], which reduces a value across a named axis (`psum` / `pmean` /
+//! `pmax`), together with its interpretation, partial-evaluation, batching, forward-mode differentiation, and
+//! transposition rules. These are the analogues of
 //! [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators) `jax.lax.psum`,
-//! `jax.lax.pmean`, `jax.lax.pmax`, and `jax.lax.axis_index`.
+//! `jax.lax.pmean`, and `jax.lax.pmax`.
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
 //! [`NamedAxes`](crate::axes::NamedAxes) environment at staging time. A name bound by an enclosing `batch` level is
@@ -23,15 +22,12 @@ use crate::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::constants::{FillOperation, IotaOperation, ZeroLike};
+use crate::macros::check_count;
+use crate::operations::constants::{FillOperation, ZeroLike};
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::{Broadcast, Concatenate, Reshape, Slice, Transpose};
 use crate::operations::math::{Reduce, ReductionKind};
-use crate::partial::{
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation,
-};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -431,152 +427,6 @@ where
             context.bind(CollectiveOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-/// Canonical operation name for [`AxisIndexOperation`].
-pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
-
-// TODO(eaplatanios): Include code examples in the docstrings similar to the JAX documentation.
-/// Nullary primitive that produces the current batch item's or device shard's index along a named axis as a scalar
-/// [`DataType::U64`] value — the ryft analogue of JAX's
-/// [`axis_index`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.axis_index.html).
-///
-/// The [`AxisIndex`](crate::axes::AxisIndex) reader stages this operation uniformly for every axis kind; resolution
-/// then depends on the enclosing binder. A *batched* axis is consumed by this operation's staged batching rule at the
-/// `batch` level that binds it, which materializes the per-item index as an [`iota`](crate::operations::constants::Iota)
-/// over the known batch size — so an `AxisIndexOperation` for a batched axis never survives into a staged body. A
-/// *device mesh* axis has no such trace-time binder: its per-device coordinate is known only at execution time, so the
-/// operation stays in the staged body and lowers inside a `shard_map` manual region to `partition_id`-based coordinate
-/// arithmetic. Only mesh uses therefore reach interpretation, which is why this operation is *not* eagerly
-/// interpretable and, having no operands, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing
-/// rather than folding (folding a nullary operation would try to interpret it).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AxisIndexOperation {
-    /// Name of the device mesh axis whose per-shard index this operation produces.
-    axis_name: String,
-}
-
-impl AxisIndexOperation {
-    /// Creates a new [`AxisIndexOperation`] referencing the mesh axis `axis_name`.
-    #[inline]
-    pub fn new(axis_name: String) -> Self {
-        Self { axis_name }
-    }
-
-    /// Returns the mesh axis name referenced by this operation.
-    #[inline]
-    pub fn axis_name(&self) -> &str {
-        &self.axis_name
-    }
-}
-
-impl Display for AxisIndexOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl Operation<ArrayType> for AxisIndexOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        AXIS_INDEX_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 0, TypeError);
-        Ok(vec![ArrayType::scalar(DataType::U64)])
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, AXIS_INDEX_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
-    }
-}
-
-impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperation {
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 0, ProgramError);
-        // A mesh axis index is a per-device coordinate that only exists during sharded execution; there is no eager
-        // value to produce. It is lowered inside a `shard_map` manual region and never interpreted directly.
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "axis_index for the device mesh axis '{}' has no eager value; it is only defined inside a shard_map \
-                manual region",
-                self.axis_name,
-            ),
-        })
-    }
-}
-
-/// Partial evaluation always residualizes an [`AxisIndexOperation`]: its value depends on the executing device, so it
-/// is never a foldable constant even though it has no (known) inputs.
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for AxisIndexOperation
-where
-    C::Operation: From<AxisIndexOperation>,
-{
-    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
-        &self,
-        context: &PartialEvaluationContext<C>,
-        _driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        context.residualize(self.clone(), Vec::new(), inputs)
-    }
-}
-
-impl_non_differentiable_operation!(AxisIndexOperation);
-impl_nullary_transposable_operation!(AxisIndexOperation);
-
-/// Batching rule for [`AxisIndexOperation`], mirroring the collective rule above and, like it, deciding purely
-/// from the active context's [`axis_name`](crate::batching::BatchingContext::axis_name). When this level's axis
-/// name matches, this level binds the axis, so the per-item index is materialized as the length-`size`
-/// [`iota`](crate::operations::constants::Iota)`(0)` mapped on the level's batch axis (the size is this level's
-/// [`axis_size`](crate::batching::BatchingContext::axis_size)); the iota binds into the parent context, so it
-/// materializes eagerly under an eager parent and stages under a staging parent. Otherwise the axis is bound
-/// elsewhere — an outer `batch` level or a device mesh — so the operation is re-staged into the parent context (which
-/// repeats the same resolution, ultimately materializing at the binding `batch` level or surviving into the staged
-/// body for a mesh axis) and presented as replicated across this level's batch items. The name is validated by the
-/// [`AxisIndex`](crate::axes::AxisIndex) reader before staging, so no name lookup is needed here.
-impl<C> BatchableOperation<C> for AxisIndexOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>,
-{
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        context: &BatchingContext<C>,
-        _driver: &D,
-        _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        if context.axis_name() == Some(self.axis_name.as_str()) {
-            // This level binds the axis: the per-item index is the length-`size` `iota(0)`, bound into the parent and
-            // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
-            // back to the per-item scalar `u64`.
-            let size = context.axis_size();
-            let physical_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
-            let mut index_vector =
-                context.parent().bind(IotaOperation::new(physical_type.clone(), 0), Vec::new(), &[])?;
-            check_count!("output", index_vector, 1, ProgramError);
-            Ok(vec![ArrayBatch::new(physical_type, index_vector.remove(0), Some(0))?])
-        } else {
-            // The axis is bound by an outer `batch` level or a device mesh: re-bind into the parent, which repeats the
-            // resolution, and present the forwarded index as replicated across this level.
-            let mut outputs =
-                context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), Vec::new(), &[])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(vec![ArrayBatch::replicated(outputs.remove(0))])
-        }
     }
 }
 
@@ -1426,7 +1276,6 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::axes::AxisIndex;
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{
         ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
@@ -1632,68 +1481,6 @@ mod tests {
 
         assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
         assert_eq!(output.to_f64s(), vec![4.0, 6.0]);
-    }
-
-    #[test]
-    fn test_batch_axis_index_produces_per_item_indices() {
-        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
-        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item| item.context().axis_index("i"),
-                Array::vector(vec![10.0, 20.0, 30.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("i"),
-            )
-            .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
-        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
-        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
-        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
-        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
-        // vary over inner items). The inner output is therefore declared replicated, and the
-        // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
-        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |row| {
-                    let context = row.context().clone();
-                    Ok(Batch::batch(
-                        &context,
-                        |scalar| scalar.context().axis_index("o"),
-                        row,
-                        BatchAxis::new(0),
-                        BatchAxis::replicated(),
-                        BatchAxisSpecification::named("i"),
-                    )?)
-                },
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("o"),
-            )
-            .unwrap();
-
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
-        assert_eq!(output.to_f64s(), vec![0.0, 1.0]);
-    }
-
-    #[test]
-    fn test_batch_axis_index_rejects_unbound_axis() {
-        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
-        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
-            |item| item.context().axis_index("j"),
-            Array::vector(vec![10.0, 20.0, 30.0]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("i"),
-        );
-        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 
     /// Returns the static `f32` vector type of the provided length used by the shape-changing collective tests.

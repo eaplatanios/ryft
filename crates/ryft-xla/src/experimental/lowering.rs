@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::axes::AxisIndexOperation;
 #[cfg(any(test, feature = "benchmarking"))]
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
@@ -12,8 +13,7 @@ use ryft_core::operations::attention::{
     AttentionMask, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveKind, CollectiveOperation,
-    PSumScatterOperation, PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveKind, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};

@@ -25,10 +25,7 @@ pub mod sort;
 pub mod tag;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
-pub use collectives::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
-    forward_collective_to_parent,
-};
+pub use collectives::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;

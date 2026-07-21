@@ -48,12 +48,12 @@ use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::axes::AxisIndexOperation;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveOperation, PSumScatterOperation,
-    PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
 };
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;

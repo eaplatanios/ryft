@@ -1,21 +1,25 @@
+use std::fmt::Display;
+
 use thiserror::Error;
 
-use crate::batching::{BatchableOperation, BatchingContext, BatchingError};
-use crate::contexts::{Context, EagerContext};
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext};
 use crate::differentiation::types::DifferentiableType;
-use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
-// TODO(eaplatanios): Should we move `AxisIndexOperation` to this module?
-use crate::operations::collectives::AxisIndexOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
+use crate::operations::constants::{IotaOperation, ZeroOperation};
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
-use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
+};
 use crate::programs::ProgramError;
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationFormatter};
+use crate::programs::regions::RegionInterface;
+use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 /// Represents axis-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -182,6 +186,159 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
     }
 }
 
+/// Canonical operation name for [`AxisIndexOperation`].
+pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
+
+/// Nullary primitive [`Operation`] that produces the current batch item's or device shard's index along a
+/// [`NamedAxis`] as a scalar [`DataType::U64`] value. This is the Ryft analogue of JAX's
+/// [`axis_index`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.axis_index.html). [`AxisIndex::axis_index`]
+/// stages this operation uniformly for every axis kind and resolution depends on the enclosing binder. A *batched* axis
+/// is consumed by this operation's staged batching rule at the `batch` level that binds it, which materializes the
+/// per-item index as an [`iota`](crate::operations::constants::Iota) over the known batch size. This means that an
+/// `AxisIndexOperation` for a batched axis never survives into a staged body. A *device mesh* axis has no such
+/// trace-time binder. Its per-device coordinate is known only at execution time, and so the operation stays in the
+/// staged body and lowers inside a `shard_map` manual region to `partition_id`-based coordinate arithmetic. Only mesh
+/// uses therefore reach interpretation, which is why this operation is *not* eagerly interpretable and, having no
+/// operands, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing rather than folding (that is
+/// because folding a nullary operation would result in trying to interpret it).
+///
+/// # Examples
+///
+/// The following batches a function over a named `items` axis and returns each item's index along that axis:
+///
+/// ```rust
+/// # use ryft_core::{Array, AxisIndex, BatchAxis, BatchAxisSpecification, batch};
+/// #
+/// let indices: Array = batch(
+///     |item| item.context().axis_index("items"),
+///     Array::vector(vec![10.0, 20.0, 30.0]),
+///     BatchAxis::new(0),
+///     BatchAxis::new(0),
+///     BatchAxisSpecification::named("items"),
+/// )
+/// .unwrap();
+/// assert_eq!(indices.to_f64s(), vec![0.0, 1.0, 2.0]);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AxisIndexOperation {
+    /// Name of the device mesh axis whose per-shard index this [`AxisIndexOperation`] produces.
+    axis_name: String,
+}
+
+impl AxisIndexOperation {
+    /// Creates a new [`AxisIndexOperation`] referencing the mesh axis `axis_name`.
+    #[inline]
+    pub fn new(axis_name: String) -> Self {
+        Self { axis_name }
+    }
+
+    /// Returns the mesh axis name referenced by this [`AxisIndexOperation`].
+    #[inline]
+    pub fn axis_name(&self) -> &str {
+        &self.axis_name
+    }
+}
+
+impl Display for AxisIndexOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation<ArrayType> for AxisIndexOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        AXIS_INDEX_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 0, TypeError);
+        Ok(vec![ArrayType::scalar(DataType::U64)])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, AXIS_INDEX_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
+    }
+}
+
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperation {
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        // A mesh axis index is a per-device coordinate that only exists during sharded execution. There is no eager
+        // value to produce. It is lowered inside a `shard_map` manual region and never interpreted directly.
+        check_count!("input", inputs, 0, ProgramError);
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`axis_index` for the device mesh axis '{}' has no eager value; \
+                it is only defined inside a `shard_map` manual region",
+                self.axis_name,
+            ),
+        })
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> PartiallyEvaluatableOperation<C>
+    for AxisIndexOperation
+{
+    #[inline]
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        _driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Partial evaluation always residualizes an `AxisIndexOperation`. Its value depends on the executing device,
+        // and so it is never a foldable constant even though it has no (known) inputs.
+        context.residualize(self.clone(), Vec::new(), inputs)
+    }
+}
+
+impl_non_differentiable_operation!(AxisIndexOperation);
+impl_nullary_transposable_operation!(AxisIndexOperation);
+
+impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>>>
+    BatchableOperation<C> for AxisIndexOperation
+{
+    fn batch<D: BatchingDriver<C>>(
+        &self,
+        context: &BatchingContext<C>,
+        _driver: &D,
+        _inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+        if context.axis_name() == Some(self.axis_name.as_str()) {
+            // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
+            // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
+            // back to the per-item scalar `u64`.
+            let size = context.axis_size();
+            let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
+            let operation = IotaOperation::new(r#type.clone(), 0);
+            let mut index = context.parent().bind(operation, Vec::new(), &[])?;
+            check_count!("output", index, 1, ProgramError);
+            Ok(vec![ArrayBatch::new(r#type, index.remove(0), Some(0))?])
+        } else {
+            // The axis is bound by an outer `batch` level or a device mesh. Re-bind into the parent, which repeats the
+            // resolution and present the forwarded index as replicated across this level.
+            let operation = AxisIndexOperation::new(self.axis_name.clone());
+            let mut index = context.parent().bind(operation, Vec::new(), &[])?;
+            check_count!("output", index, 1, ProgramError);
+            Ok(vec![ArrayBatch::replicated(index.remove(0))])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -190,10 +347,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::BatchingError;
+    use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
+    use crate::programs::types::Typed;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{ArrayType, DataType};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
 
@@ -257,5 +415,65 @@ mod tests {
             error.downcast_custom::<BatchingError>(),
             Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "missing",
         ));
+    }
+
+    #[test]
+    fn test_batch_axis_index_produces_per_item_indices() {
+        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
+        let output: Array = batch(
+            |item| item.context().axis_index("i"),
+            Array::vector(vec![10.0, 20.0, 30.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        )
+        .unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
+        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
+        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
+        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
+        // vary over inner items). The inner output is therefore declared replicated, and the outer level stacks the
+        // per-row outer index, giving the `u64` vector `[0, 1]`.
+        let x = Array::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    Ok(Batch::batch(
+                        &context,
+                        |scalar| scalar.context().axis_index("o"),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::replicated(),
+                        BatchAxisSpecification::named("i"),
+                    )?)
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("o"),
+            )
+            .unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.to_f64s(), vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_batch_axis_index_rejects_unbound_axis() {
+        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
+        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
+            |item| item.context().axis_index("j"),
+            Array::vector(vec![10.0, 20.0, 30.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        );
+        assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() }));
     }
 }

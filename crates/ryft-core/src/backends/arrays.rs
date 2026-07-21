@@ -24,6 +24,7 @@ use ryft_macros::Operation;
 // TODO(eaplatanios): Review from here onwards.
 
 use crate::Select;
+use crate::axes::AxisIndexOperation;
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
@@ -33,8 +34,7 @@ use crate::operations::attention::{
     DotProductAttentionOperation, dot_product_attention_backward_composition, dot_product_attention_composition,
 };
 use crate::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, AxisIndexOperation, CollectiveOperation, PSumScatterOperation,
-    PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveOperation, PSumScatterOperation, PpermuteOperation,
 };
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
