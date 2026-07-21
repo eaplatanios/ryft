@@ -27,13 +27,13 @@ use std::collections::HashMap;
 
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
-use crate::operations::BooleanLike;
 use crate::operations::control_flow::WhileOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::programs::Program;
 use crate::programs::regions::RegionRef;
+use crate::programs::values::Concretizable;
 
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.
@@ -44,7 +44,7 @@ use crate::programs::regions::RegionRef;
 ///
 /// The rewrite runs only when the context
 /// [is eager](Context::is_eager): only eager domains,
-/// whose primal values are concrete, can evaluate a `while` condition with [`BooleanLike::boolean`] and decide a
+/// whose primal values are concrete, can evaluate a `while` condition with [`Concretizable::concretize`] and decide a
 /// data-dependent trip count. For symbolic and staging domains the program is returned unchanged, keeping their
 /// staged (masked-scan / linear-loop) strategies.
 ///
@@ -74,7 +74,7 @@ pub(crate) fn unroll_concretizable_whiles<C>(
 >
 where
     C: Context,
-    <C as Domain>::Value: BooleanLike,
+    <C as Domain>::Value: Concretizable<bool>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     if !context.is_eager() {
@@ -117,7 +117,7 @@ fn rewrite_program_into<C>(
 ) -> Result<Vec<(<C as Domain>::Value, AtomId)>, ProgramError>
 where
     C: Context,
-    <C as Domain>::Value: BooleanLike,
+    <C as Domain>::Value: Concretizable<bool>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     let mut region_remapping = HashMap::new();
@@ -182,8 +182,8 @@ where
 /// loop's predicate does not concretize to one scalar Boolean (e.g., a batched per-item predicate) and the loop must
 /// therefore be kept staged verbatim by the caller.
 ///
-/// The condition is concretized on the current concrete carry through [`BooleanLike::boolean`]; while it is true the
-/// body is rewritten into `builder` over the current carry's atoms (via [`rewrite_program_into`], so a nested `while`
+/// The condition is concretized on the current concrete carry through [`Concretizable::concretize`]; while it is true
+/// the body is rewritten into `builder` over the current carry's atoms (via [`rewrite_program_into`], so a nested `while`
 /// inside the body is itself unrolled) while being interpreted concretely on the current carry's values to advance it.
 /// A semantic iteration bound truncates the loop once it is reached, even while the condition still produces true,
 /// matching the bounded-`while` truncation semantics.
@@ -206,7 +206,7 @@ fn unroll_while_into<C>(
 ) -> Result<Option<Vec<(<C as Domain>::Value, AtomId)>>, ProgramError>
 where
     C: Context,
-    <C as Domain>::Value: BooleanLike,
+    <C as Domain>::Value: Concretizable<bool>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation <C as Domain>::Operation>,
 {
     let mut completed_iterations = 0;
@@ -220,7 +220,7 @@ where
         let condition_values = carry.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
         let condition_outputs = condition.interpret_in_context(context, condition_values)?;
         check_count!("output", condition_outputs, 1, ProgramError);
-        let predicate = match condition_outputs[0].boolean() {
+        let predicate = match condition_outputs[0].concretize() {
             Ok(predicate) => predicate,
             // The predicate does not concretize to one scalar Boolean — e.g., a batched per-item predicate, whose
             // items stop on different iterations, has no single trip decision to unroll against. Report the loop as

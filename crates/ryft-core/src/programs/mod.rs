@@ -138,7 +138,7 @@ pub use regions::{
     RegionInterface, RegionRef,
 };
 pub use types::{Type, TypeError, Typed};
-pub use values::{Value, ValueId};
+pub use values::{Concretizable, Value, ValueId};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

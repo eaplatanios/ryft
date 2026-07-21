@@ -1362,9 +1362,9 @@ pub enum PartialTracerState<C: Context> {
 /// closure-facing counterpart of the program-replay driver behind [`Program::partially_evaluate_in_context`]). A known
 /// [`PartialTracer`] carries a concrete known-side value (i.e., a concrete value under an eager known-side inner
 /// context, and a [`Tracer`](crate::Tracer) into the enclosing trace under a staging one), so concretizing extractions
-/// such as [`BooleanLike::boolean`](crate::BooleanLike::boolean) succeed on it exactly when they succeed on the carried
-/// value. This is what lets host control flow branch on known values while partial evaluation is in progress. An
-/// unknown [`PartialTracer`] names a residual program variable and carries only its type.
+/// such as [`Concretizable::concretize`](crate::Concretizable::concretize) succeed on it exactly when they succeed on
+/// the carried value. This is what lets host control flow branch on known values while partial evaluation is in
+/// progress. An unknown [`PartialTracer`] names a residual program variable and carries only its type.
 #[derive(Clone)]
 pub struct PartialTracer<C: Context> {
     /// [`PartialEvaluationContext`] this value flows through, used to dispatch [`Operation`]s that involve it.
@@ -1699,7 +1699,6 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation, ScalarTracingContext};
     use crate::contexts::{Context, StagingContext};
-    use crate::operations::BooleanLike;
     use crate::operations::constants::{ConstantOperation, Zero};
     use crate::operations::debugging::PrintOperation;
     use crate::operations::math::{AddOperation, MulOperation, NegOperation, SinOperation};
@@ -1707,6 +1706,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
+    use crate::programs::values::Concretizable;
     use crate::types::DataType;
 
     use super::*;
@@ -1991,14 +1991,14 @@ mod tests {
         let folded = context.bind(AddOperation, Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Scalar::from(4.0)));
-        assert_eq!(folded[0].boolean(), Ok(true));
+        assert_eq!(folded[0].concretize(), Ok(true));
         assert_eq!(folded[0].r#type().into_owned(), DataType::F64);
 
         // The `Zero` capability binds a nullary `ZeroOperation`, which is vacuously all-known and folds through the
         // inner context to a known zero.
         let zero = context.zero(&DataType::F64).unwrap();
         assert_eq!(zero.value().unwrap().as_known(), Some(&Scalar::from(0.0)));
-        assert_eq!(zero.boolean(), Ok(false));
+        assert_eq!(zero.concretize(), Ok(false));
 
         // A mixed bind residualizes: the unknown input names a residual program variable, the known input
         // materializes as a residual input, and the output is an unknown value that resolves `Opaque` and rejects
@@ -2010,7 +2010,7 @@ mod tests {
         let mixed = context.bind(MulOperation, Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
         assert!(matches!(context.resolve(&mixed[0]), ValueResolution::Opaque));
-        assert!(matches!(mixed[0].boolean(), Err(ProgramError::Concretization { .. })));
+        assert!(matches!(mixed[0].concretize(), Err(ProgramError::Concretization { .. })));
 
         // Finalizing the context (after dropping every stamped clone) produces the accumulated residual program:
         // `(ẏ) = folded * ẋ` over the unknown input plus the materialized known feeder.
@@ -2049,7 +2049,7 @@ mod tests {
         assert_eq!(format!("{}", poisoned[0]), "<poison:f64>");
         assert_eq!(poisoned[0].r#type().into_owned(), DataType::F64);
         assert!(matches!(context.resolve(&poisoned[0]), ValueResolution::Opaque));
-        assert!(matches!(poisoned[0].boolean(), Err(ProgramError::MismatchedProgramBuilders)));
+        assert!(matches!(poisoned[0].concretize(), Err(ProgramError::MismatchedProgramBuilders)));
 
         // Poison propagates from inputs to outputs of later binds, and unwrapping at a boundary reports the original
         // deferred error rather than a generic poison error.

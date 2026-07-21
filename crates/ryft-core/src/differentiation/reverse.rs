@@ -1642,7 +1642,6 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::jvp;
     use crate::macros::{check_count, check_types};
-    use crate::operations::BooleanLike;
     use crate::operations::constants::{Constant, ZeroOperation};
     use crate::operations::math::{AddOperation, MulOperation, Sin};
     use crate::parameters::Placeholder;
@@ -1656,7 +1655,7 @@ mod tests {
     use crate::programs::programs::Program;
     use crate::programs::regions::{Region, RegionId, RegionInterface};
     use crate::programs::types::{TypeError, Typed};
-    use crate::programs::values::Value;
+    use crate::programs::values::{Concretizable, Value};
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
     use crate::types::DataType;
 
@@ -2500,7 +2499,7 @@ mod tests {
         // untaken `sin(x)` branch is never traced at all.
         let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .value_and_gradient(
-                |x| if x.boolean().unwrap() { x.clone() * x } else { x.sin().unwrap() },
+                |x| if x.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() },
                 Scalar::from(3.0),
             )
             .unwrap();

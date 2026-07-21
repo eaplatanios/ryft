@@ -765,11 +765,11 @@ impl OperationEnum {
             __DifferentiationContext: #ryft::Zero<<__DifferentiationContext as #ryft::Domain>::Value>
         });
         // The `while` rule concretizes data-dependent loop predicates on the carried values when the context is
-        // eager, so the dispatcher also transports the `BooleanLike` value requirement. Staged values
-        // satisfy it through the tracer `BooleanLike` implementation (whose `boolean` defers with an error) and
+        // eager, so the dispatcher also transports the `Concretizable<bool>` value requirement. Staged values satisfy
+        // it through the tracer `Concretizable<bool>` implementation (whose `concretize` defers with an error) and
         // eager values implement it directly.
         where_clause.predicates.push(syn::parse_quote! {
-            <__DifferentiationContext as #ryft::Domain>::Value: #ryft::BooleanLike
+            <__DifferentiationContext as #ryft::Domain>::Value: #ryft::Concretizable<bool>
         });
         // The per-variant rules stage ordinary primal-enum operations for both the primal and the tangent side, so the
         // enum must offer the `From` conversion for every concrete payload. Bare generic payloads have no conversion

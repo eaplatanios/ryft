@@ -14,7 +14,6 @@ use ryft_core::differentiation::{
     TranspositionDriver,
 };
 use ryft_core::macros::check_count;
-use ryft_core::operations::BooleanLike;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
@@ -46,7 +45,7 @@ use ryft_core::partial::{
 };
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface};
-use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
 use ryft_core::backends::arrays::ArrayOperation;
@@ -388,7 +387,7 @@ impl Operation<ArrayType> for JitCallOperation {
 /// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation
 where
-    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -516,7 +515,7 @@ where
 impl<C, V> DifferentiableOperation<C> for JitCallOperation
 where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,

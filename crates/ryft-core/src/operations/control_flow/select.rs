@@ -256,7 +256,7 @@ impl_differentiable_elementwise_operation! {
 /// operand shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and
 /// `on_false` need not share a shape and the branches need not share a data type (see [`SelectOperation`]). The
 /// condition is represented by the same value type as the branches. Scalar values decode their in-band condition
-/// through [`BooleanLike`](crate::operations::BooleanLike), while arrays use Boolean-typed condition arrays and staged
+/// through [`Concretizable<bool>`](crate::Concretizable), while arrays use Boolean-typed condition arrays and staged
 /// [`Tracer`]s use Boolean-typed tracer values.
 ///
 /// # Example
@@ -323,7 +323,6 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
-    use crate::operations::BooleanLike;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::math::Add;
@@ -331,6 +330,7 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::ProgramError;
     use crate::programs::types::Typed;
+    use crate::programs::values::Concretizable;
     use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
     use crate::types::{Shape, Size};
 
@@ -400,10 +400,10 @@ mod tests {
             Ok(vec![Scalar::from(3.0)]),
         );
 
-        // Scalar values decode their in-band Boolean payload through `BooleanLike`.
-        assert_eq!(Scalar::from(1.5).boolean(), Ok(true));
-        assert_eq!(Scalar::from(0.0).boolean(), Ok(false));
-        assert_eq!(Scalar::from(bf16::ZERO).boolean(), Ok(false));
+        // Scalar values concretize their in-band Boolean payload through `Concretizable<bool>`.
+        assert_eq!(Scalar::from(1.5).concretize(), Ok(true));
+        assert_eq!(Scalar::from(0.0).concretize(), Ok(false));
+        assert_eq!(Scalar::from(bf16::ZERO).concretize(), Ok(false));
 
         // Type inference validates the condition and branch types and returns the branch type.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));

@@ -1264,8 +1264,7 @@ where
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {per_item_rank}",
-                    self.split_axis,
-                    self.concat_axis,
+                    self.split_axis, self.concat_axis,
                 ),
             });
         }
@@ -1993,10 +1992,7 @@ mod tests {
         // item 0 = `[[1, 2], [3, 4]]` and item 1 = `[[5, 6], [7, 8]]`, item 0 receives `[[1, 2, 5, 6]]` and item 1
         // receives `[[3, 4, 7, 8]]` (per-item shape `[1, 4]`).
         let x = Array::from_f64s(
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]),
-            ),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()

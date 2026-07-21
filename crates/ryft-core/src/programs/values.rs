@@ -1,10 +1,17 @@
 use std::fmt::{Debug, Display};
 
-use crate::contexts::Domain;
+use crate::batching::{ArrayBatch, BatchingTracer};
+use crate::captures::CaptureReference;
+use crate::contexts::{Context, Domain};
+use crate::differentiation::DifferentiationTracer;
 use crate::parameters::Parameter;
+use crate::partial::{PartialTracer, PartialValue};
+use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::regions::RegionId;
 use crate::programs::types::Typed;
+use crate::tracing::Tracer;
+use crate::types::ArrayType;
 
 /// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`](crate::Program), identified by
 /// its containing [`Region`](crate::Region) and its region-local [`AtomId`].
@@ -78,4 +85,84 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// Returns the [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the
     /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
     fn execution_domain(&self) -> Self::ExecutionDomain;
+}
+
+/// Supports extracting this value as a concrete host-side value of type `V`. Concretization is distinct from a staged
+/// value conversion as it makes data observable to Rust code and may therefore require synchronization, device-to-host
+/// transfer, or another backend-specific readback. It fails with [`ProgramError::Concretization`] when the value is
+/// symbolic, inaccessible, or incompatible with the requested representation. A value may implement this trait for
+/// multiple concrete representations. Implementations should consequently be target-specific (e.g.,
+/// [`Concretizable<bool>`]) rather than blanket implementations that claim support for every `V` and fail at runtime.
+pub trait Concretizable<V> {
+    /// Extracts this value as a concrete host-side value of type `V`. Returns a [`ProgramError::Concretization`] error
+    /// if concretization fails.
+    fn concretize(&self) -> Result<V, ProgramError>;
+}
+
+impl<C: Context> Concretizable<bool> for Tracer<C> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        Err(ProgramError::Concretization { message: "cannot extract a concrete boolean from a tracer".to_string() })
+    }
+}
+
+impl Concretizable<bool> for CaptureReference<ArrayType> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
+        // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
+        Err(ProgramError::Concretization {
+            message: "cannot extract a concrete boolean from a captured constant reference".to_string(),
+        })
+    }
+}
+
+impl<C: Context<Value: Concretizable<bool>>> Concretizable<bool> for PartialTracer<C> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        // A partial evaluation value delegates concrete Boolean extraction to its known payload. This lets host control
+        // flow branch on values known under an eager inner context, while unknown values report that they cannot be
+        // concretized. Also, a poisoned value surfaces its deferred error here, since branching on it cannot proceed
+        // anyway.
+        match self.value()?.value() {
+            PartialValue::Known(known) => known.concretize(),
+            PartialValue::Unknown(_) => Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from an unknown partial-evaluation value".to_string(),
+            }),
+        }
+    }
+}
+
+impl<C: Context<Type = ArrayType, Value: Concretizable<bool>>> Concretizable<bool> for BatchingTracer<C> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        // A batch-carrying value delegates concrete Boolean extraction to its packed value only when it is replicated.
+        // A mapped batch has one Boolean per item and cannot drive one host branch.
+        if !self.batch().batch_axis().is_replicated() {
+            return Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a batched value".to_string(),
+            });
+        }
+        self.batch().value().concretize()
+    }
+}
+
+impl<C: Context<Value: Concretizable<bool>>> Concretizable<bool> for DifferentiationTracer<C> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        // A differentiation tracer delegates concrete Boolean extraction to its primal, so host branching succeeds
+        // exactly when that primal is concrete.
+        self.primal().concretize()
+    }
+}
+
+impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for ArrayBatch<V> {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        if let Some(axis) = self.batch_axis().axis() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a value batched along axis {axis}"),
+            });
+        }
+        self.value().concretize()
+    }
 }

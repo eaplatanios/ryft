@@ -394,7 +394,7 @@ impl<'c> Context for XlaDomain<'c> {
     }
 
     /// A client-backed domain executes every bound operation for real and its concrete [`Array`]s support host
-    /// readback through [`BooleanLike`](ryft_core::operations::BooleanLike) and
+    /// readback through [`Concretizable<bool>`](ryft_core::Concretizable) and
     /// [`WhilePredicate`](ryft_core::operations::control_flow::WhilePredicate), so strategies that fold
     /// data-dependent work through host-visible values — the eager data-dependent `while` rules and
     /// concretizable-`while` unrolling — apply. Clientless domains (the static staging [`token`](Self::token) and

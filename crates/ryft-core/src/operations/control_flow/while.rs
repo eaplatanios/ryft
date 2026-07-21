@@ -23,7 +23,6 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::BooleanLike;
 use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{ScanOperation, Select, SelectOperation};
@@ -42,7 +41,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::{RegionInterface, RegionRef};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
@@ -1014,7 +1013,7 @@ impl<C> DifferentiableOperation<C> for WhileOperation
 where
     C: Context + Zero<C::Value>,
     C::Type: WhileJvp<C>,
-    C::Value: BooleanLike,
+    C::Value: Concretizable<bool>,
     C::Operation: From<ZeroOperation<C::Type>>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
 {
@@ -1104,7 +1103,7 @@ where
 /// cotangents pass through inactive batch items unchanged.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
-    C::Value: BooleanLike,
+    C::Value: Concretizable<bool>,
     C::Operation: From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation>
@@ -1419,7 +1418,7 @@ fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
 where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType,
-    C::Value: BooleanLike,
+    C::Value: Concretizable<bool>,
     C::Operation: From<ZeroOperation<C::Type>>,
     for<'operation> &'operation WhileOperation: TryFrom<&'operation C::Operation>,
 {
@@ -1440,7 +1439,7 @@ where
         // Concretize the condition on the current concrete primal carries to decide whether another iteration runs.
         let mut condition_outputs = condition.interpret_in_context(context, primal_carries.clone())?;
         check_count!("output", condition_outputs, 1, ProgramError);
-        let predicate = match condition_outputs.remove(0).boolean() {
+        let predicate = match condition_outputs.remove(0).concretize() {
             Ok(predicate) => predicate,
             // The predicate does not concretize to one scalar Boolean — e.g., a batched per-item predicate, whose
             // items stop on different iterations, has no single trip decision. Report the loop as non-concretizable
@@ -1738,34 +1737,37 @@ where
 /// whose predicate is false keep their carried state while active items take the body's candidate update. A frozen
 /// item's predicate is recomputed from its frozen state, so a finished item can never rejoin the loop.
 ///
-/// The default implementations are the scalar-predicate semantics, expressed through [`BooleanLike`]: the predicate's
+/// The default implementations are the scalar-predicate semantics, expressed through [`Concretizable<bool>`]: the predicate's
 /// own truth decides continuation, and a true predicate takes the candidate wholesale. Value types with genuinely
 /// batched payloads (e.g. [`Array`](crate::backends::arrays::Array)) override both methods with per-item semantics, and
-/// symbolic values (tracers and capture references) inherit the defaults, which surface [`BooleanLike::boolean`]'s
+/// symbolic values (tracers and capture references) inherit the defaults, which surface [`Concretizable::concretize`]'s
 /// concretization errors — a staged while is consumed by staging and lowering rather than by this eager loop.
-pub trait WhilePredicate: BooleanLike + Clone + Sized {
+pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Returns `true` when any element of this Boolean predicate is true — the loop-continuation decision.
     fn any_true(&self) -> Result<bool, ProgramError> {
-        self.boolean()
+        self.concretize()
     }
 
     /// Selects between `on_true` and `on_false` per element under this Boolean predicate, broadcasting the predicate
     /// against their shape along its leading (prefix) axes.
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        Ok(if self.boolean()? { on_true.clone() } else { on_false.clone() })
+        Ok(if self.concretize()? { on_true.clone() } else { on_false.clone() })
     }
 }
 
-// Symbolic values inherit the scalar `WhilePredicate` defaults, which surface `BooleanLike::boolean`'s
+// Symbolic values inherit the scalar `WhilePredicate` defaults, which surface `Concretizable::concretize`'s
 // concretization errors: none of these carry a concrete predicate payload, and staged whiles are consumed by staging
 // and lowering rather than by the eager masked loop.
 impl<C: Context> WhilePredicate for Tracer<C> {}
 
 impl WhilePredicate for CaptureReference<ArrayType> {}
 
-impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C> where C::Value: BooleanLike {}
+impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C> where C::Value: Concretizable<bool> {}
 
-impl<C: Context<Type: DifferentiableType>> WhilePredicate for DifferentiationTracer<C> where C::Value: BooleanLike {}
+impl<C: Context<Type: DifferentiableType>> WhilePredicate for DifferentiationTracer<C> where
+    C::Value: Concretizable<bool>
+{
+}
 
 #[cfg(test)]
 mod tests {
@@ -2507,8 +2509,8 @@ mod tests {
         }
     }
 
-    impl BooleanLike for TestValue {
-        fn boolean(&self) -> Result<bool, ProgramError> {
+    impl Concretizable<bool> for TestValue {
+        fn concretize(&self) -> Result<bool, ProgramError> {
             match self {
                 Self::Bool(value) => Ok(*value),
                 value => Err(ProgramError::Concretization {

@@ -179,8 +179,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     family, extra value parameters after the first two are substituted with the first value parameter.
 ///   - The generated dispatcher inherits value capabilities from the payload-owned
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementations. For example, a payload that extracts
-///     a predicate states its [`BooleanLike`](crate::BooleanLike) requirement on its own implementation, and the
-///     generated payload bound transports that requirement to the enum's use site.
+///     a predicate states its [`Concretizable<bool>`](crate::Concretizable) requirement on its own implementation, and
+///     the generated payload bound transports that requirement to the enum's use site.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the

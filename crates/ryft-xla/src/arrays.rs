@@ -688,7 +688,7 @@ impl<'o> Value for Array<'o> {
     // for each capability, relying on in-crate coherence between those direct impls and the blankets; a downstream
     // backend crate cannot take that route because the coherence check cannot rule out future
     // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
-    // capability surface and only capabilities without operation-binding blankets (`BooleanLike`,
+    // capability surface and only capabilities without operation-binding blankets (`Concretizable<bool>`,
     // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
     type DispatchDomain = XlaDomain<'o>;
     type ExecutionDomain = XlaDomain<'o>;

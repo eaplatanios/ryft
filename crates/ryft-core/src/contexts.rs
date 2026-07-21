@@ -205,12 +205,12 @@ pub trait Context: Domain + Clone {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
 
-    /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) computes concrete values
-    /// immediately so that concretizing extractions such as [`BooleanLike::boolean`](crate::BooleanLike::boolean) on
-    /// values it produces can succeed and, for example, the trip count of a data-dependent loop is decidable while
-    /// differentiating. Transform contexts that wrap other contexts (e.g., batching and forward-mode differentiation)
-    /// delegate to the wrapped context, so that the answer reflects the innermost context that actually executes the
-    /// bound operations.
+    /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) function computes
+    /// concrete values immediately so that concretizing extractions such as
+    /// [`Concretizable::concretize`](crate::Concretizable::concretize) on values it produces can succeed and, for
+    /// example, the trip count of a data-dependent loop is decidable while differentiating. Transform contexts that
+    /// wrap other contexts (e.g., batching and forward-mode differentiation) delegate to the wrapped context, so that
+    /// the answer reflects the innermost context that actually executes the bound operations.
     fn is_eager(&self) -> bool;
 
     /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible

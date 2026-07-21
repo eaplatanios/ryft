@@ -90,9 +90,7 @@ mod tests {
         assert_eq!(Scalar::from(f64::INFINITY).erf().unwrap(), 1.0f64);
         assert_eq!(Scalar::from(f64::NEG_INFINITY).erf().unwrap(), -1.0f64);
         assert_eq!(Scalar::from(1.5f64).erf().unwrap(), -Scalar::from(-1.5f64).erf().unwrap());
-        let Scalar::F64(not_a_number) = Scalar::from(f64::NAN).erf().unwrap() else {
-            panic!("expected an f64 result")
-        };
+        let Scalar::F64(not_a_number) = Scalar::from(f64::NAN).erf().unwrap() else { panic!("expected an f64 result") };
         assert!(not_a_number.is_nan());
 
         // Known values covering every rational-approximation regime of the reference implementation: the small

@@ -130,8 +130,8 @@ trait Value: Clone {
     type Type: Type;
 }
 
-/// Stand-in for `ryft_core::BooleanLike`.
-trait BooleanLike {}
+/// Stand-in for `ryft_core::Concretizable`.
+trait Concretizable<V> {}
 
 /// Stand-in for `ryft_core::Parameterized`.
 trait Parameterized<V> {
@@ -553,9 +553,9 @@ impl Value for TranspositionFactor {
     type Type = ArrayType;
 }
 
-impl BooleanLike for Factor {}
+impl Concretizable<bool> for Factor {}
 
-impl BooleanLike for ScalarFactor {}
+impl Concretizable<bool> for ScalarFactor {}
 
 trait SpecialTransposableValue {}
 
@@ -1789,7 +1789,7 @@ where
 impl<C> BatchableOperation<C> for BatchRecursiveOperation<C::Constant, C::Operation>
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: BooleanLike + SpecialBatchValue,
+    C::Value: Concretizable<bool> + SpecialBatchValue,
     C::Operation: From<ZeroOperation<ArrayType>>,
 {
     fn batch<D: BatchingDriver<C>>(

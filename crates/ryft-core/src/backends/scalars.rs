@@ -20,7 +20,6 @@ use ryft_macros::{Operation, Parameter};
 
 use crate::contexts::EagerContext;
 use crate::macros::check_types;
-use crate::operations::BooleanLike;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -46,7 +45,7 @@ use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
@@ -2136,12 +2135,13 @@ impl Compare for Scalar {
 }
 
 impl Select for Scalar {
-    /// Selects between `on_true` and `on_false` after decoding the in-band `condition` through [`BooleanLike`],
+    /// Selects between `on_true` and `on_false` after concretizing the in-band `condition` through
+    /// [`Concretizable<bool>`],
     /// mirroring the broadcasting [`SelectOperation`] type-inference contract. The selected branch is promoted to the
     /// promotion of the two branch data types, so `select(condition, f32, f64)` yields an `f64` like `jnp.where`.
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let condition = condition.boolean()?;
+        let condition = condition.concretize()?;
         let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
             .map_err(|error| TypeError { message: error.to_string() })?;
         let selected = if condition { on_true } else { on_false };
@@ -2149,9 +2149,9 @@ impl Select for Scalar {
     }
 }
 
-impl BooleanLike for Scalar {
+impl Concretizable<bool> for Scalar {
     #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
+    fn concretize(&self) -> Result<bool, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Ok(Self::decode_low_precision_float(r#type, bits) != 0.0);
         }
@@ -2470,7 +2470,7 @@ mod tests {
         // Boolean extraction, and its `zero_like`/`one_like` are the identity.
         assert_eq!(token.r#type().into_owned(), DataType::Token);
         assert_eq!(token.to_string(), "token");
-        assert!(token.boolean().is_err());
+        assert!(token.concretize().is_err());
         assert!(token.compare(&token, ComparisonDirection::Equal).is_err());
         assert!(Neg::neg(&token).is_err());
         assert!(Add::add(&token, &token).is_err());
@@ -2496,7 +2496,7 @@ mod tests {
         assert_eq!(zero, Scalar::Zero);
         assert_ne!(zero, Scalar::from(false));
         assert_eq!(zero.partial_cmp(&Scalar::Zero), Some(Ordering::Equal));
-        assert!(zero.boolean().is_err());
+        assert!(zero.concretize().is_err());
         assert!(zero.compare(&zero, ComparisonDirection::Equal).is_err());
         assert!(Neg::neg(&zero).is_err());
         assert!(Add::add(&zero, &zero).is_err());
@@ -2559,7 +2559,7 @@ mod tests {
             assert_eq!(scalar.r#type().into_owned(), r#type);
             assert_eq!(scalar.low_precision_float_bits(), Some(bits));
             assert_eq!(scalar.to_string(), "1");
-            assert_eq!(scalar.boolean(), Ok(true));
+            assert_eq!(scalar.concretize(), Ok(true));
             assert_eq!(scalar.one_like(), scalar);
             assert_eq!(scalar.convert_element_type(r#type), Ok(scalar));
         }
@@ -2661,14 +2661,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_boolean_like() {
+    fn test_scalar_boolean_concretization() {
         // Boolean conversion treats any nonzero payload as true, decoding Booleans, integers, and floating-point
         // scalars alike.
-        assert_eq!(Scalar::from(true).boolean(), Ok(true));
-        assert_eq!(Scalar::from(0i32).boolean(), Ok(false));
-        assert_eq!(Scalar::from(-2i64).boolean(), Ok(true));
-        assert_eq!(Scalar::from(0.0f64).boolean(), Ok(false));
-        assert_eq!(Scalar::from(0.5f32).boolean(), Ok(true));
+        assert_eq!(Scalar::from(true).concretize(), Ok(true));
+        assert_eq!(Scalar::from(0i32).concretize(), Ok(false));
+        assert_eq!(Scalar::from(-2i64).concretize(), Ok(true));
+        assert_eq!(Scalar::from(0.0f64).concretize(), Ok(false));
+        assert_eq!(Scalar::from(0.5f32).concretize(), Ok(true));
     }
 
     #[test]
@@ -2857,9 +2857,9 @@ mod tests {
             ),
             Ok(vec![Scalar::from(Complex::new(0.0f32, 0.0f32))]),
         );
-        assert_eq!(left.boolean(), Ok(true));
-        assert_eq!(left.zero_like().boolean(), Ok(false));
-        assert_eq!(Scalar::from(Complex::new(0.0f64, 0.5f64)).boolean(), Ok(true));
+        assert_eq!(left.concretize(), Ok(true));
+        assert_eq!(left.zero_like().concretize(), Ok(false));
+        assert_eq!(Scalar::from(Complex::new(0.0f64, 0.5f64)).concretize(), Ok(true));
 
         // Complex scalars are unordered.
         assert_eq!(left.partial_cmp(&right), None);

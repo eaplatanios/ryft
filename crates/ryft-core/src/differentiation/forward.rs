@@ -1228,8 +1228,8 @@ where
 /// decided per method at the call site, in exactly the same way as [`Batch::batch`](crate::Batch::batch). Tangents are
 /// ordinary values of the same universe as the primals (i.e., [`Domain::Value`]) flowing through the same context. The
 /// type-level tangent structure, such as the cotangent types, live on [`DifferentiableType`] instead. Operations that
-/// involve predicates such as `condition`, `while`, and `select` impose their own [`BooleanLike`](crate::BooleanLike)
-/// bounds through their operation-family implementations.
+/// involve predicates such as `condition`, `while`, and `select` impose their own
+/// [`Concretizable<bool>`](crate::Concretizable) bounds through their operation-family implementations.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's [`Value`](Domain::Value) (i.e.,
 /// concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are detected lazily, like
@@ -1452,7 +1452,7 @@ impl<C: Context> ForwardModeDifferentiate for C {}
 /// entirely by that context:
 ///
 ///   - Over an **eager** context both dual halves are concrete, so the closure sees real primal values (i.e., it can
-///     branch on them with `if x.boolean()? { … }`, print them, or otherwise use Rust control flow driven by the
+///     branch on them with `if x.concretize()? { … }`, print them, or otherwise use Rust control flow driven by the
 ///     primal) and a staged data-dependent `while` combinator differentiates by running directly at the concrete
 ///     primals, with no iteration bound needed.
 ///   - Over a **staging** context the same closure stages the primal and tangent operations into the enclosing trace
@@ -1510,8 +1510,8 @@ pub fn jvp<
 /// number of tangents through the function's Jacobian at this point without re-tracing or re-differentiating.
 ///
 /// Because the closure's primal halves carry concrete values under an eager context, host control flow on primals works
-/// exactly as under [`jvp`]: the closure can branch on a primal (e.g., `if x.boolean()? { … }`), the untaken branch is
-/// never traced at all, and a data-dependent `while` combinator differentiates by running directly at the concrete
+/// exactly as under [`jvp`]: the closure can branch on a primal (e.g., `if x.concretize()? { … }`), the untaken branch
+/// is never traced at all, and a data-dependent `while` combinator differentiates by running directly at the concrete
 /// primals. This matches JAX's `linearize`/`grad` tracing semantics, where the same JVP interpreter runs over a
 /// partial-evaluation trace instead of the eval trace.
 ///
@@ -1553,13 +1553,13 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
-    use crate::operations::BooleanLike;
     use crate::operations::collectives::{CollectiveKind, CollectiveOperation};
     use crate::operations::differentiation::{StopGradient, StopGradientOperation};
     use crate::operations::math::{Dot, DotDimensionNumbers, MulOperation, Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
+    use crate::programs::values::Concretizable;
     use crate::tracing::{NestedTracingContext, Trace};
     use crate::types::DataType;
 
@@ -1848,7 +1848,7 @@ mod tests {
         // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a primal without
         // tracing the untaken branch.
         let (value, tangent) =
-            jvp(|x| Ok(if x.boolean()? { x.clone() * x.sin()? } else { -x }), Scalar::from(0.7), Scalar::from(1.0))
+            jvp(|x| Ok(if x.concretize()? { x.clone() * x.sin()? } else { -x }), Scalar::from(0.7), Scalar::from(1.0))
                 .unwrap();
         assert_abs_diff_eq!(value, 0.7 * 0.7f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
@@ -1993,7 +1993,10 @@ mod tests {
         // pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor its
         // `cos` derivative can appear in the pushforward program.
         let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .linearize(|x| Ok(if x.boolean().unwrap() { x.clone() * x } else { x.sin().unwrap() }), Scalar::from(3.0))
+            .linearize(
+                |x| Ok(if x.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
+                Scalar::from(3.0),
+            )
             .unwrap();
         assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
         let program = pushforward.program().to_string();

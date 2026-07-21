@@ -1,16 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::batching::BatchingTracer;
 use crate::broadcasting::Broadcastable;
-use crate::captures::CaptureReference;
-use crate::contexts::Context;
-use crate::differentiation::{DifferentiableType, DifferentiationTracer};
 use crate::macros::check_count;
-use crate::partial::{PartialTracer, PartialValue};
-use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
-use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
 pub mod attention;
@@ -99,75 +92,6 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
                 Ok(output)
             }
         }
-    }
-}
-
-/// Represents values from which one concrete scalar Rust Boolean can be extracted. Concrete scalar values
-/// return their truth value, while non-scalar, staged, unknown, batched, or otherwise inaccessible values return a
-/// [`ProgramError::Concretization`] error. Predicate-consuming operations such as [`ConditionOperation`] and eager
-/// [`WhileOperation`] interpretation use this capability to drive host control flow.
-pub trait BooleanLike {
-    /// Extracts the scalar Rust Boolean represented by this value. Numeric scalar backends may use ordinary truthiness
-    /// semantics (i.e., zero is `false` and non-zero is `true`), while array backends generally require a rank-zero
-    /// Boolean-typed payload. Values that cannot presently be read as one concrete predicate result in a
-    /// [`ProgramError::Concretization`] error.
-    fn boolean(&self) -> Result<bool, ProgramError>;
-}
-
-impl<C: Context> BooleanLike for Tracer<C> {
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        Err(ProgramError::Concretization { message: "cannot extract a concrete boolean from a tracer".to_string() })
-    }
-}
-
-impl BooleanLike for CaptureReference<ArrayType> {
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
-        // staging must keep predicates in the IR or add a transform-specific rule instead of trying to branch here.
-        Err(ProgramError::Concretization {
-            message: "cannot extract a concrete boolean from a captured constant reference".to_string(),
-        })
-    }
-}
-
-impl<C: Context<Value: BooleanLike>> BooleanLike for PartialTracer<C> {
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // A partial-evaluation value delegates concrete Boolean extraction to its known payload. This lets host control
-        // flow branch on values known under an eager inner context, while unknown values report that they cannot be
-        // concretized. Also, a poisoned value surfaces its deferred error here, since branching on it cannot proceed
-        // anyway.
-        match self.value()?.value() {
-            PartialValue::Known(known) => known.boolean(),
-            PartialValue::Unknown(_) => Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from an unknown partial-evaluation value".to_string(),
-            }),
-        }
-    }
-}
-
-impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingTracer<C> {
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // A batch-carrying value delegates concrete Boolean extraction to its packed value only when it is replicated.
-        // A mapped batch has one Boolean per item and cannot drive one host branch.
-        if !self.batch().batch_axis().is_replicated() {
-            return Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from a batched value".to_string(),
-            });
-        }
-        self.batch().value().boolean()
-    }
-}
-
-impl<C: Context<Type: DifferentiableType, Value: BooleanLike>> BooleanLike for DifferentiationTracer<C> {
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        // A differentiation tracer delegates concrete Boolean extraction to its primal, so host branching succeeds
-        // exactly when that primal is concrete.
-        self.primal().boolean()
     }
 }
 

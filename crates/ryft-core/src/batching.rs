@@ -81,8 +81,8 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
+use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
-use crate::operations::{BooleanLike, ElementwiseOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
@@ -697,17 +697,6 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     #[inline]
     fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
-    }
-}
-
-impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        if let Some(axis) = self.batch_axis().axis() {
-            return Err(ProgramError::Concretization {
-                message: format!("cannot extract a concrete boolean from a value batched along axis {axis}"),
-            });
-        }
-        self.value().boolean()
     }
 }
 

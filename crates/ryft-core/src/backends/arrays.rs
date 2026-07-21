@@ -28,7 +28,6 @@ use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::macros::check_count;
-use crate::operations::BooleanLike;
 use crate::operations::attention::{
     AttentionMask, DotProductAttention, DotProductAttentionBackward, DotProductAttentionBackwardOperation,
     DotProductAttentionOperation, dot_product_attention_backward_composition, dot_product_attention_composition,
@@ -83,7 +82,7 @@ use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
@@ -1791,12 +1790,12 @@ impl Select for Array {
     }
 }
 
-impl BooleanLike for Array {
-    fn boolean(&self) -> Result<bool, ProgramError> {
+impl Concretizable<bool> for Array {
+    fn concretize(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
         // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
         if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
-            return self.values[0].boolean();
+            return self.values[0].concretize();
         }
         Err(ProgramError::Concretization {
             message: format!(
@@ -1818,7 +1817,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
             });
         }
         for value in &self.values {
-            if value.boolean()? {
+            if value.concretize()? {
                 return Ok(true);
             }
         }
@@ -1846,7 +1845,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
             .zip(on_false.values.iter())
             .enumerate()
             .map(|(index, (on_true, on_false))| {
-                Ok(if self.values[index / block].boolean()? { *on_true } else { *on_false })
+                Ok(if self.values[index / block].concretize()? { *on_true } else { *on_false })
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         Ok(Self { r#type: on_true.r#type.clone(), values })
@@ -2212,14 +2211,14 @@ mod tests {
     }
 
     #[test]
-    fn test_array_boolean_like() {
+    fn test_array_boolean_concretization() {
         let vector = Array::vector(vec![0.0, 2.5]);
         let boolean = vector.compare(&Array::vector(vec![0.0, 0.0]), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.r#type().into_owned(), array_type(DataType::Boolean, &[2]));
         assert_eq!(boolean, Array::vector(vec![false, true]));
-        assert_eq!(Array::scalar(true).boolean(), Ok(true));
-        assert!(Array::vector(vec![true, false]).boolean().is_err());
-        assert!(Array::scalar(1.0).boolean().is_err());
+        assert_eq!(Array::scalar(true).concretize(), Ok(true));
+        assert!(Array::vector(vec![true, false]).concretize().is_err());
+        assert!(Array::scalar(1.0).concretize().is_err());
     }
 
     #[test]

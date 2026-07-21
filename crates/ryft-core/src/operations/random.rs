@@ -865,14 +865,7 @@ mod tests {
         // Two distinct Philox `u64[3]` states stacked at batch axis 0 (`u64[2, 3]`).
         let states = Array::new(
             ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-            vec![
-                Scalar::U64(42),
-                Scalar::U64(7),
-                Scalar::U64(9),
-                Scalar::U64(3),
-                Scalar::U64(11),
-                Scalar::U64(0),
-            ],
+            vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(9), Scalar::U64(3), Scalar::U64(11), Scalar::U64(0)],
         )
         .unwrap();
         let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(0)).unwrap();
@@ -946,14 +939,7 @@ mod tests {
         // The batched program computes each batch item's unbatched result exactly.
         let states = Array::new(
             ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
-            vec![
-                Scalar::U64(42),
-                Scalar::U64(7),
-                Scalar::U64(3),
-                Scalar::U64(11),
-                Scalar::U64(5),
-                Scalar::U64(0),
-            ],
+            vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(3), Scalar::U64(11), Scalar::U64(5), Scalar::U64(0)],
         )
         .unwrap();
         let outputs = batched.interpret(vec![states]).unwrap();

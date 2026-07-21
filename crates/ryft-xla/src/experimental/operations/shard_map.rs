@@ -8,7 +8,6 @@ use ryft_core::differentiation::{
     TranspositionDriver,
 };
 use ryft_core::macros::check_count;
-use ryft_core::operations::BooleanLike;
 use ryft_core::operations::constants::{Zero, ZeroOperation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
@@ -17,7 +16,7 @@ use ryft_core::partial::{
 };
 use ryft_core::programs::operations::Operation;
 use ryft_core::programs::regions::{RegionInterface, RegionRef};
-use ryft_core::programs::{MaybeZero, Program, ProgramError, Value};
+use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
@@ -254,7 +253,7 @@ where
 /// the surviving unknown boundary inputs plus those residual edges and emitted into the residual program.
 impl<V, C> PartiallyEvaluatableOperation<C> for ShardMapOperation<V>
 where
-    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -469,7 +468,7 @@ fn tangent_boundary_type(r#type: &ArrayType) -> ArrayType {
 ///   - `operation`: Boundary metadata of the primal shard-map being linearized.
 ///   - `program`: Borrowed `body` region of that shard-map.
 #[allow(clippy::type_complexity)]
-fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + BooleanLike>(
+fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>>(
     operation: &ShardMapOperation<V>,
     program: RegionRef<'_, V, XlaOperation<V>>,
 ) -> Result<
@@ -569,7 +568,7 @@ fn shard_map_bodies<V: PartialEq + Value<Type = ArrayType> + BooleanLike>(
 impl<C, V> DifferentiableOperation<C> for ShardMapOperation<V>
 where
     C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
-    V: PartialEq + Value<Type = ArrayType> + BooleanLike,
+    V: PartialEq + Value<Type = ArrayType> + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,

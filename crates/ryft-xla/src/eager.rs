@@ -1,13 +1,12 @@
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
-use ryft_core::operations::BooleanLike;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::Broadcast;
 use ryft_core::operations::manipulation::conversion::ElementType;
 use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::types::Typed;
-use ryft_core::programs::{ProgramError, Value};
+use ryft_core::programs::{Concretizable, ProgramError, Value};
 use ryft_core::types::DataType;
 
 use crate::experimental::ops::XlaOperation;
@@ -21,8 +20,9 @@ use crate::{Array, ArrayShard};
 /// already follow it through [`Value::dispatch_domain`] — which for a concrete [`Array`] recovers the rich,
 /// PJRT-backed [`XlaDomain`](crate::XlaDomain) that compiles a cached single-operation program and executes it —
 /// so this module only implements the capabilities those blankets cannot cover: the foreign `std::ops` operator
-/// sugar (per-type implementations required by the orphan rule) and the host-readback predicates [`BooleanLike`]
-/// and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step; callers must pass at least one input,
+/// sugar (per-type implementations required by the orphan rule) and the host-readback predicates
+/// [`Concretizable<bool>`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step; callers must pass
+/// at least one input,
 /// and the first input determines the domain (and thereby the client and compile cache) the operation executes
 /// against.
 fn bind_single_output<'o, P: Into<XlaOperation>>(
@@ -49,11 +49,11 @@ fn shard_host_bytes(shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
         .map_err(|error| concretization(error.to_string()))
 }
 
-impl BooleanLike for Array<'_> {
+impl Concretizable<bool> for Array<'_> {
     /// Extracts a concrete scalar Rust Boolean by copying one addressable shard of a rank-0 Boolean-typed [`Array`]
     /// to the host. Higher-rank or non-Boolean arrays error because they cannot collapse to a single Boolean, and
     /// arrays with no addressable shards error because the current process cannot read their payload.
-    fn boolean(&self) -> Result<bool, ProgramError> {
+    fn concretize(&self) -> Result<bool, ProgramError> {
         if self.r#type().rank() == 0 && self.data_type() == DataType::Boolean {
             let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
                 message: format!(
@@ -1641,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_boolean_like_branching_on_device_predicate() {
+    fn test_eager_boolean_concretization() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
@@ -1650,9 +1650,10 @@ mod tests {
 
         // Python-style control flow: branch on a device-computed comparison result.
         let predicate = small.compare(&large, ComparisonDirection::LessThan).unwrap();
-        let branch = if predicate.boolean().unwrap() { small.add(&large).unwrap() } else { small.mul(&large).unwrap() };
+        let branch =
+            if predicate.concretize().unwrap() { small.add(&large).unwrap() } else { small.mul(&large).unwrap() };
         assert_eq!(read_f32s(&branch), vec![7.0]);
-        assert!(!large.compare(&small, ComparisonDirection::LessThan).unwrap().boolean().unwrap());
+        assert!(!large.compare(&small, ComparisonDirection::LessThan).unwrap().concretize().unwrap());
 
         // Elementwise truthiness is an explicit comparison against zero: zero maps to false and nonzero maps to true.
         let input = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]);
@@ -1662,7 +1663,7 @@ mod tests {
 
         // Rank-one predicates cannot collapse to a single Boolean.
         let vector_predicate = boolean_vector(&client, &mesh, &[true, false]);
-        assert!(matches!(vector_predicate.boolean(), Err(ProgramError::Concretization { .. })));
+        assert!(matches!(vector_predicate.concretize(), Err(ProgramError::Concretization { .. })));
     }
 
     #[test]

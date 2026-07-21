@@ -18,7 +18,6 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::BooleanLike;
 use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{Select, SelectOperation};
 use crate::operations::manipulation::conversion::ElementType;
@@ -33,7 +32,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
+use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
@@ -160,7 +159,7 @@ impl<F, C> InterpretableOperation<C> for ConditionOperation<F>
 where
     F: Value,
     F::Type: ElementType,
-    C: Domain<Type = F::Type, Value: BooleanLike>,
+    C: Domain<Type = F::Type, Value: Concretizable<bool>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -173,7 +172,7 @@ where
                 "condition interpretation requires a predicate input".to_string(),
             ));
         }
-        let (predicate, branch_inputs) = (inputs[0].boolean()?, &inputs[1..]);
+        let (predicate, branch_inputs) = (inputs[0].concretize()?, &inputs[1..]);
         driver.interpret_region(context, if predicate { 0 } else { 1 }, branch_inputs.to_vec())
     }
 }
@@ -204,7 +203,7 @@ where
 /// `k + 1`.
 impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
-    V: Value<Type = ArrayType> + BooleanLike,
+    V: Value<Type = ArrayType> + Concretizable<bool>,
     C: Context<Type = ArrayType, Constant = V, Operation = O>,
     O: Operation<ArrayType> + From<ConditionOperation<V>> + From<ZeroOperation<ArrayType>>,
 {
@@ -224,7 +223,7 @@ where
             // boolean, such as an abstract backend capture reference — keeps the conditional on both sides of the
             // split instead.
             if let Some(predicate) = context.parent().resolve(predicate).into_constant() {
-                if let Ok(predicate) = predicate.boolean() {
+                if let Ok(predicate) = predicate.concretize() {
                     let index = if predicate { 0 } else { 1 };
                     return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
                 }
@@ -776,7 +775,7 @@ fn reconcile_branch<C: Context>(
 impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
-    <C as Domain>::Value: BooleanLike + Broadcast + Transpose + Select,
+    <C as Domain>::Value: Concretizable<bool> + Broadcast + Transpose + Select,
     O: Operation<ArrayType>
         + From<TransposeOperation>
         + From<BroadcastOperation>
