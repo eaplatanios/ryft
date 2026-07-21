@@ -1268,21 +1268,40 @@ define_reverse_jacobian_with_aux!(
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{
         DerivativeTransform, DifferentiableType, DifferentiationError, DifferentiationParameterRole,
     };
+    use crate::operations::compare::{Compare, ComparisonDirection};
+    use crate::operations::constants::ZeroLike;
+    use crate::operations::control_flow::Select;
+    use crate::operations::math::Add;
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::types::Typed;
+    use crate::programs::values::Value;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{DenseDifferentiableType, DenseDifferentiate, DenseMode, Jacobian, coordinate_offsets};
+    use super::{DenseDifferentiableType, DenseMode, Jacobian, coordinate_offsets, jacfwd, jacrev};
+
+    /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
+    /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
+    fn piecewise_select<V>(x: V) -> V
+    where
+        V: Value<Type = ArrayType>,
+        V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+    {
+        let condition = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
+        let doubled = x.add(&x).unwrap();
+        let tripled = doubled.add(&x).unwrap();
+        Select::select(&condition, &doubled, &tripled).unwrap()
+    }
 
     #[test]
     fn test_jacobian_parameterization_with_data_types() {
@@ -1438,8 +1457,7 @@ mod tests {
 
     #[test]
     fn test_jacfwd_packs_all_coordinate_directions() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let jacobian = context.jacfwd(|input| Ok(input), Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
+        let jacobian = jacfwd(|input| Ok(input), Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
@@ -1447,5 +1465,84 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
         );
         assert_eq!(block.value().values(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_select_jacfwd_computes_piecewise_derivative() {
+        // Forward mode selects the branch tangent under the primal condition, giving derivative 2 for positive inputs
+        // and 3 otherwise.
+        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+
+        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_select_jacrev_computes_piecewise_derivative() {
+        // Reverse mode routes the output cotangent through the selected branch, giving the same piecewise derivative.
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
+
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
+        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_select_jacrev_over_vector_masks_per_element() {
+        // Per-element masking over a vector input makes the Jacobian diagonal, with entries 2 for positive inputs and
+        // 3 otherwise.
+        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::vector(vec![1.0, -1.0])).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_abs_diff_eq!(block.value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[3], 3.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_select_jacrev_unbroadcasts_mixed_precision_scalar_branches() {
+        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![5.0]);
+        let f32_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let vector =
+            Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
+
+        let jacobian = jacrev(
+            |(scalar, vector)| {
+                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                Select::select(&condition, &scalar, &vector)
+            },
+            (scalar.clone(), vector.clone()),
+        )
+        .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
+        assert_eq!(blocks[0].value().to_f64s(), vec![1.0, 0.0]);
+        assert_eq!(
+            blocks[1].value().r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0]);
+
+        let jacobian = jacrev(
+            |(scalar, vector)| {
+                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                Select::select(&condition, &vector, &scalar)
+            },
+            (scalar, vector),
+        )
+        .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
+        assert_eq!(blocks[0].value().to_f64s(), vec![0.0, 1.0]);
+        assert_eq!(
+            blocks[1].value().r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+        );
+        assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
     }
 }

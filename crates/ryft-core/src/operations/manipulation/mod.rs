@@ -10,7 +10,9 @@ pub mod transpose;
 
 pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
-pub use conversion::{CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation};
+pub use conversion::{
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
+};
 pub use gather::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
 };

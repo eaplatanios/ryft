@@ -1,38 +1,173 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-use crate::differentiation::{DifferentiableType, DifferentiationError};
+use crate::differentiation::DifferentiableType;
+use crate::differentiation::forward::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::operations::ElementwiseOperation;
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ConvertElementTypeOperation`].
 pub const CONVERT_ELEMENT_TYPE_OPERATION_NAME: &str = "convert_element_type";
 
-/// Type whose values have an element [`DataType`] that can be inspected or replaced independently of the type's
-/// remaining structure and placement metadata.
+/// Unary operation that converts the element [`DataType`] of a value while preserving its shape and placement metadata.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConvertElementTypeOperation {
+    /// Element [`DataType`] produced by this [`ConvertElementTypeOperation`].
+    data_type: DataType,
+}
+
+impl ConvertElementTypeOperation {
+    /// Creates a new [`ConvertElementTypeOperation`].
+    #[inline]
+    pub fn new(data_type: DataType) -> Self {
+        Self { data_type }
+    }
+
+    /// Returns the output element [`DataType`] of this [`ConvertElementTypeOperation`].
+    #[inline]
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+}
+
+impl Display for ConvertElementTypeOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        OperationFormatter::new(formatter, 0, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("data_type", self.data_type))
+    }
+}
+
+impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONVERT_ELEMENT_TYPE_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        if input_types[0].element_type() == DataType::Token || self.data_type == DataType::Token {
+            return Err(TypeError { message: "cannot convert values to or from the token data type".to_string() });
+        }
+        Ok(vec![input_types[0].with_element_type(self.data_type)])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("data_type", self.data_type))
+    }
+}
+
+// Element-type conversion is unary elementwise even though it changes the result data type. Its custom
+// inference preserves the input's structure and placement while replacing only that data type. Implementing
+// `ElementwiseOperation` also gives it the shared elementwise `BatchableOperation` implementation.
+impl ElementwiseOperation for ConvertElementTypeOperation {
+    #[inline]
+    fn input_count(&self) -> usize {
+        1
+    }
+
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Operation::infer_output_types(self, input_types, &[])
+    }
+}
+
+impl<C: Domain<Type: ElementType, Value: ConvertElementType>> InterpretableOperation<C>
+    for ConvertElementTypeOperation
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].convert_element_type(self.data_type)?])
+    }
+}
+
+impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation>>> PartiallyEvaluatableOperation<C>
+    for ConvertElementTypeOperation
+{
+}
+
+impl_differentiable_elementwise_operation! {
+    @custom
+    ConvertElementTypeOperation,
+    /// Forward-mode differentiation rule for [`ConvertElementTypeOperation`]. The primal is converted to the requested
+    /// element data type, while a live tangent is converted to the output's differential element data type. Converting
+    /// into a type with no tangent space produces a structural zero tangent.
+    jvp<C>
+    where
+        C::Type: DifferentiableType + ElementType,
+        C::Value: ConvertElementType,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().convert_element_type(operation.data_type)?;
+            let output_tangent_type = primal.r#type().tangent();
+            let tangent = match inputs[0].tangent() {
+                _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
+                MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
+                MaybeZero::Value(tangent) => {
+                    MaybeZero::Value(tangent.convert_element_type(output_tangent_type.element_type())?)
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    /// Transposition rule for [`ConvertElementTypeOperation`]. A live output cotangent is converted back to the input's
+    /// cotangent element data type, while a structural zero remains structural. Inputs with no cotangent space cannot
+    /// participate as linear operands.
+    transpose<V, O>
+    where
+        V::Type: DifferentiableType + ElementType,
+        O: From<ConvertElementTypeOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            let input_cotangent_type = inputs[0].r#type().cotangent();
+            if input_cotangent_type.is_zero_space() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("'{CONVERT_ELEMENT_TYPE_OPERATION_NAME}' input 0 has no cotangent space"),
+                }
+                .into());
+            }
+            Ok(vec![match &outputs[0] {
+                MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
+                MaybeZero::Value(cotangent) => {
+                    MaybeZero::Value(cotangent.convert_element_type(input_cotangent_type.element_type())?)
+                }
+            }])
+        }
+    },
+}
+
+/// Type whose values have an element [`DataType`] that can be inspected and/or replaced independently of the type's
+/// remaining structure and placement metadata. [`ElementType::with_element_type`] is effectively a _casting_ operation.
 pub trait ElementType: Type {
     /// Returns the element [`DataType`].
     fn element_type(&self) -> DataType;
 
     /// Returns this type with its element [`DataType`] replaced by `data_type`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: New element data type.
     fn with_element_type(&self, data_type: DataType) -> Self;
 }
 
@@ -62,173 +197,22 @@ impl ElementType for ArrayType {
     }
 }
 
-/// Unary operation that converts the numeric element type of a value while preserving its shape and placement
-/// metadata.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ConvertElementTypeOperation {
-    /// Element data type produced by this conversion.
-    data_type: DataType,
-}
-
-impl ConvertElementTypeOperation {
-    /// Creates a conversion to `data_type`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element data type produced by the operation.
-    #[inline]
-    pub fn new(data_type: DataType) -> Self {
-        Self { data_type }
-    }
-
-    /// Returns the output element data type.
-    #[inline]
-    pub fn data_type(&self) -> DataType {
-        self.data_type
-    }
-}
-
-impl Display for ConvertElementTypeOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        OperationFormatter::new(formatter, 0, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("data_type", self.data_type))
-    }
-}
-
-impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONVERT_ELEMENT_TYPE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[T],
-        _region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        if input_types[0].element_type() == DataType::Token || self.data_type == DataType::Token {
-            return Err(TypeError { message: "cannot convert values to or from the token data type".to_string() });
-        }
-        Ok(vec![input_types[0].with_element_type(self.data_type)])
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("data_type", self.data_type))
-    }
-}
-
-impl<C> InterpretableOperation<C> for ConvertElementTypeOperation
-where
-    C: Domain,
-    C::Type: ElementType,
-    C::Value: ConvertElementType,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].convert_element_type(self.data_type)?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for ConvertElementTypeOperation
-where
-    C::Type: ElementType,
-    C::Operation: From<ConvertElementTypeOperation>,
-{
-}
-
-impl<C: Context> DifferentiableOperation<C> for ConvertElementTypeOperation
-where
-    C::Type: DifferentiableType + ElementType,
-    C::Value: ConvertElementType,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().convert_element_type(self.data_type)?;
-        let primal_type = primal.r#type();
-        let output_tangent_type = primal_type.tangent();
-        let tangent = match inputs[0].tangent() {
-            _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
-            MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
-            MaybeZero::Value(tangent) => {
-                MaybeZero::Value(tangent.convert_element_type(output_tangent_type.element_type())?)
-            }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-impl<V, O> TransposableOperation<V, O> for ConvertElementTypeOperation
-where
-    V: Value,
-    V::Type: DifferentiableType + ElementType,
-    O: Operation<V::Type> + From<ConvertElementTypeOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_cotangent_type = inputs[0].r#type().cotangent();
-        if input_cotangent_type.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{CONVERT_ELEMENT_TYPE_OPERATION_NAME}' input 0 has no cotangent space"),
-            }
-            .into());
-        }
-        Ok(vec![match &outputs[0] {
-            MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
-            MaybeZero::Value(cotangent) => {
-                MaybeZero::Value(cotangent.convert_element_type(input_cotangent_type.element_type())?)
-            }
-        }])
-    }
-}
-
-// Conversion changes element type rather than participating in ordinary elementwise output-type broadcasting, so it
-// has an explicit batching rule instead of implementing `ElementwiseOperation` and inheriting its type inference.
-impl<C> BatchableOperation<C> for ConvertElementTypeOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Value: ConvertElementType,
-{
-    fn batch<D: BatchingDriver<C>>(
-        &self,
-        _context: &BatchingContext<C>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let mut output_type = inputs[0].r#type().into_owned();
-        output_type.data_type = self.data_type;
-        let output = inputs[0].value().convert_element_type(self.data_type)?;
-        Ok(vec![ArrayBatch::new(output_type, output, inputs[0].batch_axis())?])
-    }
-}
-
-/// Value-level capability for converting a value's numeric element type.
+/// Value-level capability for converting a value's [`DataType`].
 pub trait ConvertElementType: Sized {
-    /// Promotes this value's elements to `data_type`. Unlike [`Self::convert_element_type`], this method rejects
-    /// conversions that are not permitted by the element-type promotion lattice.
+    /// Converts this value's elements to `data_type` by _casting_ them.
     ///
     /// # Parameters
     ///
-    ///   - `data_type`: Element data type to which the returned value is promoted.
+    ///   - `data_type`: Element [`DataType`] of the returned value.
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
+
+    /// Promotes this value's elements to `data_type` by _casting_ them. Unlike [`Self::convert_element_type`],
+    /// this method rejects conversions that are not permitted by the [`DataType`] promotion lattice.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element [`DataType`] to which the returned value is promoted.
+    #[inline]
     fn promote_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>
     where
         Self: Typed,
@@ -240,21 +224,10 @@ pub trait ConvertElementType: Sized {
             .map_err(|error| TypeError { message: error.to_string() })?;
         self.convert_element_type(data_type)
     }
-
-    /// Converts this value's elements to `data_type`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element data type of the returned value.
-    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
 }
 
-impl<V> ConvertElementType for V
-where
-    V: Value,
-    V::Type: ElementType,
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<ConvertElementTypeOperation>,
+impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation>>>>
+    ConvertElementType for V
 {
     #[inline]
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
@@ -288,25 +261,28 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
         assert_eq!(operation.data_type(), DataType::F32);
         assert_eq!(operation.to_string(), "convert_element_type [data_type=f32]");
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+
         check_operation_type_inference!(
+            @elementwise @unary,
             operation = operation,
             cases = [
                 {
-                    type = DataType,
-                    input_types = [DataType::F64],
-                    output_types = [DataType::F32],
+                    input_data_types = [DataType::F64],
+                    output_data_types = [DataType::F32],
                 },
                 {
-                    input_types = [input_type.clone()],
-                    output_types = [input_type.with_data_type(DataType::F32)],
-                },
-                {
-                    type = DataType,
-                    input_types = [DataType::Token],
+                    input_data_types = [DataType::Token],
                     error = "cannot convert values to or from the token data type",
                 },
             ],
+        );
+
+        check_operation_type_inference!(
+            operation = ConvertElementTypeOperation::new(DataType::Token),
+            cases = [{
+                input_types = [DataType::F64],
+                error = "cannot convert values to or from the token data type",
+            }],
         );
 
         // Check the default fold-or-residualize rule and preservation of mapped batch placement.
@@ -315,6 +291,7 @@ mod tests {
             inputs = [Scalar::from(2.0_f64)],
             expected = Scalar::from(2.0_f32),
         );
+
         check_operation_batching!(
             @exact,
             operation = operation,
@@ -342,6 +319,7 @@ mod tests {
                 tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
             }],
         );
+
         check_operation_transposition!(
             @exact,
             operation = ConvertElementTypeOperation::new(DataType::F32),

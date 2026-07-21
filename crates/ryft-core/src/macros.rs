@@ -2571,7 +2571,7 @@ macro_rules! check_operation_type_inference {
         assert_eq!(
             $crate::programs::operations::Operation::<$crate::types::ArrayType>::infer_output_types(
                 &$operation,
-                &[input_type.clone()],
+                ::std::slice::from_ref(&input_type),
                 &[],
             ),
             Ok(output_data_types
@@ -4839,7 +4839,7 @@ mod tests {
         );
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[matrix_type.clone()], &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&matrix_type), &[]),
             Ok(vec![matrix_type]),
         );
         assert_eq!(

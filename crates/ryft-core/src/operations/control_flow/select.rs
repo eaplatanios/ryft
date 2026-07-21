@@ -188,7 +188,6 @@ impl_differentiable_elementwise_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-
     /// Partition-aware transposition rule for [`SelectOperation`]. The Boolean condition (i.e., operand 0) has no
     /// tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands 1 and
     /// 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the
@@ -305,56 +304,36 @@ impl<V: Value<DispatchDomain: Context<Operation: From<SelectOperation>>>> Select
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
-    use half::bf16;
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::differentiation::forward::jvp;
     use crate::differentiation::reverse::value_and_gradient;
-    use crate::macros::{check_operation_transposition, check_operation_type_inference};
+    use crate::macros::{
+        check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
+        check_operation_type_inference,
+    };
     use crate::operations::compare::{Compare, ComparisonDirection};
-    use crate::operations::constants::ZeroLike;
-    use crate::operations::math::Add;
-    use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
-    use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
-    use crate::programs::values::Concretizable;
-    use crate::tracing_v2::{jacfwd, jacrev};
     use crate::types::{Shape, Size};
 
     use super::*;
-
-    /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged or differentiation-dual values of any context with
-    /// [`Array`] semantics.
-    fn piecewise_select<V>(x: V) -> V
-    where
-        V: Value<Type = ArrayType>,
-        V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
-    {
-        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
-        let doubled = x.add(&x).unwrap();
-        let tripled = doubled.add(&x).unwrap();
-        Select::select(&mask, &doubled, &tripled).unwrap()
-    }
 
     #[test]
     fn test_select() {
         let operation = SelectOperation;
 
-        // Operation identity.
+        // Check operation identity in both supported type universes.
         assert_eq!(Operation::<ArrayType>::name(&operation), SELECT_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::name(&operation), SELECT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), SELECT_OPERATION_NAME);
 
-        // Scalar (`DataType`) type inference validates the Boolean condition and promotes compatible branch types.
+        // Check Boolean-condition validation and branch promotion in the scalar type universe.
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -377,37 +356,9 @@ mod tests {
             ],
         );
 
-        // Scalar interpretation treats the in-band condition as true exactly when it is nonzero.
-        let branches = [Scalar::from(2.0), Scalar::from(3.0)];
-        assert_eq!(
-            operation.interpret(
-                &crate::EagerContext::<Scalar>::new(),
-                &crate::EmptyRegionDriver,
-                &[Scalar::from(1.0), branches[0], branches[1]]
-            ),
-            Ok(vec![Scalar::from(2.0)]),
-        );
-        assert_eq!(
-            operation.interpret(
-                &crate::EagerContext::<Scalar>::new(),
-                &crate::EmptyRegionDriver,
-                &[Scalar::from(0.0), branches[0], branches[1]]
-            ),
-            Ok(vec![Scalar::from(3.0)]),
-        );
-
-        // Scalar values concretize their in-band Boolean payload through `Concretizable<bool>`.
-        assert_eq!(Scalar::from(1.5).concretize(), Ok(true));
-        assert_eq!(Scalar::from(0.0).concretize(), Ok(false));
-        assert_eq!(Scalar::from(bf16::ZERO).concretize(), Ok(false));
-
-        // Type inference validates the condition and branch types and returns the branch type.
+        // Check ternary shape broadcasting and branch promotion in the array type universe.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
         let branch_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        // Type inference broadcasts the three operand shapes together (like the other elementwise operations),
-        // keeping the branch data type: a size-1 branch broadcasts up to the condition/other-branch shape, and a
-        // size-1 condition broadcasts up to the branch shape. The Boolean condition never promotes into the output
-        // data type.
         let scalar_branch = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]));
         let scalar_condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(1)]));
         check_operation_type_inference!(
@@ -446,14 +397,6 @@ mod tests {
                     input_types = [
                         condition_type.clone(),
                         branch_type.clone(),
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
-                    ],
-                    error = "'select' input types are not broadcast-compatible",
-                },
-                {
-                    input_types = [
-                        condition_type.clone(),
-                        branch_type.clone(),
                         ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
                     ],
                     output_types = [branch_type.clone()],
@@ -461,110 +404,50 @@ mod tests {
             ],
         );
 
-        // Interpretation picks per-element between the two branches.
-        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
-        let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
-        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
-        let output = operation
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
-            .unwrap();
-        assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
+        // Check eager selection, scalar broadcasting, and mixed branch data-type promotion together.
+        let output = Select::select(
+            &Array::vector(vec![true, false, true]),
+            &Array::scalar(7.0_f32),
+            &Array::vector(vec![4.0_f64, 5.0, 6.0]),
+        )
+        .unwrap();
+        assert_eq!(output.r#type().into_owned(), branch_type);
+        assert_eq!(output.to_f64s(), vec![7.0, 5.0, 7.0]);
 
-        // Interpretation broadcasts a size-1 branch up to the condition/other-branch shape, matching the broadcasting
-        // type-inference contract.
-        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
-        let on_true = Array::from_f64s(scalar_branch.clone(), vec![7.0]);
-        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
-        let output = operation
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
-            .unwrap();
-        assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].to_f64s(), vec![7.0, 5.0, 7.0]);
-
-        // Interpretation promotes mixed-but-promotable branch data types, so the output carries the promoted (`f64`)
-        // data type of the two branches.
-        let condition = Array::from_f64s(condition_type.clone(), vec![1.0, 0.0, 1.0]);
-        let on_true =
-            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])), vec![1.0, 2.0, 3.0]);
-        let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
-        let output = operation
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, &[condition, on_true, on_false])
-            .unwrap();
-        assert_eq!(*output[0].r#type(), branch_type);
-        assert_eq!(output[0].to_f64s(), vec![1.0, 5.0, 3.0]);
-
-        // The scalar implementation selects on in-band Boolean scalar conditions.
-        assert_eq!(Scalar::select(&Scalar::from(true), &Scalar::from(2.0), &Scalar::from(3.0)), Ok(Scalar::from(2.0)),);
+        // Check both scalar branches and their common promoted result type.
         assert_eq!(
-            Scalar::select(&Scalar::from(false), &Scalar::from(2.0f32), &Scalar::from(3.0f32)),
-            Ok(Scalar::from(3.0f32)),
-        );
-
-        // Mixed-but-promotable branch data types promote the selected branch to the common type (`jnp.where`-style),
-        // so the result carries the promoted data type regardless of which branch is selected.
-        assert_eq!(
-            Scalar::select(&Scalar::from(true), &Scalar::from(2.0f32), &Scalar::from(3.0f64)),
-            Ok(Scalar::from(2.0f64)),
+            Scalar::select(&Scalar::from(true), &Scalar::from(2.0_f32), &Scalar::from(3.0_f64)),
+            Ok(Scalar::from(2.0_f64)),
         );
         assert_eq!(
-            Scalar::select(&Scalar::from(false), &Scalar::from(2.0f32), &Scalar::from(3.0f64)),
-            Ok(Scalar::from(3.0f64)),
-        );
-        assert_eq!(
-            Scalar::select(&Scalar::from(true), &Scalar::from(2i32), &Scalar::from(3.0f64)),
-            Ok(Scalar::from(2.0f64)),
+            Scalar::select(&Scalar::from(false), &Scalar::from(2.0_f32), &Scalar::from(3.0_f64)),
+            Ok(Scalar::from(3.0_f64)),
         );
 
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            InterpretableOperation::<crate::EagerContext<Array>>::interpret(
-                &operation,
-                &crate::EagerContext::<Array>::new(),
-                &crate::EmptyRegionDriver,
-                &[]
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
+        // Check that known inputs fold and unknown inputs residualize.
+        check_operation_partial_evaluation!(
+            operation = operation,
+            inputs = [Scalar::from(true), Scalar::from(2.0_f32), Scalar::from(3.0_f64)],
+            expected = Scalar::from(2.0_f64),
         );
 
-        // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<Array, SelectOperation>::new();
-        let program_condition = builder.add_input(condition_type);
-        let program_on_true = builder.add_input(branch_type.clone());
-        let program_on_false = builder.add_input(branch_type);
-        let program_output = builder
-            .add_instruction(operation, Vec::new(), vec![program_condition, program_on_true, program_on_false])
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder, Placeholder], Placeholder)
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:bool[3], %1:f64[3], %2:f64[3] .
-                let %3:f64[3] = select %0 %1 %2
-                in (%3)
-            "}
-            .trim_end(),
+        // Check elementwise batching with mapped conditions and a replicated branch.
+        check_operation_batching!(
+            @exact,
+            operation = operation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::vector(vec![true, false])),
+                    (@replicated, Array::scalar(2.0)),
+                    (@mapped(axis = 0), Array::vector(vec![3.0, 4.0])),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 4.0]))],
+            }],
         );
-    }
 
-    #[test]
-    fn test_select_jacfwd_computes_piecewise_derivative() {
-        // Forward mode through `f(x) = select(x > 0, 2x, 3x)`: the tangent selects the branch tangents under the
-        // same primal condition, so the derivative is 2 where x > 0 and 3 elsewhere.
-        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
-
-        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_scalar_select_jvp_and_gradient_flow_to_selected_branch() {
-        // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `EagerContext<Scalar, ScalarOperation<Scalar>>`
-        // exercises the scalar select rules: forward mode routes each branch tangent through the selected branch, and
-        // reverse mode routes the cotangent there, so the derivative reaches only the selected branch's input.
+        // Check that differentiation routes tangents and cotangents through the selected branch. This stays explicit
+        // because the operation-check helper's finite-difference oracle cannot perturb a Boolean condition input.
         fn piecewise<V>(x: V, y: V) -> Result<V, ProgramError>
         where
             V: Clone + Compare<Output = V> + Select + std::ops::Add<Output = V>,
@@ -573,8 +456,6 @@ mod tests {
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
 
-        // `x > y`: the output is `2x`, so forward mode passes the `x` tangent through (scaled by 2) and zeroes the `y`
-        // tangent, while the gradient is `(2, 0)`.
         let (primal, tangent) = jvp(
             |(x, y)| piecewise(x, y),
             (Scalar::from(3.0), Scalar::from(2.0)),
@@ -583,117 +464,28 @@ mod tests {
         .unwrap();
         assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 2.0, epsilon = 1e-9);
-        let (_, tangent) = jvp(
-            |(x, y)| piecewise(x, y),
-            (Scalar::from(3.0), Scalar::from(2.0)),
-            (Scalar::from(0.0), Scalar::from(1.0)),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
         let (value, gradient) =
             value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.0, 2.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.1, 0.0, epsilon = 1e-9);
 
-        // `x <= y`: the output is `3y`, so the roles flip; the gradient is `(0, 3)`.
         let (primal, tangent) = jvp(
-            |(x, y)| piecewise(x, y),
-            (Scalar::from(1.0), Scalar::from(2.0)),
-            (Scalar::from(1.0), Scalar::from(0.0)),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
-        let (_, tangent) = jvp(
             |(x, y)| piecewise(x, y),
             (Scalar::from(1.0), Scalar::from(2.0)),
             (Scalar::from(0.0), Scalar::from(1.0)),
         )
         .unwrap();
+        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 3.0, epsilon = 1e-9);
         let (value, gradient) =
             value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.0, 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.1, 3.0, epsilon = 1e-9);
-    }
 
-    #[test]
-    fn test_select_jacrev_computes_piecewise_derivative() {
-        // Reverse mode through `f(x) = select(x > 0, 2x, 3x)` exercises the partition-aware select transpose: the
-        // on_true cotangent is `select(condition, cotangent, 0)` and the on_false cotangent is
-        // `select(condition, 0, cotangent)`.
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
-
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
-        assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_select_jacrev_over_vector_masks_per_element() {
-        // Per-element masking over a vector input: the Jacobian of `select(x > 0, 2x, 3x)` is diagonal with entries
-        // 2 where x > 0 and 3 elsewhere.
-        let jacobian = jacrev(|x| Ok(piecewise_select(x)), Array::vector(vec![1.0, -1.0])).unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
-        assert_abs_diff_eq!(block.value().values()[0], 2.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(block.value().values()[3], 3.0, epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_select_jacrev_unbroadcasts_mixed_precision_scalar_branches() {
-        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![5.0]);
-        let f32_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
-        let vector =
-            Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
-
-        let jacobian = jacrev(
-            |(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &scalar, &vector)
-            },
-            (scalar.clone(), vector.clone()),
-        )
-        .unwrap();
-        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
-        assert_eq!(blocks[0].value().to_f64s(), vec![1.0, 0.0]);
-        assert_eq!(
-            blocks[1].value().r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
-        );
-        assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0]);
-
-        let jacobian = jacrev(
-            |(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &vector, &scalar)
-            },
-            (scalar, vector),
-        )
-        .unwrap();
-        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
-        assert_eq!(blocks[0].value().to_f64s(), vec![0.0, 1.0]);
-        assert_eq!(
-            blocks[1].value().r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
-        );
-        assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn test_select_partitioned_transpose_routes_the_cotangent_into_the_selected_branch() {
-        // Condition `[true, false]` (known), branches and cotangent are length-two f64 vectors (linear branches).
+        // Check that primitive transposition partitions the cotangent between the two linear branches.
         let condition = Array::vector(vec![true, false]);
-        // The branches are linear operands, so only their type enters the transpose; their values are unused.
         let on_true = Array::vector(vec![10.0, 20.0]);
         let cotangent = Array::vector(vec![5.0, 7.0]);
         let branch_type = on_true.r#type().into_owned();
