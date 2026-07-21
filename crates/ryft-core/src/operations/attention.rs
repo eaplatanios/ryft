@@ -473,28 +473,6 @@ impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
     }
 }
 
-/// Returns whether `data_type` is a (real) floating-point data type.
-fn data_type_is_float(data_type: DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN
-            | DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU
-            | DataType::BF16
-            | DataType::F16
-            | DataType::F32
-            | DataType::F64
-    )
-}
-
 /// Returns the static `[batch, sequence, heads, head_dim]` dimensions of an attention operand type, rejecting
 /// dynamic shapes and any rank other than 4.
 fn static_attention_dimensions(
@@ -554,7 +532,7 @@ fn validated_attention_operands(
     let key = static_attention_dimensions(operation_name, "key", key_type)?;
     let value = static_attention_dimensions(operation_name, "value", value_type)?;
     let data_type = query_type.data_type();
-    if !data_type_is_float(data_type) {
+    if !data_type.is_floating_point() {
         return Err(TypeError {
             message: format!("'{operation_name}' requires floating-point operands but got data type {data_type}"),
         });

@@ -61,7 +61,7 @@ impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        if input_types[0].element_type() == DataType::Token || self.data_type == DataType::Token {
+        if input_types[0].element_type().is_token() || self.data_type.is_token() {
             return Err(TypeError { message: "cannot convert values to or from the token data type".to_string() });
         }
         Ok(vec![input_types[0].with_element_type(self.data_type)])

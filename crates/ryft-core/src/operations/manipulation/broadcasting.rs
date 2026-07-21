@@ -2,11 +2,10 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::{
+    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
@@ -15,14 +14,15 @@ use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
+
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -95,9 +95,10 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-// TODO(eaplatanios): Review this module.
-
-impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> for BroadcastOperation {
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for BroadcastOperation
+where
+    C::Value: Broadcast,
+{
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -106,20 +107,24 @@ impl<C: Domain<Type = ArrayType, Value: Broadcast>> InterpretableOperation<C> fo
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
+        Ok(vec![inputs[0].broadcast(self.output_type.clone(), self.output_axes())?])
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
-    for BroadcastOperation
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for BroadcastOperation where
+    C::Operation: From<BroadcastOperation>
 {
 }
 
-// Forward-mode differentiation rule for [`BroadcastOperation`]. `broadcast` is structural-linear, so the tangent is
-// the same broadcast applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent
-// before this rule is consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>> DifferentiableOperation<C>
-    for BroadcastOperation
+/// Forward-mode differentiation rule for [`BroadcastOperation`]. Broadcasting is structural-linear, so the tangent
+/// follows the same axis mapping as the primal. A structural-zero input tangent remains structural and acquires the
+/// primal output's tangent type.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for BroadcastOperation
+where
+    C::Value: Broadcast,
+    C::Operation: From<BroadcastOperation>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -144,7 +149,8 @@ impl<C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOpe
 /// the target type that are not named in `output_axes`, plus the mapped axes whose input extent is `1` stretched to a
 /// larger target extent. After the reduction, the surviving axes are reordered into input-axis order when
 /// `output_axes` is not monotonically increasing, and stretched unit axes are restored with a reshape so the cotangent
-/// matches the input type exactly. Symbolic-zero cotangents propagate unchanged.
+/// matches the input type exactly. Symbolic-zero cotangents propagate unchanged, and an input with no cotangent space
+/// receives the structural zero of that space.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for BroadcastOperation
 where
     O: Operation<ArrayType>
@@ -166,10 +172,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         let input_cotangent_type = inputs[0].r#type().cotangent();
         if input_cotangent_type.is_zero_space() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "'broadcast' input 0 has no cotangent space".to_string(),
-            }
-            .into());
+            return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
         }
         let MaybeZero::Value(cotangent) = &outputs[0] else {
             return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
@@ -178,32 +181,41 @@ where
     }
 }
 
-/// Lifts a broadcast's `output_axes` and target shape through one batching level.
+/// Lifts a broadcast's output-axis mapping and target type through one batching level.
 ///
-/// When the input is batched at axis `k` (in the input's unbatched logical shape), the lifted broadcast inserts a batch
-/// dimension of size `axis_size` at position `k` in the target shape, places a corresponding batch axis at output
-/// position `k_out = k`, and shifts the existing `output_axes` so each previously mapped output axis `>= k_out` is
-/// shifted by one. The new batch input axis itself maps to `k_out`.
+/// The mapped batch axis occupies `input_batch_axis` in the physical input type. The lifted broadcast inserts a
+/// dimension of size `axis_size` at the same position in the physical output type, shifts every existing output-axis
+/// mapping at or after that position, and maps the physical input's batch axis to the inserted output axis.
+///
+/// # Parameters
+///
+///   - `output_axes`: Per-input-axis mapping used by the unbatched broadcast.
+///   - `output_type`: Unbatched output type targeted by the broadcast.
+///   - `input_batch_axis`: Position of the mapped batch axis in the physical input type.
+///   - `axis_size`: Extent of the mapped batch axis.
 pub fn lift_broadcast(
     output_axes: &[usize],
     output_type: &ArrayType,
     input_batch_axis: usize,
     axis_size: usize,
 ) -> Result<(Vec<usize>, ArrayType, usize), TypeError> {
-    let target_batch_axis = input_batch_axis;
-    let lifted_target = output_type.with_inserted_dimension(target_batch_axis, Size::Static(axis_size))?;
+    let output_batch_axis = input_batch_axis;
+    let lifted_output_type = output_type.with_inserted_dimension(output_batch_axis, Size::Static(axis_size))?;
 
-    let mut lifted_dimensions = Vec::with_capacity(output_axes.len() + 1);
-    for &output_axis in output_axes.iter() {
-        let shifted_output_axis = if output_axis >= target_batch_axis { output_axis + 1 } else { output_axis };
-        lifted_dimensions.push(shifted_output_axis);
+    let mut lifted_output_axes = Vec::with_capacity(output_axes.len() + 1);
+    for &output_axis in output_axes {
+        let shifted_output_axis = if output_axis >= output_batch_axis { output_axis + 1 } else { output_axis };
+        lifted_output_axes.push(shifted_output_axis);
     }
-    lifted_dimensions.insert(input_batch_axis, target_batch_axis);
+    lifted_output_axes.insert(input_batch_axis, output_batch_axis);
 
-    Ok((lifted_dimensions, lifted_target, target_batch_axis))
+    Ok((lifted_output_axes, lifted_output_type, output_batch_axis))
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for BroadcastOperation {
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for BroadcastOperation
+where
+    C::Value: Broadcast,
+{
     fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
@@ -213,23 +225,28 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for B
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
             None => {
-                // Replicated input: the broadcast itself does not change. Pass through.
+                // A replicated input has no mapped axis to lift, so the original broadcast remains replicated.
                 let output_value = inputs[0].value().broadcast(self.output_type().clone(), self.output_axes())?;
                 Ok(vec![ArrayBatch::replicated(output_value)])
             }
             Some(batch_axis) => {
                 let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-                let (lifted_dimensions, mut lifted_target, target_batch_axis) =
+                let (lifted_output_axes, mut lifted_output_type, output_batch_axis) =
                     lift_broadcast(self.output_axes(), self.output_type(), batch_axis, axis_size)?;
                 if let Some(sharding) = self.output_type().sharding() {
-                    lifted_target.sharding = Some(
+                    lifted_output_type.sharding = Some(
                         sharding
-                            .with_inserted_dimension(target_batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)
+                            .with_inserted_dimension(output_batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)
                             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
                     );
                 }
-                let output_value = inputs[0].value().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
-                Ok(vec![ArrayBatch::new(lifted_target, output_value, BatchAxis::from_position(target_batch_axis))?])
+                let output_value =
+                    inputs[0].value().broadcast(lifted_output_type.clone(), lifted_output_axes.as_slice())?;
+                Ok(vec![ArrayBatch::new(
+                    lifted_output_type,
+                    output_value,
+                    BatchAxis::from_position(output_batch_axis),
+                )?])
             }
         }
     }
@@ -487,8 +504,9 @@ impl Broadcast for ArrayType {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
-    Broadcast for V
+impl<V: Value<Type = ArrayType>> Broadcast for V
+where
+    V::DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>,
 {
     #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
@@ -505,7 +523,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::differentiation::jvp;
     use crate::macros::{
@@ -562,10 +579,6 @@ mod tests {
             ],
         );
 
-        // Type-level (abstract) broadcasting validates the axis mapping and returns the target type without
-        // consuming the borrowed input type.
-        assert_eq!(input_type.broadcast(output_type.clone(), &[1]), Ok(output_type.clone()));
-
         // Interpretation replicates the payload along the added axis.
         let input = Array::vector(vec![1.0, 2.0, 3.0]);
         let output = operation
@@ -574,29 +587,7 @@ mod tests {
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
-        // The convenience capabilities delegate to `broadcast`.
-        let broadcast_leading = Array::vector(vec![1.0, 2.0, 3.0]).broadcast_leading(vec![2]).unwrap();
-        assert_eq!(*broadcast_leading.r#type(), output_type);
-        assert_eq!(broadcast_leading.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-        let broadcast_to = Array::vector(vec![1.0, 2.0, 3.0]).broadcast_to(output_type.shape().clone()).unwrap();
-        assert_eq!(*broadcast_to.r#type(), output_type);
-        assert_eq!(broadcast_to.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-
-        // Invalid axis mappings and interpreter arity report precise errors.
-        assert_eq!(
-            BroadcastOperation::new(output_type.clone(), vec![2])
-                .infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError {
-                message: "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string()
-            }),
-        );
-        assert_eq!(
-            BroadcastOperation::new(output_type.clone(), vec![1, 1]).infer_output_types(
-                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]),)],
-                &[]
-            ),
-            Err(TypeError { message: "broadcasting output axes map two input axes to output axis 1".to_string() }),
-        );
+        // Invalid interpreter arity reports the exact program error.
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
@@ -606,17 +597,11 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
-        assert_eq!(
-            Array::vector(vec![1.0, 2.0, 3.0]).broadcast(output_type.clone(), &[2]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string(),
-            })),
-        );
 
         // Program rendering uses the canonical operation name and includes the captured metadata.
         let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation, Vec::new(), vec![program_input]).unwrap()[0];
+        let program_output = builder.add_instruction(operation.clone(), Vec::new(), vec![program_input]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
@@ -633,7 +618,7 @@ mod tests {
         let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
-            operation = BroadcastOperation::new(output_type.clone(), vec![1]),
+            operation = operation.clone(),
             cases = [
                 {
                     inputs = [(@known, input.clone())],
@@ -648,7 +633,7 @@ mod tests {
             ],
         );
 
-        // Batching lifts the broadcast around the mapped axis and preserves ordinary replicated placement.
+        // Batching preserves replicated inputs and lifts mapped inputs through the explicit output-axis mapping.
         check_operation_batching!(
             @exact,
             operation = BroadcastOperation::new(
@@ -656,19 +641,33 @@ mod tests {
                 vec![0],
             ),
             axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(
-                    ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
-                    vec![
-                        1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
-                        4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
-                    ],
-                ))],
-            }],
+            cases = [
+                {
+                    inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    outputs = [(@replicated, Array::matrix(
+                        3,
+                        4,
+                        vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0],
+                    ))],
+                },
+                {
+                    inputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        3,
+                        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    ))],
+                    outputs = [(@mapped(axis = 0), Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
+                        vec![
+                            1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
+                            4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
+                        ],
+                    ))],
+                },
+            ],
         );
 
-        // Broadcast is structural-linear: its JVP broadcasts the tangent as well as the primal.
+        // Broadcasting is structural-linear: its JVP broadcasts both the primal and its tangent.
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-9),
             operation = BroadcastOperation::new(
@@ -680,113 +679,40 @@ mod tests {
                 tangents = [Array::vector(vec![3.0, 4.0])],
                 primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 1.0, 2.0])],
                 tangent_outputs = [Array::matrix(2, 2, vec![3.0, 4.0, 3.0, 4.0])],
+                jvp = indoc! {"
+                    lambda %0:f64[2], %1:f64[2] .
+                    let %2:f64[2, 2] = broadcast [output_type=f64[2, 2], output_axes=[1]] %0
+                        %3:f64[2, 2] = broadcast [output_type=f64[2, 2], output_axes=[1]] %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+
+        // The pullback sums the output cotangent over every newly replicated output axis.
+        check_operation_transposition!(
+            @exact,
+            operation = operation,
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Size::Static(3)]),
+                )))],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0])],
+                pullback = indoc! {"
+                    lambda %0:f64[2, 3] .
+                    let %1:f64[3] = reduce_sum [axes=[0]] %0
+                    in (%1)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_array_type_broadcast() {
-        // A dynamic input dimension maps through to an identical dynamic output dimension, while replicated axes
-        // (unmapped output axes) keep requiring static extents.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]));
-        assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
-
-        // A dynamic input dimension does not broadcast to a different dynamic output dimension or to a static one.
-        let unbounded = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
-        assert_eq!(
-            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
-        );
-        assert_eq!(
-            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
-        );
-
-        // Static input dimensions do not expand into dynamic output dimensions, whether they are 1 or not.
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])).broadcast(unbounded.clone(), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string(),
-            })),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(unbounded, &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
-                    only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
-        );
-
-        // Replicating the input along an unmapped dynamic output axis is rejected because the replication count
-        // is unknown.
-        assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
-                &[1],
-            ),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *"
-                    .to_string(),
-            })),
-        );
-
-        // Lifting a mapped broadcast inserts the batch dimension without dropping memory or sharding metadata.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap()
-            .with_memory(Memory::Host { pinned: true });
-        let (output_axes, lifted, batch_axis) = lift_broadcast(&[0], &output_type, 0, 2).unwrap();
-        assert_eq!(output_axes, vec![0, 1]);
-        assert_eq!(lifted, output_type.with_inserted_dimension(0, Size::Static(2)).unwrap());
-        assert_eq!(batch_axis, 0);
-    }
-
-    #[test]
-    fn test_broadcast_array() {
-        // Mapping a vector's single axis to output axis 1 replicates it across the added leading axis.
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output = Array::vector(vec![1.0, 2.0, 3.0]).broadcast(target, &[1]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-
-        // Mapping a [2, 2] matrix to output axes 0 and 2 replicates it along the added middle axis.
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)]));
-        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).broadcast(target, &[0, 2]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
-
-        // Static unit axes are stretched to the corresponding target extent.
-        let input = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]);
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output = input.broadcast(target, &[0, 1]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-
-        // Empty targets produce empty payloads.
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
-        let output = Array::vector(vec![1.0, 2.0]).broadcast(target, &[1]).unwrap();
-        assert_eq!(output.to_f64s(), Vec::<f64>::new());
-    }
-
-    #[test]
-    fn test_broadcast_transforms() {
+    fn test_broadcast_transform_metadata() {
         // Explicit mapped-axis sharding remains attached to the lifted batch dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let physical_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap(),
@@ -809,20 +735,24 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-        let input = ArrayBatch::new(
-            physical_input_type.clone(),
-            Array::from_f64s(physical_input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-
-        let outputs = BroadcastOperation::new(logical_output_type, vec![0])
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap();
-
-        assert_eq!(outputs[0].r#type().as_ref(), &expected_output_type);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        check_operation_batching!(
+            @exact,
+            operation = BroadcastOperation::new(logical_output_type, vec![0]),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::from_f64s(
+                    input_type,
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ))],
+                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                    expected_output_type,
+                    vec![
+                        1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
+                        4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
+                    ],
+                ))],
+            }],
+        );
 
         // Differentiation derives the tangent target from the primal output, preserving promoted tangent types.
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2)]));
@@ -841,24 +771,6 @@ mod tests {
         assert_eq!(primal.r#type().as_ref(), &primal_output_type);
         assert_eq!(tangent.r#type().as_ref(), &tangent_output_type);
         assert_eq!(tangent.to_f64s(), vec![1.0, 3.0, 1.0, 3.0]);
-
-        // The pullback sums over added dimensions.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        check_operation_transposition!(
-            @exact,
-            operation = BroadcastOperation::new(output_type, vec![1]),
-            cases = [{
-                inputs = [(@linear(type = input_type))],
-                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
-                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0])],
-                pullback = indoc! {"
-                    lambda %0:f64[2, 3] .
-                    let %1:f64[3] = reduce_sum [axes=[0]] %0
-                    in (%1)
-                "},
-            }],
-        );
 
         // Input axis 0 (size 2) maps to output axis 2 and input axis 1 (size 3) maps to output axis 0, so the pullback
         // must sum over output axis 1 and swap the surviving axes back into input order.
@@ -911,5 +823,138 @@ mod tests {
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &input_cotangent_type);
+
+        // Inputs with no cotangent space receive the structural zero of that space rather than being rejected.
+        let input_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(3)]));
+        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
+        let contributions = operation
+            .transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type.clone())],
+                &[MaybeZero::Zero(output_type.cotangent())],
+            )
+            .unwrap();
+        assert_eq!(contributions.len(), 1);
+        assert!(contributions[0].is_zero());
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent());
+    }
+
+    #[test]
+    fn test_lift_broadcast() {
+        // Lifting an interior batch axis shifts arbitrary existing mappings and preserves placement metadata.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]))
+                .with_sharding(
+                    Sharding::new(mesh, vec![ShardingDimension::replicated(); 3])
+                        .unwrap()
+                        .with_unreduced_axes(["x"])
+                        .unwrap(),
+                )
+                .unwrap()
+                .with_memory(Memory::Host { pinned: true });
+
+        let (output_axes, lifted_output_type, output_batch_axis) = lift_broadcast(&[2, 0], &output_type, 1, 5).unwrap();
+
+        assert_eq!(output_axes, vec![3, 1, 0]);
+        assert_eq!(lifted_output_type, output_type.with_inserted_dimension(1, Size::Static(5)).unwrap());
+        assert_eq!(output_batch_axis, 1);
+    }
+
+    #[test]
+    fn test_array_type_broadcast() {
+        // Type-level broadcasting validates arbitrary mappings without consuming the input type.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        assert_eq!(input_type.broadcast(output_type.clone(), &[1]), Ok(output_type.clone()));
+        assert_eq!(
+            input_type.broadcast(output_type.clone(), &[2]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string(),
+            })),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]))
+                .broadcast(output_type, &[1, 1]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting output axes map two input axes to output axis 1".to_string(),
+            })),
+        );
+
+        // A dynamic input dimension maps only to the identical dynamic dimension, while replicated output axes must
+        // remain static because their replication counts need to be known.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]));
+        assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
+
+        let unbounded = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        assert_eq!(
+            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(
+            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])).broadcast(unbounded.clone(), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string(),
+            })),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(unbounded, &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
+                    only broadcasts to an identical dynamic dimension"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                &[1],
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *"
+                    .to_string(),
+            })),
+        );
+    }
+
+    #[test]
+    fn test_array_broadcast() {
+        // Arbitrary axis mappings replicate the payload along every unmapped target axis.
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)]));
+        let output = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).broadcast(target, &[0, 2]).unwrap();
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
+
+        // Static unit axes stretch to the target extent, and empty target dimensions produce empty payloads.
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output = Array::matrix(1, 3, vec![1.0, 2.0, 3.0]).broadcast(target, &[0, 1]).unwrap();
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
+        let output = Array::vector(vec![1.0, 2.0]).broadcast(target, &[1]).unwrap();
+        assert_eq!(output.to_f64s(), Vec::<f64>::new());
+
+        // Convenience methods delegate to the same primitive with leading and right-aligned axis mappings.
+        let output = Array::vector(vec![1.0, 2.0, 3.0]).broadcast_leading(vec![2]).unwrap();
+        assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])));
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let output = Array::scalar(7.0).broadcast_to(Shape::new(vec![2.into(), 3.into()])).unwrap();
+        assert_eq!(output.to_f64s(), vec![7.0; 6]);
+        let output = Array::vector(vec![10.0, 20.0, 30.0]).broadcast_to(Shape::new(vec![2.into(), 3.into()])).unwrap();
+        assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
     }
 }

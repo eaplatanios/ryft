@@ -154,7 +154,7 @@ impl XlaExecutableSignature {
             types
                 .iter()
                 .map(|r#type| {
-                    if r#type.data_type() == DataType::Zero && r#type.static_shape().is_some() {
+                    if r#type.data_type().is_zero() && r#type.static_shape().is_some() {
                         None
                     } else {
                         let index = physical_index;
@@ -747,7 +747,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+        if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_sine_or_cosine(
                 input_values[0],
                 &output_types[0],
@@ -774,7 +774,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+        if output_types[0].data_type().is_complex() {
             return Ok(vec![lower_complex_sine_or_cosine(
                 input_values[0],
                 &output_types[0],
@@ -1447,7 +1447,7 @@ fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: C
 
     // Complex constants are composed as `value + 0i` from two real part constants through `stablehlo.complex`, so
     // that the dense-elements attribute helpers stay real-valued (MLIR has no complex scalar attribute to splat).
-    if matches!(data_type, DataType::C64 | DataType::C128) {
+    if data_type.is_complex() {
         let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_tensor_type =
             context.tensor_type(lower_element_type(part_data_type, context)?, &[], None, location)?;
@@ -1513,7 +1513,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     // The zero-space type has exactly one value. Both `zero_like` and `one_like` therefore materialize that value,
     // even though a typed `one` operation remains invalid because the type has no numeric multiplicative identity.
     let integer_value = match output_types {
-        [output_type] if output_type.data_type() == DataType::Zero => 0,
+        [output_type] if output_type.data_type().is_zero() => 0,
         _ => integer_value,
     };
     lower_constant_output(output_types, integer_value, block, context, location)
@@ -7325,7 +7325,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
         XlaOperation::Sin(_) => {
-            if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+            if output_types[0].data_type().is_complex() {
                 return Ok(vec![lower_complex_sine_or_cosine(
                     input_values[0],
                     &output_types[0],
@@ -7343,7 +7343,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
         XlaOperation::Cos(_) => {
-            if matches!(output_types[0].data_type(), DataType::C64 | DataType::C128) {
+            if output_types[0].data_type().is_complex() {
                 return Ok(vec![lower_complex_sine_or_cosine(
                     input_values[0],
                     &output_types[0],
@@ -8848,16 +8848,14 @@ fn float_reduction_identity_bound(data_type: DataType) -> Option<f64> {
 /// them at the type's width and signedness — [`DataType::U64`]'s maximum therefore wraps to `-1`, whose
 /// two's-complement bits are exactly `u64::MAX`. Returns `None` for non-integer data types.
 fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> {
-    match data_type {
-        DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64 => {
-            let width = signed_integer_width(data_type).unwrap();
-            Some((i64::MIN >> (64 - width), i64::MAX >> (64 - width)))
-        }
-        DataType::U1 | DataType::U2 | DataType::U4 | DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64 => {
-            let width = unsigned_integer_width(data_type).unwrap();
-            Some((0, (u64::MAX >> (64 - width)) as i64))
-        }
-        _ => None,
+    if data_type.is_signed() {
+        let width = signed_integer_width(data_type).unwrap();
+        Some((i64::MIN >> (64 - width), i64::MAX >> (64 - width)))
+    } else if data_type.is_unsigned() {
+        let width = unsigned_integer_width(data_type).unwrap();
+        Some((0, (u64::MAX >> (64 - width)) as i64))
+    } else {
+        None
     }
 }
 
@@ -8979,13 +8977,13 @@ where
     L: Copy + Location<'c, 't>,
 {
     let data_type = output_type.data_type();
-    if data_type == DataType::Zero {
+    if data_type.is_zero() {
         if value != Scalar::Zero {
             return Err(LoweringError::UnsupportedDataType { data_type });
         }
         return lower_f64_constant_splat(0.0, output_type, output_tensor_type, block, context, location);
     }
-    if matches!(data_type, DataType::C64 | DataType::C128) {
+    if data_type.is_complex() {
         let (real, imaginary) = match value {
             Scalar::C64(value) => (value.re as f64, value.im as f64),
             Scalar::C128(value) => (value.re, value.im),

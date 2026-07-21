@@ -81,7 +81,7 @@ use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -1794,7 +1794,7 @@ impl Concretizable<bool> for Array {
     fn concretize(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element) so that batch-varying while can extract a final
         // `any(mask)` result. Higher-rank predicates still error because they cannot collapse to a single Boolean.
-        if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
+        if self.r#type.rank() == 0 && self.r#type.data_type().is_boolean() && self.values.len() == 1 {
             return self.values[0].concretize();
         }
         Err(ProgramError::Concretization {
@@ -1811,7 +1811,7 @@ impl Concretizable<bool> for Array {
 /// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl crate::operations::control_flow::WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
-        if self.r#type.data_type() != DataType::Boolean {
+        if !self.r#type.data_type().is_boolean() {
             return Err(ProgramError::Concretization {
                 message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
             });
@@ -1825,7 +1825,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() != DataType::Boolean
+        if !self.r#type.data_type().is_boolean()
             || on_true.r#type != on_false.r#type
             || self.values.is_empty()
             || !on_true.values.len().is_multiple_of(self.values.len())
@@ -1854,7 +1854,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
 
 impl ConvertElementType for Array {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        if self.r#type.data_type() == DataType::Token || data_type == DataType::Token {
+        if self.r#type.data_type().is_token() || data_type.is_token() {
             return Err(
                 TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
             );

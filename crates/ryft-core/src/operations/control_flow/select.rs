@@ -46,7 +46,7 @@ impl Operation<DataType> for SelectOperation {
         _region_interfaces: &[RegionInterface<DataType>],
     ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
-        if input_types[0] != DataType::Boolean {
+        if !input_types[0].is_boolean() {
             return Err(TypeError {
                 message: format!("'select' condition data type {} is not {}", input_types[0], DataType::Boolean),
             });
@@ -104,7 +104,7 @@ impl ElementwiseOperation for SelectOperation {
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
-        if condition.data_type() != DataType::Boolean {
+        if !condition.data_type().is_boolean() {
             return Err(TypeError {
                 message: format!("'select' condition data type {} is not {}", condition.data_type(), DataType::Boolean),
             });

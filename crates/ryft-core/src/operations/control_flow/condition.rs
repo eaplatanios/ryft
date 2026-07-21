@@ -35,7 +35,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType};
+use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this.
 
@@ -132,7 +132,7 @@ where
     ) -> Result<Vec<F::Type>, TypeError> {
         let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
-        if !input_types[0].is_scalar() || input_types[0].element_type() != DataType::Boolean {
+        if !input_types[0].is_scalar() || !input_types[0].element_type().is_boolean() {
             return Err(TypeError {
                 message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
             });

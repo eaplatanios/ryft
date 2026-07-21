@@ -21,11 +21,11 @@ use crate::operations::math::{DivOperation, MulOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, StaticShape};
+use crate::types::{ArrayType, Shape, StaticShape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -117,10 +117,10 @@ pub fn reduce_abstract(
     }
 
     let data_type = input.data_type();
-    if kind.requires_boolean() && data_type != DataType::Boolean {
+    if kind.requires_boolean() && !data_type.is_boolean() {
         return Err(TypeError { message: format!("'{op}' kind {kind} requires Boolean inputs but got {data_type}") });
     }
-    if !kind.requires_boolean() && data_type == DataType::Boolean {
+    if !kind.requires_boolean() && data_type.is_boolean() {
         return Err(TypeError { message: format!("'{op}' kind {kind} requires numeric inputs but got {data_type}") });
     }
     // Min/max reductions select elements by order, and complex element types are unordered.

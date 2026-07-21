@@ -32,35 +32,16 @@ define_elementwise_operation!(
     abs,
     infer_data_types = |input_types: &[DataType]| {
         let input_type = input_types[0];
-        let output_type = match input_type {
-            DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::I16
-            | DataType::I32
-            | DataType::I64
-            | DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN
-            | DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU
-            | DataType::BF16
-            | DataType::F16
-            | DataType::F32
-            | DataType::F64 => input_type,
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            input_type => {
-                return Err(TypeError {
-                    message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-                });
-            }
+        let output_type = if input_type == DataType::C64 {
+            DataType::F32
+        } else if input_type == DataType::C128 {
+            DataType::F64
+        } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
+            input_type
+        } else {
+            return Err(TypeError {
+                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
+            });
         };
         Ok(vec![output_type])
     },

@@ -54,7 +54,7 @@ impl Concretizable<bool> for Array<'_> {
     /// to the host. Higher-rank or non-Boolean arrays error because they cannot collapse to a single Boolean, and
     /// arrays with no addressable shards error because the current process cannot read their payload.
     fn concretize(&self) -> Result<bool, ProgramError> {
-        if self.r#type().rank() == 0 && self.data_type() == DataType::Boolean {
+        if self.r#type().rank() == 0 && self.data_type().is_boolean() {
             let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
                 message: format!(
                     "cannot extract a concrete boolean from an array of type {} with no addressable shards",
@@ -79,7 +79,7 @@ impl Concretizable<bool> for Array<'_> {
 /// against the operands along its leading (prefix) axes on device before selecting.
 impl WhilePredicate for Array<'_> {
     fn any_true(&self) -> Result<bool, ProgramError> {
-        if self.data_type() != DataType::Boolean {
+        if !self.data_type().is_boolean() {
             return Err(ProgramError::Concretization {
                 message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
             });
@@ -108,7 +108,7 @@ impl WhilePredicate for Array<'_> {
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        if self.data_type() != DataType::Boolean || on_true.r#type() != on_false.r#type() {
+        if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "mask_select requires a Boolean prefix-shaped predicate and congruent operands, but got \

@@ -983,50 +983,6 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_replicates_across_added_axes() {
-        use crate::operations::manipulation::Broadcast;
-
-        // A length-3 vector broadcast to shape [2, 3] with output_axes=[1]: the input
-        // axis maps to output axis 1, so the value replicates across output axis 0.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output = input.broadcast(target, &[1]).unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn test_broadcast_leading_prepends_axes() {
-        use crate::operations::manipulation::Broadcast;
-
-        // `t.broadcast_leading([2])` prepends a leading axis of size 2 and replicates the original
-        // values across it. Matches `jax.lax.broadcast(t, [2])`.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        let output = input.broadcast_leading(vec![2]).unwrap();
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-        );
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn test_broadcast_to_uses_numpy_right_alignment() {
-        use crate::operations::manipulation::Broadcast;
-
-        // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
-        let scalar = Array::scalar(7.0);
-        let output = scalar.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
-        assert_eq!(output.to_f64s(), vec![7.0; 6]);
-
-        // A rank-1 `[3]` vector broadcasts to `[2, 3]` by right-aligning: input axis 0 maps
-        // to output axis 1, replicating across output axis 0 — matches NumPy's
-        // `np.broadcast_to(x, (2, 3))`.
-        let vector = Array::vector(vec![10.0, 20.0, 30.0]);
-        let output = vector.broadcast_to(Shape::new(vec![Size::Static(2), Size::Static(3)])).unwrap();
-        assert_eq!(output.to_f64s(), vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
-    }
-
-    #[test]
     fn test_select_batches_with_replicated_predicate_via_broadcast() {
         // Predicate is a rank-0 replicated scalar; on_true / on_false are mapped vectors of
         // size 3. With the JAX-style broadcasting elementwise batching rule, the replicated

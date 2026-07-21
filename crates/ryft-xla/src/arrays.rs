@@ -226,7 +226,7 @@ impl<'o> Array<'o> {
                 return Err(Error::BufferTypeMismatch { expected: expected_array_type, actual: array_type });
             }
             if validate_zero_carriers
-                && r#type.data_type() == DataType::Zero
+                && r#type.data_type().is_zero()
                 && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
             {
                 return Err(Error::NonCanonicalZeroBuffer { device_id });
@@ -237,7 +237,7 @@ impl<'o> Array<'o> {
 
         // Materialize the global shard list with local storage attached to the shards addressable from this process.
         // A validated zero-space carrier is discarded because its false bits carry no logical information.
-        let zero_space = r#type.data_type() == DataType::Zero;
+        let zero_space = r#type.data_type().is_zero();
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
@@ -269,7 +269,7 @@ impl<'o> Array<'o> {
     /// Constructs a bufferless array of the unique value represented by [`DataType::Zero`]. Local shards are marked
     /// addressable without allocating PJRT buffers, while remote shards retain metadata only.
     pub(crate) fn from_zero_space(client: &'o Client<'o>, r#type: ArrayType, mesh: DeviceMesh) -> Result<Self, Error> {
-        if r#type.data_type() != DataType::Zero {
+        if !r#type.data_type().is_zero() {
             return Err(PjrtError::invalid_argument(format!(
                 "bufferless zero-space construction requires zero element type but got {}",
                 r#type.data_type(),
@@ -342,7 +342,7 @@ impl<'o> Array<'o> {
         if buffer.len() != expected_byte_count {
             return Err(Error::ByteCountMismatch { expected: expected_byte_count, actual: buffer.len() }.into());
         }
-        if r#type.data_type() == DataType::Zero {
+        if r#type.data_type().is_zero() {
             return Ok(Self::from_zero_space(client, r#type, mesh)?);
         }
 
@@ -1108,7 +1108,7 @@ pub(crate) trait ArrayTypeExtension {
 impl ArrayTypeExtension for ArrayType {
     #[inline]
     fn size_in_bytes(&self) -> Result<usize, Error> {
-        if self.data_type() == DataType::Zero {
+        if self.data_type().is_zero() {
             return Ok(0);
         }
         let element_count = self.element_count()?.ok_or_else(|| Error::DynamicShape { shape: self.shape().clone() })?;

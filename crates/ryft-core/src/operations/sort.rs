@@ -149,10 +149,9 @@ impl Operation<ArrayType> for SortOperation {
             });
         }
         for input_type in &input_types[..self.key_count] {
-            if matches!(input_type.data_type(), DataType::Token | DataType::Zero | DataType::C64 | DataType::C128) {
-                return Err(TypeError {
-                    message: format!("'sort' does not support key data type {}", input_type.data_type()),
-                });
+            let data_type = input_type.data_type();
+            if data_type.is_token() || data_type.is_zero() || data_type.is_complex() {
+                return Err(TypeError { message: format!("'sort' does not support key data type {data_type}") });
             }
         }
         if self.axis >= key_type.rank() {

@@ -1333,26 +1333,84 @@ static DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS: [[Option<DataType>; DataType::COU
 };
 
 impl DataType {
+    /// Returns `true` if this [`DataType`] represents an effect-ordering token (i.e., if it is [`DataType::Token`]).
+    #[inline]
+    pub const fn is_token(self) -> bool {
+        matches!(self, Self::Token)
+    }
+
+    /// Returns `true` if this [`DataType`] represents the zero-information differential space
+    /// (i.e., if it is [`DataType::Zero`]).
+    #[inline]
+    pub const fn is_zero(self) -> bool {
+        matches!(self, Self::Zero)
+    }
+
+    /// Returns `true` if this [`DataType`] represents Boolean values (i.e., if it is [`DataType::Boolean`]).
+    #[inline]
+    pub const fn is_boolean(self) -> bool {
+        matches!(self, Self::Boolean)
+    }
+
+    /// Returns `true` if this [`DataType`] represents a signed integer.
+    #[inline]
+    pub const fn is_signed(self) -> bool {
+        matches!(self, Self::I1 | Self::I2 | Self::I4 | Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
+    /// Returns `true` if this [`DataType`] represents an unsigned integer.
+    #[inline]
+    pub const fn is_unsigned(self) -> bool {
+        matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64)
+    }
+
     /// Returns `true` if this [`DataType`] represents a signed or unsigned integer.
     #[inline]
-    pub fn is_integer(self) -> bool {
+    pub const fn is_integer(self) -> bool {
+        self.is_signed() || self.is_unsigned()
+    }
+
+    /// Returns `true` if this [`DataType`] represents a real floating-point value.
+    #[inline]
+    pub const fn is_floating_point(self) -> bool {
         matches!(
             self,
-            Self::I1
-                | Self::I2
-                | Self::I4
-                | Self::I8
-                | Self::I16
-                | Self::I32
-                | Self::I64
-                | Self::U1
-                | Self::U2
-                | Self::U4
-                | Self::U8
-                | Self::U16
-                | Self::U32
-                | Self::U64
+            Self::F4E2M1FN
+                | Self::F6E2M3FN
+                | Self::F6E3M2FN
+                | Self::F8E3M4
+                | Self::F8E4M3
+                | Self::F8E4M3FN
+                | Self::F8E4M3FNUZ
+                | Self::F8E4M3B11FNUZ
+                | Self::F8E5M2
+                | Self::F8E5M2FNUZ
+                | Self::F8E8M0FNU
+                | Self::BF16
+                | Self::F16
+                | Self::F32
+                | Self::F64
         )
+    }
+
+    /// Returns `true` if this [`DataType`] represents a complex value.
+    #[inline]
+    pub const fn is_complex(self) -> bool {
+        matches!(self, Self::C64 | Self::C128)
+    }
+
+    /// Returns `true` if this [`DataType`] represents a real numeric value. This includes integer and floating-point
+    /// types, but excludes [`DataType::Token`], [`DataType::Zero`], [`DataType::Boolean`], and complex types.
+    #[inline]
+    pub const fn is_real(self) -> bool {
+        self.is_integer() || self.is_floating_point()
+    }
+
+    /// Returns `true` if this [`DataType`] represents a numeric value. This includes integer, floating-point, and
+    /// complex types, but excludes [`DataType::Token`], [`DataType::Zero`], and [`DataType::Boolean`].
+    #[inline]
+    pub const fn is_numeric(self) -> bool {
+        self.is_real() || self.is_complex()
     }
 
     /// Returns the promoted [`DataType`] for the provided data types, which is defined as the least upper bound of
@@ -1491,7 +1549,7 @@ impl Type for DataType {
 
     #[inline]
     fn is_complex(&self) -> bool {
-        matches!(self, Self::C64 | Self::C128)
+        self.is_complex()
     }
 }
 
@@ -1500,15 +1558,50 @@ mod tests {
     use super::{DataType, DataTypeError, Type};
 
     #[test]
-    fn test_data_type_is_integer() {
-        assert!(DataType::I1.is_integer());
-        assert!(DataType::I64.is_integer());
-        assert!(DataType::U1.is_integer());
-        assert!(DataType::U64.is_integer());
-        assert!(!DataType::Boolean.is_integer());
-        assert!(!DataType::F32.is_integer());
-        assert!(!DataType::C64.is_integer());
-        assert!(!DataType::Token.is_integer());
+    fn test_data_type_classification() {
+        let signed =
+            [DataType::I1, DataType::I2, DataType::I4, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
+        let unsigned =
+            [DataType::U1, DataType::U2, DataType::U4, DataType::U8, DataType::U16, DataType::U32, DataType::U64];
+        let floating_point = [
+            DataType::F4E2M1FN,
+            DataType::F6E2M3FN,
+            DataType::F6E3M2FN,
+            DataType::F8E3M4,
+            DataType::F8E4M3,
+            DataType::F8E4M3FN,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F8E5M2,
+            DataType::F8E5M2FNUZ,
+            DataType::F8E8M0FNU,
+            DataType::BF16,
+            DataType::F16,
+            DataType::F32,
+            DataType::F64,
+        ];
+        let complex = [DataType::C64, DataType::C128];
+        for data_type in DataType::ALL {
+            assert_eq!(data_type.is_token(), data_type == DataType::Token);
+            assert_eq!(data_type.is_zero(), data_type == DataType::Zero);
+            assert_eq!(data_type.is_boolean(), data_type == DataType::Boolean);
+            assert_eq!(data_type.is_signed(), signed.contains(&data_type));
+            assert_eq!(data_type.is_unsigned(), unsigned.contains(&data_type));
+            assert_eq!(data_type.is_integer(), signed.contains(&data_type) || unsigned.contains(&data_type));
+            assert_eq!(data_type.is_floating_point(), floating_point.contains(&data_type));
+            assert_eq!(
+                data_type.is_real(),
+                signed.contains(&data_type) || unsigned.contains(&data_type) || floating_point.contains(&data_type),
+            );
+            assert_eq!(data_type.is_complex(), complex.contains(&data_type));
+            assert_eq!(
+                data_type.is_numeric(),
+                signed.contains(&data_type)
+                    || unsigned.contains(&data_type)
+                    || floating_point.contains(&data_type)
+                    || complex.contains(&data_type),
+            );
+        }
     }
 
     #[test]

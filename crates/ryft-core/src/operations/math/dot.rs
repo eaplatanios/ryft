@@ -222,25 +222,7 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
     if operand == accumulation {
         return true;
     }
-    let operand_is_float = matches!(
-        operand,
-        DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN
-            | DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU
-            | DataType::BF16
-            | DataType::F16
-            | DataType::F32
-            | DataType::F64
-    );
-    if operand_is_float {
+    if operand.is_floating_point() {
         return matches!(accumulation, DataType::F32 | DataType::F64);
     }
     match (integer_parts(operand), integer_parts(accumulation)) {

@@ -179,7 +179,7 @@ pub trait WhileTypeSemantics: Type {
 
 impl WhileTypeSemantics for ArrayType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
-        if condition_output.data_type() != DataType::Boolean {
+        if !condition_output.data_type().is_boolean() {
             return Err(TypeError {
                 message: format!("'while' condition output type must be a Boolean array, but got {condition_output}"),
             });
@@ -208,7 +208,7 @@ impl WhileTypeSemantics for ArrayType {
 
 impl WhileTypeSemantics for DataType {
     fn validate_while_condition_output(condition_output: &Self, _state_types: &[Self]) -> Result<(), TypeError> {
-        if condition_output != &DataType::Boolean {
+        if !condition_output.is_boolean() {
             return Err(TypeError {
                 message: format!("'while' condition output type must be bool, but got {condition_output}"),
             });

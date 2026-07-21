@@ -145,43 +145,22 @@ macro_rules! check_types {
     // This internal helper accepts the numeric universe: signed and unsigned integers, real floating-point values,
     // and complex values. It recurses so later selectors can refine that universe without duplicating its variant list.
     (@matches_data_type $input_type:ident; @numeric $($selectors:tt)*) => {
-        !matches!(
-            $input_type,
-            $crate::DataType::Token | $crate::DataType::Zero | $crate::DataType::Boolean
-        ) && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+        $input_type.is_numeric() && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
     };
 
     // This internal helper accepts real floating-point and complex types as one float-capable universe. Keeping this
     // predicate independent from `@real` lets callers retain complex values with `@float` or exclude them by composing
     // `@float @real`.
     (@matches_data_type $input_type:ident; @float $($selectors:tt)*) => {
-        matches!(
-            $input_type,
-            $crate::DataType::F4E2M1FN
-                | $crate::DataType::F6E2M3FN
-                | $crate::DataType::F6E3M2FN
-                | $crate::DataType::F8E3M4
-                | $crate::DataType::F8E4M3
-                | $crate::DataType::F8E4M3FN
-                | $crate::DataType::F8E4M3FNUZ
-                | $crate::DataType::F8E4M3B11FNUZ
-                | $crate::DataType::F8E5M2
-                | $crate::DataType::F8E5M2FNUZ
-                | $crate::DataType::F8E8M0FNU
-                | $crate::DataType::BF16
-                | $crate::DataType::F16
-                | $crate::DataType::F32
-                | $crate::DataType::F64
-                | $crate::DataType::C64
-                | $crate::DataType::C128
-        ) && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+        ($input_type.is_floating_point() || $input_type.is_complex())
+            && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
     };
 
     // This internal helper excludes complex types from the universe established by preceding or following selectors.
     // Its independent predicate makes selector order irrelevant and supports both `@numeric @real` and `@float @real`
     // without compound selector names.
     (@matches_data_type $input_type:ident; @real $($selectors:tt)*) => {
-        !matches!($input_type, $crate::DataType::C64 | $crate::DataType::C128)
+        !$input_type.is_complex()
             && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
     };
 }

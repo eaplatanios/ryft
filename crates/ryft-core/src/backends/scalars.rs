@@ -2249,12 +2249,12 @@ impl ConvertElementType for Scalar {
         if source == target {
             return Ok(*self);
         }
-        if source == DataType::Token || target == DataType::Token {
+        if source.is_token() || target.is_token() {
             return Err(
                 TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
             );
         }
-        if source == DataType::Zero || target == DataType::Zero {
+        if source.is_zero() || target.is_zero() {
             return Err(TypeError { message: "cannot convert values to or from the zero data type".to_string() }.into());
         }
         let converted = if let Some((data_type, bits)) = self.low_precision_float_parts() {

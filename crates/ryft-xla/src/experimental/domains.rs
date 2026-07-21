@@ -716,7 +716,7 @@ impl<'c> XlaDomain<'c> {
             Some(_) => array_type.clone(),
             None => array_type.replicated(mesh).map_err(ArrayError::from)?,
         };
-        if array_type.data_type() == DataType::Zero {
+        if array_type.data_type().is_zero() {
             return Ok(Array::from_zero_space(client, effective_type, mesh.clone())?
                 .with_compilation_cache(Arc::clone(&self.cache)));
         }
@@ -1821,7 +1821,7 @@ impl<'c> XlaDomain<'c> {
             .collect::<Vec<_>>();
         let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
         for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types) {
-            if input_type.data_type() == DataType::Zero {
+            if input_type.data_type().is_zero() {
                 *donation = false;
             }
         }
@@ -2671,7 +2671,7 @@ fn materialize_zero_space_carriers<'c>(
         .iter()
         .zip(inputs)
         .map(|(input_type, input)| {
-            if input_type.data_type() != DataType::Zero {
+            if !input_type.data_type().is_zero() {
                 return Ok(input);
             }
             input.block_until_ready()?;
