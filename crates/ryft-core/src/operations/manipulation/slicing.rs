@@ -344,8 +344,7 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        match batch_axes[0] {
+        match inputs[0].batch_axis_position() {
             None => self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]),
             Some(batch_axis) => {
                 let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
@@ -362,12 +361,8 @@ where
     }
 }
 
-/// Trait that represents [`Operation`] types that support/include [`SliceOperation`]. Backend-owned closed
-/// [`Operation`] types implement this trait so that generic transform code can stage [`SliceOperation`]s without
-/// knowing which operation type is in use.
 /// Represents the ability to extract a (possibly strided) sub-array using static start, limit, and stride values.
-/// This is the direct analogue of the StableHLO [`slice`](https://openxla.org/stablehlo/spec#slice) operation and
-/// JAX's [`lax.slice`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.slice.html).
+/// Its semantics follow StableHLO's [`slice`](https://openxla.org/stablehlo/spec#slice) operation.
 ///
 /// `t.slice(start_indices, limit_indices, strides)` returns the sub-array whose element at index `i` is the input
 /// element at index `start_indices + i * strides`, with output dimension
@@ -387,8 +382,7 @@ where
 /// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Slice the middle 1x2 block out of a 2x3 matrix. This is equivalent to
-/// // `jax.lax.slice(x, start_indices=(1, 1), limit_indices=(2, 3))` in JAX.
+/// // Slice the middle 1x2 block out of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let y = x.slice(&[1, 1], &[2, 3], &[1, 1])?;
 /// // `y` has shape [1, 2] with values [[5.0, 6.0]].
@@ -414,11 +408,9 @@ pub trait Slice: Sized {
 }
 
 /// Returns the output [`Sharding`] for a same-rank shape-changing operation (`slice`, `dynamic_slice`, or
-/// [`pad`](super::padding)), mirroring JAX's `_get_sharding_for_varying_out_shape` (which JAX's slice, dynamic_slice,
-/// and pad sharding rules all share). The operand sharding is carried through unchanged: resizing dimensions in place
-/// neither changes the per-dimension placement relative to the array axes nor the pending cross-device reduction
-/// state — selecting or padding elements commutes with a pending sum, so a value unreduced/reduced over a mesh axis
-/// stays so (this is where ryft diverges from JAX, which leaves `dynamic_slice` on unreduced operands unimplemented).
+/// [`pad`](super::padding)). The operand sharding is carried through unchanged: resizing dimensions in place neither
+/// changes the per-dimension placement relative to the array axes nor the pending cross-device reduction state.
+/// Selecting or padding elements commutes with a pending sum, so a value unreduced/reduced over a mesh axis stays so.
 /// The one constraint: a dimension whose size changes and is sharded over [`Explicit`](MeshAxisType::Explicit) mesh
 /// axes must keep an output size divisible by the product of those axes' sizes, so the result stays evenly sharded.
 /// The check is gated to explicit axes, leaving `Manual`/`Auto` shardings to `shard_map` / the compiler.
@@ -457,14 +449,12 @@ pub(crate) fn resized_output_sharding(
     Ok(Some(sharding.clone()))
 }
 
-/// Returns the output [`Sharding`] for an in-place update ([`UpdateSlice`] / [`DynamicUpdateSlice`]), mirroring JAX's
-/// `_dynamic_update_slice_sharding_rule` and `_dus_(un)reduced_rule`. Because the update is written into the operand
-/// without resharding, the two must agree on placement and reduction state wherever an
+/// Returns the output [`Sharding`] for an in-place update ([`UpdateSlice`] / [`DynamicUpdateSlice`]). Because the
+/// update is written into the operand without resharding, the two must agree on placement and reduction state wherever an
 /// [`Explicit`](MeshAxisType::Explicit) mesh axis is involved; differences confined to `Manual`/`Auto` axes are
 /// tolerated (left to `shard_map` / the compiler). The output keeps the operand's sharding, except that the update's
 /// [`varying_manual_axes`](Sharding::varying_manual_axes) are unioned in — the written region may vary over manual
-/// axes the operand does not, so the result does too (ryft diverges from JAX here, which returns the operand sharding
-/// verbatim). An operand without a sharding leaves the output unsharded.
+/// axes the operand does not, so the result does too. An operand without a sharding leaves the output unsharded.
 fn update_slice_output_sharding(
     operand: &ArrayType,
     update: &ArrayType,
@@ -579,7 +569,7 @@ where
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let operation =
             SliceOperation::new(start_indices.to_vec(), limit_indices.to_vec()).with_strides(strides.to_vec())?;
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
     }
 }
 
@@ -623,7 +613,7 @@ impl Operation<ArrayType> for UpdateSliceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        match (&input_types[0]).update_slice(&input_types[1], self.start_indices.as_slice()) {
+        match input_types[0].update_slice(&input_types[1], self.start_indices.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -752,8 +742,7 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
+        let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
@@ -860,7 +849,7 @@ impl UpdateSlice for ArrayType {
                 }
                 .into());
             };
-            if start + update_size > input_size {
+            if start.checked_add(update_size).is_none_or(|limit| limit > input_size) {
                 return Err(TypeError {
                     message: format!(
                         "'update_slice' update axis {axis} with start index {start} and size {update_size} does not \
@@ -1065,10 +1054,8 @@ where
     }
 }
 
-/// Represents the ability to extract a statically shaped sub-array at start indices that are computed at run time.
-/// This is the direct analogue of the StableHLO
-/// [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation and JAX's
-/// [`lax.dynamic_slice`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.dynamic_slice.html).
+/// Represents the ability to extract a statically shaped sub-array at start indices that are computed at run time,
+/// with the semantics of StableHLO's [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation.
 ///
 /// `t.dynamic_slice(start_indices, sizes)` extracts the block of shape `sizes` whose origin is given by the scalar
 /// integer values in `start_indices` (one per input axis). Start indices are clamped per StableHLO semantics so the
@@ -1091,8 +1078,7 @@ where
 /// # use ryft_core::types::{ArrayType, DataType};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix. This is equivalent to
-/// // `jax.lax.dynamic_slice(x, (i, j), slice_sizes=(1, 2))` in JAX.
+/// // Extract a 1x2 block starting at row 1, column 1 of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
 /// let j = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0]);
@@ -1137,15 +1123,15 @@ impl DynamicSlice for ArrayType {
             // A dynamic input axis is accepted: StableHLO clamps the start index into
             // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
             // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
-            if let Size::Static(input_size) = self.dimension(axis as isize) {
-                if size > input_size {
-                    return Err(TypeError {
-                        message: format!(
-                            "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
-                        ),
-                    }
-                    .into());
+            if let Size::Static(input_size) = self.dimension(axis as isize)
+                && size > input_size
+            {
+                return Err(TypeError {
+                    message: format!(
+                        "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
+                    ),
                 }
+                .into());
             }
         }
         let output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
@@ -1331,9 +1317,8 @@ where
 }
 
 /// Represents the ability to overwrite a contiguous sub-array with an update value at start indices that are
-/// computed at run time. This is the direct analogue of the StableHLO
-/// [`dynamic_update_slice`](https://openxla.org/stablehlo/spec#dynamic_update_slice) operation and JAX's
-/// [`lax.dynamic_update_slice`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.dynamic_update_slice.html).
+/// computed at run time, with the semantics of StableHLO's
+/// [`dynamic_update_slice`](https://openxla.org/stablehlo/spec#dynamic_update_slice) operation.
 ///
 /// `t.dynamic_update_slice(update, start_indices)` returns a value equal to `t` except that the block whose origin
 /// is given by the scalar integer values in `start_indices` (one per input axis) is replaced by `update`. Start
@@ -1354,8 +1339,7 @@ where
 /// # use ryft_core::types::{ArrayType, DataType};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Overwrite the last two elements of the first row of a 2x3 matrix. This is equivalent to
-/// // `jax.lax.dynamic_update_slice(x, update, (i, j))` in JAX.
+/// // Overwrite the last two elements of the first row of a 2x3 matrix.
 /// let x = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let update = Array::matrix(1, 2, vec![8.0, 9.0]);
 /// let i = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![0.0]);
@@ -1864,7 +1848,7 @@ const UPDATE_SLICE_TRANSPOSE_CONTEXT: &str = "'update_slice' transpose";
 /// Extracts the static dimensions of an update operand type, reporting a precise error when any dimension is
 /// dynamic. The `context` parameter selects the reported rule name because this helper serves both the static and
 /// the captured-index update-slice transpose rules.
-pub(crate) fn static_update_sizes(context: &str, update_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
+fn static_update_sizes(context: &str, update_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
     update_type
         .shape()
         .dimensions()
@@ -1885,11 +1869,7 @@ pub(crate) fn static_update_sizes(context: &str, update_type: &ArrayType) -> Res
 /// leading physical axis) contribute slice `item` with the batch axis dropped, while replicated operands are used
 /// whole. Batched operand types must be fully static so the item slice bounds are provable; `operation_name` selects
 /// the rule named in the error reported otherwise.
-pub(crate) fn expansion_item<V>(
-    operation_name: &'static str,
-    input: &ArrayBatch<V>,
-    item: usize,
-) -> Result<V, ProgramError>
+fn expansion_item<V>(operation_name: &'static str, input: &ArrayBatch<V>, item: usize) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + Slice + Reshape,
 {
@@ -1948,7 +1928,7 @@ fn replace_sharding_dimension(
 /// updates replicated avoids assigning a nontrivial mapped-axis sharding to an extent-one update. `interpret_item`
 /// produces the per-item result; an empty batch axis is rejected with a precise error naming `operation_name` because
 /// no batch item can seed the accumulator.
-pub(crate) fn stack_expansion_items<V, InterpretItemFn>(
+fn stack_expansion_items<V, InterpretItemFn>(
     operation_name: &'static str,
     axis_size: usize,
     axis_sharding: ShardingDimension,
@@ -2067,10 +2047,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::BatchAxis;
+    use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::LinearizationTracer;
-    use crate::macros::{check_operation_batching, check_operation_transposition};
+    use crate::differentiation::{LinearizationTracer, value_and_gradient};
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
@@ -2079,13 +2062,32 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::{DenseDifferentiate, ReverseModeDifferentiate};
+    use crate::tracing_v2::jacfwd;
 
     use super::*;
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
     fn index(value: f64) -> Array {
         Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value])
+    }
+
+    /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
+    fn index_constant<V>(exemplar: &V, value: f64) -> V
+    where
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
+    {
+        exemplar
+            .dispatch_domain()
+            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]))
+            .unwrap()
+    }
+
+    /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.
+    fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
+        let length = values.len();
+        let value = Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(length)])), values);
+        ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
     }
 
     #[test]
@@ -2102,7 +2104,27 @@ mod tests {
         // capability backs it without consuming the borrowed input type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![Size::Dynamic(None), Size::Static(3)]),
+                    )],
+                    error = "'slice' does not support dynamic input axis 0 with size *; slice bounds cannot be \
+                        validated against an unknown extent",
+                },
+            ],
+        );
         assert_eq!(input_type.slice(&[1, 1], &[2, 3], &[1, 1]), Ok(output_type.clone()));
 
         // Interpretation copies the selected block out of the row-major payload.
@@ -2146,10 +2168,6 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
             operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
             Err(TypeError { message: "'slice' start_indices has length 2 but input has rank 1".to_string() }),
         );
@@ -2190,17 +2208,6 @@ mod tests {
             })),
         );
         assert_eq!(
-            operation.infer_output_types(
-                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]),)],
-                &[],
-            ),
-            Err(TypeError {
-                message: "'slice' does not support dynamic input axis 0 with size *; slice bounds cannot be \
-                    validated against an unknown extent"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
                 &EagerContext::<Array>::new(),
@@ -2224,14 +2231,77 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_slice_operation_rejects_malformed_strides() {
-        // Building a `SliceOperation` with `with_strides` validates the strides eagerly, so malformed input (here a
-        // stride of `0`) returns an error instead of panicking inside the operation.
-        let result = SliceOperation::new(vec![0], vec![2]).with_strides(vec![0]);
-        assert!(matches!(result, Err(ProgramError::Type(_))));
+        // Check standard partial evaluation with known and residual operands.
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
+        let expected = Array::vector(vec![1.0, 2.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = SliceOperation::new(vec![1], vec![3]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching slices each item without slicing the mapped axis.
+        check_operation_batching!(
+            @exact,
+            operation = SliceOperation::new(vec![1], vec![3]),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                    ))],
+                    outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
+                },
+                {
+                    inputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]))],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0]))],
+                },
+            ],
+        );
+
+        // Static slicing is linear; check both the JVP and the unit- and non-unit-stride pullbacks.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = SliceOperation::new(vec![1], vec![3]),
+            cases = [{
+                primals = [Array::vector(vec![0.0, 1.0, 2.0, 3.0])],
+                tangents = [Array::vector(vec![4.0, 5.0, 6.0, 7.0])],
+                primal_outputs = [Array::vector(vec![1.0, 2.0])],
+                tangent_outputs = [Array::vector(vec![5.0, 6.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = SliceOperation::new(vec![1], vec![3]),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![4.into()]))))],
+                output_cotangents = [Array::vector(vec![5.0, 7.0])],
+                input_cotangents = [Array::vector(vec![0.0, 5.0, 7.0, 0.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = SliceOperation::new(vec![1], vec![6]).with_strides(vec![2]).unwrap(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
+                input_cotangents = [Array::vector(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0])],
+            }],
+        );
     }
 
     #[test]
@@ -2247,11 +2317,37 @@ mod tests {
         // capability backs it without consuming the borrowed input type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
-            Ok(vec![input_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone(), update_type.clone()],
+                    output_types = [input_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 2 inputs but got 0",
+                },
+                {
+                    input_types = [
+                        input_type.clone(),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                    ],
+                    error = "'update_slice' input data type f64 does not match update data type f32",
+                },
+            ],
         );
-        assert_eq!((&input_type).update_slice(&update_type, &[0, 1]), Ok(input_type.clone()));
+        assert_eq!(input_type.update_slice(&update_type, &[0, 1]), Ok(input_type.clone()));
+        assert_eq!(
+            UpdateSliceOperation::new(vec![0, usize::MAX])
+                .infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
+            Err(TypeError {
+                message: format!(
+                    "'update_slice' update axis 1 with start index {} and size 2 does not fit in input size 3",
+                    usize::MAX,
+                ),
+            }),
+        );
 
         // Interpretation overwrites the selected block of the row-major payload.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -2265,22 +2361,6 @@ mod tests {
         assert_eq!(scalar.to_f64s(), vec![7.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    input_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
-                ],
-                &[],
-            ),
-            Err(TypeError {
-                message: "'update_slice' input data type f64 does not match update data type f32".to_string(),
-            }),
-        );
         assert_eq!(
             operation.infer_output_types(
                 &[input_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),],
@@ -2354,6 +2434,98 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check standard partial evaluation with known and residual operands.
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
+        let update = Array::vector(vec![8.0, 9.0]);
+        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = UpdateSliceOperation::new(vec![1]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, update.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, update.clone()),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching aligns mapped and replicated operands before applying the update independently to each item.
+        check_operation_batching!(
+            @exact,
+            operation = UpdateSliceOperation::new(vec![1]),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(
+                            2,
+                            4,
+                            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                        )),
+                        (@replicated, Array::vector(vec![9.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0],
+                    ))],
+                },
+            ],
+        );
+
+        // Static update-slice is jointly linear in the operand and update.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = UpdateSliceOperation::new(vec![1]),
+            cases = [{
+                primals = [
+                    Array::vector(vec![0.0, 1.0, 2.0, 3.0]),
+                    Array::vector(vec![8.0, 9.0]),
+                ],
+                tangents = [
+                    Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                    Array::vector(vec![5.0, 6.0]),
+                ],
+                primal_outputs = [Array::vector(vec![0.0, 8.0, 9.0, 3.0])],
+                tangent_outputs = [Array::vector(vec![1.0, 5.0, 6.0, 4.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = UpdateSliceOperation::new(vec![1]),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![4.into()])))),
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                ],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
+                input_cotangents = [
+                    Array::vector(vec![1.0, 0.0, 0.0, 4.0]),
+                    Array::vector(vec![2.0, 3.0]),
+                ],
+            }],
+        );
     }
 
     #[test]
@@ -2369,9 +2541,27 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone()], &[]),
-            Ok(vec![output_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone(), index_type.clone(), index_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "'dynamic_slice' expects an input operand followed by its start index operands but got \
+                        no inputs",
+                },
+                {
+                    input_types = [input_type.clone(), index_type.clone()],
+                    error = "'dynamic_slice' expects one start index per input axis (2) but got 1",
+                },
+                {
+                    input_types = [input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()],
+                    error = "'dynamic_slice' start index 0 must be a scalar integer but has type f64[]",
+                },
+            ],
         );
         assert_eq!(
             input_type.dynamic_slice(&[index_type.clone(), index_type.clone()], &[1, 2]),
@@ -2394,20 +2584,6 @@ mod tests {
         assert_eq!(clamped[0].to_f64s(), vec![4.0, 5.0]);
 
         // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError {
-                message: "'dynamic_slice' expects an input operand followed by its start index operands but got no \
-                    inputs"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), index_type.clone()], &[]),
-            Err(TypeError {
-                message: "'dynamic_slice' expects one start index per input axis (2) but got 1".to_string()
-            }),
-        );
         assert_eq!(
             DynamicSliceOperation::new(vec![1])
                 .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
@@ -2443,13 +2619,6 @@ mod tests {
                 &[],
             ),
             Ok(vec![output_type.clone()]),
-        );
-        assert_eq!(
-            operation
-                .infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()], &[]),
-            Err(TypeError {
-                message: "'dynamic_slice' start index 0 must be a scalar integer but has type f64[]".to_string(),
-            }),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2503,6 +2672,48 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Partial evaluation folds known starts and residualizes the read when the operand remains unknown.
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
+        let start = index(1.0);
+        let expected = Array::vector(vec![1.0, 2.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = DynamicSliceOperation::new(vec![2]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, start.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, start.clone()),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Replicated starts lift by inserting a zero start for the mapped axis.
+        check_operation_batching!(
+            @exact,
+            operation = DynamicSliceOperation::new(vec![2]),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                    )),
+                    (@replicated, start),
+                ],
+                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
+            }],
+        );
     }
 
     #[test]
@@ -2517,15 +2728,26 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         let index_type = ArrayType::scalar(DataType::I32);
-        assert_eq!(
-            operation.infer_output_types(
-                &[input_type.clone(), update_type.clone(), index_type.clone(), index_type.clone(),],
-                &[],
-            ),
-            Ok(vec![input_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [input_type.clone(), update_type.clone(), index_type.clone(), index_type.clone()],
+                    output_types = [input_type.clone()],
+                },
+                {
+                    input_types = [input_type.clone()],
+                    error = "'dynamic_update_slice' expects an input operand and an update operand followed by start \
+                        index operands but got 1 inputs",
+                },
+                {
+                    input_types = [input_type.clone(), update_type.clone(), index_type.clone()],
+                    error = "'dynamic_update_slice' expects one start index per input axis (2) but got 1",
+                },
+            ],
         );
         assert_eq!(
-            (&input_type).dynamic_update_slice(&update_type, &[index_type.clone(), index_type.clone()]),
+            input_type.dynamic_update_slice(&update_type, &[index_type.clone(), index_type.clone()]),
             Ok(input_type.clone()),
         );
 
@@ -2555,14 +2777,6 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone()], &[]),
-            Err(TypeError {
-                message: "'dynamic_update_slice' expects an input operand and an update operand followed by start \
-                    index operands but got 1 inputs"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
             operation.infer_output_types(
                 &[
                     input_type.clone(),
@@ -2587,12 +2801,6 @@ mod tests {
                 &[],
             ),
             Err(TypeError { message: "'dynamic_update_slice' update has rank 1 but input has rank 2".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), update_type.clone(), index_type.clone()], &[]),
-            Err(TypeError {
-                message: "'dynamic_update_slice' expects one start index per input axis (2) but got 1".to_string(),
-            }),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2688,10 +2896,59 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Partial evaluation folds known updates and residualizes an unknown operand with captured start indices.
+        let input = Array::vector(vec![0.0, 1.0, 2.0, 3.0]);
+        let update = Array::vector(vec![8.0, 9.0]);
+        let start = index(1.0);
+        let expected = Array::vector(vec![0.0, 8.0, 9.0, 3.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = DynamicUpdateSliceOperation,
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, update.clone()), (@known, start.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, update.clone()),
+                        (@known, start.clone()),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Replicated starts align the input and update on one mapped axis.
+        check_operation_batching!(
+            @exact,
+            operation = DynamicUpdateSliceOperation,
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                    )),
+                    (@replicated, update),
+                    (@replicated, start),
+                ],
+                outputs = [(@mapped(axis = 0), Array::matrix(
+                    2,
+                    4,
+                    vec![0.0, 8.0, 9.0, 3.0, 4.0, 8.0, 9.0, 7.0],
+                ))],
+            }],
+        );
     }
 
     #[test]
-    fn test_slicing_array_kernels() {
+    fn test_array_slicing() {
         // Rank-3 slice exercises the row-major odometer across non-contiguous blocks.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
@@ -2750,96 +3007,89 @@ mod tests {
     }
 
     #[test]
-    fn test_slice_and_dynamic_slice_propagate_sharding() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        // [4, 4] sharded over `x` on axis 0 and unreduced over the manual axis `m`.
-        let sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                .unwrap()
-                .with_unreduced_axes(["m"])
-                .unwrap();
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let start = ArrayType::scalar(DataType::I32);
-
-        // Slicing the `x`-sharded axis to an evenly divisible size keeps the operand sharding (reduction state and
-        // the unreduced manual axis included).
-        assert_eq!(input.slice(&[0, 0], &[2, 4], &[1, 1]).unwrap().sharding(), Some(&sharding));
-        // Slicing it to a size not divisible by the explicit mesh-axis size (2) is rejected.
-        assert!(input.slice(&[0, 0], &[3, 4], &[1, 1]).is_err());
-
-        // dynamic_slice carries the same sharding through (ryft diverges from JAX, which leaves an unreduced
-        // dynamic_slice operand unimplemented) and applies the same divisibility check.
-        assert_eq!(input.dynamic_slice(&[start.clone(), start.clone()], &[2, 4]).unwrap().sharding(), Some(&sharding),);
-        assert!(input.dynamic_slice(&[start.clone(), start.clone()], &[3, 4]).is_err());
-    }
-
-    #[test]
-    fn test_update_slice_requires_matching_sharding() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                .unwrap();
-        let replicated =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                .unwrap();
-        let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
-            .with_sharding(sharded.clone())
-            .unwrap();
-        let matching = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-            .with_sharding(sharded.clone())
-            .unwrap();
-        let conflicting = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-            .with_sharding(replicated)
-            .unwrap();
-        let start = ArrayType::scalar(DataType::I32);
-
-        // A matching update keeps the operand's sharding; an update conflicting on an Explicit axis is rejected.
-        assert_eq!((&operand).update_slice(&matching, &[0, 0]).unwrap().sharding(), Some(&sharded));
-        assert!((&operand).update_slice(&conflicting, &[0, 0]).is_err());
-
-        // dynamic_update_slice applies the same operand-vs-update rule.
-        assert_eq!(
-            (&operand).dynamic_update_slice(&matching, &[start.clone(), start.clone()]).unwrap().sharding(),
-            Some(&sharded),
-        );
-        assert!((&operand).dynamic_update_slice(&conflicting, &[start.clone(), start.clone()]).is_err());
-    }
-
-    #[test]
-    fn test_update_slice_unions_update_varying_manual_axes() {
+    fn test_array_type_slicing() {
         use std::collections::BTreeSet;
 
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let dimensions = || vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
-        // The operand does not vary over the manual axis `m`, but the update does, so the result varies over `m` too.
-        let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
-            .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap())
+        {
+            let mesh = LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+                MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            ])
             .unwrap();
-        let update = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-            .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap().with_varying_manual_axes(["m"]).unwrap())
+            // [4, 4] sharded over `x` on axis 0 and unreduced over the manual axis `m`.
+            let sharding =
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["m"])
+                    .unwrap();
+            let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+            let start = ArrayType::scalar(DataType::I32);
+
+            // Static and dynamic slicing preserve the sharding for evenly divisible output sizes and reject an
+            // incompatible size on an explicitly sharded axis.
+            assert_eq!(input.slice(&[0, 0], &[2, 4], &[1, 1]).unwrap().sharding(), Some(&sharding));
+            assert!(input.slice(&[0, 0], &[3, 4], &[1, 1]).is_err());
+            assert_eq!(
+                input.dynamic_slice(&[start.clone(), start.clone()], &[2, 4]).unwrap().sharding(),
+                Some(&sharding),
+            );
+            assert!(input.dynamic_slice(&[start.clone(), start.clone()], &[3, 4]).is_err());
+        }
+
+        {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let sharded =
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap();
+            let replicated =
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()]).unwrap();
+            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+                .with_sharding(sharded.clone())
+                .unwrap();
+            let matching = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+                .with_sharding(sharded.clone())
+                .unwrap();
+            let conflicting = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+                .with_sharding(replicated)
+                .unwrap();
+            let start = ArrayType::scalar(DataType::I32);
+
+            // Static and dynamic updates keep matching operand placement and reject explicit placement conflicts.
+            assert_eq!(operand.update_slice(&matching, &[0, 0]).unwrap().sharding(), Some(&sharded));
+            assert!(operand.update_slice(&conflicting, &[0, 0]).is_err());
+            assert_eq!(
+                operand.dynamic_update_slice(&matching, &[start.clone(), start.clone()]).unwrap().sharding(),
+                Some(&sharded),
+            );
+            assert!(operand.dynamic_update_slice(&conflicting, &[start.clone(), start.clone()]).is_err());
+        }
+
+        {
+            let mesh = LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+                MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            ])
             .unwrap();
-        let output = (&operand).update_slice(&update, &[0, 0]).unwrap();
-        assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+            let dimensions = || vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+                .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap())
+                .unwrap();
+            let update = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+                .with_sharding(Sharding::new(mesh, dimensions()).unwrap().with_varying_manual_axes(["m"]).unwrap())
+                .unwrap();
+
+            // An update that varies over a manual axis makes the result vary over that axis as well.
+            let output = operand.update_slice(&update, &[0, 0]).unwrap();
+            assert_eq!(output.sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+        }
     }
 
     #[test]
-    fn test_dynamic_slice_partitioned_transpose_computes_update_slice_adjoint() {
+    fn test_dynamic_slice_differentiation() {
         // Slice a [1, 2] block at start (1, 1) of a [2, 3] operand: the operand is linear and the scalar start indices
         // are the known operands. The sliced output and its cotangent have shape [1, 2].
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
@@ -2859,10 +3109,25 @@ mod tests {
                 input_cotangents = [Array::matrix(2, 3, vec![0.0, 0.0, 0.0, 0.0, 5.0, 7.0])],
             }],
         );
+
+        // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
+        // batched basis tangents.
+        let jacobian = jacfwd(
+            |x| {
+                let start = index_constant(&x, 1.0);
+                Ok(x.dynamic_slice(&[start], &[2]).unwrap())
+            },
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]
-    fn test_dynamic_update_slice_partitioned_transpose_computes_operand_adjoints() {
+    fn test_dynamic_update_slice_differentiation() {
         // Update a [1, 2] block at start (0, 1) of a [2, 3] input: the input and update are linear and the scalar
         // start indices are the known operands. The output and its cotangent have shape [2, 3].
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
@@ -2886,171 +3151,24 @@ mod tests {
                 ],
             }],
         );
-    }
 
-    /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
-    fn index_constant<V>(exemplar: &V, value: f64) -> V
-    where
-        V: crate::programs::Value<Type = ArrayType>,
-        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
-    {
-        exemplar
-            .dispatch_domain()
-            .lift(Array::from_f64s(ArrayType::scalar(DataType::I32), vec![value]))
-            .unwrap()
-    }
-
-    #[test]
-    fn test_slice_value_and_grad_zero_pads_cotangent() {
-        // f(x) = sum(slice(x, [1], [3])): the pullback writes the all-ones cotangent into a zero array at the slice
-        // offsets, so the gradient is the indicator of the sliced window.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| x.slice(&[1], &[3], &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 5.0, epsilon = 1e-9);
-        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn test_strided_slice_value_and_grad_pads_cotangent() {
-        // f(x) = sum(slice(x, [1], [6], strides=[2]) * w) with w = [1, 2, 3]: the forward slice reads positions 1,
-        // 3, and 5, so the pullback pads the weighted cotangent [1, 2, 3] with `low = 1`, `interior = 1`, and
-        // `high = 0`, scattering it back to exactly those positions.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let weights = x.context().lift(Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
-                    (x.slice(&[1], &[6], &[2]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-            )
-            .unwrap();
-        // f = x[1] + 2 * x[3] + 3 * x[5] = 1 + 6 + 15.
-        assert_abs_diff_eq!(value.to_f64s()[0], 22.0, epsilon = 1e-9);
-        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]);
-    }
-
-    #[test]
-    fn test_slice_jacfwd_selects_input_coordinates() {
-        // Forward mode through `f(x) = slice(x, [1], [3])` produces the 2x4 selection Jacobian.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
-            .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
-        assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn test_update_slice_value_and_grad_splits_cotangent() {
-        // f(x, u) = sum(update_slice(x, u, [1])): the input gradient is the cotangent with the update window zeroed
-        // and the update gradient is the slice of the cotangent at the update window.
-        let (value, (input_gradient, update_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-                (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
-            )
-            .unwrap();
+        // Composing JVP and transposition must retain the captured start index: the input gradient is the output
+        // cotangent with the update window zeroed, while the update gradient is that window of the cotangent.
+        let (value, (input_gradient, update_gradient)) = value_and_gradient(
+            |(x, update)| {
+                let start = index_constant(&x, 1.0);
+                x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+            },
+            (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
+        )
+        .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
     }
 
     #[test]
-    fn test_dynamic_slice_value_and_grad_scatters_at_captured_indices() {
-        // f(x) = sum(dynamic_slice(x, [1], [2])): the integer start index is a constant of the trace (its tangent is
-        // a structural zero that the JVP rule ignores), and the pullback scatters the all-ones cotangent into a zero
-        // array at the captured index.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let start = index_constant(&x, 1.0);
-                    x.dynamic_slice(&[start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 5.0, epsilon = 1e-9);
-        assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn test_dynamic_slice_jacfwd_selects_input_coordinates() {
-        // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
-        // batched basis tangents (the direct batched JVP path).
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
-                |x| {
-                    let start = index_constant(&x, 1.0);
-                    Ok(x.dynamic_slice(&[start], &[2]).unwrap())
-                },
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-            )
-            .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
-        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
-        assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn test_dynamic_update_slice_value_and_grad_splits_cotangent() {
-        // f(x, u) = sum(dynamic_update_slice(x, u, [1])): the input gradient is the cotangent with the update window
-        // zeroed and the update gradient is the dynamic slice of the cotangent at the captured index.
-        let (value, (input_gradient, update_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(x, update)| {
-                    let start = index_constant(&x, 1.0);
-                    x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
-                },
-                (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
-        assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
-        assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
-    }
-
-    #[test]
-    fn test_slice_batching_lifts_batch_axis() {
-        check_operation_batching!(
-            @exact,
-            operation = SliceOperation::new(vec![1], vec![3]),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))],
-                    outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]))],
-                },
-                {
-                    inputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0, 3.0]))],
-                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0]))],
-                },
-            ],
-        );
-
-        check_operation_batching!(
-            @exact,
-            operation = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap(),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(
-                    axis = 0
-                ), Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))],
-                outputs = [(@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 2.0, 4.0, 6.0]))],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_slice_batching_carries_batch_extended_sharding() {
-        use crate::batching::Batch;
+    fn test_slice_batching_sharding() {
         use crate::operations::manipulation::Slice;
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
@@ -3066,18 +3184,7 @@ mod tests {
         // slice keeps the sharding); batching restores the replicated batch axis, so the staged slice's output stays
         // sharded.
         let (output_type, _program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| {
-                let context = x.context().clone();
-                Ok(Batch::batch(
-                    &context,
-                    |item| item.slice(&[0], &[2], &[1]),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap())
-            },
+            |x| Ok(batch(|item| item.slice(&[0], &[2], &[1]), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap()),
             input_type,
         )
         .unwrap();
@@ -3088,45 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_slice_batching_materializes_uniform_operands() {
-        // A replicated update is broadcast to gain the batch axis so each batch item writes the same block.
-        let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
-        let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input, update],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-
-        // A replicated input is broadcast to gain the batch axis when only the update is batched.
-        let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
-        let update = {
-            let value = Array::matrix(2, 2, vec![8.0, 8.0, 9.0, 9.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input, update],
-            )
-            .unwrap();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
-    }
-
-    #[test]
-    fn test_update_slice_batching_preserves_materialized_batch_placement() {
+    fn test_update_slice_batching_sharding() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =
@@ -3169,33 +3238,6 @@ mod tests {
                 assert_eq!(output.value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
             }
         }
-    }
-
-    /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.
-    fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
-        let length = values.len();
-        let value = Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(length)])), values);
-        ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
-    }
-
-    #[test]
-    fn test_dynamic_slice_batching_lifts_replicated_indices() {
-        // Replicated start indices lift the batch axis with a zero start index for it.
-        let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input, ArrayBatch::replicated(index(1.0))],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 5.0, 6.0]);
     }
 
     #[test]
@@ -3251,26 +3293,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_update_slice_batching_materializes_uniform_operands() {
-        let input = {
-            let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));
-        let outputs = DynamicUpdateSliceOperation
-            .batch(
-                &BatchingContext::new(crate::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[input, update, ArrayBatch::replicated(index(1.0))],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-    }
-
-    #[test]
     fn test_dynamic_update_slice_batching_expands_batch_varying_indices() {
         // A batched update with batch-varying start indices over a replicated input expands per item: item 0
         // writes `[9, 9]` at offset 0 and item 1 writes `[8, 8]` at offset 2 of the shared input.
@@ -3311,39 +3333,35 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_slice_batching_expands_batch_varying_indices_under_tracing() {
-        use crate::batching::Batch;
-
+    fn test_dynamic_slice_batching_under_tracing() {
         // vmap-under-tracing composition: each batch item extracts a window of the differentiated vector at its own
         // start index, so the batching rule must stage the per-item expansion (instead of rejecting the batch-varying
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    let starts = context
-                        .lift(Array::from_f64s(
-                            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
-                            vec![1.0, 2.0],
-                        ))
-                        .unwrap();
-                    let stacked: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |(item, start)| item.dynamic_slice(&[start], &[2]),
-                        (x, starts),
-                        (BatchAxis::replicated(), BatchAxis::new(0)),
-                        BatchAxis::new(0),
-                        None,
-                    )
+        let (value, gradient) = value_and_gradient(
+            |x| {
+                let context = x.context().clone();
+                let starts = context
+                    .lift(Array::from_f64s(
+                        ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                        vec![1.0, 2.0],
+                    ))
                     .unwrap();
-                    let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
-                    (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
-                },
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-            )
-            .unwrap();
+                let stacked: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+                    |(item, start)| item.dynamic_slice(&[start], &[2]),
+                    (x, starts),
+                    (BatchAxis::replicated(), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
+            },
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
         assert_abs_diff_eq!(value.to_f64s()[0], 33.0, epsilon = 1e-9);
         assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 5.0, 4.0]);

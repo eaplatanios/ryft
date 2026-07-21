@@ -1,7 +1,10 @@
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
-use crate::batching::{BatchAxis, BatchingContext, BatchingDriver, InterpretableBatchableOperation};
+use crate::batching::{
+    ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
+};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -41,14 +44,27 @@ impl Permutation {
     }
 
     /// Returns the inverse [`Permutation`] of this one (i.e., the one that _undoes_ it). Transposing by a permutation
-    /// and then by its inverse restores the original axis order.
+    /// and then by its inverse restores the original axis order. Returns a [`TypeError`] if this value is not a
+    /// bijection over `0..self.len()`.
     #[inline]
-    pub fn inverse(&self) -> Permutation {
+    pub fn inverse(&self) -> Result<Permutation, TypeError> {
         let mut inverse = vec![0usize; self.0.len()];
+        let mut seen = vec![false; self.0.len()];
         for (position, axis) in self.0.iter().enumerate() {
+            if *axis >= self.0.len() {
+                return Err(TypeError {
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation axis {axis} is out of bounds"),
+                });
+            }
+            if seen[*axis] {
+                return Err(TypeError {
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation contains duplicate axis {axis}"),
+                });
+            }
+            seen[*axis] = true;
             inverse[*axis] = position;
         }
-        Permutation(inverse)
+        Ok(Permutation(inverse))
     }
 }
 
@@ -124,7 +140,7 @@ impl Operation<ArrayType> for TransposeOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        match (&input_types[0]).transpose(&self.permutation) {
+        match input_types[0].transpose(&self.permutation) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -195,7 +211,7 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        let inverse = self.permutation().inverse();
+        let inverse = self.permutation().inverse()?;
         match &outputs[0] {
             MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.transpose(inverse)?)]),
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
@@ -222,7 +238,7 @@ pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> 
     lifted
 }
 
-impl<C: Context<Type = ArrayType>> crate::batching::BatchableOperation<C> for TransposeOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<C>,
 {
@@ -230,11 +246,11 @@ where
         &self,
         context: &BatchingContext<C>,
         _driver: &D,
-        inputs: &[crate::batching::ArrayBatch<C::Value>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
-        crate::batching::ArrayBatch::common_batch_size(inputs)?;
+        ArrayBatch::common_batch_size(inputs)?;
         let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
             None => (self.permutation().to_vec(), None),
@@ -255,13 +271,22 @@ pub trait Transpose: Sized {
 
     /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order. This is the
     /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html).
-    /// Returns `self` unchanged when `from == to`.
+    /// Returns `self` unchanged when `from == to`. An out-of-bounds source or destination axis yields a [`TypeError`]
+    /// rather than being clamped or panicking.
     #[inline]
     fn move_axis(&self, from: usize, to: usize) -> Result<Self, ProgramError>
     where
         Self: Typed<Type = ArrayType>,
     {
         let rank = self.r#type().rank();
+        for axis in [from, to] {
+            if axis >= rank {
+                return Err(TypeError {
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' move axis {axis} is out of bounds"),
+                }
+                .into());
+            }
+        }
         self.transpose(
             (0..rank)
                 .filter(move |&axis| axis != from)
@@ -381,7 +406,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         }
         Ok(self
             .dispatch_domain()
-            .bind(TransposeOperation::new(permutation.to_vec()), Vec::new(), &[self.clone()])?
+            .bind(TransposeOperation::new(permutation.to_vec()), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
@@ -392,8 +417,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -407,18 +435,28 @@ mod tests {
     #[test]
     fn test_permutation() {
         // Empty and identity permutations are their own inverses.
-        assert_eq!(Permutation::from(vec![]).inverse(), Permutation::from(vec![]));
-        assert_eq!(Permutation::from(vec![0, 1, 2]).inverse(), Permutation::from(vec![0, 1, 2]));
+        assert_eq!(Permutation::from(vec![]).inverse(), Ok(Permutation::from(vec![])));
+        assert_eq!(Permutation::from(vec![0, 1, 2]).inverse(), Ok(Permutation::from(vec![0, 1, 2])));
 
         // A swap is its own inverse, while a cycle inverts to the reverse cycle.
-        assert_eq!(Permutation::from(vec![1, 0]).inverse(), Permutation::from(vec![1, 0]));
-        assert_eq!(Permutation::from(vec![2, 0, 1]).inverse(), Permutation::from(vec![1, 2, 0]));
+        assert_eq!(Permutation::from(vec![1, 0]).inverse(), Ok(Permutation::from(vec![1, 0])));
+        assert_eq!(Permutation::from(vec![2, 0, 1]).inverse(), Ok(Permutation::from(vec![1, 2, 0])));
+
+        // Invalid wrappers report the same precise validation errors as the type-level transpose contract.
+        assert_eq!(
+            Permutation::from(vec![2, 0]).inverse(),
+            Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
+        );
+        assert_eq!(
+            Permutation::from(vec![0, 0]).inverse(),
+            Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
+        );
 
         // Inverting twice recovers the original permutation, and applying the inverse after the permutation restores
         // the identity ordering.
         let permutation = Permutation::from(vec![3, 0, 2, 1]);
-        let inverse = permutation.inverse();
-        assert_eq!(inverse.inverse(), permutation);
+        let inverse = permutation.inverse().unwrap();
+        assert_eq!(inverse.inverse(), Ok(permutation.clone()));
         let composed = inverse.iter().map(|axis| permutation[*axis]).collect::<Vec<_>>();
         assert_eq!(composed, vec![0, 1, 2, 3]);
     }
@@ -436,32 +474,44 @@ mod tests {
         // Type inference permutes the input shape, including dynamic dimension sizes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
-        assert_eq!(
-            operation.infer_output_types(
-                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]))],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]))]),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]),
+                    )],
+                    output_types = [ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]),
+                    )],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                    error = "'transpose' permutation has length 2 but input has rank 1",
+                },
+            ],
         );
 
         // Interpretation reorders the row-major payload.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = operation
+            .clone()
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
-            Err(TypeError { message: "'transpose' permutation has length 2 but input has rank 1".to_string() }),
-        );
+        // Invalid permutations and interpreter arity report precise errors.
         assert_eq!(
             TransposeOperation::new(vec![0, 2]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
@@ -494,10 +544,73 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check standard partial evaluation with known and residual operands.
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let expected = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = TransposeOperation::new(vec![1, 0]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.clone().r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Check that batching lifts the per-item permutation while leaving the mapped axis in place.
+        let batched_input = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
+            (0..24).map(|value| value as f64).collect(),
+        );
+        let batched_output = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 4.into(), 3.into()])),
+            vec![
+                0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 12.0, 16.0, 20.0, 13.0, 17.0, 21.0, 14.0,
+                18.0, 22.0, 15.0, 19.0, 23.0,
+            ],
+        );
+        check_operation_batching!(
+            @exact,
+            operation = TransposeOperation::new(vec![1, 0]),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), batched_input)],
+                outputs = [(@mapped(axis = 0), batched_output)],
+            }],
+        );
+
+        // Transpose is structural-linear: its JVP applies the same permutation and its pullback applies the inverse.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = TransposeOperation::new(vec![1, 0]),
+            cases = [{
+                primals = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])],
+                tangents = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0])],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 3.0, 2.0, 4.0])],
+                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 7.0, 6.0, 8.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = TransposeOperation::new(vec![1, 0]),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))))],
+                output_cotangents = [Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [Array::matrix(2, 3, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])],
+            }],
+        );
     }
 
     #[test]
-    fn test_transpose_permutes_sharding_dimensions() {
+    fn test_array_type_transpose() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -588,10 +701,8 @@ mod tests {
         assert!(matrix().transpose(vec![1]).is_err());
         assert!(matrix().transpose(vec![0, 2]).is_err());
         assert!(matrix().transpose(vec![0, 0]).is_err());
-    }
 
-    #[test]
-    fn test_move_axis() {
+        // `move_axis` shifts intervening dimensions while preserving their relative order.
         // On a matrix, moving axis 0 to position 1 is a plain transpose: the [2, 3] payload becomes [3, 2].
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let output = matrix.move_axis(0, 1).unwrap();
@@ -618,10 +729,12 @@ mod tests {
         // An out-of-bounds source axis is a clean error rather than an out-of-bounds panic, since the built
         // permutation is validated by the type-level transpose.
         assert!(matrix.move_axis(2, 0).is_err());
-    }
+        assert_eq!(
+            matrix.move_axis(0, 2),
+            Err(TypeError { message: "'transpose' move axis 2 is out of bounds".to_string() }.into()),
+        );
 
-    #[test]
-    fn test_swap_axes() {
+        // `swap_axes` exchanges exactly two dimensions and validates both indices.
         // Swapping axes 0 and 1 of a matrix is a plain transpose: the [2, 3] payload becomes [3, 2].
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let swapped = matrix.swap_axes(0, 1).unwrap();
@@ -650,29 +763,5 @@ mod tests {
 
         // An out-of-bounds axis is a clean error rather than an out-of-bounds panic.
         assert!(matrix.swap_axes(2, 0).is_err());
-    }
-
-    #[test]
-    fn test_transpose_batching_lifts_permutation() {
-        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-item rank-2 matrices,
-        // which we transpose. The combined effect is to permute axes 1 and 2 of the original
-        // tensor, leaving the batch axis (originally axis 0) in place.
-        let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
-        let x = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
-            x_data,
-        );
-
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
-            .unwrap();
-
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(3)])),
-        );
-        // Spot-check: original [0, 0, 0] = 0 → output[0, 0, 0] = 0. Original [0, 0, 1] = 1 → output[0, 1, 0] = 1.
-        assert_eq!(output.to_f64s()[0], 0.0);
-        assert_eq!(output.to_f64s()[1 * 3], 1.0);
     }
 }

@@ -151,9 +151,9 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
+    use crate::differentiation::value_and_gradient;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::tracing::{DomainTracer, Trace};
-    use crate::tracing_v2::ReverseModeDifferentiate;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -193,8 +193,7 @@ mod tests {
         // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
         // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
         // the gradient) exercises the effect keep-alive of the partition projections.
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (value, gradient) = domain.value_and_gradient(print_square, Array::scalar(3.0)).unwrap();
+        let (value, gradient) = value_and_gradient(print_square, Array::scalar(3.0)).unwrap();
         assert_eq!(value.to_f64s()[0], 9.0);
         assert_eq!(gradient.to_f64s()[0], 6.0);
     }

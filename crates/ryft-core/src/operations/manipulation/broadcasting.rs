@@ -211,13 +211,11 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for B
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        match batch_axes[0] {
+        match inputs[0].batch_axis_position() {
             None => {
                 // Replicated input: the broadcast itself does not change. Pass through.
-                let output_value =
-                    inputs[0].value().clone().broadcast(self.output_type().clone(), self.output_axes())?;
-                Ok(vec![ArrayBatch::new(self.output_type().clone(), output_value, None)?])
+                let output_value = inputs[0].value().broadcast(self.output_type().clone(), self.output_axes())?;
+                Ok(vec![ArrayBatch::replicated(output_value)])
             }
             Some(batch_axis) => {
                 let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
@@ -230,16 +228,14 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for B
                             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
                     );
                 }
-                let output_value =
-                    inputs[0].value().clone().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
+                let output_value = inputs[0].value().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
                 Ok(vec![ArrayBatch::new(lifted_target, output_value, BatchAxis::from_position(target_batch_axis))?])
             }
         }
     }
 }
 
-/// Represents the ability to perform general N-dimensional broadcasting. This is the direct analogue of JAX's
-/// [`lax.broadcast_in_dim`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast_in_dim.html).
+/// Represents the ability to perform general N-dimensional broadcasting.
 /// `t.broadcast(output_type, output_axes)` expands `t` to `output_type` by mapping each input axis `i` to output axis
 /// `output_axes[i]`, replicating the value along the axes of `output_type` that are not named in `output_axes`. For
 /// each `i`, the input dimension at axis `i` must either equal the corresponding output dimension or be `1` (in which
@@ -263,8 +259,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for B
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Broadcast a length-3 vector to a `[2, 3]` matrix by mapping its single axis to output axis 1. This is
-/// // equivalent to `broadcast_in_dim(jnp.array([1, 2, 3]), shape=(2, 3), broadcast_dimensions=(1,))` in JAX.
+/// // Broadcast a length-3 vector to a `[2, 3]` matrix by mapping its single axis to output axis 1.
 /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
 /// let y = x.broadcast(output_type, &[1])?;
@@ -273,9 +268,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for B
 /// //    [1.0, 2.0, 3.0]]
 /// assert_eq!(y.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 ///
-/// // Broadcast a `[2, 2]` matrix over a new dimension of size 3 by mapping its axes to output axes 0 and 2. This is
-/// // equivalent to `broadcast_in_dim(jnp.array([[1, 2], [3, 4]]), shape=(2, 3, 2), broadcast_dimensions=(0, 2))`
-/// // in JAX.
+/// // Broadcast a `[2, 2]` matrix over a new dimension of size 3 by mapping its axes to output axes 0 and 2.
 /// let x = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
 /// let output_type = ArrayType::new(
 ///     DataType::F64,
@@ -305,8 +298,7 @@ pub trait Broadcast: Sized {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
 
     /// Broadcasts `self` by prepending leading dimensions of the provided sizes, replicating it along those new
-    /// dimensions. This is the direct analogue of JAX's
-    /// [`lax.broadcast`]( https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast.html).
+    /// dimensions.
     /// `t.broadcast_leading([s0, s1, ...])` produces a value whose shape is `[s0, s1, ..., t.shape...]`, with the
     /// original value replicated across the new leading axes. This is equivalent to
     /// `t.broadcast(output_type, output_axes)` with `output_type` having shape `[s0, s1, ..., t.shape...]`
@@ -325,7 +317,6 @@ pub trait Broadcast: Sized {
     /// #
     /// # fn main() -> Result<(), ProgramError> {
     /// // Broadcast a length-3 vector to a `[2, 3]` matrix by prepending one leading axis of size 2.
-    /// // This is equivalent to `jax.lax.broadcast(jnp.array([1, 2, 3]), sizes=(2,))` in JAX.
     /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
     /// let y = x.broadcast_leading(vec![2])?;
     /// // `y` has shape [2, 3] with values:
@@ -348,9 +339,7 @@ pub trait Broadcast: Sized {
     }
 
     /// Broadcasts `self` to `shape` using the broadcasting semantics of [`Broadcastable`](crate::Broadcastable).
-    /// This is the direct analogue of JAX's
-    /// [`jnp.broadcast_to`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.broadcast_to.html),
-    /// which itself mirrors NumPy's
+    /// These semantics match NumPy's
     /// [`numpy.broadcast_to`](https://numpy.org/doc/stable/reference/generated/numpy.broadcast_to.html).
     /// `t.broadcast_to(shape)` right-aligns the input shape with `shape`: input axis `i` corresponds to output axis
     /// `shape.rank() - input.rank() + i`. Each corresponding input dimension must equal the output dimension or be `1`,
@@ -373,7 +362,6 @@ pub trait Broadcast: Sized {
     /// #
     /// # fn main() -> Result<(), ProgramError> {
     /// // Broadcast a length-3 vector to a `[3, 3]` matrix by replicating the input across the leading axis.
-    /// // This is equivalent to `jnp.broadcast_to(jnp.array([1, 2, 3]), (3, 3))` in JAX.
     /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
     /// let y = x.broadcast_to(Shape::new(vec![Size::Static(3), Size::Static(3)]))?;
     /// // `y` has shape [3, 3] with values:
@@ -506,67 +494,34 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), Vec::new(), &[self.clone()])?
+            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
-    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::ForwardModeDifferentiate;
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::jvp;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
+    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
-    use crate::programs::{Program, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
     use crate::types::{DataType, Memory};
 
     use super::*;
-
-    /// Runs `operation`'s transpose rule against a staged cotangent of the target type and returns the built pullback
-    /// program mapping output cotangents to input cotangents.
-    fn transposed_broadcast_program(
-        operation: &BroadcastOperation,
-        input_type: &ArrayType,
-    ) -> Program<Array, ArrayOperation<Array>, Array, Array> {
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let builder = context.builder().clone();
-        let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
-        let cotangent = context.tracer(cotangent_atom, None);
-        let contribution = operation
-            .transpose(
-                &mut context,
-                &EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type.clone())],
-                &[MaybeZero::Value(cotangent)],
-            )
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("transpose should return one contribution");
-        let MaybeZero::Value(contribution) = contribution else {
-            panic!("transpose should produce one staged cotangent contribution");
-        };
-        let contribution_atom = contribution.atom_id().unwrap();
-        drop(contribution);
-        drop(context);
-        let builder =
-            Rc::try_unwrap(builder).expect("transpose builder should not have outstanding terms").into_inner();
-        builder.build::<Array, Array>(vec![contribution_atom], Placeholder, Placeholder).unwrap()
-    }
 
     #[test]
     fn test_broadcast() {
@@ -581,7 +536,31 @@ mod tests {
 
         // Type inference validates the axis mapping and returns the target type.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))],
+                    error = "broadcasting input data type f32 does not match output data type f64",
+                },
+                {
+                    input_types = [output_type.clone()],
+                    error = "broadcasting output axes has length 1 but input has rank 2",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                    error = "broadcasting input axis 0 has size 2, which is neither 3 nor 1",
+                },
+            ],
+        );
 
         // Type-level (abstract) broadcasting validates the axis mapping and returns the target type without
         // consuming the borrowed input type.
@@ -603,21 +582,7 @@ mod tests {
         assert_eq!(*broadcast_to.r#type(), output_type);
         assert_eq!(broadcast_to.to_f64s(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))], &[]),
-            Err(TypeError {
-                message: "broadcasting input data type f32 does not match output data type f64".to_string(),
-            }),
-        );
-        assert_eq!(
-            operation.infer_output_types(std::slice::from_ref(&output_type), &[]),
-            Err(TypeError { message: "broadcasting output axes has length 1 but input has rank 2".to_string() }),
-        );
+        // Invalid axis mappings and interpreter arity report precise errors.
         assert_eq!(
             BroadcastOperation::new(output_type.clone(), vec![2])
                 .infer_output_types(std::slice::from_ref(&input_type), &[]),
@@ -631,10 +596,6 @@ mod tests {
                 &[]
             ),
             Err(TypeError { message: "broadcasting output axes map two input axes to output axis 1".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
-            Err(TypeError { message: "broadcasting input axis 0 has size 2, which is neither 3 nor 1".to_string() }),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -666,10 +627,65 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check standard partial evaluation with known and residual operands.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = BroadcastOperation::new(output_type.clone(), vec![1]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching lifts the broadcast around the mapped axis and preserves ordinary replicated placement.
+        check_operation_batching!(
+            @exact,
+            operation = BroadcastOperation::new(
+                ArrayType::new(DataType::F64, Shape::new(vec![3.into(), 4.into()])),
+                vec![0],
+            ),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))],
+                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 4.into()])),
+                    vec![
+                        1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
+                        4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0, 6.0,
+                    ],
+                ))],
+            }],
+        );
+
+        // Broadcast is structural-linear: its JVP broadcasts the tangent as well as the primal.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = BroadcastOperation::new(
+                ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into()])),
+                vec![1],
+            ),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0])],
+                tangents = [Array::vector(vec![3.0, 4.0])],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 1.0, 2.0])],
+                tangent_outputs = [Array::matrix(2, 2, vec![3.0, 4.0, 3.0, 4.0])],
+            }],
+        );
     }
 
     #[test]
-    fn test_broadcast_with_dynamic_dimensions() {
+    fn test_array_type_broadcast() {
         // A dynamic input dimension maps through to an identical dynamic output dimension, while replicated axes
         // (unmapped output axes) keep requiring static extents.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
@@ -724,6 +740,22 @@ mod tests {
                     .to_string(),
             })),
         );
+
+        // Lifting a mapped broadcast inserts the batch dimension without dropping memory or sharding metadata.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let (output_axes, lifted, batch_axis) = lift_broadcast(&[0], &output_type, 0, 2).unwrap();
+        assert_eq!(output_axes, vec![0, 1]);
+        assert_eq!(lifted, output_type.with_inserted_dimension(0, Size::Static(2)).unwrap());
+        assert_eq!(batch_axis, 0);
     }
 
     #[test]
@@ -751,27 +783,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lift_broadcast_preserves_memory_and_sharding() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap()
-            .with_memory(Memory::Host { pinned: true });
-
-        let (output_axes, lifted, batch_axis) = lift_broadcast(&[0], &output_type, 0, 2).unwrap();
-
-        assert_eq!(output_axes, vec![0, 1]);
-        assert_eq!(lifted, output_type.with_inserted_dimension(0, Size::Static(2)).unwrap());
-        assert_eq!(batch_axis, 0);
-    }
-
-    #[test]
-    fn test_broadcast_batching_preserves_explicit_mapped_axis_sharding() {
+    fn test_broadcast_transforms() {
+        // Explicit mapped-axis sharding remains attached to the lifted batch dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let physical_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
             .with_sharding(
@@ -810,92 +823,76 @@ mod tests {
 
         assert_eq!(outputs[0].r#type().as_ref(), &expected_output_type);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-    }
 
-    #[test]
-    fn test_broadcast_differentiation_uses_the_primal_output_tangent_type() {
+        // Differentiation derives the tangent target from the primal output, preserving promoted tangent types.
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2)]));
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
         let primal_output_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)]));
         let tangent_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
 
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(
-                |value| value.broadcast(primal_output_type.clone(), &[1]),
-                Array::from_f64s(primal_type, vec![2.0, 4.0]),
-                Array::from_f64s(tangent_type, vec![1.0, 3.0]),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |value| value.broadcast(primal_output_type.clone(), &[1]),
+            Array::from_f64s(primal_type, vec![2.0, 4.0]),
+            Array::from_f64s(tangent_type, vec![1.0, 3.0]),
+        )
+        .unwrap();
 
         assert_eq!(primal.r#type().as_ref(), &primal_output_type);
         assert_eq!(tangent.r#type().as_ref(), &tangent_output_type);
         assert_eq!(tangent.to_f64s(), vec![1.0, 3.0, 1.0, 3.0]);
-    }
 
-    #[test]
-    fn test_broadcast_transpose_sums_over_added_axes() {
+        // The pullback sums over added dimensions.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(output_type, vec![1]);
-
-        let program = transposed_broadcast_program(&operation, &input_type);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[2, 3] .
-                let %1:f64[3] = reduce_sum [axes=[0]] %0
-                in (%1)
-            "}
-            .trim_end(),
+        check_operation_transposition!(
+            @exact,
+            operation = BroadcastOperation::new(output_type, vec![1]),
+            cases = [{
+                inputs = [(@linear(type = input_type))],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0])],
+                pullback = indoc! {"
+                    lambda %0:f64[2, 3] .
+                    let %1:f64[3] = reduce_sum [axes=[0]] %0
+                    in (%1)
+                "},
+            }],
         );
-        let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let contribution = program.interpret(cotangent).unwrap();
-        assert_eq!(contribution.to_f64s(), vec![5.0, 7.0, 9.0]);
-    }
 
-    #[test]
-    fn test_broadcast_transpose_restores_permuted_dimensions() {
         // Input axis 0 (size 2) maps to output axis 2 and input axis 1 (size 3) maps to output axis 0, so the pullback
         // must sum over output axis 1 and swap the surviving axes back into input order.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
-        let operation = BroadcastOperation::new(output_type, vec![2, 0]);
-
-        let program = transposed_broadcast_program(&operation, &input_type);
-        let cotangent_values: Vec<f64> = (0..24).map(|value| value as f64).collect();
-        let cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)])),
-            cotangent_values.clone(),
+        check_operation_transposition!(
+            @exact,
+            operation = BroadcastOperation::new(output_type.clone(), vec![2, 0]),
+            cases = [{
+                inputs = [(@linear(type = input_type))],
+                output_cotangents = [Array::from_f64s(
+                    output_type,
+                    (0..24).map(|value| value as f64).collect(),
+                )],
+                input_cotangents = [Array::matrix(2, 3, vec![12.0, 44.0, 76.0, 16.0, 48.0, 80.0])],
+            }],
         );
-        let contribution = program.interpret(cotangent).unwrap();
-        assert_eq!(*contribution.r#type(), input_type);
-        for input_0 in 0..2 {
-            for input_1 in 0..3 {
-                let expected: f64 = (0..4).map(|reduced| cotangent_values[input_1 * 8 + reduced * 2 + input_0]).sum();
-                assert_abs_diff_eq!(contribution.to_f64s()[input_0 * 3 + input_1], expected, epsilon = 1e-9);
-            }
-        }
-    }
 
-    #[test]
-    fn test_broadcast_transpose_sums_stretched_unit_axes() {
         // Input axis 0 has extent 1 stretched to 2 in the target, so the pullback sums over it and restores the unit
         // axis with a reshape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(output_type, vec![0, 1]);
+        check_operation_transposition!(
+            @exact,
+            operation = BroadcastOperation::new(output_type, vec![0, 1]),
+            cases = [{
+                inputs = [(@linear(type = input_type))],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [Array::matrix(1, 3, vec![5.0, 7.0, 9.0])],
+            }],
+        );
 
-        let program = transposed_broadcast_program(&operation, &input_type);
-        let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let contribution = program.interpret(cotangent).unwrap();
-        assert_eq!(*contribution.r#type(), input_type);
-        assert_eq!(contribution.to_f64s(), vec![5.0, 7.0, 9.0]);
-    }
-
-    #[test]
-    fn test_broadcast_transpose_propagates_symbolic_zero() {
+        // Symbolic-zero cotangents remain symbolic and acquire the input's promoted cotangent type.
         let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
@@ -914,20 +911,5 @@ mod tests {
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &input_cotangent_type);
-    }
-
-    #[test]
-    fn test_broadcast_value_and_gradient() {
-        // f(x) = sum(broadcast(x, [2, 3], [1])): every input coordinate is replicated twice, so the gradient is 2 at
-        // every coordinate.
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| x.broadcast(output_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
-                Array::vector(vec![1.0, 2.0, 3.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 12.0, epsilon = 1e-9);
-        assert_eq!(gradient.to_f64s(), vec![2.0, 2.0, 2.0]);
     }
 }

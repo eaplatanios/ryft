@@ -522,12 +522,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{Batch, BatchAxis};
+    use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{LinearizationTracer, ReverseModeDifferentiate};
+    use crate::differentiation::{LinearizationTracer, vjp};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::linear::DenseDifferentiate;
+    use crate::tracing_v2::jacrev;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -658,15 +658,14 @@ mod tests {
         let input = Array::from_f64s(vector_f64_type(8).with_sharding(input_sharding.clone()).unwrap(), vec![1.0; 8]);
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-        let (_output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(
-                {
-                    let target = target.clone();
-                    move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
-                },
-                input,
-            )
-            .unwrap();
+        let (_output, pullback) = vjp(
+            {
+                let target = target.clone();
+                move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
+            },
+            input,
+        )
+        .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
 
         let staged = pullback
@@ -686,28 +685,26 @@ mod tests {
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(8)]));
         let input = Array::from_f64s(input_type.clone(), vec![1.0; 8]);
-        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(
-                {
-                    let target = target.clone();
-                    move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
-                },
-                input.clone(),
-            )
-            .unwrap();
+        let (output, pullback) = vjp(
+            {
+                let target = target.clone();
+                move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
+            },
+            input.clone(),
+        )
+        .unwrap();
         let cotangent = pullback.apply(Array::from_f64s(output.r#type().cotangent(), vec![1.0; 8])).unwrap();
         assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent());
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
 
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacrev(
-                {
-                    let target = target.clone();
-                    move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
-                },
-                input,
-            )
-            .unwrap();
+        let jacobian = jacrev(
+            {
+                let target = target.clone();
+                move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))
+            },
+            input,
+        )
+        .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.input_type(), &input_type);
         assert_eq!(block.value().r#type().data_type(), DataType::F32);
@@ -728,17 +725,8 @@ mod tests {
         let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
         let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
-                let context = x.context().clone();
                 let target = target.clone();
-                Ok(Batch::batch(
-                    &context,
-                    move |item| Ok(item.reshard(&target)),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap())
+                Ok(batch(move |item| Ok(item.reshard(&target)), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap())
             },
             matrix_type(2, 3),
         )
@@ -755,8 +743,8 @@ mod tests {
         // The hint targets the auto axis `a`. The constraint is self-adjoint, so its transpose re-applies the same
         // hint to the cotangent rather than dualizing it.
         let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let (_output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(
+        let (_output, pullback) =
+            vjp(
                 {
                     let hint = hint.clone();
                     move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
@@ -787,17 +775,9 @@ mod tests {
         let expected_lifted = hint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
         let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
-                let context = x.context().clone();
                 let hint = hint.clone();
-                Ok(Batch::batch(
-                    &context,
-                    move |item| Ok(item.constrain_sharding(&hint)),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap())
+                Ok(batch(move |item| Ok(item.constrain_sharding(&hint)), x, BatchAxis::new(0), BatchAxis::new(0), None)
+                    .unwrap())
             },
             matrix_type(2, 3),
         )

@@ -1,6 +1,4 @@
-use crate::{
-    DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, mlir_op, mlir_op_trait,
-};
+use crate::{DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, mlir_op, mlir_op_trait};
 
 /// CHLO [`Operation`] that performs element-wise error function computation on a tensor of floating-point element
 /// type, where `erf(x) = 2/√π · ∫₀ˣ e^{-t²} dt`. The XLA compiler legalizes this operation to a rational polynomial

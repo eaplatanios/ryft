@@ -75,7 +75,7 @@ mod tests {
     use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, jvp};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -85,7 +85,6 @@ mod tests {
     use crate::programs::atoms::MaybeZero;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -252,12 +251,10 @@ mod tests {
 
     #[test]
     fn test_div_low_precision_differentiation_uses_widened_tangents() {
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let left = Scalar::from(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let right = Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let (primal, tangent): (Scalar, Scalar) = context
-            .jvp(|(left, right)| Ok(left / right), (left, right), (Scalar::from(1.0f32), Scalar::from(1.0f32)))
-            .unwrap();
+        let (primal, tangent): (Scalar, Scalar) =
+            jvp(|(left, right)| Ok(left / right), (left, right), (Scalar::from(1.0f32), Scalar::from(1.0f32))).unwrap();
         assert_eq!(primal, Scalar::from(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Scalar::from(-0.5f32));
     }

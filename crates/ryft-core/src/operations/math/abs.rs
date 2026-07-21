@@ -158,10 +158,10 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, value_and_gradient};
+    use crate::differentiation::{gradient, jvp, value_and_gradient};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -169,7 +169,6 @@ mod tests {
     };
     use crate::operations::math::{Reduce, ReductionKind};
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::ArrayType;
 
     use super::*;
@@ -330,9 +329,8 @@ mod tests {
 
         // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
         // zero tangent and gradient at the origin.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
-            context.jvp(
+            jvp(
                 |z| z.abs(),
                 Scalar::from(ComplexNumber::new(0.0f64, 0.0f64)),
                 Scalar::from(ComplexNumber::new(1.0f64, 2.0f64)),
@@ -349,9 +347,8 @@ mod tests {
     fn test_abs_complex_differentiation_avoids_overflow() {
         // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
         // directional derivative `Re((conj(z) / |z|) * dz)`.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
-            context.jvp(
+            jvp(
                 |z| z.abs(),
                 Scalar::from(ComplexNumber::new(1e308f64, 0.0)),
                 Scalar::from(ComplexNumber::new(2.0f64, 0.0)),
@@ -363,11 +360,9 @@ mod tests {
     #[test]
     fn test_abs_low_precision_differentiation_uses_widened_tangents() {
         // The coefficient and tangent are computed in the widened differential representation.
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-
-        let (_, tangent) = context.jvp(|input| input.abs(), primal, input_tangent).unwrap();
+        let (_, tangent) = jvp(|input| input.abs(), primal, input_tangent).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_eq!(tangent.to_f64s(), vec![3.0]);
     }

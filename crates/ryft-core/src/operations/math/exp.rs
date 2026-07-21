@@ -49,8 +49,7 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::{gradient_holomorphic, jvp};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -58,7 +57,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::types::Typed;
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -148,10 +146,9 @@ mod tests {
 
     #[test]
     fn test_exp_low_precision_differentiation_uses_widened_tangents() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (primal_output, tangent) = context.jvp(|input| input.exp(), primal, input_tangent).unwrap();
+        let (primal_output, tangent) = jvp(|input| input.exp(), primal, input_tangent).unwrap();
         // The primal output stays genuinely `f8e8m0fnu`-encoded (not an `f64` pun): `exp(2) ≈ 7.39` rounds to the
         // nearest representable power of two, `8 = 2^3`, whose biased-exponent encoding is `0x82`.
         assert_eq!(primal_output.r#type().as_ref(), &ArrayType::scalar(DataType::F8E8M0FNU));

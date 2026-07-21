@@ -26,6 +26,8 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Memory};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`TransferToMemoryOperation`].
 pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &str = "transfer_to_memory";
 
@@ -235,9 +237,9 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{ArrayBatch, Batch, BatchAxis, BatchableOperation, BatchingContext};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::differentiation::{jvp, value_and_gradient, vjp};
     use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::programs::types::Typed;
     use crate::tracing::Trace;
@@ -314,9 +316,7 @@ mod tests {
         // axis preserved.
         let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
-                let context = x.context().clone();
-                Ok(Batch::batch(
-                    &context,
+                Ok(batch(
                     |item| Ok(item.transfer_to_memory(PINNED_HOST)),
                     x,
                     BatchAxis::new(0),
@@ -339,22 +339,19 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_jvp_moves_the_primal_and_the_tangent() {
         // Eagerly the transfer is the identity on both the primal and the tangent.
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(
-                |x| Ok(x.transfer_to_memory(PINNED_HOST)),
-                Array::vector(vec![2.0, 3.0]),
-                Array::vector(vec![1.0, 0.5]),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |x| Ok(x.transfer_to_memory(PINNED_HOST)),
+            Array::vector(vec![2.0, 3.0]),
+            Array::vector(vec![1.0, 0.5]),
+        )
+        .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
         assert_eq!(tangent.to_f64s(), vec![1.0, 0.5]);
     }
 
     #[test]
     fn test_transfer_to_memory_transposition_moves_the_cotangent_back_to_the_source_memory() {
-        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), Array::vector(vec![2.0, 3.0]))
-            .unwrap();
+        let (output, pullback) = vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), Array::vector(vec![2.0, 3.0])).unwrap();
         let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.to_f64s(), vec![2.0, 3.0]);
         // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
@@ -377,16 +374,15 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
-                    let back = on_host.transfer_to_memory(Memory::Device);
-                    back.dot(&back, &DotDimensionNumbers::inner_product())
-                },
-                Array::vector(vec![0.5, 1.5]),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            |x| {
+                let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
+                let back = on_host.transfer_to_memory(Memory::Device);
+                back.dot(&back, &DotDimensionNumbers::inner_product())
+            },
+            Array::vector(vec![0.5, 1.5]),
+        )
+        .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.5, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);

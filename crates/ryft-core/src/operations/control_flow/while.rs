@@ -46,6 +46,8 @@ use crate::programs::{MaybeZero, Program, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`WhileOperation`].
 pub const WHILE_OPERATION_NAME: &str = "while";
 
@@ -1781,8 +1783,9 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
+    use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::LinearizationTracer;
+    use crate::differentiation::{LinearizationTracer, jvp, linearize, value_and_gradient, vjp};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
     use crate::operations::debugging::PrintOperation;
@@ -1991,7 +1994,6 @@ mod tests {
         type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = LinearizationTracer<TestContext>;
 
-        let context = TestContext::new();
         let function = |state: TestTracer| {
             let mut outputs = state.context().bind(
                 ArrayOperation::While(WhileOperation::new()),
@@ -2000,11 +2002,11 @@ mod tests {
             )?;
             Ok(outputs.remove(0))
         };
-        let (output, pushforward) = context.linearize(function, Array::scalar(3.5)).unwrap();
+        let (output, pushforward) = linearize(function, Array::scalar(3.5)).unwrap();
         assert_eq!(output, Array::scalar(-0.5));
         assert_eq!(pushforward.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
 
-        let (output, pullback) = context.vjp(function, Array::scalar(3.5)).unwrap();
+        let (output, pullback) = vjp(function, Array::scalar(3.5)).unwrap();
         assert_eq!(output, Array::scalar(-0.5));
         assert_eq!(pullback.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
     }
@@ -3008,18 +3010,17 @@ mod tests {
 
         // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 4);
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                move |x| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::scalar(2.0),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            },
+            Array::scalar(2.0),
+        )
+        .unwrap();
         assert_eq!(value.to_f64s(), vec![256.0]);
         assert_eq!(gradient.to_f64s(), vec![1024.0]);
     }
@@ -3082,18 +3083,17 @@ mod tests {
         // The eager-domain entry point differentiates the same bounded loop to identical numbers: the loop exits
         // through its condition after three iterations, well below the bound of five.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                move |x| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::scalar(1.0),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            },
+            Array::scalar(1.0),
+        )
+        .unwrap();
         assert_eq!(value.to_f64s(), vec![8.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
@@ -3136,18 +3136,17 @@ mod tests {
         assert_eq!(outputs[0].to_f64s(), vec![16.0]);
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                move |x| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::scalar(2.0),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            },
+            Array::scalar(2.0),
+        )
+        .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
 
@@ -3202,14 +3201,12 @@ mod tests {
         while_regions: Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>,
         batch_size: usize,
     ) -> Program<Array, TestDomainOperation, Array, Array> {
-        use crate::batching::Batch;
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let input_tracer = parent.tracer(input_atom, None);
-        let output = Batch::batch(
-            &parent,
+        let output = batch(
             |item| {
                 let mut outputs = item.context().bind(
                     TestDomainOperation::While(while_operation),
@@ -3293,8 +3290,6 @@ mod tests {
 
     #[test]
     fn test_while_batching_stages_plain_loops_for_replicated_predicates_under_tracing() {
-        use crate::batching::Batch;
-
         // vmap-under-tracing of a loop whose predicate depends only on a replicated counter: the staged batching
         // rule batches the condition and body at the state batch axes and stages one plain `while` — no mask
         // machinery (`reduce_any` / per-element `select`) appears in the staged program. Two iterations double the
@@ -3306,8 +3301,7 @@ mod tests {
             builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         let counter_tracer = parent.tracer(counter_atom, None);
         let value_tracer = parent.tracer(value_atom, None);
-        let (counter_output, value_output) = Batch::batch(
-            &parent,
+        let (counter_output, value_output) = batch(
             |(counter, value)| {
                 let (while_operation, while_regions) = counter_doubling_while_operation();
                 let mut outputs = counter.context().bind(
@@ -3389,9 +3383,8 @@ mod tests {
         assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 
         // The plain eager domain produces the same numbers...
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0]))
-            .unwrap();
+        let (primal, tangent) =
+            jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0])).unwrap();
         assert_eq!(primal.to_f64s(), vec![8.0, 10.0, 9.0]);
         assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 

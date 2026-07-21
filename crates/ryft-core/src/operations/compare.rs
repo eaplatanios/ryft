@@ -216,7 +216,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::differentiation::forward::{DifferentiationTracer, ForwardModeDifferentiate};
+    use crate::differentiation::forward::{DifferentiationTracer, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
@@ -306,15 +306,11 @@ mod tests {
     fn test_compare_differentiation() {
         // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
         // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(piecewise_select, Array::scalar(2.0), Array::scalar(1.0))
-            .unwrap();
+        let (primal, tangent) = jvp(piecewise_select, Array::scalar(2.0), Array::scalar(1.0)).unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-        let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(piecewise_select, Array::scalar(-2.0), Array::scalar(1.0))
-            .unwrap();
+        let (primal, tangent) = jvp(piecewise_select, Array::scalar(-2.0), Array::scalar(1.0)).unwrap();
         assert_eq!(primal.to_f64s(), vec![-6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
     }

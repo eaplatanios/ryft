@@ -131,11 +131,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::batching::{Batch, BatchAxis};
+    use crate::backends::scalars::Scalar;
+    use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::forward::ForwardModeDifferentiate;
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
@@ -245,15 +244,14 @@ mod tests {
     #[test]
     fn test_stop_gradient_composes_with_batching() {
         // Gradient stopping composes with batching: `x * stop_gradient(x)` batches like `x * x`.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |x| Ok(x.clone() * x.stop_gradient()),
-                Array::vector(vec![1.0, 2.0, 3.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
+        let output: Array = batch(
+            |x| Ok(x.clone() * x.stop_gradient()),
+            Array::vector(vec![1.0, 2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
         assert_eq!(output.to_f64s(), vec![1.0, 4.0, 9.0]);
     }
 
@@ -261,15 +259,13 @@ mod tests {
     fn test_stop_gradient_differentiation() {
         // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
         // derivative of the identity primal function, so the finite-difference operation helper does not apply.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = context.jvp(|x| Ok(x.stop_gradient()), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
+        let (primal, tangent) = jvp(|x| Ok(x.stop_gradient()), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, 2.0);
         assert_eq!(tangent, 0.0);
 
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like `x * c` with `c` frozen
         // at the primal value, so `f'(x) = stop_gradient(x)`.
-        let (value, gradient) =
-            context.value_and_gradient(|x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
+        let (value, gradient) = value_and_gradient(|x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
         assert_eq!(value, 9.0);
         assert_eq!(gradient, 3.0);
 

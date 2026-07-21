@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::BatchableOperation;
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
@@ -91,7 +91,7 @@ impl ConvertElementTypeOperation {
 impl Display for ConvertElementTypeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         OperationFormatter::new(formatter, 0, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("data_type", &self.data_type))
+            .bracketed(|operation| operation.field("data_type", self.data_type))
     }
 }
 
@@ -115,51 +115,7 @@ impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, CONVERT_ELEMENT_TYPE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("data_type", &self.data_type))
-    }
-}
-
-/// Value-level capability for converting a value's numeric element type.
-pub trait ConvertElementType: Sized {
-    /// Promotes this value's elements to `data_type`. Unlike [`Self::convert_element_type`], this method rejects
-    /// conversions that are not permitted by the element-type promotion lattice.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element data type to which the returned value is promoted.
-    fn promote_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>
-    where
-        Self: Typed,
-        Self::Type: ElementType,
-    {
-        self.r#type()
-            .element_type()
-            .promote_to(data_type)
-            .map_err(|error| TypeError { message: error.to_string() })?;
-        self.convert_element_type(data_type)
-    }
-
-    /// Converts this value's elements to `data_type`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Element data type of the returned value.
-    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
-}
-
-impl<V> ConvertElementType for V
-where
-    V: Value,
-    V::Type: ElementType,
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<ConvertElementTypeOperation>,
-{
-    #[inline]
-    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(ConvertElementTypeOperation::new(data_type), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
+            .bracketed(|operation| operation.field("data_type", self.data_type))
     }
 }
 
@@ -251,17 +207,61 @@ where
     C: Context<Type = ArrayType>,
     C::Value: ConvertElementType,
 {
-    fn batch<D: crate::batching::BatchingDriver<C>>(
+    fn batch<D: BatchingDriver<C>>(
         &self,
-        _context: &crate::batching::BatchingContext<C>,
+        _context: &BatchingContext<C>,
         _driver: &D,
-        inputs: &[crate::batching::ArrayBatch<C::Value>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let mut output_type = inputs[0].r#type().into_owned();
         output_type.data_type = self.data_type;
         let output = inputs[0].value().convert_element_type(self.data_type)?;
-        Ok(vec![crate::batching::ArrayBatch::new(output_type, output, inputs[0].batch_axis())?])
+        Ok(vec![ArrayBatch::new(output_type, output, inputs[0].batch_axis())?])
+    }
+}
+
+/// Value-level capability for converting a value's numeric element type.
+pub trait ConvertElementType: Sized {
+    /// Promotes this value's elements to `data_type`. Unlike [`Self::convert_element_type`], this method rejects
+    /// conversions that are not permitted by the element-type promotion lattice.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element data type to which the returned value is promoted.
+    fn promote_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>
+    where
+        Self: Typed,
+        Self::Type: ElementType,
+    {
+        self.r#type()
+            .element_type()
+            .promote_to(data_type)
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        self.convert_element_type(data_type)
+    }
+
+    /// Converts this value's elements to `data_type`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element data type of the returned value.
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
+}
+
+impl<V> ConvertElementType for V
+where
+    V: Value,
+    V::Type: ElementType,
+    V::DispatchDomain: Context,
+    <V::DispatchDomain as Domain>::Operation: From<ConvertElementTypeOperation>,
+{
+    #[inline]
+    fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ConvertElementTypeOperation::new(data_type), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
     }
 }
 
@@ -269,67 +269,128 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::contexts::EagerContext;
+    use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
+    use crate::differentiation::jvp;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::programs::types::Typed;
-    use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::types::{ArrayType, DataType};
+    use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::ConvertElementType;
+    use super::*;
 
     #[test]
-    fn test_convert_element_type_jvp_uses_differential_representations() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+    fn test_convert_element_type() {
+        // Check operation metadata and exact inference, including structural array metadata and token rejection.
+        let operation = ConvertElementTypeOperation::new(DataType::F32);
+        assert_eq!(Operation::<DataType>::name(&operation), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
+        assert_eq!(operation.data_type(), DataType::F32);
+        assert_eq!(operation.to_string(), "convert_element_type [data_type=f32]");
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    type = DataType,
+                    input_types = [DataType::F64],
+                    output_types = [DataType::F32],
+                },
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [input_type.with_data_type(DataType::F32)],
+                },
+                {
+                    type = DataType,
+                    input_types = [DataType::Token],
+                    error = "cannot convert values to or from the token data type",
+                },
+            ],
+        );
 
+        // Check the default fold-or-residualize rule and preservation of mapped batch placement.
+        check_operation_partial_evaluation!(
+            operation = operation,
+            inputs = [Scalar::from(2.0_f64)],
+            expected = Scalar::from(2.0_f32),
+        );
+        check_operation_batching!(
+            @exact,
+            operation = operation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]))],
+                outputs = [(
+                    @mapped(axis = 0),
+                    Array::from_f64s(
+                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                        vec![1.0, 2.0],
+                    )
+                )],
+            }],
+        );
+
+        // Check the continuous conversion JVP against finite differences and its reverse conversion of cotangents.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-6),
+            operation = ConvertElementTypeOperation::new(DataType::F64),
+            cases = [{
+                primals = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])],
+                tangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])],
+                primal_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
+                tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = ConvertElementTypeOperation::new(DataType::F32),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
+            }],
+        );
+
+        // Low-precision primals use their wider differential representations in both conversion directions.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (output, output_tangent) =
-            context.jvp(|value| value.convert_element_type(DataType::F32), primal, tangent).unwrap();
+        let (output, output_tangent) = jvp(|value| value.convert_element_type(DataType::F32), primal, tangent).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
         let (_, output_tangent) =
-            context.jvp(|value| value.convert_element_type(DataType::F8E8M0FNU), primal, tangent).unwrap();
+            jvp(|value| value.convert_element_type(DataType::F8E8M0FNU), primal, tangent).unwrap();
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
-    }
 
-    #[test]
-    fn test_convert_element_type_jvp_converts_narrower_real_and_complex_tangents() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-
-        let (_, tangent) = context
-            .jvp(
-                |value| value.convert_element_type(DataType::F32),
-                Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]),
-                Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]),
-            )
-            .unwrap();
+        // Narrowing real and complex primals also narrows their concrete tangent values.
+        let (_, tangent) = jvp(
+            |value| value.convert_element_type(DataType::F32),
+            Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]),
+            Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]),
+        )
+        .unwrap();
         assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
-        let (_, tangent) = context
-            .jvp(
-                |value| value.convert_element_type(DataType::C64),
-                Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]),
-                Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]),
-            )
-            .unwrap();
+        let (_, tangent) = jvp(
+            |value| value.convert_element_type(DataType::C64),
+            Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]),
+            Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]),
+        )
+        .unwrap();
         assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]));
-    }
 
-    #[test]
-    fn test_convert_element_type_jvp_is_zero_through_non_differentiable_types() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        // Passing through an element type with a zero-dimensional tangent space erases the incoming tangent.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
-        let (output, output_tangent) = context
-            .jvp(
-                |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64),
-                primal,
-                tangent,
-            )
-            .unwrap();
+        let (output, output_tangent) = jvp(
+            |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64),
+            primal,
+            tangent,
+        )
+        .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]));
     }

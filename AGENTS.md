@@ -267,14 +267,8 @@ update this file so that they do not need to remind you again in the future.
 
 ## Testing Guidelines
 
-- All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
-  Consult that file before writing or revising unit tests.
-- When changing what `ryft-core` transforms (batching, differentiation, tracing) stage into programs — operand
-  shapes, inserted or elided operations — also run the backend crate test suites (at least
-  `cargo test -p ryft-xla --lib`), not just `ryft-core`. Backend lowerings impose stricter contracts than
-  `ryft-core` type inference; for example, StableHLO elementwise operations require shape-congruent operands with no
-  implicit broadcasting, so an "optimization" that elides a staged `BroadcastInDim` can pass every `ryft-core` test
-  and still break XLA lowering.
+All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
+Consult that file before writing or revising unit tests.
 
 ## Crate-Specific Conventions
 

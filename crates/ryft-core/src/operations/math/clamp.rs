@@ -31,11 +31,10 @@ impl<V: Maximum + Minimum> Clamp for V {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
+    use crate::differentiation::value_and_gradient;
     use crate::operations::constants::OneLike;
-    use crate::tracing_v2::ReverseModeDifferentiate;
 
     use super::*;
 
@@ -65,14 +64,13 @@ mod tests {
     #[test]
     fn test_clamp_differentiation() {
         // The gradient follows the clamped value: `1` strictly inside the interval and `0` outside it.
-        let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (value, gradient) = domain.value_and_gradient(clamp_to_unit_interval, Array::scalar(0.5)).unwrap();
+        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(0.5)).unwrap();
         assert_eq!(value.to_f64s(), vec![0.5]);
         assert_eq!(gradient.to_f64s(), vec![1.0]);
-        let (value, gradient) = domain.value_and_gradient(clamp_to_unit_interval, Array::scalar(2.5)).unwrap();
+        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(2.5)).unwrap();
         assert_eq!(value.to_f64s(), vec![1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
-        let (value, gradient) = domain.value_and_gradient(clamp_to_unit_interval, Array::scalar(-2.5)).unwrap();
+        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(-2.5)).unwrap();
         assert_eq!(value.to_f64s(), vec![-1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
     }

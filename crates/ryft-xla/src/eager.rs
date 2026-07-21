@@ -737,13 +737,9 @@ mod tests {
             ),
         ];
         for (direction, expected_primary, expected_secondary, expected_passenger) in cases {
-            let sorted = Sort::sort_with_key_count(
-                &[primary.clone(), secondary.clone(), passenger.clone()],
-                0,
-                direction,
-                2,
-            )
-            .unwrap();
+            let sorted =
+                Sort::sort_with_key_count(&[primary.clone(), secondary.clone(), passenger.clone()], 0, direction, 2)
+                    .unwrap();
             assert_eq!(read_i32s(&sorted[0]), expected_primary);
             assert_eq!(read_f32s(&sorted[1]), expected_secondary);
             assert_eq!(read_f32s(&sorted[2]), expected_passenger);
@@ -784,17 +780,15 @@ mod tests {
             values_to_bytes::<u64>(&state_values).as_slice(),
         )
         .unwrap();
-        let reference_state =
-            CpuArray::new(
-                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
-                state_values.iter().copied().map(Scalar::U64).collect(),
-            )
-            .unwrap();
+        let reference_state = CpuArray::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
+            state_values.iter().copied().map(Scalar::U64).collect(),
+        )
+        .unwrap();
 
         // An odd `u32` element count exercises the padded counter pair and the truncated word layout.
         let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
-        let (device_state, device_bits) =
-            state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
+        let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
         let device_words = values_from_bytes::<u32>(
@@ -869,12 +863,11 @@ mod tests {
             values_to_bytes::<u64>(&state_values).as_slice(),
         )
         .unwrap();
-        let reference_state =
-            CpuArray::new(
-                ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])),
-                state_values.iter().copied().map(Scalar::U64).collect(),
-            )
-            .unwrap();
+        let reference_state = CpuArray::new(
+            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])),
+            state_values.iter().copied().map(Scalar::U64).collect(),
+        )
+        .unwrap();
 
         // An odd `u32` element count exercises the padded counter quad and the truncated word layout.
         let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
@@ -1025,16 +1018,21 @@ mod tests {
         let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
         let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec());
         let reference_rhs = CpuArray::from_f64s(operand_type.clone(), rhs_values.to_vec());
-        let lhs_bytes =
-            reference_lhs.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<_>>();
-        let rhs_bytes =
-            reference_rhs.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<_>>();
+        let lhs_bytes = reference_lhs
+            .values()
+            .iter()
+            .map(|value| value.low_precision_float_bits().unwrap())
+            .collect::<Vec<_>>();
+        let rhs_bytes = reference_rhs
+            .values()
+            .iter()
+            .map(|value| value.low_precision_float_bits().unwrap())
+            .collect::<Vec<_>>();
         let device_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 2]);
         let lhs = Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
         let rhs = Array::from_host_buffer(&client, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
 
-        let device_product =
-            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32);
+        let device_product = lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32);
         let reference_product =
             reference_lhs.dot_with_accumulation_type(&reference_rhs, &DotDimensionNumbers::matmul(), DataType::F32);
         assert_eq!(device_product.r#type().data_type(), DataType::F32);
@@ -1065,16 +1063,23 @@ mod tests {
         let reference_lhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![0.5, 2.0]);
         let reference_rhs_scales = CpuArray::from_f64s(scale_type.clone(), vec![2.0, 0.5]);
         let bits = |reference: &CpuArray| {
-            reference.values().iter().map(|value| value.low_precision_float_bits().unwrap()).collect::<Vec<u8>>()
+            reference
+                .values()
+                .iter()
+                .map(|value| value.low_precision_float_bits().unwrap())
+                .collect::<Vec<u8>>()
         };
         let device_element_type = replicated_type(&mesh, DataType::F4E2M1FN, &[2, 16]);
         let device_scale_type = replicated_type(&mesh, DataType::F8E4M3FN, &[2, 1]);
-        let lhs =
-            Array::from_host_buffer(&client, device_element_type.clone(), mesh.clone(), bits(&reference_lhs).as_slice())
-                .unwrap();
-        let rhs =
-            Array::from_host_buffer(&client, device_element_type, mesh.clone(), bits(&reference_rhs).as_slice())
-                .unwrap();
+        let lhs = Array::from_host_buffer(
+            &client,
+            device_element_type.clone(),
+            mesh.clone(),
+            bits(&reference_lhs).as_slice(),
+        )
+        .unwrap();
+        let rhs = Array::from_host_buffer(&client, device_element_type, mesh.clone(), bits(&reference_rhs).as_slice())
+            .unwrap();
         let lhs_scales = Array::from_host_buffer(
             &client,
             device_scale_type.clone(),
@@ -1133,10 +1138,8 @@ mod tests {
                 .unwrap();
             assert_eq!(device_output.r#type().data_type(), DataType::F32);
             assert_eq!(device_output.shape().dimensions(), &dimensions);
-            for (device_value, reference_value) in read_f32s(&device_output)
-                .iter()
-                .map(|value| f64::from(*value))
-                .zip(reference_output.to_f64s())
+            for (device_value, reference_value) in
+                read_f32s(&device_output).iter().map(|value| f64::from(*value)).zip(reference_output.to_f64s())
             {
                 assert!(
                     (device_value - reference_value).abs() < 1e-5,
@@ -1428,8 +1431,7 @@ mod tests {
             (&device_dv, &reference_dv),
             (&device_dbias.unwrap(), &reference_dbias.unwrap()),
         ] {
-            for (device_value, reference_value) in
-                read_f32s(device_cotangent).iter().zip(reference_cotangent.to_f64s())
+            for (device_value, reference_value) in read_f32s(device_cotangent).iter().zip(reference_cotangent.to_f64s())
             {
                 assert!(
                     (f64::from(*device_value) - reference_value).abs() < 1e-5,
@@ -1505,17 +1507,14 @@ mod tests {
 
         use ryft_core::backends::arrays::ArrayOperation;
         use ryft_core::contexts::EagerContext;
-        let reference_function = differentiable_dot_product_attention::<
-            EagerContext<CpuArray, ArrayOperation<CpuArray>>,
-        >(scale, mask, None, None);
+        let reference_function = differentiable_dot_product_attention::<EagerContext<CpuArray, ArrayOperation<CpuArray>>>(
+            scale, mask, None, None,
+        );
         let (reference_loss, (reference_query_gradient, reference_key_gradient, reference_value_gradient)) =
             EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
                 .value_and_gradient(
                     |(query, key, value)| {
-                        reference_function
-                            .call((query, key, value))
-                            .unwrap()
-                            .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                        reference_function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
                     },
                     (
                         reference(&query_values, &query_dimensions),
@@ -1530,9 +1529,7 @@ mod tests {
             (&key_gradient, &reference_key_gradient),
             (&value_gradient, &reference_value_gradient),
         ] {
-            for (device_value, reference_value) in
-                read_f32s(device_gradient).iter().zip(reference_gradient.to_f64s())
-            {
+            for (device_value, reference_value) in read_f32s(device_gradient).iter().zip(reference_gradient.to_f64s()) {
                 assert!(
                     (f64::from(*device_value) - reference_value).abs() < 1e-5,
                     "expected {reference_value} but got {device_value}",

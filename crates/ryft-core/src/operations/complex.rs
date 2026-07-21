@@ -363,14 +363,15 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::jvp;
+
     use super::*;
     use crate::backends::arrays::Array;
-    use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::tracing_v2::ForwardModeDifferentiate;
 
     #[test]
     fn test_complex() {
@@ -550,45 +551,42 @@ mod tests {
 
     #[test]
     fn test_complex_differentiation() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
         // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) = domain.jvp(|x| x.conjugate(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
+        let (primal, tangent) = jvp(|x| x.conjugate(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
         assert_eq!(primal, Scalar::from(z.conj()));
         assert_eq!(tangent, Scalar::from(tangent_seed.conj()));
 
         // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
-        let (primal, tangent) = domain.jvp(|x| x.real(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
+        let (primal, tangent) = jvp(|x| x.real(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
         assert_eq!(primal, Scalar::from(z.re));
         assert_eq!(tangent, Scalar::from(tangent_seed.re));
-        let (primal, tangent) = domain.jvp(|x| x.imaginary(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
+        let (primal, tangent) = jvp(|x| x.imaginary(), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
         assert_eq!(primal, Scalar::from(z.im));
         assert_eq!(tangent, Scalar::from(tangent_seed.im));
 
         // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
         // structural zero that must be materialized to keep the staged `complex` arity.
-        let (primal, tangent) = domain
-            .jvp(
-                |(real, imaginary)| real.complex(&imaginary),
-                (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
-                (Scalar::from(0.25f64), Scalar::from(4.0f64)),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |(real, imaginary)| real.complex(&imaginary),
+            (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
+            (Scalar::from(0.25f64), Scalar::from(4.0f64)),
+        )
+        .unwrap();
         assert_eq!(primal, Scalar::from(ComplexNumber::new(1.5f64, -2.0f64)));
         assert_eq!(tangent, Scalar::from(ComplexNumber::new(0.25f64, 4.0f64)));
-        let (_, tangent) = domain
-            .jvp(
-                |(real, imaginary)| {
-                    let constant = imaginary.context().lift(Scalar::from(0.0f64))?;
-                    let _ = imaginary;
-                    real.complex(&constant)
-                },
-                (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
-                (Scalar::from(0.25f64), Scalar::from(4.0f64)),
-            )
-            .unwrap();
+        let (_, tangent) = jvp(
+            |(real, imaginary)| {
+                let constant = imaginary.context().lift(Scalar::from(0.0f64))?;
+                let _ = imaginary;
+                real.complex(&constant)
+            },
+            (Scalar::from(1.5f64), Scalar::from(-2.0f64)),
+            (Scalar::from(0.25f64), Scalar::from(4.0f64)),
+        )
+        .unwrap();
         assert_eq!(tangent, Scalar::from(ComplexNumber::new(0.25f64, 0.0f64)));
     }
 
@@ -606,11 +604,9 @@ mod tests {
         assert_eq!(gradient, Scalar::from(z.conj() + z.conj()));
 
         // Forward and reverse agree through the ℝ-linear rules: the jvp of f at tangent ż is 2·Re(z̄ · ż).
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-        let (primal, tangent) = domain
-            .jvp(|x| Ok((x.clone() * x.conjugate()?).real()?), Scalar::from(z), Scalar::from(tangent_seed))
-            .unwrap();
+        let (primal, tangent) =
+            jvp(|x| Ok((x.clone() * x.conjugate()?).real()?), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
         assert_eq!(primal, Scalar::from(z.norm_sqr()));
         assert_eq!(tangent, Scalar::from((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
     }

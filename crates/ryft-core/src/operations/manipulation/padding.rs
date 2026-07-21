@@ -319,10 +319,9 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
-        if batch_axes[1].is_none() {
-            let Some(batch_axis) = batch_axes[0] else {
+        if inputs[1].batch_axis_position().is_none() {
+            let Some(batch_axis) = inputs[0].batch_axis_position() else {
                 return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
             };
             let mut edge_padding_low = self.edge_padding_low().to_vec();
@@ -340,10 +339,10 @@ where
     }
 }
 
-/// Represents the ability to expand an array by adding edge and interior padding filled with a scalar padding value.
-/// This is the direct analogue of the StableHLO [`pad`](https://openxla.org/stablehlo/spec#pad) operation and JAX's
-/// [`lax.pad`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.pad.html), restricted to non-negative padding
-/// amounts (StableHLO also allows negative edge padding, which trims elements instead; that form is not supported).
+/// Represents the ability to expand an array by adding edge and interior padding filled with a scalar padding value,
+/// with the semantics of StableHLO's [`pad`](https://openxla.org/stablehlo/spec#pad) operation restricted to
+/// non-negative padding amounts. StableHLO also allows negative edge padding, which trims elements instead; that form
+/// is not supported.
 ///
 /// `t.pad(padding_value, edge_padding_low, edge_padding_high, interior_padding)` returns an array that holds the
 /// input element with index `i` at output index `edge_padding_low + i * (interior_padding + 1)` along each axis and
@@ -449,13 +448,22 @@ impl Pad for ArrayType {
                 }
                 .into());
             };
-            let interior = if size == 0 { 0 } else { (size - 1) * (interior_padding[axis] + 1) + 1 };
-            output_dimensions.push(Size::Static(edge_padding_low[axis] + interior + edge_padding_high[axis]));
+            let output_size = if size == 0 {
+                edge_padding_low[axis].checked_add(edge_padding_high[axis])
+            } else {
+                interior_padding[axis]
+                    .checked_add(1)
+                    .and_then(|stride| (size - 1).checked_mul(stride))
+                    .and_then(|interior| interior.checked_add(1))
+                    .and_then(|interior| edge_padding_low[axis].checked_add(interior))
+                    .and_then(|size| size.checked_add(edge_padding_high[axis]))
+            }
+            .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?;
+            output_dimensions.push(Size::Static(output_size));
         }
         // Padding resizes dimensions in place, so the operand sharding (placement and reduction state) carries
-        // through, with the same divisibility check on padded sharded dimensions that `slice` applies (JAX's
-        // `_pad_sharding_rule` reuses the shared `_get_sharding_for_varying_out_shape`). The scalar padding value's
-        // sharding does not affect the output.
+        // through, with the same divisibility check on padded sharded dimensions that `slice` applies. The scalar
+        // padding value's sharding does not affect the output.
         let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_sharding(sharding)
@@ -490,23 +498,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::check_operation_batching;
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::linear::DenseDifferentiate;
     use crate::types::DataType;
 
     use super::*;
@@ -528,9 +535,41 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let padding_value_type = ArrayType::scalar(DataType::F64);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(8)]));
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
-            Ok(vec![output_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone(), padding_value_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [input_type.clone()],
+                    error = "expected 2 inputs but got 1",
+                },
+                {
+                    input_types = [input_type.clone(), ArrayType::scalar(DataType::F32)],
+                    error = "'pad' input data type f64 does not match padding value data type f32",
+                },
+                {
+                    input_types = [input_type.clone(), input_type.clone()],
+                    error = "'pad' padding value must be a scalar but has type f64[3]",
+                },
+                {
+                    input_types = [
+                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
+                        padding_value_type.clone(),
+                    ],
+                    error = "'pad' does not support dynamic input axis 0 with size *; the padded extent cannot be \
+                        computed from an unknown extent",
+                },
+                {
+                    input_types = [
+                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
+                        padding_value_type.clone(),
+                    ],
+                    error = "'pad' output size overflows usize on axis 0",
+                },
+            ],
         );
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
 
@@ -547,7 +586,7 @@ mod tests {
         // rank-0 inputs pass through unchanged.
         let empty_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
         assert_eq!(
-            (&empty_type).pad(&padding_value_type, &[1], &[2], &[1]),
+            empty_type.pad(&padding_value_type, &[1], &[2], &[1]),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
         );
         let empty = Array::from_f64s(empty_type, vec![]).pad(&Array::scalar(7.0), &[1], &[2], &[1]).unwrap();
@@ -565,35 +604,10 @@ mod tests {
             })),
         );
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone()], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
-            Err(TypeError {
-                message: "'pad' input data type f64 does not match padding value data type f32".to_string(),
-            }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[input_type.clone(), input_type.clone()], &[]),
-            Err(TypeError { message: "'pad' padding value must be a scalar but has type f64[3]".to_string() }),
-        );
-        assert_eq!(
             PadOperation::new(vec![1, 0], vec![2, 0], vec![1, 0])
                 .unwrap()
                 .infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
             Err(TypeError { message: "'pad' edge_padding_low has length 2 but input has rank 1".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])), padding_value_type.clone(),],
-                &[],
-            ),
-            Err(TypeError {
-                message: "'pad' does not support dynamic input axis 0 with size *; the padded extent cannot be \
-                    computed from an unknown extent"
-                    .to_string(),
-            }),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -623,10 +637,108 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check standard partial evaluation with known and residual operands.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        let padding_value = Array::scalar(9.0);
+        let expected = Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, padding_value.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, padding_value.clone()),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching inserts zero padding on the mapped axis and expands per item for a mapped padding value.
+        check_operation_batching!(
+            @exact,
+            operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        3,
+                        vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0]))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        3,
+                        vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        3,
+                        vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0],
+                    ))],
+                },
+            ],
+        );
+
+        // Pad is linear in both inputs: its JVP pads tangent values and its pullback separates written and padding
+        // positions.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]), Array::scalar(9.0)],
+                tangents = [Array::vector(vec![0.1, 0.2, 0.3]), Array::scalar(0.5)],
+                primal_outputs = [Array::vector(vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0])],
+                tangent_outputs = [Array::vector(vec![0.5, 0.1, 0.5, 0.2, 0.5, 0.3, 0.5, 0.5])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+                input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]), Array::scalar(24.0)],
+            }],
+        );
     }
 
     #[test]
-    fn test_pad_array_kernel() {
+    fn test_array_pad() {
         // A rank-2 pad exercises the odometer across axes with different padding amounts: rows gain one interior
         // row and columns gain asymmetric edge padding.
         let input = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
@@ -644,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_propagates_sharding() {
+    fn test_array_type_pad() {
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let mesh = LogicalMesh::new(vec![
@@ -670,106 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_value_and_grad_splits_cotangent() {
-        // f(x, p) = sum(pad(x, p, low=[1], high=[2], interior=[1]) * w) with w = [1..8]: the padded output is
-        // [p, x0, p, x1, p, x2, p, p], so f = 2*x0 + 4*x1 + 6*x2 + (1 + 3 + 5 + 7 + 8)*p. The input gradient is the
-        // strided slice of the weighted cotangent at the pad geometry (positions 1, 3, and 5 of w) and the
-        // padding-value gradient is the sum over the padding positions, computed as sum(w) - sum(sliced w) =
-        // 36 - 12 = 24.
-        let (value, (input_gradient, padding_value_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(x, padding_value)| {
-                    let weights =
-                        x.context().lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
-                    (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-                },
-                (Array::vector(vec![1.0, 2.0, 3.0]), Array::scalar(9.0)),
-            )
-            .unwrap();
-        // f = 2 * 1 + 4 * 2 + 6 * 3 + 24 * 9 = 28 + 216.
-        assert_abs_diff_eq!(value.to_f64s()[0], 244.0, epsilon = 1e-9);
-        assert_eq!(input_gradient.to_f64s(), vec![2.0, 4.0, 6.0]);
-        assert_eq!(padding_value_gradient.to_f64s(), vec![24.0]);
-    }
-
-    #[test]
-    fn test_pad_jacfwd_scatters_input_coordinates() {
-        // Forward mode through `f(x) = pad(x, 0, low=[1], high=[2], interior=[1])` produces the 8x3 scatter
-        // Jacobian: output positions 1, 3, and 5 hold the input coordinates.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
-                |x| {
-                    let padding_value = x.context().lift(Array::scalar(0.0))?;
-                    x.pad(&padding_value, &[1], &[2], &[1])
-                },
-                Array::vector(vec![1.0, 2.0, 3.0]),
-            )
-            .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[8]);
-        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3]);
-        assert_eq!(
-            block.value().values(),
-            &[
-                0.0, 0.0, 0.0, //
-                1.0, 0.0, 0.0, //
-                0.0, 0.0, 0.0, //
-                0.0, 1.0, 0.0, //
-                0.0, 0.0, 0.0, //
-                0.0, 0.0, 1.0, //
-                0.0, 0.0, 0.0, //
-                0.0, 0.0, 0.0, //
-            ],
-        );
-    }
-
-    #[test]
-    fn test_pad_batching_lifts_batch_axis_with_zero_paddings() {
-        check_operation_batching!(
-            @exact,
-            operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@replicated, Array::scalar(0.0)),
-                    ],
-                    outputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 3, vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]))],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@replicated, Array::scalar(0.0)),
-                    ],
-                    outputs = [(@replicated, Array::vector(vec![0.0, 1.0, 2.0]))],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
-                    ],
-                    outputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 3, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]))],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
-                    ],
-                    outputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 3, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]))],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_pad_batching_expansion_preserves_batch_placement() {
+    fn test_pad_batching() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =
@@ -816,10 +829,8 @@ mod tests {
             );
             assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
         }
-    }
 
-    #[test]
-    fn test_pad_batching_expands_an_empty_batch() {
+        // Per-item expansion handles an empty batch without inventing values or dropping the mapped placement.
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =

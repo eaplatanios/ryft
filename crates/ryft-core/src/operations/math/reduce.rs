@@ -750,8 +750,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::contexts::EagerContext;
-    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;
     use crate::types::{ArrayType, DataType, Shape, Size};
@@ -1055,17 +1054,15 @@ mod tests {
 
     #[test]
     fn test_reduce_extrema_derivatives_split_ties_evenly() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for kind in [ReductionKind::Max, ReductionKind::Min] {
             let input = Array::vector(vec![1.0, 1.0]);
-            let (primal, tangent) = context
-                .jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), Array::vector(vec![1.0, 3.0]))
-                .unwrap();
+            let (primal, tangent) =
+                jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), Array::vector(vec![1.0, 3.0])).unwrap();
             assert_eq!(primal.values(), &[1.0]);
             assert_eq!(tangent.values(), &[2.0]);
 
             let (primal, gradient) =
-                context.value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)), input).unwrap();
+                value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)), input).unwrap();
             assert_eq!(primal.values(), &[1.0]);
             assert_abs_diff_eq!(gradient.values()[0], 0.5, epsilon = 1e-9);
             assert_abs_diff_eq!(gradient.values()[1], 0.5, epsilon = 1e-9);

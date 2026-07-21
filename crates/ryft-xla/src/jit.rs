@@ -3396,10 +3396,8 @@ mod tests {
             &key.reshape(static_shape(&[1, dimension]))?,
             &[position.clone(), zero_index.clone()],
         )?;
-        let cache_values = state[3].dynamic_update_slice(
-            &value.reshape(static_shape(&[1, dimension]))?,
-            &[position.clone(), zero_index],
-        )?;
+        let cache_values = state[3]
+            .dynamic_update_slice(&value.reshape(static_shape(&[1, dimension]))?, &[position.clone(), zero_index])?;
 
         // Masked scaled dot-product attention over the visible cache prefix `[0, position]`.
         let attended = match attention {
@@ -3422,10 +3420,8 @@ mod tests {
                 weights.dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
             }
             DecodeAttention::CustomCall => {
-                let operation = CustomCallOperation::new(
-                    DECODE_ATTENTION_CUSTOM_CALL_TARGET,
-                    vec![query.r#type().into_owned()],
-                );
+                let operation =
+                    CustomCallOperation::new(DECODE_ATTENTION_CUSTOM_CALL_TARGET, vec![query.r#type().into_owned()]);
                 let inputs = [cache_keys.clone(), cache_values.clone(), query, position.clone()];
                 V::custom_call(&operation, &inputs)?.remove(0)
             }
@@ -3492,8 +3488,7 @@ mod tests {
             carry_types,
         )
         .unwrap();
-        let outputs =
-            context.bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &inputs).unwrap();
+        let outputs = context.bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &inputs).unwrap();
         vec![outputs[4].clone(), outputs[2].clone(), outputs[3].clone()]
     }
 

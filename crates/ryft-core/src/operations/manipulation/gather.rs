@@ -35,11 +35,10 @@ use super::slicing::{batch_by_item_expansion, is_integer};
 /// Canonical operation name for [`GatherOperation`].
 pub const GATHER_OPERATION_NAME: &str = "gather";
 
-/// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scatter::Scatter), mirroring JAX's
-/// [`GatherScatterMode`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.GatherScatterMode.html). The mode does
-/// not affect the output [`Type`](crate::programs::types::Type) — only how a start index that would read or write outside the
-/// operand is treated at execution time. It is shared by both operations (gather and scatter both reference it; the
-/// scatter combiner kind lives in [`super::scatter`]).
+/// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scatter::Scatter). The mode does not
+/// affect the output [`Type`](crate::programs::types::Type)—only how a start index that would read or write outside
+/// the operand is treated at execution time. It is shared by both operations; the scatter combiner kind lives in
+/// [`super::scatter`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GatherScatterMode {
     /// The caller promises every index is in bounds; out-of-bounds behavior is undefined (and gradients are wrong if
@@ -73,9 +72,7 @@ impl Display for GatherScatterMode {
 }
 
 /// Specification of how the index operand and the sliced windows map onto the operand and output axes of a
-/// [`gather`](Gather), mirroring StableHLO's
-/// [`gather`](https://openxla.org/stablehlo/spec#gather) dimension numbers and JAX's
-/// [`GatherDimensionNumbers`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.GatherDimensionNumbers.html).
+/// [`gather`](Gather), following StableHLO's [`gather`](https://openxla.org/stablehlo/spec#gather) dimension numbers.
 ///
 /// The index vector dimension is implicit and always the last axis of the indices operand (JAX's convention): the
 /// indices operand has shape `[batch..., index_vector]`, where each length-`index_vector` slice is one start-index
@@ -339,11 +336,9 @@ impl Operation<ArrayType> for GatherOperation {
 
 /// Value-level gather capability: the receiver-style entry point for staging or executing [`GatherOperation`].
 ///
-/// This is the direct analogue of the StableHLO [`gather`](https://openxla.org/stablehlo/spec#gather) operation and
-/// JAX's [`lax.gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.gather.html). The receiver is the operand
-/// (the data source); `indices` is a separate integer-typed value whose last axis holds each start-index vector. The
-/// output assembles the sliced windows according to `operation`'s [`GatherDimensionNumbers`]; see that type for the
-/// shape rule and the implicit index-vector-dimension convention.
+/// The receiver is the operand (the data source); `indices` is a separate integer-typed value whose last axis holds
+/// each start-index vector. The output assembles the sliced windows according to `operation`'s
+/// [`GatherDimensionNumbers`]; see that type for the shape rule and the implicit index-vector-dimension convention.
 ///
 /// # Example
 ///
@@ -379,7 +374,7 @@ pub trait Gather: Sized {
 
 impl Gather for ArrayType {
     /// Type-level gather: validates the dimension numbers and slice sizes against the operand and indices types and
-    /// computes the output shape and placement. Mirrors JAX's `_gather_shape_rule`/`_gather_sharding_rule`.
+    /// computes the output shape and placement.
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
         let operand = self;
         let dimensions = operation.dimensions();
@@ -490,16 +485,15 @@ impl Gather for ArrayType {
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
-            if let Size::Static(extent) = operand.dimension(axis as isize) {
-                if size > extent {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent \
-                             {extent}"
-                        ),
-                    }
-                    .into());
+            if let Size::Static(extent) = operand.dimension(axis as isize)
+                && size > extent
+            {
+                return Err(TypeError {
+                    message: format!(
+                        "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent {extent}"
+                    ),
                 }
+                .into());
             }
             if collapsed.contains(&axis) && size != 1 {
                 return Err(TypeError {
@@ -620,16 +614,16 @@ impl Gather for ArrayType {
                     }
                 }
             }
-            if let Some(sharding) = indices_sharding {
-                if dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension]) {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{GATHER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
-                             mesh axes"
-                        ),
-                    }
-                    .into());
+            if let Some(sharding) = indices_sharding
+                && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension])
+            {
+                return Err(TypeError {
+                    message: format!(
+                        "'{GATHER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
+                         mesh axes"
+                    ),
                 }
+                .into());
             }
 
             // Propagate placement: offset positions inherit the operand window axes; the remaining positions inherit
@@ -1056,16 +1050,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::{check_operation_batching, check_operation_transposition};
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::contexts::Context;
+    use crate::macros::{
+        check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
+        check_operation_type_inference,
+    };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::linear::DenseDifferentiate;
+    use crate::tracing_v2::jacfwd;
     use crate::types::DataType;
 
     use super::*;
@@ -1078,8 +1072,18 @@ mod tests {
         ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
     }
 
+    /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
+    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
+    where
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
+    {
+        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
+        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
+    }
+
     #[test]
-    fn test_gather_take_rows_inference_and_rendering() {
+    fn test_gather() {
         // Take whole rows of a [3, 2] matrix indexed by a [2, 1] index array: offset axis 1 carries the row (slice
         // sizes [1, 2]); axis 0 (the collapsed row axis) is driven by the start index.
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
@@ -1089,9 +1093,22 @@ mod tests {
 
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
-        assert_eq!(
-            operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
-            Ok(vec![float_type(vec![2, 2])])
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [operand.clone(), indices.clone()],
+                    output_types = [float_type(vec![2, 2])],
+                },
+                {
+                    input_types = [operand.clone()],
+                    error = "expected 2 inputs but got 1",
+                },
+                {
+                    input_types = [operand.clone(), float_type(vec![2, 1])],
+                    error = "'gather' indices must be integer-typed but have type f32[2, 1]",
+                },
+            ],
         );
 
         assert_eq!(
@@ -1104,19 +1121,90 @@ mod tests {
                 "]",
             ),
         );
+
+        // Interpretation handles each out-of-bounds mode explicitly.
+        let scalar_dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
+        let scalar_indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 5.0]);
+        let run = |mode| {
+            Array::vector(vec![10.0, 20.0, 30.0, 40.0])
+                .gather(&scalar_indices, &GatherOperation::new(scalar_dimensions.clone(), vec![1]).with_mode(mode))
+                .unwrap()
+                .to_f64s()
+        };
+        assert_eq!(run(GatherScatterMode::Clip), vec![20.0, 40.0]);
+        assert_eq!(run(GatherScatterMode::PromiseInBounds), vec![20.0, 40.0]);
+        assert_eq!(run(GatherScatterMode::FillOrDrop), vec![20.0, 0.0]);
+
+        // Partial evaluation folds fully known gathers and residualizes an unknown data operand with known indices.
+        let operand_value = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let indices_value = Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]);
+        let expected = Array::matrix(2, 2, vec![0.0, 1.0, 4.0, 5.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = operation.clone(),
+            cases = [
+                {
+                    inputs = [(@known, operand_value.clone()), (@known, indices_value.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = operand_value.r#type().into_owned(), replay = operand_value.clone())),
+                        (@known, indices_value.clone()),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching expands each mapped item independently, including the empty-batch boundary.
+        check_operation_batching!(
+            @exact,
+            operation = operation.clone(),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 2.into()])),
+                        (0..12).map(|value| value as f64).collect(),
+                    )),
+                    (@replicated, indices_value),
+                ],
+                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 2.into()])),
+                    vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0, 10.0, 11.0],
+                ))],
+            }],
+        );
+        check_operation_batching!(
+            @exact,
+            operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]),
+            axis_size = 0,
+            cases = [{
+                inputs = [
+                    (@mapped(axis = 0), Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![0.into(), 3.into()])),
+                        Vec::new(),
+                    )),
+                    (@mapped(axis = 0), Array::from_f64s(
+                        ArrayType::new(DataType::I32, Shape::new(vec![0.into(), 1.into(), 1.into()])),
+                        Vec::new(),
+                    )),
+                ],
+                outputs = [(@mapped(axis = 0), Array::from_f64s(
+                    ArrayType::new(DataType::F64, Shape::new(vec![0.into(), 1.into()])),
+                    Vec::new(),
+                ))],
+            }],
+        );
     }
 
     #[test]
-    fn test_gather_rejects_invalid_dimension_numbers() {
+    fn test_gather_dimension_numbers() {
         let operand = float_type(vec![3, 2]);
         let indices = indices_type(vec![2, 1]);
-
-        // Non-integer indices are rejected.
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        assert_eq!(
-            operation.infer_output_types(&[operand.clone(), float_type(vec![2, 1])], &[]),
-            Err(TypeError { message: "'gather' indices must be integer-typed but have type f32[2, 1]".to_string() }),
-        );
 
         // start_index_map length must equal the index vector extent (here 1, not 2).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
@@ -1149,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_propagates_and_replicates_sharding() {
+    fn test_array_type_gather() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -1181,26 +1269,6 @@ mod tests {
         let indices = indices_type(vec![3, 1]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         assert!(operation.infer_output_types(&[operand, indices], &[]).is_err());
-    }
-
-    #[test]
-    fn test_gather_eager_modes() {
-        use crate::backends::arrays::Array;
-
-        // Gather scalars from [10, 20, 30, 40] at positions 1 and 5; position 5 is out of bounds (last valid is 3).
-        let dimensions = GatherDimensionNumbers::new(vec![], vec![0], vec![0]);
-        let indices = Array::from_f64s(indices_type(vec![2, 1]), vec![1.0, 5.0]);
-        let run = |mode| {
-            Array::vector(vec![10.0, 20.0, 30.0, 40.0])
-                .gather(&indices, &GatherOperation::new(dimensions.clone(), vec![1]).with_mode(mode))
-                .unwrap()
-                .to_f64s()
-        };
-        // Clip and promise-in-bounds clamp the out-of-bounds index to the last valid start.
-        assert_eq!(run(GatherScatterMode::Clip), vec![20.0, 40.0]);
-        assert_eq!(run(GatherScatterMode::PromiseInBounds), vec![20.0, 40.0]);
-        // Fill-or-drop fills the out-of-bounds query with zero.
-        assert_eq!(run(GatherScatterMode::FillOrDrop), vec![20.0, 0.0]);
     }
 
     /// Minimal operation enum hosting the primal [`GatherOperation`] (the forward gather) and the primal
@@ -1237,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_partitioned_transpose_computes_scatter_add_adjoint() {
+    fn test_gather_differentiation() {
         // Take rows 0 and 2 of a [3, 2] operand: the operand is linear and the [2, 1] index array is the known
         // operand. The gathered output and its cotangent have shape [2, 2].
         let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
@@ -1258,53 +1326,18 @@ mod tests {
                 input_cotangents = [Array::matrix(3, 2, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0])],
             }],
         );
-    }
 
-    /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
-    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
-    where
-        V: crate::programs::Value<Type = ArrayType>,
-        V::DispatchDomain: crate::contexts::Context<Constant = Array>,
-    {
-        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
-        exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
-    }
-
-    #[test]
-    fn test_gather_value_and_grad_scatters_at_captured_indices() {
-        // f(x) = sum(gather(x, [[0], [2]])) takes rows 0 and 2 of a 3x2 matrix; the integer indices are constants of
-        // the trace, so the gather/scatter-add transpose duality pulls the all-ones cotangent back into a zero operand
-        // at exactly those rows.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x| {
-                    let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
-                    let operation =
-                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                    x.gather(&indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
-                },
-                Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 10.0, epsilon = 1e-9);
-        assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn test_gather_jacfwd_selects_operand_coordinates() {
-        // Forward mode through `f(x) = gather(x, [[0], [2]])` selects the operand coordinate feeding each output, so the
-        // Jacobian is the row-selection indicator from the captured-index linear gather.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
-                |x| {
-                    let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
-                    let operation =
-                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                    Ok(x.gather(&indices, &operation).unwrap())
-                },
-                Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-            )
-            .unwrap();
+        // Forward mode selects the operand coordinate feeding each gathered output.
+        let jacobian = jacfwd(
+            |operand| {
+                let indices = index_array(&operand, vec![2, 1], vec![0.0, 2.0]);
+                let operation =
+                    GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+                Ok(operand.gather(&indices, &operation).unwrap())
+            },
+            Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+        )
+        .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2, 2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3, 2]);
@@ -1316,26 +1349,6 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
                 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
             ],
-        );
-    }
-
-    #[test]
-    fn test_gather_batching_expands_an_empty_batch() {
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(3)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(0), Size::Static(1), Size::Static(1)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(1)]));
-        check_operation_batching!(
-            @exact,
-            operation = GatherOperation::new(GatherDimensionNumbers::new(Vec::new(), vec![0], vec![0]), vec![1]),
-            axis_size = 0,
-            cases = [{
-                inputs = [
-                    (@mapped(axis = 0), Array::from_f64s(operand_type, Vec::new())),
-                    (@mapped(axis = 0), Array::from_f64s(indices_type, Vec::new())),
-                ],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(output_type, Vec::new()))],
-            }],
         );
     }
 }

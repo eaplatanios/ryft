@@ -37,6 +37,8 @@ use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType};
 
+// TODO(eaplatanios): Review this.
+
 /// Canonical operation name for [`ConditionOperation`].
 pub const CONDITION_OPERATION_NAME: &str = "condition";
 
@@ -1124,9 +1126,9 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::batching::{Batch, BatchingTracer};
+    use crate::batching::{BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
+    use crate::differentiation::{DifferentiationTracer, LinearizationTracer, jvp, linearize};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{AddOperation, DivOperation, SinOperation};
@@ -1135,7 +1137,6 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::tracing_v2::test_util::scalar_scale_branch;
     use crate::types::{DataType, Shape, Size};
 
@@ -1530,8 +1531,7 @@ mod tests {
         let operand_atom = builder.borrow_mut().add_input(operand_type);
         let predicate_tracer = parent.tracer(predicate_atom, None);
         let operand_tracer = parent.tracer(operand_atom, None);
-        let output = Batch::batch(
-            &parent,
+        let output = batch(
             |(predicate, x)| {
                 let condition_regions = vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)];
                 let condition = ConditionOperation::new();
@@ -1584,8 +1584,7 @@ mod tests {
             builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         let predicate_tracer = parent.tracer(predicate_atom, None);
         let operand_tracer = parent.tracer(operand_atom, None);
-        let output = Batch::batch(
-            &parent,
+        let output = batch(
             |(predicate, x)| {
                 let condition_regions = vec![scalar_scale_branch(2.0), constant_branch];
                 let condition = ConditionOperation::new();
@@ -1618,23 +1617,21 @@ mod tests {
     /// and merges their outputs per batch item through the `Select` batching rule.
     #[test]
     fn test_condition_batching_selects_branch_outputs_per_item_for_batch_varying_predicates() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let output = context
-            .batch(
-                |(predicate, x)| {
-                    let outputs = x.context().bind(
-                        ArrayOperation::Condition(ConditionOperation::new()),
-                        vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
-                        &[predicate.clone(), x.clone()],
-                    )?;
-                    Ok(outputs.into_iter().next().unwrap())
-                },
-                (Array::vector(vec![true, false, true]), Array::vector(vec![1.0, 4.0, 9.0])),
-                (BatchAxis::new(0), BatchAxis::new(0)),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
+        let output = batch(
+            |(predicate, x)| {
+                let outputs = x.context().bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+                    &[predicate.clone(), x.clone()],
+                )?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (Array::vector(vec![true, false, true]), Array::vector(vec![1.0, 4.0, 9.0])),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
         assert_eq!(output.to_f64s(), vec![2.0, 12.0, 18.0]);
     }
 
@@ -1652,8 +1649,7 @@ mod tests {
                 .unwrap();
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
         };
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let result: Result<Array, BatchingError> = context.batch(
+        let result: Result<Array, BatchingError> = batch(
             |(predicate, x)| {
                 let outputs = x.context().bind(
                     ArrayOperation::Condition(ConditionOperation::new()),
@@ -1685,26 +1681,25 @@ mod tests {
         for (predicate, expected_value, expected_tangent) in
             [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
         {
-            let (value, pushforward) = TestContext::new()
-                .linearize(
-                    move |input: TestTracer| {
-                        let predicate = input.context().lift(Array::from_f64s(
-                            ArrayType::scalar(DataType::Boolean),
-                            vec![if predicate { 1.0 } else { 0.0 }],
-                        ))?;
-                        let mut outputs = input.context().bind(
-                            ArrayOperation::Condition(ConditionOperation::new()),
-                            vec![
-                                scalar_branch(ArrayOperation::Add(AddOperation)),
-                                scalar_branch(ArrayOperation::Sin(SinOperation)),
-                            ],
-                            &[predicate, input.clone()],
-                        )?;
-                        Ok(outputs.remove(0))
-                    },
-                    Array::scalar(0.7),
-                )
-                .unwrap();
+            let (value, pushforward) = linearize(
+                move |input: TestTracer| {
+                    let predicate = input.context().lift(Array::from_f64s(
+                        ArrayType::scalar(DataType::Boolean),
+                        vec![if predicate { 1.0 } else { 0.0 }],
+                    ))?;
+                    let mut outputs = input.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![
+                            scalar_branch(ArrayOperation::Add(AddOperation)),
+                            scalar_branch(ArrayOperation::Sin(SinOperation)),
+                        ],
+                        &[predicate, input.clone()],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                Array::scalar(0.7),
+            )
+            .unwrap();
             assert_eq!(value, Array::scalar(expected_value));
             assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
         }
@@ -1715,22 +1710,21 @@ mod tests {
         type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = DifferentiationTracer<TestContext>;
 
-        let (primal, tangent) = TestContext::new()
-            .jvp(
-                |input: TestTracer| {
-                    let predicate =
-                        input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
-                    let mut outputs = input.context().bind(
-                        ArrayOperation::Condition(ConditionOperation::new()),
-                        vec![boolean_branch(), boolean_branch()],
-                        &[predicate, input.clone()],
-                    )?;
-                    Ok(outputs.remove(0))
-                },
-                Array::scalar(2.0),
-                Array::scalar(3.0),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |input: TestTracer| {
+                let predicate =
+                    input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+                let mut outputs = input.context().bind(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    vec![boolean_branch(), boolean_branch()],
+                    &[predicate, input.clone()],
+                )?;
+                Ok(outputs.remove(0))
+            },
+            Array::scalar(2.0),
+            Array::scalar(3.0),
+        )
+        .unwrap();
         assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
         assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
     }

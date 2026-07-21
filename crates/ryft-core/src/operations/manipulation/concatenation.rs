@@ -229,8 +229,7 @@ where
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         }
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
+        let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
@@ -247,9 +246,8 @@ where
     }
 }
 
-/// Represents the ability to join two or more arrays end to end along one axis. This is the direct analogue of the
-/// StableHLO [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation and JAX's
-/// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html).
+/// Represents the ability to join two or more arrays end to end along one axis, with the semantics of StableHLO's
+/// [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation.
 ///
 /// `Concatenate::concatenate(operands, axis)` returns an array whose elements along `axis` are the elements of the
 /// first operand followed by the elements of the second operand, and so on. There must be at least one operand, all
@@ -277,8 +275,7 @@ where
 /// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Join two 1x2 matrices along axis 0 into a 2x2 matrix. This is equivalent to
-/// // `jax.lax.concatenate([x, y], dimension=0)` in JAX.
+/// // Join two 1x2 matrices along axis 0 into a 2x2 matrix.
 /// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
 /// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
 /// let z = Concatenate::concatenate(&[x, y], 0)?;
@@ -441,30 +438,29 @@ where
             );
         };
         let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), Vec::new(), operands)?;
-        crate::macros::check_count!("output", outputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
-    use crate::macros::check_operation_batching;
-    use crate::operations::math::{Reduce, ReductionKind};
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::linear::DenseDifferentiate;
     use crate::types::DataType;
 
     use super::*;
@@ -483,9 +479,39 @@ mod tests {
         let first_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         let second_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2)]));
-        assert_eq!(
-            operation.infer_output_types(&[first_type.clone(), second_type.clone()], &[]),
-            Ok(vec![output_type.clone()]),
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [first_type.clone(), second_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "'concatenate' expects at least one operand but got none",
+                },
+                {
+                    input_types = [first_type.clone(), ArrayType::scalar(DataType::F64)],
+                    error = "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has \
+                        rank 2",
+                },
+                {
+                    input_types = [
+                        first_type.clone(),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+                    ],
+                    error = "'concatenate' operands must share one data type but operand 1 has data type f32 and \
+                        operand 0 has data type f64",
+                },
+                {
+                    input_types = [
+                        first_type.clone(),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
+                    ],
+                    error = "'concatenate' operands must agree on every axis other than 0 but operand 1 has size 5 \
+                        on axis 1 and operand 0 has size 2",
+                },
+            ],
         );
         assert_eq!(ArrayType::concatenate(&[first_type.clone(), second_type.clone()], 0), Ok(output_type.clone()),);
 
@@ -528,49 +554,10 @@ mod tests {
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Dynamic(None)]))]),
         );
 
-        // Invalid inputs report precise operation and capability errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }),
-        );
+        // Invalid axes and mismatched dynamic dimensions report precise operation errors.
         assert_eq!(
             ConcatenateOperation::new(2).infer_output_types(&[first_type.clone(), second_type.clone()], &[]),
             Err(TypeError { message: "'concatenate' axis 2 is out of bounds for operands of rank 2".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[first_type.clone(), ArrayType::scalar(DataType::F64)], &[]),
-            Err(TypeError {
-                message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 2"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    first_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
-                ],
-                &[]
-            ),
-            Err(TypeError {
-                message: "'concatenate' operands must share one data type but operand 1 has data type f32 and operand \
-                    0 has data type f64"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    first_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
-                ],
-                &[]
-            ),
-            Err(TypeError {
-                message: "'concatenate' operands must agree on every axis other than 0 but operand 1 has size 5 on \
-                    axis 1 and operand 0 has size 2"
-                    .to_string(),
-            }),
         );
         // A non-concatenated dynamic axis must match per `Size` equality across operands.
         assert_eq!(
@@ -606,10 +593,104 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check standard partial evaluation with known and residual operands.
+        let first = Array::vector(vec![1.0, 2.0]);
+        let second = Array::vector(vec![3.0, 4.0, 5.0]);
+        let expected = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ConcatenateOperation::new(0),
+            cases = [
+                {
+                    inputs = [(@known, first.clone()), (@known, second.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
+                        (@known, second.clone()),
+                    ],
+                    outputs = [(@residual, expected.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = first.r#type().into_owned(), replay = first.clone())),
+                        (@unknown(type = second.r#type().into_owned(), replay = second.clone())),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Batching aligns mapped and replicated operands before lifting the concatenation axis.
+        check_operation_batching!(
+            @exact,
+            operation = ConcatenateOperation::new(0),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@replicated, Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        4,
+                        vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::vector(vec![1.0, 2.0])),
+                        (@replicated, Array::vector(vec![3.0])),
+                    ],
+                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                },
+            ],
+        );
+
+        // Concatenate is linear in each operand: the JVP concatenates tangents and the pullback splits cotangents.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = ConcatenateOperation::new(0),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
+                tangents = [Array::vector(vec![0.5, 1.0]), Array::vector(vec![1.5, 2.0, 2.5])],
+                primal_outputs = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
+                tangent_outputs = [Array::vector(vec![0.5, 1.0, 1.5, 2.0, 2.5])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = ConcatenateOperation::new(0),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                ],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
+                input_cotangents = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
+            }],
+        );
     }
 
     #[test]
-    fn test_concatenate_propagates_operand_sharding() {
+    fn test_array_type_concatenate() {
         use std::collections::BTreeSet;
 
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -664,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concatenate_array_kernel() {
+    fn test_array_concatenate() {
         // A rank-3 concatenation along a middle axis exercises the row-major odometer: the two operands interleave
         // their middle-axis blocks while keeping the leading and trailing axes intact.
         let first = Array::from_f64s(
@@ -702,85 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concatenate_value_and_grad_routes_cotangent_per_operand() {
-        // f(x, y) = sum(concatenate([x, y], 0) * w) with w = [1, 2, 3, 4, 5]: the joined output is [x0, x1, y0, y1,
-        // y2], so f = x0 + 2*x1 + 3*y0 + 4*y1 + 5*y2. The pullback slices the weighted cotangent [1, 2, 3, 4, 5] into
-        // the first two entries for x and the last three for y.
-        let (value, (x_gradient, y_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(x, y)| {
-                    let weights = x.context().lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
-                    (Concatenate::concatenate(&[x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-                },
-                (Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])),
-            )
-            .unwrap();
-        // f = 1 + 4 + 9 + 16 + 25 = 55.
-        assert_abs_diff_eq!(value.to_f64s()[0], 55.0, epsilon = 1e-9);
-        assert_eq!(x_gradient.to_f64s(), vec![1.0, 2.0]);
-        assert_eq!(y_gradient.to_f64s(), vec![3.0, 4.0, 5.0]);
-    }
-
-    #[test]
-    fn test_concatenate_jacfwd_stacks_operand_coordinates() {
-        // Forward mode through `f(x, y) = concatenate([x, y], 0)` over `x = [a, b]` and `y = [c]` produces one
-        // selection Jacobian block per operand: `x` maps to the first two output rows and `y` to the last.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
-                |(x, y)| Concatenate::concatenate(&[x, y], 0),
-                (Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0])),
-            )
-            .unwrap();
-        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-        let [x_block, y_block] = blocks.as_slice() else { unreachable!() };
-        assert_eq!(x_block.output_type().static_shape().unwrap().as_slice(), &[3]);
-        assert_eq!(x_block.input_type().static_shape().unwrap().as_slice(), &[2]);
-        // d(output)/d(x): output rows 0 and 1 are x0 and x1; row 2 (from y) is unaffected by x.
-        assert_eq!(x_block.value().values(), &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(y_block.output_type().static_shape().unwrap().as_slice(), &[3]);
-        assert_eq!(y_block.input_type().static_shape().unwrap().as_slice(), &[1]);
-        // d(output)/d(y): only output row 2 (from y0) depends on y.
-        assert_eq!(y_block.value().values(), &[0.0, 0.0, 1.0]);
-    }
-
-    #[test]
-    fn test_concatenate_batching_lifts_batch_axis() {
-        check_operation_batching!(
-            @exact,
-            operation = ConcatenateOperation::new(0),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0])),
-                    ],
-                    outputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 4, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]))],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
-                        (@replicated, Array::vector(vec![8.0, 9.0])),
-                    ],
-                    outputs = [(@mapped(
-                        axis = 0
-                    ), Array::matrix(2, 4, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]))],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::vector(vec![1.0, 2.0])),
-                        (@replicated, Array::vector(vec![3.0])),
-                    ],
-                    outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_concatenate_batching_preserves_materialized_batch_placement() {
+    fn test_concatenate_batching() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =

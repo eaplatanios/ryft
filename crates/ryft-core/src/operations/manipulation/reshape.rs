@@ -30,7 +30,7 @@ pub const RESHAPE_OPERATION_NAME: &str = "reshape";
 /// [`Operation`] that reshapes its input array to a target [`Shape`]. The input shape is not part of the operation
 /// payload; it is recoverable from the staged input types wherever a rule needs it. Refer to the documentation of
 /// [`Reshape`] for more information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshapeOperation {
     /// Output [`Shape`] of this [`ReshapeOperation`].
     shape: Shape,
@@ -251,15 +251,13 @@ where
 }
 
 /// Represents the ability to reshape an array to a target [`Shape`] without changing its element count or its layout.
-/// This is the direct analogue of JAX's
-/// [`jnp.reshape`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.reshape.html).
 ///
 /// `t.reshape(target_shape)` reinterprets `t`'s payload under the specified target [`Shape`]. The input and target
 /// shapes must have equal element counts. When the input carries a [`Sharding`], it is propagated using singleton
 /// stripping and contiguous split/merge grouping: dimensions that map one-to-one keep their sharding, while dimensions
 /// that split or merge must be replicated.
 ///
-/// # Example
+/// # Examples
 ///
 /// The following example shows how to use [`Reshape`] in practice:
 ///
@@ -446,24 +444,11 @@ where
         let mut outputs = self.dispatch_domain().bind(
             ReshapeOperation::new(output_type.shape().clone()),
             Vec::new(),
-            &[self.clone()],
+            std::slice::from_ref(self),
         )?;
         Ok(outputs.remove(0))
     }
 }
-
-/// Convenience trait for values that support reshape.
-pub trait ReshapeOps: Reshape + Sized {}
-
-impl<T: Reshape> ReshapeOps for T {}
-
-/// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
-///
-/// This is the trait bound most reshape-aware transforms use when they need both the abstract leaf
-/// contract and the value-level reshape operation.
-pub trait ReshapeValue: Value<Type = ArrayType> + ReshapeOps {}
-
-impl<T: Value<Type = ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 #[cfg(test)]
 mod tests {
@@ -471,8 +456,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::EagerContext;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
@@ -496,7 +484,23 @@ mod tests {
         // Type inference validates the element count and returns the target shape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
         let output_type = ArrayType::new(DataType::F64, shape.clone());
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![output_type.clone()]));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]))],
+                    error = "'reshape' changes the number of elements",
+                },
+            ],
+        );
 
         // Type-level (abstract) reshaping validates the target shape and returns the output type without consuming
         // the borrowed input type.
@@ -510,15 +514,7 @@ mod tests {
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        // Invalid inputs report precise operation and interpreter errors.
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]))], &[]),
-            Err(TypeError { message: "'reshape' changes the number of elements".to_string() }),
-        );
+        // Invalid interpreter arity reports the exact program error.
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
@@ -543,11 +539,66 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // Check the standard partial-evaluation contract for both known and residual inputs.
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            cases = [
+                {
+                    inputs = [(@known, input.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(type = input.r#type().into_owned(), replay = input.clone()))],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+
+        // Check batching, forward differentiation, and the inverse-reshape pullback.
+        let batched_input = Array::matrix(2, 6, (0..12).map(|value| value as f64).collect());
+        let batched_output = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into()])),
+            (0..12).map(|value| value as f64).collect(),
+        );
+        check_operation_batching!(
+            @exact,
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), batched_input)],
+                outputs = [(@mapped(axis = 0), batched_output)],
+            }],
+        );
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 2.into()])),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0])],
+                tangents = [Array::vector(vec![5.0, 6.0, 7.0, 8.0])],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])],
+                tangent_outputs = [Array::matrix(2, 2, vec![5.0, 6.0, 7.0, 8.0])],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+            }],
+        );
     }
 
     // TODO(eaplatanios): A single dynamic dimension should be allowed.
     #[test]
-    fn test_reshape_with_dynamic_dimensions() {
+    fn test_array_type_reshape() {
         // Reshaping requires statically known element counts on both sides, so dynamic input and target shapes are
         // rejected with precise errors at the type level, through operation inference, and through value kernels.
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
@@ -578,10 +629,8 @@ mod tests {
 
         // Reshaping a dynamically sized type to its own shape short-circuits as the identity.
         assert_eq!(dynamic_type.reshape(dynamic_type.shape().clone()), Ok(dynamic_type.clone()));
-    }
 
-    #[test]
-    fn test_reshape_preserves_sharding_across_inserted_singleton_axes() {
+        // Singleton insertion preserves the corresponding non-singleton dimension placement.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -602,10 +651,8 @@ mod tests {
                 )
                 .unwrap())
         );
-    }
 
-    #[test]
-    fn test_reshape_merges_replicated_axes_and_preserves_unchanged_sharding() {
+        // Merging replicated axes preserves an independent unchanged sharded dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2), Size::Static(3)]))
@@ -630,10 +677,8 @@ mod tests {
                 )
                 .unwrap())
         );
-    }
 
-    #[test]
-    fn test_reshape_splits_replicated_axis_and_preserves_unchanged_sharding() {
+        // Splitting a replicated axis likewise preserves an unchanged sharded dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(6)]))
             .with_sharding(
@@ -657,11 +702,7 @@ mod tests {
                 )
                 .unwrap())
         );
-    }
 
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_reshape_preserves_reduction_state_axes() {
         // Reshape regroups ranked dimensions but leaves the reduction-state (unreduced/reduced) and varying-manual
         // axis sets untouched, since those describe mesh axes that do not correspond to ranked array dimensions.
         let mesh = LogicalMesh::new(vec![
@@ -695,10 +736,8 @@ mod tests {
                 )
                 .unwrap())
         );
-    }
 
-    #[test]
-    fn test_reshape_rejects_partitioned_split() {
+        // A genuinely split sharded dimension cannot preserve its placement.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
@@ -709,10 +748,8 @@ mod tests {
                 message: "'reshape' cannot preserve sharding across the requested reshape".to_string(),
             })),
         );
-    }
 
-    #[test]
-    fn test_reshape_rejects_partitioned_merge() {
+        // A genuinely merged sharded dimension cannot preserve its placement either.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
             .with_sharding(
@@ -725,10 +762,8 @@ mod tests {
                 message: "'reshape' cannot preserve sharding across the requested reshape".to_string(),
             })),
         );
-    }
 
-    #[test]
-    fn test_reshape_allows_unsharded_many_to_many_group() {
+        // Many-to-many regrouping is supported when every participating dimension is replicated.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(6)]))
             .with_sharding(
@@ -750,31 +785,5 @@ mod tests {
                 )
                 .unwrap())
         );
-    }
-
-    #[test]
-    fn test_reshape_batching_lifts_input_and_output_shapes() {
-        // x has shape [2, 6]; outer batch over axis 0 yields per-item rank-1 vectors of size 6,
-        // which we reshape to per-item [2, 3]. The combined effect should be a [2, 2, 3] tensor
-        // whose leading axis is the original batch dimension.
-        let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
-        let x = Array::matrix(2, 6, x_data.clone());
-
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(3)])),
-        );
-        // Row-major reshape preserves payload ordering; the lifted op only repositions strides.
-        assert_eq!(output.to_f64s(), x_data);
     }
 }

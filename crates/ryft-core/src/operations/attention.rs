@@ -2249,7 +2249,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::ProgramBatchingOutputAxesPolicy;
     use crate::contexts::EagerContext;
-    use crate::differentiation::ReverseModeDifferentiate;
+    use crate::differentiation::value_and_gradient;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -3932,15 +3932,11 @@ mod tests {
 
         let function =
             differentiable_dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(scale, mask, None, None);
-        let (loss_value, (query_gradient, key_gradient, value_gradient)) =
-            EagerContext::<Array, ArrayOperation<Array>>::new()
-                .value_and_gradient(
-                    |(query, key, value)| {
-                        function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                    },
-                    (query.clone(), key.clone(), value.clone()),
-                )
-                .unwrap();
+        let (loss_value, (query_gradient, key_gradient, value_gradient)) = value_and_gradient(
+            |(query, key, value)| function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum),
+            (query.clone(), key.clone(), value.clone()),
+        )
+        .unwrap();
         let loss = |query_values: &[f64], key_values: &[f64], value_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());
@@ -3971,14 +3967,13 @@ mod tests {
         let function = differentiable_dot_product_attention_with_bias::<EagerContext<Array, ArrayOperation<Array>>>(
             scale, mask, None, None,
         );
-        let (_, (_, _, _, bias_gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(query, key, value, bias)| {
-                    function.call((query, key, value, bias)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                },
-                (query, key, value, bias),
-            )
-            .unwrap();
+        let (_, (_, _, _, bias_gradient)) = value_and_gradient(
+            |(query, key, value, bias)| {
+                function.call((query, key, value, bias)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            },
+            (query, key, value, bias),
+        )
+        .unwrap();
         let bias_loss = |bias_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());
@@ -4021,17 +4016,16 @@ mod tests {
             EagerContext<Array, ArrayOperation<Array>>,
         >(scale, mask, None, None);
         let (loss_value, (query_gradient, key_gradient, value_gradient, query_lengths_gradient, _)) =
-            EagerContext::<Array, ArrayOperation<Array>>::new()
-                .value_and_gradient(
-                    |(query, key, value, query_lengths, key_value_lengths)| {
-                        function
-                            .call((query, key, value, query_lengths, key_value_lengths))
-                            .unwrap()
-                            .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                    },
-                    (query.clone(), key.clone(), value.clone(), query_lengths.clone(), key_value_lengths.clone()),
-                )
-                .unwrap();
+            value_and_gradient(
+                |(query, key, value, query_lengths, key_value_lengths)| {
+                    function
+                        .call((query, key, value, query_lengths, key_value_lengths))
+                        .unwrap()
+                        .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                },
+                (query.clone(), key.clone(), value.clone(), query_lengths.clone(), key_value_lengths.clone()),
+            )
+            .unwrap();
         let loss = |query_values: &[f64], key_values: &[f64], value_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());

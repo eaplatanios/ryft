@@ -153,9 +153,10 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::{Array, ArrayOperation};
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::differentiation::{jvp, vjp};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -164,7 +165,6 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -341,23 +341,20 @@ mod tests {
     fn test_mul_complex_differentiation() {
         // Complex arrays differentiate through the same rule: the eager JVP computes `l·dr + dl·r` elementwise over
         // `c128` payloads, and the reverse-mode pullback applies the bilinear (conjugation-free) transpose pairing.
-        let array_context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let left = Complex::new(1.0f64, 2.0);
         let right = Complex::new(0.5f64, -1.0);
         let left_tangent = Complex::new(-0.5f64, 0.25);
         let right_tangent = Complex::new(2.0f64, 1.0);
-        let (primal, tangent) = array_context
-            .jvp(
-                |(left, right)| Ok(left * right),
-                (Array::vector(vec![left]), Array::vector(vec![right])),
-                (Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |(left, right)| Ok(left * right),
+            (Array::vector(vec![left]), Array::vector(vec![right])),
+            (Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])),
+        )
+        .unwrap();
         assert_eq!(primal, Array::vector(vec![left * right]));
         assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]));
-        let (_, pullback) = array_context
-            .vjp(|(left, right)| Ok(left * right), (Array::vector(vec![left]), Array::vector(vec![right])))
-            .unwrap();
+        let (_, pullback) =
+            vjp(|(left, right)| Ok(left * right), (Array::vector(vec![left]), Array::vector(vec![right]))).unwrap();
         let cotangent = Complex::new(0.5f64, 3.0);
         let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent])).unwrap();
         assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]));

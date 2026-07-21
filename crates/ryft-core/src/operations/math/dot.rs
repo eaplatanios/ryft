@@ -2029,7 +2029,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{Batch, BatchAxis};
+    use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::operations::Operation;
@@ -3392,15 +3392,14 @@ mod tests {
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let x = Array::matrix(3, 4, x_data);
 
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .unwrap();
+        let output: Array = batch(
+            |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
+            x,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.

@@ -321,7 +321,7 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::contexts::EagerContext;
+    use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
@@ -331,7 +331,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::types::Typed;
     use crate::programs::values::Concretizable;
-    use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
+    use crate::tracing_v2::{jacfwd, jacrev};
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -557,14 +557,10 @@ mod tests {
     fn test_select_jacfwd_computes_piecewise_derivative() {
         // Forward mode through `f(x) = select(x > 0, 2x, 3x)`: the tangent selects the branch tangents under the
         // same primal condition, so the derivative is 2 where x > 0 and 3 elsewhere.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(2.0))
-            .unwrap();
+        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(-2.0))
-            .unwrap();
+        let jacobian = jacfwd(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
@@ -573,8 +569,6 @@ mod tests {
         // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `EagerContext<Scalar, ScalarOperation<Scalar>>`
         // exercises the scalar select rules: forward mode routes each branch tangent through the selected branch, and
         // reverse mode routes the cotangent there, so the derivative reaches only the selected branch's input.
-        use crate::backends::scalars::ScalarOperation;
-
         fn piecewise<V>(x: V, y: V) -> Result<V, ProgramError>
         where
             V: Clone + Compare<Output = V> + Select + std::ops::Add<Output = V>,
@@ -583,55 +577,47 @@ mod tests {
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
 
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-
         // `x > y`: the output is `2x`, so forward mode passes the `x` tangent through (scaled by 2) and zeroes the `y`
         // tangent, while the gradient is `(2, 0)`.
-        let (primal, tangent) = domain
-            .jvp(
-                |(x, y)| piecewise(x, y),
-                (Scalar::from(3.0), Scalar::from(2.0)),
-                (Scalar::from(1.0), Scalar::from(0.0)),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |(x, y)| piecewise(x, y),
+            (Scalar::from(3.0), Scalar::from(2.0)),
+            (Scalar::from(1.0), Scalar::from(0.0)),
+        )
+        .unwrap();
         assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 2.0, epsilon = 1e-9);
-        let (_, tangent) = domain
-            .jvp(
-                |(x, y)| piecewise(x, y),
-                (Scalar::from(3.0), Scalar::from(2.0)),
-                (Scalar::from(0.0), Scalar::from(1.0)),
-            )
-            .unwrap();
+        let (_, tangent) = jvp(
+            |(x, y)| piecewise(x, y),
+            (Scalar::from(3.0), Scalar::from(2.0)),
+            (Scalar::from(0.0), Scalar::from(1.0)),
+        )
+        .unwrap();
         assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
-        let (value, gradient) = domain
-            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0)))
-            .unwrap();
+        let (value, gradient) =
+            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.0, 2.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.1, 0.0, epsilon = 1e-9);
 
         // `x <= y`: the output is `3y`, so the roles flip; the gradient is `(0, 3)`.
-        let (primal, tangent) = domain
-            .jvp(
-                |(x, y)| piecewise(x, y),
-                (Scalar::from(1.0), Scalar::from(2.0)),
-                (Scalar::from(1.0), Scalar::from(0.0)),
-            )
-            .unwrap();
+        let (primal, tangent) = jvp(
+            |(x, y)| piecewise(x, y),
+            (Scalar::from(1.0), Scalar::from(2.0)),
+            (Scalar::from(1.0), Scalar::from(0.0)),
+        )
+        .unwrap();
         assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
-        let (_, tangent) = domain
-            .jvp(
-                |(x, y)| piecewise(x, y),
-                (Scalar::from(1.0), Scalar::from(2.0)),
-                (Scalar::from(0.0), Scalar::from(1.0)),
-            )
-            .unwrap();
+        let (_, tangent) = jvp(
+            |(x, y)| piecewise(x, y),
+            (Scalar::from(1.0), Scalar::from(2.0)),
+            (Scalar::from(0.0), Scalar::from(1.0)),
+        )
+        .unwrap();
         assert_abs_diff_eq!(tangent, 3.0, epsilon = 1e-9);
-        let (value, gradient) = domain
-            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0)))
-            .unwrap();
+        let (value, gradient) =
+            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.0, 0.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.1, 3.0, epsilon = 1e-9);

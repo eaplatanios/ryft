@@ -4612,9 +4612,7 @@ mod tests {
                                 let sharding = sharding.clone();
                                 move |y| {
                                     let permuted = shard_map::<_, _, ArrayType, GradientTracer>(
-                                        |local_x: ShardMapTracer| {
-                                            local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap()
-                                        },
+                                        |local_x: ShardMapTracer| local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap(),
                                         y,
                                         mesh.clone(),
                                         sharding.clone(),

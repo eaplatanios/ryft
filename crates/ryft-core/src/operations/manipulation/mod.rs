@@ -15,7 +15,7 @@ pub use gather::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
 };
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
-pub use reshape::{RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, ReshapeOps, ReshapeValue};
+pub use reshape::{RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation};
 pub use scatter::{
     LinearScatterAddOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
     ScatterReductionKind,

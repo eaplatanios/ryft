@@ -1278,9 +1278,10 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{
-        ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
+        ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, batch,
     };
     use crate::contexts::EagerContext;
+    use crate::differentiation::value_and_gradient;
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -1362,7 +1363,7 @@ mod tests {
     fn test_collective_over_unbound_axis_is_rejected() {
         use crate::axes::AxisError;
         use crate::backends::arrays::{Array, ArrayOperation};
-        use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingTracer};
+        use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer};
         use crate::contexts::EagerContext;
 
         // The batch binds the axis `"i"`, but the collective names `"j"`, which no enclosing transform binds. Rather
@@ -1370,7 +1371,7 @@ mod tests {
         // `AxisError::UnboundAxisName`, matching JAX's error for a collective over an unbound axis name. The error
         // rides the `ProgramError::Custom` channel as a `BatchingError::Axis` and is re-typed at the public `batch`
         // boundary, so the surfaced error is exactly that variant.
-        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
+        let result: Result<Array, BatchingError> = batch(
             |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 item.collective("j", CollectiveKind::PSum)
             },
@@ -1385,33 +1386,29 @@ mod tests {
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
         use crate::backends::arrays::{Array, ArrayOperation};
-        use crate::batching::{Batch, BatchAxisSpecification};
+        use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::ReverseModeDifferentiate;
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `psum`, which re-broadcasts the cotangent across the batch items, giving `∂g/∂x_i = 1`
         // for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                    let context = x.context().clone();
-                    let total: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| item.collective("i", CollectiveKind::PSum),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::replicated(),
-                        BatchAxisSpecification::named("i"),
-                    )
-                    .unwrap();
-                    total
-                },
-                Array::vector(vec![1.0, 2.0, 3.0]),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let total: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+                    |item| item.collective("i", CollectiveKind::PSum),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("i"),
+                )
+                .unwrap();
+                total
+            },
+            Array::vector(vec![1.0, 2.0, 3.0]),
+        )
+        .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 1.0]);
     }
@@ -1419,34 +1416,30 @@ mod tests {
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
         use crate::backends::arrays::{Array, ArrayOperation};
-        use crate::batching::{Batch, BatchAxisSpecification};
+        use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
-        use crate::tracing_v2::ReverseModeDifferentiate;
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `pmean`, which carries the `1/N` factor, so `∂g/∂x_i = 1/N` for every input. With `x =
         // [1, 2, 3]` (so `N = 3`) the value is `2` and the gradient is `[1/3, 1/3, 1/3]`, witnessing the `1/N`
         // scaling that distinguishes `pmean` from `psum`.
-        let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                    let context = x.context().clone();
-                    let mean: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| item.collective("i", CollectiveKind::PMean),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::replicated(),
-                        BatchAxisSpecification::named("i"),
-                    )
-                    .unwrap();
-                    mean
-                },
-                Array::vector(vec![1.0, 2.0, 3.0]),
-            )
-            .unwrap();
+        let (value, gradient) = value_and_gradient(
+            |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
+                let mean: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+                    |item| item.collective("i", CollectiveKind::PMean),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("i"),
+                )
+                .unwrap();
+                mean
+            },
+            Array::vector(vec![1.0, 2.0, 3.0]),
+        )
+        .unwrap();
         assert_eq!(value.to_f64s(), vec![2.0]);
         assert_eq!(gradient.to_f64s(), vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
     }
@@ -1459,25 +1452,22 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |row| {
-                    let context = row.context().clone();
-                    Ok(Batch::batch(
-                        &context,
-                        |scalar| scalar.collective("outer", CollectiveKind::PSum),
-                        row,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxisSpecification::named("inner"),
-                    )?)
-                },
-                x,
-                BatchAxis::new(0),
-                BatchAxis::replicated(),
-                BatchAxisSpecification::named("outer"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |row| {
+                Ok(batch(
+                    |scalar| scalar.collective("outer", CollectiveKind::PSum),
+                    row,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("inner"),
+                )?)
+            },
+            x,
+            BatchAxis::new(0),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::named("outer"),
+        )
+        .unwrap();
 
         assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
         assert_eq!(output.to_f64s(), vec![4.0, 6.0]);
@@ -1632,7 +1622,7 @@ mod tests {
         // The batch binds only the axis `"i"`, but the `all_gather` names `"x"`, which no enclosing transform binds.
         // Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
         // acting as identity.
-        let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
+        let result: Result<Array, BatchingError> = batch(
             |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
             BatchAxis::new(0),
@@ -1650,15 +1640,14 @@ mod tests {
         // mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
         // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
-                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-                BatchAxis::new(0),
-                BatchAxis::replicated(),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_gather("x", 0),
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            BatchAxis::new(0),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)])));
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -1687,15 +1676,14 @@ mod tests {
         // `[33, 44]`, matching the verified cross-device `shard_map` execution semantics of StableHLO's
         // `reduce_scatter`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.psum_scatter("x", 0),
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.psum_scatter("x", 0),
+            x,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
@@ -1709,17 +1697,14 @@ mod tests {
 
         // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
         // receives item 0's `[1, 2]`.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                    item.ppermute("x", vec![(0, 1), (1, 0)])
-                },
-                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.ppermute("x", vec![(0, 1), (1, 0)]),
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
@@ -1733,15 +1718,14 @@ mod tests {
 
         // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
         // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.ppermute("x", vec![(0, 1)]),
-                Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.ppermute("x", vec![(0, 1)]),
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(output.to_f64s(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 
@@ -1754,15 +1738,14 @@ mod tests {
         // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 0),
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 0),
+            x,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)])),
@@ -1782,15 +1765,14 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
-        let output: Array = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .batch(
-                |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 1),
-                x,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::named("x"),
-            )
-            .unwrap();
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>>| item.all_to_all("x", 0, 1),
+            x,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(4)])),
