@@ -7,7 +7,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -26,7 +26,7 @@ use crate::types::{ArrayType, Shape, Size};
 
 use super::slicing::{batch_by_item_expansion, resized_output_sharding};
 
-// TODO(eaplatanios): Review from here onwards.
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`PadOperation`].
 pub const PAD_OPERATION_NAME: &str = "pad";
@@ -211,6 +211,7 @@ where
         + From<ReduceOperation>
         + From<SubOperation>
         + From<ZeroOperation<ArrayType>>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -260,7 +261,8 @@ where
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", input_cotangents, 1, ProgramError);
-                let input_cotangent = input_cotangents.into_iter().next().unwrap();
+                let input_cotangent =
+                    input_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
                 let all_axes: Vec<usize> = (0..cotangent.r#type().as_ref().rank()).collect();
                 let total_sums = context.stage_operation(
                     ReduceOperation::new(all_axes.clone(), ReductionKind::Sum),
@@ -287,10 +289,12 @@ where
                     &[total_sums.into_iter().next().unwrap(), sliced_sum],
                 )?;
                 check_count!("output", padding_value_cotangents, 1, ProgramError);
-                Ok(vec![
-                    MaybeZero::Value(input_cotangent),
-                    MaybeZero::Value(padding_value_cotangents.into_iter().next().unwrap()),
-                ])
+                let padding_value_cotangent = padding_value_cotangents
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unalign_cotangent(&inputs[1].r#type().cotangent())?;
+                Ok(vec![MaybeZero::Value(input_cotangent), MaybeZero::Value(padding_value_cotangent)])
             }
         }
     }
@@ -354,8 +358,10 @@ where
 ///     `interior_padding` padding elements between each adjacent pair).
 ///
 /// All three padding slices must have length equal to the input rank, and the padding value must be a rank-0 scalar
-/// with the input's data type. Padding requires static input extents: inputs with dynamic dimensions are rejected
-/// because the padded extent cannot be computed from an unknown extent.
+/// with the input's data type in the same memory space. Padding requires static input extents: inputs with dynamic
+/// dimensions are rejected because the padded extent cannot be computed from an unknown extent. A zero-padding
+/// operation passes its input through unchanged. Any non-identity output keeps the input memory space, clears explicit
+/// physical layout metadata, and preserves compatible sharding and reduction state.
 ///
 /// [`Pad`] is the transpose dual of strided [`Slice`]: slicing with stride
 /// `s` keeps every `s`-th element, while padding with `interior_padding = s - 1` puts elements back at every `s`-th
@@ -423,6 +429,16 @@ impl Pad for ArrayType {
             }
             .into());
         }
+        if self.memory() != padding_value.memory() {
+            return Err(TypeError {
+                message: format!(
+                    "'pad' input and padding value must share one memory space but reside in {} and {}",
+                    self.memory(),
+                    padding_value.memory(),
+                ),
+            }
+            .into());
+        }
         let rank = self.rank();
         for (name, padding) in [
             ("edge_padding_low", edge_padding_low),
@@ -435,6 +451,12 @@ impl Pad for ArrayType {
                 }
                 .into());
             }
+        }
+        if edge_padding_low.iter().all(|padding| *padding == 0)
+            && edge_padding_high.iter().all(|padding| *padding == 0)
+            && interior_padding.iter().all(|padding| *padding == 0)
+        {
+            return Ok(self.clone());
         }
         let mut output_dimensions = Vec::with_capacity(rank);
         for axis in 0..rank {
@@ -466,6 +488,7 @@ impl Pad for ArrayType {
         // padding value's sharding does not affect the output.
         let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_memory(self.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -486,6 +509,15 @@ where
         edge_padding_high: &[usize],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().pad(
+            padding_value.r#type().as_ref(),
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+        )?;
+        if output_type.eq(self.r#type().as_ref()) {
+            return Ok(self.clone());
+        }
         let mut outputs = self.dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
             Vec::new(),
@@ -514,7 +546,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::DataType;
+    use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -735,6 +767,32 @@ mod tests {
                 input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]), Array::scalar(24.0)],
             }],
         );
+
+        // The pullback restores the complete cotangent types of both operands after slicing and reducing the output
+        // cotangent.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
+        let padding_type = ArrayType::scalar(DataType::F64)
+            .with_layout(Layout::Strided(StridedLayout::new(Vec::new())))
+            .with_memory(Memory::Host { pinned: true });
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![8.into()])).with_memory(Memory::Host { pinned: true });
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [{
+                inputs = [(@linear(type = input_type.clone())), (@linear(type = padding_type.clone()))],
+                output_cotangents = [Array::from_f64s(
+                    output_type,
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                )],
+                input_cotangents = [
+                    Array::from_f64s(input_type, vec![2.0, 4.0, 6.0]),
+                    Array::from_f64s(padding_type, vec![24.0]),
+                ],
+            }],
+        );
     }
 
     #[test]
@@ -773,6 +831,23 @@ mod tests {
             .with_sharding(sharding.clone())
             .unwrap();
         let pad_value = ArrayType::scalar(DataType::F32);
+
+        // Padding preserves a common memory placement and rejects a padding scalar that would require an implicit
+        // transfer.
+        let host_input =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_memory(Memory::Host { pinned: true });
+        let host_padding = ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true });
+        assert_eq!(host_input.pad(&host_padding, &[0], &[1], &[0]).unwrap().memory(), Memory::Host { pinned: true },);
+        assert_eq!(
+            host_input.pad(&pad_value, &[0], &[1], &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "'pad' input and padding value must share one memory space but reside in Host[Pinned] and \
+                          Device"
+                    .to_string(),
+            })),
+        );
+        let laid_out_input = host_input.with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        assert_eq!(laid_out_input.pad(&host_padding, &[0], &[0], &[0]), Ok(laid_out_input.clone()));
 
         // Padding to an evenly divisible size keeps the operand sharding (including the unreduced manual axis): with
         // low = 0, interior = 0, and high = 4 the output is 0 + 4 + 4 = 8, divisible by the `x` mesh-axis size (2).

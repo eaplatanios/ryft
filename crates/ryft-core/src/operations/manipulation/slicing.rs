@@ -8,6 +8,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    ElementwiseDerivativeAlignment,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -25,9 +26,9 @@ use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, Memory, Shape, Size};
 
-// TODO(eaplatanios): Review from here onwards.
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`SliceOperation`].
 pub const SLICE_OPERATION_NAME: &str = "slice";
@@ -41,39 +42,30 @@ pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 /// Canonical operation name for [`DynamicUpdateSliceOperation`].
 pub const DYNAMIC_UPDATE_SLICE_OPERATION_NAME: &str = "dynamic_update_slice";
 
-// TODO(eaplatanios): This should be a function on `DataType` along with other helpers like
-//  `is_boolean`, `is_floating_point`, etc.
-/// Returns `true` when `data_type` is a signed or unsigned integer type and can therefore carry a slice start index.
-pub(crate) fn is_integer(data_type: DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::I16
-            | DataType::I32
-            | DataType::I64
-            | DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::U8
-            | DataType::U16
-            | DataType::U32
-            | DataType::U64,
-    )
-}
-
 /// Validates the scalar integer start-index operand types of a dynamic slicing operation. Each index type must be a
-/// rank-0 integer type, and all indices must share one integer type. The `operation_name` parameter selects the
-/// reported operation name because this helper serves both [`DynamicSliceOperation`] and
-/// [`DynamicUpdateSliceOperation`].
-fn validate_start_index_types(operation_name: &'static str, index_types: &[ArrayType]) -> Result<(), ProgramError> {
+/// rank-0 integer type, all indices must share one integer type, and every index must reside in `operand_memory`. The
+/// `operation_name` parameter selects the reported operation name because this helper serves both
+/// [`DynamicSliceOperation`] and [`DynamicUpdateSliceOperation`].
+fn validate_start_index_types(
+    operation_name: &'static str,
+    operand_memory: Memory,
+    index_types: &[ArrayType],
+) -> Result<(), ProgramError> {
     for (index, index_type) in index_types.iter().enumerate() {
-        if index_type.rank() != 0 || !is_integer(index_type.data_type()) {
+        if index_type.rank() != 0 || !index_type.data_type().is_integer() {
             return Err(TypeError {
                 message: format!(
                     "'{operation_name}' start index {index} must be a scalar integer but has type {index_type}",
+                ),
+            }
+            .into());
+        }
+        if index_type.memory() != operand_memory {
+            return Err(TypeError {
+                message: format!(
+                    "'{operation_name}' operand and start indices must share one memory space but start index {index} \
+                     resides in {} and the operand resides in {operand_memory}",
+                    index_type.memory(),
                 ),
             }
             .into());
@@ -266,6 +258,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
     O: Operation<ArrayType> + From<UpdateSliceOperation> + From<PadOperation> + From<ZeroOperation<ArrayType>>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -286,7 +279,9 @@ where
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+                let cotangent =
+                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
+                Ok(vec![MaybeZero::Value(cotangent)])
             }
             MaybeZero::Value(cotangent) => {
                 let input_type = inputs[0].r#type();
@@ -317,15 +312,19 @@ where
                     edge_padding_high.push(high);
                     interior_padding.push(stride - 1);
                 }
-                let zero =
-                    MaybeZero::Zero(ArrayType::scalar(input_type.data_type().cotangent())).materialize(context)?;
+                let zero = MaybeZero::Zero(
+                    ArrayType::scalar(input_type.data_type().cotangent()).with_memory(input_type.memory()),
+                )
+                .materialize(context)?;
                 let outputs = context.stage_operation(
                     PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
                     Vec::new(),
                     &[cotangent.clone(), zero],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+                let cotangent =
+                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
+                Ok(vec![MaybeZero::Value(cotangent)])
             }
         }
     }
@@ -370,7 +369,8 @@ where
 /// `start_indices[d] == limit_indices[d]` is empty). All three slices must have length equal to the input rank, and
 /// each axis must satisfy `start_indices[d] <= limit_indices[d] <= input_dimension[d]` and `strides[d] >= 1`. Slicing
 /// requires static input extents: inputs with dynamic dimensions are rejected because the bounds cannot be validated
-/// against an unknown extent.
+/// against an unknown extent. A slice covering the complete input with unit strides passes it through unchanged. Any
+/// other output preserves the input memory space and clears explicit physical layout metadata.
 ///
 /// # Example
 ///
@@ -551,8 +551,12 @@ impl Slice for ArrayType {
             }
             output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
         }
+        if output_dimensions.as_slice() == self.shape().dimensions() {
+            return Ok(self.clone());
+        }
         let sharding = resized_output_sharding(self, &output_dimensions, SLICE_OPERATION_NAME)?;
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_memory(self.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -567,6 +571,10 @@ where
     <V::DispatchDomain as Domain>::Operation: From<SliceOperation>,
 {
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = self.r#type().slice(start_indices, limit_indices, strides)?;
+        if output_type.eq(self.r#type().as_ref()) {
+            return Ok(self.clone());
+        }
         let operation =
             SliceOperation::new(start_indices.to_vec(), limit_indices.to_vec()).with_strides(strides.to_vec())?;
         Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
@@ -684,6 +692,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceOperation
 where
     O: Operation<ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -718,9 +727,11 @@ where
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
+                let update_cotangent =
+                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?;
                 Ok(vec![
                     MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
-                    MaybeZero::Value(update_cotangents.into_iter().next().unwrap()),
+                    MaybeZero::Value(update_cotangent),
                 ])
             }
         }
@@ -768,7 +779,8 @@ where
 /// `start_indices` is replaced by `update`. The update must have the same data type and rank as the input, all of
 /// its dimensions must be static, and each axis must satisfy
 /// `start_indices[d] + update_dimension[d] <= input_dimension[d]`. Unlike [`DynamicUpdateSlice`], the start indices
-/// are validated when the operation is constructed, so no index clamping occurs.
+/// are validated when the operation is constructed, so no index clamping occurs. The input and update must reside in
+/// the same memory space, and the output retains the complete input type, including layout and memory placement.
 ///
 /// # Example
 ///
@@ -808,6 +820,16 @@ impl UpdateSlice for ArrayType {
                     "'update_slice' input data type {} does not match update data type {}",
                     self.data_type(),
                     update.data_type(),
+                ),
+            }
+            .into());
+        }
+        if self.memory() != update.memory() {
+            return Err(TypeError {
+                message: format!(
+                    "'update_slice' input and update must share one memory space but reside in {} and {}",
+                    self.memory(),
+                    update.memory(),
                 ),
             }
             .into());
@@ -1063,9 +1085,13 @@ where
 /// `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`. The output shape is exactly `sizes` and is therefore
 /// fully static even though the slice origin is not. Each static input axis must satisfy
 /// `sizes[d] <= input_dimension[d]`. A [`Size::Dynamic`] input axis is accepted: the clamp keeps the read in bounds
-/// against any runtime extent, and the output dimension is still the static `sizes[d]`, so no bound needs to be
-/// proven against the unknown extent. This is what lets a dynamically-sized stack (such as the residual stacks of an
-/// unbounded-loop pullback) be read iteration by iteration.
+/// against any runtime extent satisfying the operation's `sizes[d] <= input_dimension[d]` precondition, and the output
+/// dimension is still the static `sizes[d]`. A finite dynamic upper bound is rejected when it proves that no admissible
+/// runtime extent could satisfy that precondition. This is what lets a dynamically-sized stack (such as the residual
+/// stacks of an unbounded-loop pullback) be read iteration by iteration. The operand and start indices must reside in
+/// the same memory space. A slice whose sizes equal the input shape passes it through unchanged because every clamped
+/// origin is necessarily zero. Any other output preserves the input memory space and clears explicit physical layout
+/// metadata.
 ///
 /// # Example
 ///
@@ -1118,25 +1144,39 @@ impl DynamicSlice for ArrayType {
             }
             .into());
         }
-        validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, start_indices)?;
+        validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
         for (axis, &size) in sizes.iter().enumerate() {
             // A dynamic input axis is accepted: StableHLO clamps the start index into
             // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
             // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
-            if let Size::Static(input_size) = self.dimension(axis as isize)
-                && size > input_size
-            {
-                return Err(TypeError {
-                    message: format!(
-                        "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
-                    ),
+            match self.dimension(axis as isize) {
+                Size::Static(input_size) if size > input_size => {
+                    return Err(TypeError {
+                        message: format!(
+                            "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
+                        ),
+                    }
+                    .into());
                 }
-                .into());
+                Size::Dynamic(Some(upper_bound)) if size >= upper_bound => {
+                    return Err(TypeError {
+                        message: format!(
+                            "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
+                             {upper_bound}",
+                        ),
+                    }
+                    .into());
+                }
+                _ => {}
             }
         }
         let output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
+        if output_dimensions.as_slice() == self.shape().dimensions() {
+            return Ok(self.clone());
+        }
         let sharding = resized_output_sharding(self, &output_dimensions, DYNAMIC_SLICE_OPERATION_NAME)?;
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
+            .with_memory(self.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -1151,6 +1191,11 @@ where
     <V::DispatchDomain as Domain>::Operation: From<DynamicSliceOperation>,
 {
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
+        let start_index_types = start_indices.iter().map(|index| index.r#type().into_owned()).collect::<Vec<_>>();
+        let output_type = self.r#type().dynamic_slice(start_index_types.as_slice(), sizes)?;
+        if output_type.eq(self.r#type().as_ref()) {
+            return Ok(self.clone());
+        }
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self.clone());
         inputs.extend(start_indices.iter().cloned());
@@ -1326,7 +1371,8 @@ where
 /// along axis `d` is `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`. The update must have
 /// the same data type and rank as the input, all of its dimensions must be static, and each axis must satisfy
 /// `update_dimension[d] <= input_dimension[d]`; inputs with dynamic dimensions are rejected because that bound
-/// cannot be proven against an unknown extent.
+/// cannot be proven against an unknown extent. The input, update, and start indices must reside in the same memory
+/// space, and the output retains the complete input type, including layout and memory placement.
 ///
 /// # Example
 ///
@@ -1374,6 +1420,16 @@ impl DynamicUpdateSlice for ArrayType {
             }
             .into());
         }
+        if self.memory() != update.memory() {
+            return Err(TypeError {
+                message: format!(
+                    "'dynamic_update_slice' input and update must share one memory space but reside in {} and {}",
+                    self.memory(),
+                    update.memory(),
+                ),
+            }
+            .into());
+        }
         let rank = self.rank();
         if update.rank() != rank {
             return Err(TypeError {
@@ -1390,7 +1446,7 @@ impl DynamicUpdateSlice for ArrayType {
             }
             .into());
         }
-        validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, start_indices)?;
+        validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
         for axis in 0..rank {
             let update_dimension = update.dimension(axis as isize);
             let Size::Static(update_size) = update_dimension else {
@@ -1725,6 +1781,7 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<LinearDynamicUpdateSliceOperation<F>>
         + From<LinearDynamicSliceOperation<F>>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1755,9 +1812,11 @@ where
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
+                let update_cotangent =
+                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?;
                 Ok(vec![
                     MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
-                    MaybeZero::Value(update_cotangents.into_iter().next().unwrap()),
+                    MaybeZero::Value(update_cotangent),
                 ])
             }
         }
@@ -1792,6 +1851,7 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<DynamicUpdateSliceOperation>
         + From<DynamicSliceOperation>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1836,7 +1896,9 @@ where
             )?;
             check_count!("output", update_cotangents, 1, ProgramError);
             contributions[0] = MaybeZero::Value(input_cotangents.into_iter().next().unwrap());
-            contributions[1] = MaybeZero::Value(update_cotangents.into_iter().next().unwrap());
+            contributions[1] = MaybeZero::Value(
+                update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?,
+            );
         }
         Ok(contributions)
     }
@@ -2063,6 +2125,7 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
     use crate::tracing_v2::jacfwd;
+    use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -2296,11 +2359,29 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = SliceOperation::new(vec![1], vec![6]).with_strides(vec![2]).unwrap(),
-            cases = [{
-                inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
-                input_cotangents = [Array::vector(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0])],
-            }],
+            cases = [
+                {
+                    inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))))],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
+                    input_cotangents = [Array::vector(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0])],
+                },
+                {
+                    inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
+                        .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+                        .with_memory(Memory::Host { pinned: true })))],
+                    output_cotangents = [Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
+                            .with_memory(Memory::Host { pinned: true }),
+                        vec![1.0, 2.0, 3.0],
+                    )],
+                    input_cotangents = [Array::from_f64s(
+                        ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
+                            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+                            .with_memory(Memory::Host { pinned: true }),
+                        vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
+                    )],
+                },
+            ],
         );
     }
 
@@ -2526,6 +2607,25 @@ mod tests {
                 ],
             }],
         );
+
+        // Slicing the output cotangent back to the update restores the update's complete layout-bearing type.
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
+        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
+        check_operation_transposition!(
+            @exact,
+            operation = UpdateSliceOperation::new(vec![1]),
+            cases = [{
+                inputs = [(@linear(type = input_type.clone())), (@linear(type = update_type.clone()))],
+                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0])],
+                input_cotangents = [
+                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]),
+                    Array::from_f64s(update_type, vec![2.0, 3.0]),
+                ],
+            }],
+        );
     }
 
     #[test]
@@ -2607,8 +2707,7 @@ mod tests {
             ),
             Ok(vec![output_type.clone()]),
         );
-        // A bounded-dynamic input axis is likewise accepted (the bound does not need to cover the static size; the
-        // clamp keeps the read safe at run time).
+        // A bounded-dynamic input axis is accepted when its maximum possible extent can contain the static slice.
         assert_eq!(
             operation.infer_output_types(
                 &[
@@ -2619,6 +2718,19 @@ mod tests {
                 &[],
             ),
             Ok(vec![output_type.clone()]),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(1)), Size::Static(3)])),
+                    index_type.clone(),
+                    index_type.clone(),
+                ],
+                &[],
+            ),
+            Err(TypeError {
+                message: "'dynamic_slice' size 1 cannot fit axis 0 with exclusive upper bound 1".to_string(),
+            }),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -3012,6 +3124,46 @@ mod tests {
 
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
+        // Every slicing operation preserves the operand's memory placement, and operations with update or dynamic
+        // index operands reject combinations that would require an implicit transfer.
+        let host_operand =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_memory(Memory::Host { pinned: true });
+        let host_update =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])).with_memory(Memory::Host { pinned: true });
+        let host_index = ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true });
+        let laid_out_host_operand = host_operand.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        assert_eq!(laid_out_host_operand.slice(&[0], &[4], &[1]), Ok(laid_out_host_operand.clone()));
+        assert_eq!(
+            laid_out_host_operand.dynamic_slice(std::slice::from_ref(&host_index), &[4]),
+            Ok(laid_out_host_operand),
+        );
+        assert_eq!(host_operand.slice(&[0], &[2], &[1]).unwrap().memory(), Memory::Host { pinned: true });
+        assert_eq!(
+            host_operand.dynamic_slice(std::slice::from_ref(&host_index), &[2]).unwrap().memory(),
+            Memory::Host { pinned: true },
+        );
+        assert_eq!(host_operand.update_slice(&host_update, &[0]).unwrap().memory(), Memory::Host { pinned: true });
+        assert_eq!(
+            host_operand.dynamic_update_slice(&host_update, std::slice::from_ref(&host_index)).unwrap().memory(),
+            Memory::Host { pinned: true },
+        );
+        assert_eq!(
+            host_operand.update_slice(&ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])), &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "'update_slice' input and update must share one memory space but reside in Host[Pinned] and \
+                          Device"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(
+            host_operand.dynamic_slice(&[ArrayType::scalar(DataType::I32)], &[2]),
+            Err(ProgramError::Type(TypeError {
+                message: "'dynamic_slice' operand and start indices must share one memory space but start index 0 \
+                          resides in Device and the operand resides in Host[Pinned]"
+                    .to_string(),
+            })),
+        );
+
         {
             let mesh = LogicalMesh::new(vec![
                 MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -3148,6 +3300,31 @@ mod tests {
                 input_cotangents = [
                     Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 4.0, 5.0, 6.0]),
                     Array::matrix(1, 2, vec![2.0, 3.0]),
+                ],
+            }],
+        );
+
+        // Dynamic update-slice restores the layout-bearing update cotangent after its dynamic slice.
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
+        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
+        let start =
+            Array::from_f64s(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }), vec![1.0]);
+        check_operation_transposition!(
+            @exact,
+            operation = DynamicUpdateSliceOperation,
+            cases = [{
+                inputs = [
+                    (@linear(type = input_type.clone())),
+                    (@linear(type = update_type.clone())),
+                    (@known, start),
+                ],
+                output_cotangents = [Array::from_f64s(input_type.clone(), vec![1.0, 2.0, 3.0, 4.0])],
+                input_cotangents = [
+                    Array::from_f64s(input_type, vec![1.0, 0.0, 0.0, 4.0]),
+                    Array::from_f64s(update_type, vec![2.0, 3.0]),
                 ],
             }],
         );

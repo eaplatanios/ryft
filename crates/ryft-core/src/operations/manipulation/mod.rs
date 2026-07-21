@@ -1,24 +1,24 @@
 pub mod broadcasting;
 pub mod concatenation;
 pub mod conversion;
-pub mod gather;
+pub mod gathering;
 pub mod padding;
-pub mod reshape;
-pub mod scatter;
+pub mod reshaping;
+pub mod scattering;
 pub mod slicing;
-pub mod transpose;
+pub mod transposition;
 
 pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
 pub use conversion::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
 };
-pub use gather::{
+pub use gathering::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
 };
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
-pub use reshape::{RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation};
-pub use scatter::{
+pub use reshaping::{RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation};
+pub use scattering::{
     LinearScatterAddOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
     ScatterReductionKind,
 };
@@ -27,4 +27,4 @@ pub use slicing::{
     DynamicUpdateSlice, DynamicUpdateSliceOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation,
     SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
-pub use transpose::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
+pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};

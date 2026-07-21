@@ -2532,16 +2532,17 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
-    ) => {
+    ) => {{
+        let input_types = [$($input_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::<$type>::infer_output_types(
                 &$operation,
-                &[$($input_type),*],
+                input_types.as_slice(),
                 &[],
             ),
             Ok(vec![$($output_type),*]),
         );
-    };
+    }};
 
     // This internal branch checks a successful unary element-type case in both the data-type and array-type universes.
     // The array fixture carries shape, layout, and memory metadata so the assertion also verifies structural lifting.
@@ -2658,18 +2659,19 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             error = $message:expr $(,)?
         }
-    ) => {
+    ) => {{
+        let input_types = [$($input_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::<$type>::infer_output_types(
                 &$operation,
-                &[$($input_type),*],
+                input_types.as_slice(),
                 &[],
             ),
             Err($crate::programs::types::TypeError {
                 message: ::core::convert::Into::<::std::string::String>::into($message),
             }),
         );
-    };
+    }};
 
     // This internal branch checks a successful ordinary case by inferring with no attached regions and comparing the
     // complete ordered output-type vector. Keeping success separate lets callers use natural `output_types` syntax.
@@ -2679,16 +2681,17 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             output_types = [$($output_type:expr),* $(,)?] $(,)?
         }
-    ) => {
+    ) => {{
+        let input_types = [$($input_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &$operation,
-                &[$($input_type),*],
+                input_types.as_slice(),
                 &[],
             ),
             Ok(vec![$($output_type),*]),
         );
-    };
+    }};
 
     // This internal branch checks a rejected ordinary case against its complete `TypeError` message. It is distinct
     // from the success branch so diagnostics remain exact without making callers construct the error wrapper.
@@ -2698,18 +2701,19 @@ macro_rules! check_operation_type_inference {
             input_types = [$($input_type:expr),* $(,)?],
             error = $message:expr $(,)?
         }
-    ) => {
+    ) => {{
+        let input_types = [$($input_type),*];
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &$operation,
-                &[$($input_type),*],
+                input_types.as_slice(),
                 &[],
             ),
             Err($crate::programs::types::TypeError {
                 message: ::core::convert::Into::<::std::string::String>::into($message),
             }),
         );
-    };
+    }};
 }
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under partial evaluation. The concise `inputs`

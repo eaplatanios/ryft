@@ -1333,6 +1333,28 @@ static DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS: [[Option<DataType>; DataType::COU
 };
 
 impl DataType {
+    /// Returns `true` if this [`DataType`] represents a signed or unsigned integer.
+    #[inline]
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::I1
+                | Self::I2
+                | Self::I4
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::U1
+                | Self::U2
+                | Self::U4
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+        )
+    }
+
     /// Returns the promoted [`DataType`] for the provided data types, which is defined as the least upper bound of
     /// the input [`DataType`]s in the type promotion lattice described in the documentation of [`DataType`]. In other
     /// words, it returns the _smallest_ [`DataType`] that every input type can be promoted to, automatically. Note
@@ -1476,6 +1498,18 @@ impl Type for DataType {
 #[cfg(test)]
 mod tests {
     use super::{DataType, DataTypeError, Type};
+
+    #[test]
+    fn test_data_type_is_integer() {
+        assert!(DataType::I1.is_integer());
+        assert!(DataType::I64.is_integer());
+        assert!(DataType::U1.is_integer());
+        assert!(DataType::U64.is_integer());
+        assert!(!DataType::Boolean.is_integer());
+        assert!(!DataType::F32.is_integer());
+        assert!(!DataType::C64.is_integer());
+        assert!(!DataType::Token.is_integer());
+    }
 
     #[test]
     fn test_data_type_promoted() {

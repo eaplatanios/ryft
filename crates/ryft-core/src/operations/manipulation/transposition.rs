@@ -8,7 +8,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -22,7 +22,7 @@ use crate::sharding::{Sharding, ShardingError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
@@ -98,8 +98,8 @@ impl From<&[usize]> for Permutation {
     }
 }
 
-/// [`Operation`] that reorders the axes of its input array according to a static permutation. The output shape is the
-/// input shape with its axes permuted. Output dimension `i` is set to input dimension `permutation[i]`.
+/// [`Operation`] that reorders the axes of its input array according to a static permutation. Refer to the
+/// documentation of [`Transpose`] for more information.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TransposeOperation {
     /// Axis [`Permutation`] of this [`TransposeOperation`].
@@ -201,6 +201,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
 where
     O: Operation<ArrayType> + From<TransposeOperation>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -213,7 +214,10 @@ where
         check_count!("output", outputs, 1, ProgramError);
         let inverse = self.permutation().inverse()?;
         match &outputs[0] {
-            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.transpose(inverse)?)]),
+            MaybeZero::Value(cotangent) => {
+                let cotangent = cotangent.transpose(inverse)?;
+                Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?)])
+            }
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
     }
@@ -260,9 +264,26 @@ where
     }
 }
 
-/// Represents the ability to transpose the axes of an array. [`Transpose`] fills the same role for
-/// [`TransposeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic
-/// [`Operation`]s.
+/// Reorders the axes of an array according to a permutation. Output axis `i` receives input axis `permutation[i]`, so
+/// the permutation must contain every input axis exactly once. An identity permutation passes the input through
+/// unchanged. Every other transposition preserves the element type, memory space, and reduction state, permutes shape
+/// and per-dimension sharding in the same way as the data, and clears an explicit physical layout because a logical
+/// axis permutation does not determine a unique output storage layout.
+///
+/// [`Transpose`] fills the same role for [`TransposeOperation`] that [`std::ops::Add`] and [`std::ops::Neg`] fill for
+/// their corresponding arithmetic [`Operation`]s.
+///
+/// # Examples
+///
+/// ```rust
+/// use ryft_core::backends::arrays::Array;
+/// use ryft_core::operations::manipulation::Transpose;
+///
+/// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+/// let output = input.transpose([1, 0])?;
+/// assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+/// # Ok::<(), ryft_core::ProgramError>(())
+/// ```
 pub trait Transpose: Sized {
     /// Reorders the axes of `self` according to the provided permutation, validating that the permutation is a
     /// bijection of the input axes. The permutation is accepted as any `AsRef<[usize]>` (for example, an owned
@@ -351,8 +372,8 @@ impl Transpose for Sharding {
 
 impl Transpose for ArrayType {
     /// Type-level transpose: validates that `permutation` has length equal to the input rank and is a permutation of
-    /// `0..rank` (every axis in range, no duplicates), then permutes the shape and the output sharding. Output axis
-    /// `i` carries input axis `permutation[i]`.
+    /// `0..rank` (every axis in range, no duplicates), then returns the input unchanged for the identity permutation
+    /// or permutes its shape and output sharding otherwise. Output axis `i` carries input axis `permutation[i]`.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.as_ref();
         let input = self;
@@ -382,6 +403,9 @@ impl Transpose for ArrayType {
             }
             seen[*axis] = true;
         }
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
+            return Ok(input.clone());
+        }
         let permuted = permutation.iter().map(|axis| input.dimension(*axis as isize)).collect::<Vec<_>>();
 
         // The output sharding permutes its dimension entries the same way as the array axes: the reduction-state and
@@ -390,6 +414,7 @@ impl Transpose for ArrayType {
         let sharding = input.sharding().map(|sharding| sharding.transpose(permutation)).transpose()?;
 
         ArrayType::new(input.data_type(), Shape::new(permuted))
+            .with_memory(input.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -401,6 +426,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     #[inline]
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.as_ref();
+        self.r#type().transpose(permutation)?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
@@ -428,7 +454,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Size};
+    use crate::types::{DataType, Layout, Memory, Size, StridedLayout};
 
     use super::*;
 
@@ -474,6 +500,11 @@ mod tests {
         // Type inference permutes the input shape, including dynamic dimension sizes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let placed_input_type = input_type
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
+            .with_memory(Memory::Host { pinned: true });
+        let placed_output_type = output_type.clone().with_memory(Memory::Host { pinned: true });
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -490,6 +521,10 @@ mod tests {
                         DataType::F64,
                         Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]),
                     )],
+                },
+                {
+                    input_types = [placed_input_type.clone()],
+                    output_types = [placed_output_type.clone()],
                 },
                 {
                     input_types = [],
@@ -520,6 +555,13 @@ mod tests {
             TransposeOperation::new(vec![0, 0]).infer_output_types(std::slice::from_ref(&input_type), &[]),
             Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
         );
+        assert_eq!(
+            input.transpose([0]),
+            Err(ProgramError::Type(TypeError {
+                message: "'transpose' permutation has length 1 but input has rank 2".to_string(),
+            })),
+        );
+        assert_eq!(placed_input_type.transpose([0, 1]), Ok(placed_input_type.clone()));
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
@@ -605,6 +647,24 @@ mod tests {
                 inputs = [(@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))))],
                 output_cotangents = [Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
                 input_cotangents = [Array::matrix(2, 3, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])],
+            }],
+        );
+
+        // The inverse permutation restores the complete input cotangent type, including placement metadata that the
+        // forward transpose intentionally clears because it cannot infer a new physical layout.
+        check_operation_transposition!(
+            @exact,
+            operation = TransposeOperation::new(vec![1, 0]),
+            cases = [{
+                inputs = [(@linear(type = placed_input_type.clone()))],
+                output_cotangents = [Array::from_f64s(
+                    placed_output_type,
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )],
+                input_cotangents = [Array::from_f64s(
+                    placed_input_type,
+                    vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
+                )],
             }],
         );
     }

@@ -8,7 +8,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -24,12 +24,12 @@ use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
 
-// TODO(eaplatanios): Review from here onwards.
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
-/// [`Operation`] that joins two or more input arrays end to end along one axis. Refer to the documentation of
+/// [`Operation`] that joins one or more input arrays end to end along one axis. Refer to the documentation of
 /// [`Concatenate`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConcatenateOperation {
@@ -136,6 +136,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ConcatenateOperation
 where
     O: Operation<ArrayType> + From<SliceOperation>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -197,7 +198,9 @@ where
                         std::slice::from_ref(cotangent),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
-                    input_cotangents.push(MaybeZero::Value(outputs.into_iter().next().unwrap()));
+                    let input_cotangent =
+                        outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent())?;
+                    input_cotangents.push(MaybeZero::Value(input_cotangent));
                     offset += operand_axis_size;
                 }
                 Ok(input_cotangents)
@@ -246,21 +249,23 @@ where
     }
 }
 
-/// Represents the ability to join two or more arrays end to end along one axis, with the semantics of StableHLO's
+/// Represents the ability to join one or more arrays end to end along one axis, with the semantics of StableHLO's
 /// [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation.
 ///
 /// `Concatenate::concatenate(operands, axis)` returns an array whose elements along `axis` are the elements of the
 /// first operand followed by the elements of the second operand, and so on. There must be at least one operand, all
 /// operands must share one data type and one rank, and every axis other than `axis` must have the same [`Size`]
-/// across all operands. The output keeps the shared non-concatenated dimensions and has size along `axis` equal to
-/// the sum of the operand sizes along `axis`.
+/// across all operands. All operands must reside in the same memory space. A single operand passes through unchanged.
+/// A multi-operand result keeps the common memory placement, clears explicit physical layout metadata, keeps the
+/// shared non-concatenated dimensions, and has size along `axis` equal to the sum of the operand sizes along `axis`.
 ///
 /// # Dynamic Dimensions
 ///
 /// The concatenated axis may be dynamic: if any operand's `axis` dimension is [`Size::Dynamic`], the output `axis`
-/// dimension is also [`Size::Dynamic`], with an upper bound equal to the sum of the operand upper bounds when every
-/// operand is bounded and an unbounded `Size::Dynamic(None)` otherwise. So concatenating a dynamic stack with a
-/// fixed slice along the dynamic axis grows the stack while keeping its type dynamic — `[?, d] ++ [1, d] = [?, d]`
+/// dimension is also [`Size::Dynamic`], with a tight exclusive upper bound computed from the operands' maximum sizes
+/// when every operand is bounded and an unbounded `Size::Dynamic(None)` otherwise. So concatenating a dynamic stack
+/// with a fixed slice along the dynamic axis grows the stack while keeping its type dynamic —
+/// `[?, d] ++ [1, d] = [?, d]`
 /// along axis `0`. This is the typing that lets a dynamically-sized residual stack accumulate one iteration per loop
 /// iteration. The non-concatenated axes must still match per [`Size`] equality (a [`Size::Dynamic`] non-concatenated
 /// axis is allowed only when every operand carries the same [`Size`] there) and propagate unchanged.
@@ -316,12 +321,15 @@ impl Concatenate for ArrayType {
             }
             .into());
         }
+        if operands.len() == 1 {
+            return Ok(first.clone());
+        }
         // The concatenated dimension accumulates as we scan operands: a static run sums sizes, while any dynamic
         // operand size forces a dynamic output dimension whose upper bound stays known only if every operand is
         // bounded.
         let mut concatenated_static = 0usize;
         let mut concatenated_dynamic = false;
-        let mut concatenated_upper_bound = Some(0usize);
+        let mut maximum_concatenated_size = Some(0usize);
         for (index, operand) in operands.iter().enumerate() {
             if operand.data_type() != first.data_type() {
                 return Err(TypeError {
@@ -344,6 +352,17 @@ impl Concatenate for ArrayType {
                 }
                 .into());
             }
+            if operand.memory() != first.memory() {
+                return Err(TypeError {
+                    message: format!(
+                        "'concatenate' operands must share one memory space but operand {index} resides in {} and \
+                         operand 0 resides in {}",
+                        operand.memory(),
+                        first.memory(),
+                    ),
+                }
+                .into());
+            }
             for other_axis in 0..rank {
                 if other_axis == axis {
                     continue;
@@ -362,18 +381,25 @@ impl Concatenate for ArrayType {
             }
             let dimension = operand.dimension(axis as isize);
             match dimension {
-                Size::Static(size) => concatenated_static += size,
-                Size::Dynamic(_) => concatenated_dynamic = true,
+                Size::Static(size) => {
+                    concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| TypeError {
+                        message: format!("'concatenate' output size overflows usize on axis {axis}"),
+                    })?;
+                    maximum_concatenated_size = maximum_concatenated_size.and_then(|maximum| maximum.checked_add(size));
+                }
+                Size::Dynamic(upper_bound) => {
+                    concatenated_dynamic = true;
+                    maximum_concatenated_size = match (maximum_concatenated_size, upper_bound) {
+                        (Some(maximum), Some(upper_bound)) => maximum.checked_add(upper_bound.saturating_sub(1)),
+                        _ => None,
+                    };
+                }
             }
-            concatenated_upper_bound = match (concatenated_upper_bound, dimension.upper_bound()) {
-                (Some(accumulated), Some(bound)) => Some(accumulated + bound),
-                _ => None,
-            };
         }
         let concatenated = if concatenated_dynamic {
-            // When every operand is bounded the summed upper bound includes one slack unit per operand (each
-            // `Size::upper_bound` is exclusive), which still soundly over-approximates the concatenated extent.
-            Size::Dynamic(concatenated_upper_bound)
+            // Bounds are exclusive. Sum each operand's maximum possible size, then add one to make the result
+            // exclusive as well. If that final addition overflows, retain an unbounded dynamic result.
+            Size::Dynamic(maximum_concatenated_size.and_then(|maximum| maximum.checked_add(1)))
         } else {
             Size::Static(concatenated_static)
         };
@@ -418,6 +444,7 @@ impl Concatenate for ArrayType {
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
         ArrayType::new(first.data_type(), Shape::new(dimensions))
+            .with_memory(first.memory())
             .with_sharding(output_sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
@@ -437,6 +464,10 @@ where
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
+        if operands.len() == 1 {
+            ArrayType::concatenate(&[first.r#type().into_owned()], axis)?;
+            return Ok(first.clone());
+        }
         let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), Vec::new(), operands)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -461,7 +492,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::DataType;
+    use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -517,6 +548,11 @@ mod tests {
 
         // A single operand passes through unchanged.
         assert_eq!(ArrayType::concatenate(std::slice::from_ref(&first_type), 0), Ok(first_type.clone()));
+        let placed_type = first_type
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(ArrayType::concatenate(std::slice::from_ref(&placed_type), 0), Ok(placed_type));
 
         // Interpretation joins the row-major payloads along axis 0.
         let first = Array::matrix(1, 2, vec![1.0, 2.0]);
@@ -535,8 +571,9 @@ mod tests {
         );
 
         // Dynamic-axis propagation: concatenating along a dynamic axis yields a dynamic axis. With one operand
-        // unbounded, the output upper bound is unknown; with all bounded, the output upper bound sums the operand
-        // bounds. The non-concatenated axes still propagate their (possibly equal dynamic) sizes.
+        // unbounded, the output upper bound is unknown; with all bounded, the output uses the tight exclusive bound
+        // obtained by summing each operand's maximum size and adding one. The non-concatenated axes still propagate
+        // their (possibly equal dynamic) sizes.
         let dynamic_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
         let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         assert_eq!(
@@ -546,7 +583,19 @@ mod tests {
         let bounded_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(2)]));
         assert_eq!(
             operation.infer_output_types(&[bounded_stack.clone(), fixed_slice.clone()], &[]),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(6)), Size::Static(2)]))]),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(5)), Size::Static(2)]))]),
+        );
+        assert_eq!(
+            ArrayType::concatenate(
+                &[
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])),
+                ],
+                0,
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "'concatenate' output size overflows usize on axis 0".to_string(),
+            })),
         );
         let dynamic_non_axis = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(None)]));
         assert_eq!(
@@ -675,17 +724,42 @@ mod tests {
                 tangent_outputs = [Array::vector(vec![0.5, 1.0, 1.5, 2.0, 2.5])],
             }],
         );
+        let layout = Layout::Strided(StridedLayout::new(vec![8]));
+        let placed_left_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
+            .with_layout(layout.clone())
+            .with_memory(Memory::Host { pinned: true });
+        let placed_right_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
+            .with_layout(layout)
+            .with_memory(Memory::Host { pinned: true });
+        let placed_output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![5.into()])).with_memory(Memory::Host { pinned: true });
         check_operation_transposition!(
             @exact,
             operation = ConcatenateOperation::new(0),
-            cases = [{
-                inputs = [
-                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
-                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
-                ],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
-                input_cotangents = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
-            }],
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                    ],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
+                    input_cotangents = [Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0, 4.0, 5.0])],
+                },
+                {
+                    inputs = [
+                        (@linear(type = placed_left_type.clone())),
+                        (@linear(type = placed_right_type.clone())),
+                    ],
+                    output_cotangents = [Array::from_f64s(
+                        placed_output_type,
+                        vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                    )],
+                    input_cotangents = [
+                        Array::from_f64s(placed_left_type, vec![1.0, 2.0]),
+                        Array::from_f64s(placed_right_type, vec![3.0, 4.0, 5.0]),
+                    ],
+                },
+            ],
         );
     }
 
@@ -701,6 +775,26 @@ mod tests {
         ])
         .unwrap();
         let operation = ConcatenateOperation::new(0);
+
+        // Concatenation preserves a common memory placement and rejects operands that would require an implicit
+        // transfer.
+        let host_row = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)]))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            ArrayType::concatenate(&[host_row.clone(), host_row.clone()], 0).unwrap().memory(),
+            Memory::Host { pinned: true },
+        );
+        assert_eq!(
+            ArrayType::concatenate(
+                &[host_row, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),],
+                0,
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "'concatenate' operands must share one memory space but operand 1 resides in Device and \
+                          operand 0 resides in Host[Pinned]"
+                    .to_string(),
+            })),
+        );
         let sharded = || {
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap()

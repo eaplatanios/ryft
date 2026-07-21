@@ -7,7 +7,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -22,7 +22,7 @@ use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`ReshapeOperation`].
 pub const RESHAPE_OPERATION_NAME: &str = "reshape";
@@ -128,6 +128,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshapeOperation
 where
     O: Operation<ArrayType> + From<ReshapeOperation>,
+    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -140,7 +141,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Value(cotangent) => {
-                Ok(vec![MaybeZero::Value(cotangent.reshape(inputs[0].r#type().shape().clone())?)])
+                let cotangent = cotangent.reshape(inputs[0].r#type().shape().clone())?;
+                Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?)])
             }
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
@@ -250,12 +252,14 @@ where
     }
 }
 
-/// Represents the ability to reshape an array to a target [`Shape`] without changing its element count or its layout.
+/// Represents the ability to reshape an array to a target [`Shape`] without changing its element count or row-major
+/// element order.
 ///
 /// `t.reshape(target_shape)` reinterprets `t`'s payload under the specified target [`Shape`]. The input and target
 /// shapes must have equal element counts. When the input carries a [`Sharding`], it is propagated using singleton
 /// stripping and contiguous split/merge grouping: dimensions that map one-to-one keep their sharding, while dimensions
-/// that split or merge must be replicated.
+/// that split or merge must be replicated. A non-identity reshape preserves the input memory space and clears explicit
+/// physical layout metadata because the logical shape change does not determine a unique output storage layout.
 ///
 /// # Examples
 ///
@@ -421,6 +425,7 @@ impl Reshape for ArrayType {
         };
 
         ArrayType::new(self.data_type(), shape)
+            .with_memory(self.memory())
             .with_sharding(sharding)
             .map_err(|_| TypeError { message: "'reshape' produced an invalid output type".to_string() }.into())
     }
@@ -467,7 +472,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::DataType;
+    use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -594,9 +599,32 @@ mod tests {
                 input_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
             }],
         );
+
+        // Reshaping back to the input shape restores its complete cotangent type after the forward reshape has
+        // intentionally cleared physical layout metadata.
+        let layout = Layout::Strided(StridedLayout::new(vec![8]));
+        let placed_input_type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
+            .with_layout(layout)
+            .with_memory(Memory::Host { pinned: true });
+        let placed_output_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()]))
+            .with_memory(Memory::Host { pinned: true });
+        check_operation_transposition!(
+            @exact,
+            operation = ReshapeOperation::new(Shape::new(vec![2.into(), 3.into()])),
+            cases = [{
+                inputs = [(@linear(type = placed_input_type.clone()))],
+                output_cotangents = [Array::from_f64s(
+                    placed_output_type,
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )],
+                input_cotangents = [Array::from_f64s(
+                    placed_input_type,
+                    vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                )],
+            }],
+        );
     }
 
-    // TODO(eaplatanios): A single dynamic dimension should be allowed.
     #[test]
     fn test_array_type_reshape() {
         // Reshaping requires statically known element counts on both sides, so dynamic input and target shapes are
@@ -629,6 +657,18 @@ mod tests {
 
         // Reshaping a dynamically sized type to its own shape short-circuits as the identity.
         assert_eq!(dynamic_type.reshape(dynamic_type.shape().clone()), Ok(dynamic_type.clone()));
+
+        // A non-identity reshape preserves memory placement but clears a layout whose output strides cannot be
+        // inferred from the logical target shape alone.
+        let placed_type = static_type
+            .clone()
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            placed_type.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                .with_memory(Memory::Host { pinned: true })),
+        );
 
         // Singleton insertion preserves the corresponding non-singleton dimension placement.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
