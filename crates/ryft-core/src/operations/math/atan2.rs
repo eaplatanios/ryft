@@ -3,7 +3,7 @@ use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg a
 use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::macros::{
-    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
@@ -27,8 +27,7 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     Atan2Operation,
     jvp<C>
     where

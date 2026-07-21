@@ -2,7 +2,7 @@ use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
 use crate::differentiation::forward::DifferentiationDual;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::{
-    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
@@ -48,8 +48,7 @@ define_elementwise_operation!(
     check_array_types = [@no_unreduced],
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     AbsOperation,
     jvp<C>
     where

@@ -22,7 +22,7 @@ use crate::differentiation::{
     TransposableOperation, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::{FillOperation, ZeroLike};
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::{Broadcast, Concatenate, Reshape, Slice, Transpose};
@@ -296,77 +296,70 @@ fn pmean_factor_type(data_type: DataType) -> ArrayType {
     ArrayType::new(data_type, Shape::scalar())
 }
 
-/// Forward-mode (JVP) rule for [`CollectiveOperation`]. `PSum`/`PMean` are linear and self-adjoint, so the tangent is
-/// the same collective applied to the operand tangent: `tangent_out = collective(input.tangent())`. A structural-zero
-/// operand tangent is preserved as-is rather than staging a collective on a zero, keeping `collective(zero)` out of the
-/// tangent program. `PMax` is non-linear and reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation)
-/// error.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CollectiveOperation
-where
-    C::Operation: From<CollectiveOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        if matches!(self.kind, CollectiveKind::PMax) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "pmax differentiation is not yet supported".to_string(),
+impl_differentiable_operation! {
+    CollectiveOperation,
+    /// Forward-mode (JVP) rule for [`CollectiveOperation`]. `PSum`/`PMean` are linear and self-adjoint, so the tangent
+    /// is the same collective applied to the operand tangent: `tangent_out = collective(input.tangent())`. A
+    /// structural-zero operand tangent is preserved as-is rather than staging a collective on a zero, keeping
+    /// `collective(zero)` out of the tangent program. `PMax` is non-linear and reports an
+    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<CollectiveOperation>,
+    {
+        |operation, context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            if matches!(operation.kind, CollectiveKind::PMax) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "pmax differentiation is not yet supported".to_string(),
+                }
+                .into());
             }
-            .into());
+            let primal =
+                stage_collective(context, &operation.axis_name, operation.kind, inputs[0].primal())?;
+            // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the
+            // tangent program.
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                MaybeZero::Value(tangent) => {
+                    MaybeZero::Value(stage_collective(context, &operation.axis_name, operation.kind, tangent)?)
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        let primal = stage_collective(context, &self.axis_name, self.kind, inputs[0].primal())?;
-        // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the tangent
-        // program.
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-            MaybeZero::Value(tangent) => {
-                MaybeZero::Value(stage_collective(context, &self.axis_name, self.kind, tangent)?)
+    },
+    /// Transpose rule for [`CollectiveOperation`]. `psum`/`pmean` are self-adjoint, so the operand cotangent is the
+    /// same collective applied to the output cotangent. The single operand is linear (its [`PartialValue`] is
+    /// [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent and so receives a structural zero.
+    /// `PMax` reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<CollectiveOperation>,
+    {
+        |operation, context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            if matches!(operation.kind, CollectiveKind::PMax) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "pmax transpose is not yet supported".to_string(),
+                }
+                .into());
             }
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for [`CollectiveOperation`]. `psum`/`pmean` are self-adjoint, so the operand cotangent is the same
-/// collective applied to the output cotangent. The single operand is linear (its [`PartialValue`] is
-/// [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent and so receives a structural zero.
-/// `PMax` reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V, O> TransposableOperation<V, O> for CollectiveOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + From<CollectiveOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        if matches!(self.kind, CollectiveKind::PMax) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "pmax transpose is not yet supported".to_string(),
+            // A known (non-linear) operand contributes no cotangent.
+            if inputs[0].is_known() {
+                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]);
             }
-            .into());
-        }
-        // A known (non-linear) operand contributes no cotangent.
-        if inputs[0].is_known() {
-            return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]);
-        }
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => {
-                let contribution = stage_collective(context, &self.axis_name, self.kind, cotangent)?;
-                Ok(vec![MaybeZero::Value(contribution)])
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    let contribution = stage_collective(context, &operation.axis_name, operation.kind, cotangent)?;
+                    Ok(vec![MaybeZero::Value(contribution)])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
         }
-    }
+    },
 }
 
 /// Re-stages this collective of the same axis name and kind on a single tracer operand, returning its single output.

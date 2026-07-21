@@ -2,11 +2,8 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::impl_non_transposable_operation;
+use crate::macros::impl_differentiable_operation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::effects::{Effect, Effects};
@@ -243,31 +240,29 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCa
 {
 }
 
-/// Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error directing
-/// users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
-/// [`custom_vjp`](crate::tracing_v2::CustomVjp), which is also how JAX handles `ffi_call` differentiation.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CustomCallOperation
-where
-    C::Operation: From<CustomCallOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \
-                 provide one",
-                self.target_name,
-            ),
+impl_differentiable_operation! {
+    CustomCallOperation,
+    /// Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error directing
+    /// users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
+    /// [`custom_vjp`](crate::tracing_v2::CustomVjp), which is also how JAX handles `ffi_call` differentiation.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<CustomCallOperation>,
+    {
+        |operation, _context, _driver, _inputs| {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \
+                     provide one",
+                    operation.target_name,
+                ),
+            }
+            .into())
         }
-        .into())
-    }
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(CustomCallOperation);
 
 /// Foreign kernels are opaque, so there is no batching rule to derive: batching reports an error, and callers
 /// should invoke a kernel that understands the batch axis instead.

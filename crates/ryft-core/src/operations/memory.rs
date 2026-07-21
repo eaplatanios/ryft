@@ -12,18 +12,14 @@ use half::{bf16, f16};
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{check_count, impl_differentiable_operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Memory};
 
 // TODO(eaplatanios): Review this.
@@ -133,59 +129,52 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>> BatchableOperation<C
     }
 }
 
-/// Forward-mode rule for [`TransferToMemoryOperation`]: a memory transfer is structural-linear, so the tangent is
-/// transferred to the same destination as the primal. The shared all-zero fast path handles a zero operand tangent
-/// before this rule is consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransferToMemoryOperation
-where
-    C::Operation: From<TransferToMemoryOperation>,
-    C::Value: TransferToMemory,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().transfer_to_memory(self.destination());
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(self.destination())),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map
-/// between two memories, so its transpose moves the output cotangent back to the operand's source memory by staging a
-/// transfer to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransferToMemoryOperation
-where
-    O: Operation<ArrayType> + From<TransferToMemoryOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
-            MaybeZero::Value(cotangent) => {
-                let outputs = context.stage_operation(
-                    TransferToMemoryOperation::new(inputs[0].r#type().memory()),
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+impl_differentiable_operation! {
+    TransferToMemoryOperation,
+    /// Forward-mode rule for [`TransferToMemoryOperation`]: a memory transfer is structural-linear, so the tangent is
+    /// transferred to the same destination as the primal. The shared all-zero fast path handles a zero operand tangent
+    /// before this rule is consulted, so the operand tangent reaching here is always live.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<TransferToMemoryOperation>,
+        C::Value: TransferToMemory,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().transfer_to_memory(operation.destination());
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(operation.destination())),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    /// Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
+    /// memories, so its transpose moves the output cotangent back to the operand's source memory by staging a transfer
+    /// to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<TransferToMemoryOperation>,
+    {
+        |_operation, context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+                MaybeZero::Value(cotangent) => {
+                    let outputs = context.stage_operation(
+                        TransferToMemoryOperation::new(inputs[0].r#type().memory()),
+                        Vec::new(),
+                        std::slice::from_ref(cotangent),
+                    )?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+                }
             }
         }
-    }
+    },
 }
 
 /// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for

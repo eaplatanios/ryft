@@ -5,14 +5,11 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::{Broadcast, Transpose};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -101,52 +98,47 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeO
 {
 }
 
-/// Forward-mode rule for [`ReshapeOperation`]: `reshape` is structural-linear, so the tangent is the same reshape
-/// applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is
-/// consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReshapeOperation
-where
-    C::Operation: From<ReshapeOperation>,
-    C::Value: Reshape,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().reshape(self.output_shape().clone())?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(self.output_shape().clone())?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshapeOperation
-where
-    O: Operation<ArrayType> + From<ReshapeOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => {
-                let cotangent = cotangent.reshape(inputs[0].r#type().shape().clone())?;
-                Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?)])
-            }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+impl_differentiable_operation! {
+    ReshapeOperation,
+    /// Forward-mode rule for [`ReshapeOperation`]: `reshape` is structural-linear, so the tangent is the same reshape
+    /// applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is
+    /// consulted, so the operand tangent reaching here is always live.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<ReshapeOperation>,
+        C::Value: Reshape,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().reshape(operation.output_shape().clone())?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(operation.output_shape().clone())?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<ReshapeOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    let cotangent = cotangent.reshape(inputs[0].r#type().shape().clone())?;
+                    Ok(vec![MaybeZero::Value(
+                        cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?,
+                    )])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+            }
+        }
+    },
 }
 
 /// Lifts a reshape's per-item `input_shape` / `output_shape` pair through one batching level by

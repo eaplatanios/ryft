@@ -5,11 +5,9 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::impl_non_transposable_operation;
+use crate::macros::impl_differentiable_operation;
 use crate::operations::constants::IotaOperation;
 use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -200,50 +198,48 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SortOper
 {
 }
 
-/// Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys' lexicographic
-/// order, so the live tangents ride one staged sort as extra passenger operands after the primals — the first half
-/// of the outputs are the primal outputs and the rest are the co-permuted tangents (the same trick JAX's sort JVP
-/// uses). The staged sort carries the original `key_count`, and because the tangents append after every primal
-/// operand they always land in the passenger positions. Structural-zero tangents stay symbolic because any
-/// permutation of zeros is zero.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for SortOperation
-where
-    C::Operation: From<SortOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let live_indices = inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, input)| input.tangent().as_value().map(|tangent| (index, tangent.clone())))
-            .collect::<Vec<_>>();
-        operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
-        let mut outputs = context.bind(*self, Vec::new(), operands.as_slice())?;
-        let output_tangents = outputs.split_off(inputs.len());
-        let mut tangent_by_output = vec![None; inputs.len()];
-        for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
-            tangent_by_output[*index] = Some(tangent);
+impl_differentiable_operation! {
+    SortOperation,
+    /// Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys' lexicographic
+    /// order, so the live tangents ride one staged sort as extra passenger operands after the primals — the first half
+    /// of the outputs are the primal outputs and the rest are the co-permuted tangents (the same trick JAX's sort JVP
+    /// uses). The staged sort carries the original `key_count`, and because the tangents append after every primal
+    /// operand they always land in the passenger positions. Structural-zero tangents stay symbolic because any
+    /// permutation of zeros is zero.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<SortOperation>,
+    {
+        |operation, context, _driver, inputs| {
+            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let live_indices = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| input.tangent().as_value().map(|tangent| (index, tangent.clone())))
+                .collect::<Vec<_>>();
+            operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
+            let mut outputs = context.bind(*operation, Vec::new(), operands.as_slice())?;
+            let output_tangents = outputs.split_off(inputs.len());
+            let mut tangent_by_output = vec![None; inputs.len()];
+            for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
+                tangent_by_output[*index] = Some(tangent);
+            }
+            outputs
+                .into_iter()
+                .zip(tangent_by_output)
+                .map(|(primal, tangent)| {
+                    let tangent = match tangent {
+                        Some(tangent) => MaybeZero::Value(tangent),
+                        None => MaybeZero::Zero(primal.r#type().tangent()),
+                    };
+                    DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
+                })
+                .collect()
         }
-        outputs
-            .into_iter()
-            .zip(tangent_by_output)
-            .map(|(primal, tangent)| {
-                let tangent = match tangent {
-                    Some(tangent) => MaybeZero::Value(tangent),
-                    None => MaybeZero::Zero(primal.r#type().tangent()),
-                };
-                DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
-            })
-            .collect()
-    }
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(SortOperation);
 
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the

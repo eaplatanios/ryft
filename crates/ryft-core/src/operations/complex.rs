@@ -1,6 +1,6 @@
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::macros::{
-    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
 use crate::operations::constants::{Zero, ZeroLikeOperation};
 use crate::operations::math::NegOperation;
@@ -79,8 +79,7 @@ define_elementwise_operation!(
     },
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     ComplexOperation,
     jvp<C>
     where
@@ -164,8 +163,7 @@ define_elementwise_operation!(
     },
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     ConjugateOperation,
     jvp<C>
     where
@@ -232,8 +230,7 @@ define_elementwise_operation!(
     },
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     RealOperation,
     jvp<C>
     where
@@ -302,8 +299,7 @@ define_elementwise_operation!(
     },
 );
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     ImaginaryOperation,
     jvp<C>
     where

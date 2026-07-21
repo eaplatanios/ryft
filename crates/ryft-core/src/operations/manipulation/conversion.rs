@@ -4,7 +4,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::forward::DifferentiationDual;
 use crate::differentiation::{DifferentiableType, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
@@ -109,8 +109,7 @@ impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation>>
 {
 }
 
-impl_differentiable_elementwise_operation! {
-    @custom
+impl_differentiable_operation! {
     ConvertElementTypeOperation,
     /// Forward-mode differentiation rule for [`ConvertElementTypeOperation`]. The primal is converted to the requested
     /// element data type, while a live tangent is converted to the output's differential element data type. Converting

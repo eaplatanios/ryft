@@ -6,13 +6,10 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::macros::{check_count, impl_differentiable_operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -174,53 +171,48 @@ impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> Partiall
 {
 }
 
-/// Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the same
-/// transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
-/// rule is consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransposeOperation
-where
-    C::Operation: From<TransposeOperation>,
-    C::Value: Transpose,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().transpose(self.permutation())?;
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(self.permutation())?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
-where
-    O: Operation<ArrayType> + From<TransposeOperation>,
-    Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let inverse = self.permutation().inverse()?;
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => {
-                let cotangent = cotangent.transpose(inverse)?;
-                Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?)])
-            }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+impl_differentiable_operation! {
+    TransposeOperation,
+    /// Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the same
+    /// transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before
+    /// this rule is consulted, so the operand tangent reaching here is always live.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<TransposeOperation>,
+        C::Value: Transpose,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().transpose(operation.permutation())?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(operation.permutation())?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-    }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<TransposeOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
+    {
+        |operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            let inverse = operation.permutation().inverse()?;
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    let cotangent = cotangent.transpose(inverse)?;
+                    Ok(vec![MaybeZero::Value(
+                        cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?,
+                    )])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+            }
+        }
+    },
 }
 
 /// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.

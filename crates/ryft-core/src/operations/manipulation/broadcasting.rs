@@ -2,26 +2,25 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationError;
 use crate::differentiation::elementwise::BroadcastDerivativeAlignment;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+use crate::differentiation::forward::DifferentiationDual;
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::ReshapeOperation;
 use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
+
+// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -112,67 +111,62 @@ impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> Partiall
 {
 }
 
-// Forward-mode differentiation rule for [`BroadcastOperation`]. Broadcasting is structural-linear, so the tangent
-// follows the same axis mapping as the primal. A structural-zero input tangent remains structural and acquires the
-// primal output's tangent type.
-impl<C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>> DifferentiableOperation<C>
-    for BroadcastOperation
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().broadcast(self.output_type().clone(), self.output_axes())?;
-        let tangent_type = primal.r#type().tangent();
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.broadcast(tangent_type, self.output_axes())?),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
-///
-/// The pullback of a broadcast is a sum-reduction over every output axis the input was replicated along: the axes of
-/// the target type that are not named in `output_axes`, plus the mapped axes whose input extent is `1` stretched to a
-/// larger target extent. After the reduction, the surviving axes are reordered into input-axis order when
-/// `output_axes` is not monotonically increasing, and stretched unit axes are restored with a reshape so the cotangent
-/// matches the input type exactly. Symbolic-zero cotangents propagate unchanged, and an input with no cotangent space
-/// receives the structural zero of that space.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for BroadcastOperation
-where
-    O: Operation<ArrayType>
-        + From<BroadcastOperation>
-        + From<ConvertElementTypeOperation>
-        + From<ReduceOperation>
-        + From<TransposeOperation>
-        + From<ReshapeOperation>
-        + From<ReshardOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_cotangent_type = inputs[0].r#type().cotangent();
-        if input_cotangent_type.is_zero_space() {
-            return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+impl_differentiable_operation! {
+    BroadcastOperation,
+    /// Forward-mode differentiation rule for [`BroadcastOperation`]. Broadcasting is structural-linear, so the
+    /// tangent follows the same axis mapping as the primal. A structural-zero input tangent remains structural and
+    /// acquires the primal output's tangent type.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType, Value: Broadcast, Operation: From<BroadcastOperation>>,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().broadcast(operation.output_type().clone(), operation.output_axes())?;
+            let tangent_type = primal.r#type().tangent();
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
+                MaybeZero::Value(tangent) => {
+                    MaybeZero::Value(tangent.broadcast(tangent_type, operation.output_axes())?)
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-        let MaybeZero::Value(cotangent) = &outputs[0] else {
-            return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
-        };
-        Ok(vec![MaybeZero::Value(cotangent.unalign_cotangent_along(&input_cotangent_type, self.output_axes())?)])
-    }
+    },
+    /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
+    ///
+    /// The pullback of a broadcast is a sum-reduction over every output axis the input was replicated along: the axes
+    /// of the target type that are not named in `output_axes`, plus the mapped axes whose input extent is `1` stretched
+    /// to a larger target extent. After the reduction, the surviving axes are reordered into input-axis order when
+    /// `output_axes` is not monotonically increasing, and stretched unit axes are restored with a reshape so the
+    /// cotangent matches the input type exactly. Symbolic-zero cotangents propagate unchanged, and an input with no
+    /// cotangent space receives the structural zero of that space.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType>
+            + From<BroadcastOperation>
+            + From<ConvertElementTypeOperation>
+            + From<ReduceOperation>
+            + From<TransposeOperation>
+            + From<ReshapeOperation>
+            + From<ReshardOperation>,
+    {
+        |operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            let input_cotangent_type = inputs[0].r#type().cotangent();
+            if input_cotangent_type.is_zero_space() {
+                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+            }
+            let MaybeZero::Value(cotangent) = &outputs[0] else {
+                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+            };
+            Ok(vec![MaybeZero::Value(
+                cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
+            )])
+        }
+    },
 }
 
 /// Lifts a broadcast's output-axis mapping and target type through one batching level.
@@ -519,11 +513,13 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
     use crate::differentiation::jvp;
+    use crate::differentiation::reverse::TransposableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;

@@ -36,21 +36,17 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
 /// Canonical operation name for [`ReshardOperation`].
@@ -215,62 +211,55 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::Operation: From<ReshardOperation> {}
 
-/// Forward-mode rule for [`ReshardOperation`]: `reshard` is structural-linear, so the tangent is resharded by the
-/// same target sharding as the primal. The shared all-zero fast path handles a zero operand tangent before this rule is
-/// consulted, so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReshardOperation
-where
-    C::Operation: From<ReshardOperation>,
-    C::Value: Reshard,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().reshard(self.sharding());
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(self.sharding())),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
-/// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input
-/// cotangent is distributed like the input. An input that carries no sharding receives an exactly unsharded
-/// cotangent through an identity-axis broadcast.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshardOperation
-where
-    O: Operation<ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_cotangent_type = inputs[0].r#type().cotangent();
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => {
-                let contribution = match input_cotangent_type.sharding() {
-                    Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding),
-                    None => cotangent.broadcast(
-                        input_cotangent_type.clone(),
-                        &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
-                    )?,
-                };
-                Ok(vec![MaybeZero::Value(contribution)])
-            }
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_cotangent_type)]),
+impl_differentiable_operation! {
+    ReshardOperation,
+    /// Forward-mode rule for [`ReshardOperation`]: `reshard` is structural-linear, so the tangent is resharded by the
+    /// same target sharding as the primal. The shared all-zero fast path handles a zero operand tangent before this rule
+    /// is consulted, so the operand tangent reaching here is always live.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<ReshardOperation>,
+        C::Value: Reshard,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().reshard(operation.sharding());
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(operation.sharding())),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-    }
+    },
+    /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
+    /// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input
+    /// cotangent is distributed like the input. An input that carries no sharding receives an exactly unsharded
+    /// cotangent through an identity-axis broadcast.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
+    {
+        |_operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            let input_cotangent_type = inputs[0].r#type().cotangent();
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    let contribution = match input_cotangent_type.sharding() {
+                        Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding),
+                        None => cotangent.broadcast(
+                            input_cotangent_type.clone(),
+                            &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
+                        )?,
+                    };
+                    Ok(vec![MaybeZero::Value(contribution)])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_cotangent_type)]),
+            }
+        }
+    },
 }
 
 /// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
@@ -438,51 +427,47 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperatio
 {
 }
 
-/// Forward-mode rule for [`ShardingConstraintOperation`]: the sharding hint is linear, so the same hint applies
-/// to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is consulted,
-/// so the operand tangent reaching here is always live.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ShardingConstraintOperation
-where
-    C::Operation: From<ShardingConstraintOperation>,
-    C::Value: ConstrainSharding,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().constrain_sharding(self.sharding());
-        let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(self.sharding())),
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of the output
-/// is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with `ad.deflinear2`).
-/// Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the operation's own.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ShardingConstraintOperation
-where
-    O: Operation<ArrayType> + From<ShardingConstraintOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.constrain_sharding(self.sharding()))]),
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+impl_differentiable_operation! {
+    ShardingConstraintOperation,
+    /// Forward-mode rule for [`ShardingConstraintOperation`]: the sharding hint is linear, so the same hint applies to
+    /// the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is consulted,
+    /// so the operand tangent reaching here is always live.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<ShardingConstraintOperation>,
+        C::Value: ConstrainSharding,
+    {
+        |operation, _context, _driver, inputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().constrain_sharding(operation.sharding());
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(operation.sharding())),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
-    }
+    },
+    /// Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of the
+    /// output is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with
+    /// `ad.deflinear2`). Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the
+    /// operation's own.
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<ArrayType> + From<ShardingConstraintOperation>,
+    {
+        |operation, _context, _driver, inputs, outputs| {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    Ok(vec![MaybeZero::Value(cotangent.constrain_sharding(operation.sharding()))])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+            }
+        }
+    },
 }
 
 /// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]

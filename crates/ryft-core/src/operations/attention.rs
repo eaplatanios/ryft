@@ -6,11 +6,9 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-};
+use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, Zero, ZeroOperation};
 use crate::operations::control_flow::Select;
@@ -902,54 +900,50 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotProdu
 {
 }
 
-/// The operation is the inference fast path, so there is no differentiation rule: differentiating reports an error
-/// directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs the
-/// activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DotProductAttentionOperation
-where
-    C::Operation: From<DotProductAttentionOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support differentiation; use \
-                 'differentiable_dot_product_attention' for the training path"
-            ),
+impl_differentiable_operation! {
+    DotProductAttentionOperation,
+    /// The operation is the inference fast path, so there is no differentiation rule: differentiating reports an
+    /// error directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs the
+    /// activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<DotProductAttentionOperation>,
+    {
+        |_operation, _context, _driver, _inputs| {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support differentiation; use \
+                     'differentiable_dot_product_attention' for the training path"
+                ),
+            }
+            .into())
         }
-        .into())
-    }
+    },
+    transpose = @nonlinear,
 }
 
-impl_non_transposable_operation!(DotProductAttentionOperation);
-
-/// The backward operation rejects differentiation: second-order derivatives go through an explicit attention
-/// composition instead of the fused backward pass.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DotProductAttentionBackwardOperation
-where
-    C::Operation: From<DotProductAttentionBackwardOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support differentiation; differentiate \
-                 an explicit attention composition for higher-order derivatives"
-            ),
+impl_differentiable_operation! {
+    DotProductAttentionBackwardOperation,
+    /// The backward operation rejects differentiation: second-order derivatives go through an explicit attention
+    /// composition instead of the fused backward pass.
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<DotProductAttentionBackwardOperation>,
+    {
+        |_operation, _context, _driver, _inputs| {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support differentiation; \
+                     differentiate an explicit attention composition for higher-order derivatives"
+                ),
+            }
+            .into())
         }
-        .into())
-    }
+    },
+    transpose = @nonlinear,
 }
-
-impl_non_transposable_operation!(DotProductAttentionBackwardOperation);
 
 /// Shared merge-reshape batching rule for [`DotProductAttentionOperation`] and
 /// [`DotProductAttentionBackwardOperation`]: attention is batch-parallel, so one mapped batch level folds into the
