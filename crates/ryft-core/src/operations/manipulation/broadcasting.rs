@@ -13,14 +13,13 @@ use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::types::{ArrayType, Shape, Size};
-
-// TODO(eaplatanios): Review this.
 
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &str = "broadcast";
@@ -133,14 +132,12 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
-    ///
-    /// The pullback of a broadcast is a sum-reduction over every output axis the input was replicated along: the axes
-    /// of the target type that are not named in `output_axes`, plus the mapped axes whose input extent is `1` stretched
-    /// to a larger target extent. After the reduction, the surviving axes are reordered into input-axis order when
-    /// `output_axes` is not monotonically increasing, and stretched unit axes are restored with a reshape so the
-    /// cotangent matches the input type exactly. Symbolic-zero cotangents propagate unchanged, and an input with no
-    /// cotangent space receives the structural zero of that space.
+    /// Transposition rule for [`BroadcastOperation`]. The pullback of a broadcast is a sum-reduction over every output
+    /// axis the input was replicated along (i.e., he axes of the target type that are not named in `output_axes`, plus
+    /// the mapped axes whose input extent is `1` stretched to a larger target extent). After the reduction, the
+    /// surviving axes are reordered into input-axis order when `output_axes` is not monotonically increasing, and
+    /// stretched unit axes are restored with a reshape so the cotangent matches the input type exactly. Symbolic-zero
+    /// cotangents propagate unchanged, and an input with no cotangent space receives the structural zero of that space.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
@@ -168,6 +165,8 @@ impl_differentiable_operation! {
         }
     },
 }
+
+// TODO(eaplatanios): Review this.
 
 /// Lifts a broadcast's output-axis mapping and target type through one batching level.
 ///
