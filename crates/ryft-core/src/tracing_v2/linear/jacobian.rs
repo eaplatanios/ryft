@@ -194,19 +194,21 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Type-family capability required to materialize dense derivatives like [`Jacobian`](crate::Jacobian)s and
+/// A [`Type`] that is supported by dense differentiation functions that compute [`Jacobian`](crate::Jacobian)s and
 /// [`Hessian`](crate::Hessian)s. [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values,
-/// but they do not state that a leaf (i.e., a [`Parameter`]) has a finite coordinate space, that several directions can
-/// be represented by one value, or how packed replay results become public derivative blocks. Implementations of this
-/// trait provide only those representation-specific operations. The Jacobian algorithms retain ownership of structure
-/// traversal, differentiation, ordering, and result construction.
-///
-/// [`ArrayType`] currently provides the sole implementation. [`DataType`](crate::DataType) remains usable as Jacobian
-/// metadata, but scalar operation families do not yet have a packed batching representation and therefore intentionally
-/// do not implement this capability.
+/// but they do not state that a leaf (i.e., a [`Parameter`]) has a finite coordinate space, that several directions
+/// can be represented by one value, or how packed replay results become public derivative blocks. Implementations
+/// of this trait provide only those representation-specific operations. The Jacobian and Hessian algorithms retain
+/// ownership of structure traversal, differentiation, ordering, and result construction.
 pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
-    /// Packed value used during one multi-direction derivative replay.
-    type PackedValue;
+    /// Intermediate representation of one logical [`C::Value`](Domain::Value) during a packed, multi-direction
+    /// derivative replay. A value is either mapped over the packed coordinate directions or replicated unchanged across
+    /// them. Its logical per-direction type remains `Self`, while its physical representation may carry an additional
+    /// axis that indexes those directions. [`basis`](Self::basis) and [`replicated`](Self::replicated) construct these
+    /// values, [`replay`](Self::replay) propagates them through the derivative program, and the block extraction
+    /// methods convert them back into ordinary [`C::Value`](Domain::Value)s. Implementations must preserve which
+    /// physical axis, if any, carries the packed directions.
+    type DenseValue;
 
     /// Returns the finite coordinate count of `type`, reporting the leaf path when it cannot be enumerated.
     ///
@@ -239,10 +241,10 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         value_type: &Self,
         coordinate_offset: usize,
         basis_size: usize,
-    ) -> Result<Self::PackedValue, DifferentiationError>;
+    ) -> Result<Self::DenseValue, DifferentiationError>;
 
     /// Represents one replay input that is identical for every packed direction.
-    fn replicated(value: C::Value) -> Self::PackedValue;
+    fn replicated(value: C::Value) -> Self::DenseValue;
 
     /// Replays `region` once for all packed inputs while preserving its complete nested-region arena.
     ///
@@ -256,8 +258,8 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         context: &C,
         region: RegionRef<'_, C::Constant, C::Operation>,
         batch_size: usize,
-        inputs: Vec<Self::PackedValue>,
-    ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
+        inputs: Vec<Self::DenseValue>,
+    ) -> Result<Vec<Self::DenseValue>, DifferentiationError>;
 
     /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the
     /// values of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite
@@ -289,7 +291,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ///   - `input_type`: Differentiated input-leaf type.
     ///   - `output_type`: Differentiated output-leaf type.
     fn forward_block(
-        packed: &Self::PackedValue,
+        packed: &Self::DenseValue,
         batch_size: usize,
         coordinate_offset: usize,
         input_type: &Self,
@@ -307,7 +309,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ///   - `output_type`: Differentiated output-leaf type.
     ///   - `input_type`: Differentiated input-leaf type.
     fn reverse_block(
-        packed: &Self::PackedValue,
+        packed: &Self::DenseValue,
         batch_size: usize,
         coordinate_offset: usize,
         output_type: &Self,
@@ -325,7 +327,7 @@ where
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
-    type PackedValue = ArrayBatch<C::Value>;
+    type DenseValue = ArrayBatch<C::Value>;
 
     fn coordinate_count(
         r#type: &Self,
@@ -358,7 +360,7 @@ where
         value_type: &Self,
         coordinate_offset: usize,
         basis_size: usize,
-    ) -> Result<Self::PackedValue, DifferentiationError> {
+    ) -> Result<Self::DenseValue, DifferentiationError> {
         if coordinate_type.shape() != value_type.shape() {
             return Err(TypeError {
                 message: format!(
@@ -388,7 +390,7 @@ where
     }
 
     #[inline]
-    fn replicated(value: C::Value) -> Self::PackedValue {
+    fn replicated(value: C::Value) -> Self::DenseValue {
         ArrayBatch::replicated(value)
     }
 
@@ -396,8 +398,8 @@ where
         context: &C,
         region: RegionRef<'_, C::Constant, C::Operation>,
         batch_size: usize,
-        inputs: Vec<Self::PackedValue>,
-    ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
+        inputs: Vec<Self::DenseValue>,
+    ) -> Result<Vec<Self::DenseValue>, DifferentiationError> {
         Ok(BatchingContext::new(context.clone(), batch_size)
             .batch_region(region, inputs)
             .map_err(ProgramError::from)?)
@@ -425,7 +427,7 @@ where
     }
 
     fn forward_block(
-        packed: &Self::PackedValue,
+        packed: &Self::DenseValue,
         batch_size: usize,
         coordinate_offset: usize,
         input_type: &Self,
@@ -459,7 +461,7 @@ where
     }
 
     fn reverse_block(
-        packed: &Self::PackedValue,
+        packed: &Self::DenseValue,
         batch_size: usize,
         coordinate_offset: usize,
         output_type: &Self,
