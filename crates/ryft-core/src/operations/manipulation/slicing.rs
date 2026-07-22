@@ -2237,6 +2237,7 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::jacobian::jacobian_forward;
     use crate::differentiation::{LinearizationTracer, value_and_gradient};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -2250,7 +2251,6 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::jacobian_forward;
     use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;

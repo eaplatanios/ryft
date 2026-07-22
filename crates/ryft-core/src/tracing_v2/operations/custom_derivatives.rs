@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn test_jacobian_reverse_through_custom_vjp_uses_the_custom_backward_rule() {
-        use crate::tracing_v2::jacobian_reverse;
+        use crate::differentiation::jacobian::jacobian_reverse;
 
         // jacobian_reverse interprets the pullback with batch-stacked cotangent bases, exercising the batched replay
         // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal

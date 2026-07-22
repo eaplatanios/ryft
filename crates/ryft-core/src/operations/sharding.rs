@@ -509,10 +509,10 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::jacobian::jacobian_reverse;
     use crate::differentiation::{LinearizationTracer, vjp};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::jacobian_reverse;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;

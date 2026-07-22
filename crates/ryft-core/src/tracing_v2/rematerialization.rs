@@ -3061,7 +3061,7 @@ mod tests {
 
     #[test]
     fn test_jacobian_reverse_through_rematerialization_uses_the_rematerializing_backward_program() {
-        use crate::tracing_v2::jacobian_reverse;
+        use crate::differentiation::jacobian::jacobian_reverse;
 
         // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`;
         // `jacobian_reverse` exercises the batched replay of the derived backward program.

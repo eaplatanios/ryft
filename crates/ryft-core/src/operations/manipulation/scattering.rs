@@ -1060,12 +1060,12 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::Context;
+    use crate::differentiation::jacobian::jacobian_forward;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::jacobian_forward;
     use crate::types::{DataType, Layout, Memory, Shape, Size, StridedLayout};
 
     use super::*;
