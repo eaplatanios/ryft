@@ -1222,21 +1222,22 @@ where
 /// how [`Batch`](crate::Batch) carries batching. [`ReverseModeDifferentiate`](crate::ReverseModeDifferentiate) is its
 /// sibling that builds reverse mode on top of it (i.e., `vjp = linearize + transpose`).
 ///
-/// This trait is blanket-implemented for all [`Context`]s and has no items of its own to implement. Every entry point
-/// is a defaulted method whose `where` clause carries its actual requirements (e.g., the operation family's
-/// [`DifferentiableOperation`] rules), so whether a particular transform is available on a particular context is
-/// decided per method at the call site, in exactly the same way as [`Batch::batch`](crate::Batch::batch). Tangents are
-/// ordinary values of the same universe as the primals (i.e., [`Domain::Value`]) flowing through the same context. The
-/// type-level tangent structure, such as the cotangent types, live on [`DifferentiableType`] instead. Operations that
-/// involve predicates such as `condition`, `while`, and `select` impose their own
-/// [`Concretizable<bool>`](crate::Concretizable) bounds through their operation-family implementations.
+/// This trait is blanket-implemented for every [`Context`] whose type family is [`DifferentiableType`] and has no
+/// items of its own to implement. Every entry point is a defaulted method whose `where` clause carries its remaining
+/// requirements (e.g., the operation family's [`DifferentiableOperation`] rules), so whether a particular transform
+/// is available on a particular context is decided per method at the call site, in exactly the same way as
+/// [`Batch::batch`](crate::Batch::batch). Tangents are ordinary values of the same universe as the primals (i.e.,
+/// [`Domain::Value`]) flowing through the same context. The type-level tangent structure, such as the cotangent types,
+/// live on [`DifferentiableType`] instead. Operations that involve predicates such as `condition`, `while`, and
+/// `select` impose their own [`Concretizable<bool>`](crate::Concretizable) bounds through their operation-family
+/// implementations.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's [`Value`](Domain::Value) (i.e.,
 /// concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are detected lazily, like
 /// everything else about staging: a foreign tracer fails the builder-identity check either when an operation binds it
 /// (via [`StagingContext::stage_operation`]) or when it escapes through a trace boundary (i.e., the boundary output
 /// checks), with [`ProgramError::MismatchedProgramBuilders`].
-pub trait ForwardModeDifferentiate: Context {
+pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward, with this
     /// [`Context`] executing (or staging) the differentiated operations. Refer to the documentation of the [`jvp`]
     /// function for information on the forward-mode transform and its arguments.
@@ -1256,7 +1257,6 @@ pub trait ForwardModeDifferentiate: Context {
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
         Self: Zero<Self::Value>,
-        Self::Type: DifferentiableType,
         Self::Operation: DifferentiableOperation<Self>,
     {
         if primals.parameters().next().is_none() {
@@ -1317,7 +1317,6 @@ pub trait ForwardModeDifferentiate: Context {
         primals: Input,
     ) -> Result<(Output::To<Self::Value>, Pushforward<Self, Input, Output::To<Self::Value>>), DifferentiationError>
     where
-        Self::Type: DifferentiableType,
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + From<ZeroOperation<Self::Type>>,
@@ -1434,7 +1433,7 @@ pub trait ForwardModeDifferentiate: Context {
     }
 }
 
-impl<C: Context> ForwardModeDifferentiate for C {}
+impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 
 /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the closure
 /// **directly on [`DifferentiationTracer`] duals** (i.e., the single forward-mode entry point, and the analogue of
