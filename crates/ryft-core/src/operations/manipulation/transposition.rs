@@ -27,10 +27,10 @@ pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
 
 /// Axis permutation used by [`TransposeOperation`] and the [`Transpose`] capability. For each output axis `i`,
 /// `permutation[i]` is the input axis routed to it. [`Permutation`] is a thin wrapper over the axis vector. It
-/// [`Deref`]s to `[usize]` and implements [`AsRef<[usize]>`](AsRef), and so it composes with everything that already
-/// accepts an axis slice. Also, it supports [`From`] conversion from an owned [`Vec<usize>`](Vec) or a borrowed
-/// `&[usize]`. Validity (i.e., being a bijection of `0..len`) is not enforced at construction time. It is validated
-/// against a concrete input rank by the type-level [`Transpose`] rule.
+/// [`Deref`]s to `[usize]` and implements [`AsRef<[usize]>`](AsRef), and so it composes with everything that accepts an
+/// axis slice. It supports [`From`] conversion from owned vectors and arrays as well as borrowed permutations, vectors,
+/// arrays, and slices. Validity (i.e., being a bijection of `0..len`) is not enforced at construction time. It is
+/// validated against a concrete input rank by the type-level [`Transpose`] rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Permutation(Vec<usize>);
 
@@ -89,10 +89,38 @@ impl From<Vec<usize>> for Permutation {
     }
 }
 
+impl From<&Vec<usize>> for Permutation {
+    #[inline]
+    fn from(axes: &Vec<usize>) -> Self {
+        Self(axes.clone())
+    }
+}
+
 impl From<&[usize]> for Permutation {
     #[inline]
     fn from(axes: &[usize]) -> Self {
         Self(axes.to_vec())
+    }
+}
+
+impl<const N: usize> From<[usize; N]> for Permutation {
+    #[inline]
+    fn from(axes: [usize; N]) -> Self {
+        Self(axes.into())
+    }
+}
+
+impl<const N: usize> From<&[usize; N]> for Permutation {
+    #[inline]
+    fn from(axes: &[usize; N]) -> Self {
+        Self(axes.to_vec())
+    }
+}
+
+impl From<&Permutation> for Permutation {
+    #[inline]
+    fn from(permutation: &Permutation) -> Self {
+        permutation.clone()
     }
 }
 
@@ -179,9 +207,9 @@ impl_differentiable_operation! {
         C::Value: Transpose,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the
-            // same transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand
-            // tangent before this rule is consulted, so the operand tangent reaching here is always live.
+            // Forward-mode differentiation rule for `TransposeOperation`. `transpose` is structural-linear, and so the
+            // tangent is the same transpose applied to the operand tangent. The shared all-zero fast path handles a
+            // zero operand tangent before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transpose(operation.permutation())?;
             let tangent = match inputs[0].tangent() {
@@ -270,16 +298,13 @@ where
 /// ```
 pub trait Transpose: Sized {
     /// Reorders the axes of `self` according to the provided [`Permutation`], validating that the permutation is a
-    /// bijection of the input axes. The permutation is accepted as any `AsRef<[usize]>` (for example, an owned
-    /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
-    
-    // TODO(eaplatanios): Review from here onwards.
+    /// bijection of the input axes.
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError>;
 
     /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order. This is the
-    /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html).
-    /// Returns `self` unchanged when `from == to`. An out-of-bounds source or destination axis yields a [`TypeError`]
-    /// rather than being clamped or panicking.
+    /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html). Returns
+    /// `self` unchanged when `from == to`. An out-of-bounds source or destination axis yields a [`TypeError`] rather
+    /// than being clamped or panicking.
     #[inline]
     fn move_axis(&self, from: usize, to: usize) -> Result<Self, ProgramError>
     where
@@ -305,8 +330,8 @@ pub trait Transpose: Sized {
     }
 
     /// Swaps axes `i` and `j`, leaving every other axis in place. This is the analogue of NumPy's
-    /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html).
-    /// Returns `self` unchanged when `i == j`. An out-of-bounds axis yields a [`TypeError`] rather than a panic.
+    /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html). Returns `self`
+    /// unchanged when `i == j`. An out-of-bounds axis yields a [`TypeError`] rather than a panic.
     #[inline]
     fn swap_axes(&self, i: usize, j: usize) -> Result<Self, ProgramError>
     where
@@ -328,19 +353,18 @@ pub trait Transpose: Sized {
 }
 
 impl Transpose for Sharding {
-    /// Reorders the per-dimension [`ShardingDimension`](crate::ShardingDimension) entries so that output dimension `i`
-    /// carries the entry of input dimension `permutation[i]`, while the reduction-state and manual-axis sets are left
-    /// unchanged. This is the sharding-level analogue of an array axis permutation. `permutation` must be a permutation
-    /// of `0..rank` matching this sharding's rank; otherwise a type error describing the offending dimension is
-    /// returned.
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        let permutation = permutation.as_ref();
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        // Reorder the per-dimension `ShardingDimension` entries so that output dimension `i` carries the entry of input
+        // dimension `permutation[i]`, while leaving the reduction-state and manual-axis sets unchanged. This is the
+        // sharding-level analogue of an array axis permutation. `permutation` must be a permutation of `0..rank`
+        // matching this sharding's rank. Otherwise, a type error describing the offending dimension is returned.`
+        let permutation = permutation.into();
         let permute_dimensions = || -> Result<Self, ShardingError> {
             if permutation.len() != self.dimensions().len() {
                 return Err(ShardingError::DimensionOutOfBounds { dimension: permutation.len(), rank: self.rank() });
             }
             let mut dimensions = Vec::with_capacity(self.dimensions().len());
-            for axis in permutation {
+            for axis in permutation.iter() {
                 let dimension = self
                     .dimensions()
                     .get(*axis)
@@ -357,24 +381,26 @@ impl Transpose for Sharding {
 }
 
 impl Transpose for ArrayType {
-    /// Type-level transpose: validates that `permutation` has length equal to the input rank and is a permutation of
-    /// `0..rank` (every axis in range, no duplicates), then returns the input unchanged for the identity permutation
-    /// or permutes its shape and output sharding otherwise. Output axis `i` carries input axis `permutation[i]`.
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        let permutation = permutation.as_ref();
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        // Validate that `permutation` has length equal to the input rank and is a permutation of `0..rank` (i.e.,
+        // every axis in range with no duplicates), and then return the input unchanged for the identity permutation
+        // or permute its shape and output sharding, otherwise. Output axis `i` carries input axis `permutation[i]`.
+        let permutation = permutation.into();
         let input = self;
         let rank = input.rank();
         if permutation.len() != rank {
             return Err(TypeError {
                 message: format!(
-                    "'{TRANSPOSE_OPERATION_NAME}' permutation has length {} but input has rank {rank}",
+                    "'{}' permutation has length {} but input has rank {}",
+                    TRANSPOSE_OPERATION_NAME,
                     permutation.len(),
+                    rank,
                 ),
             }
             .into());
         }
         let mut seen = vec![false; rank];
-        for axis in permutation {
+        for axis in permutation.iter() {
             if *axis >= rank {
                 return Err(TypeError {
                     message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation axis {axis} is out of bounds"),
@@ -410,15 +436,15 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     Transpose for V
 {
     #[inline]
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        let permutation = permutation.as_ref();
-        self.r#type().transpose(permutation)?;
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        let permutation = permutation.into();
+        self.r#type().transpose(permutation.clone())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
         Ok(self
             .dispatch_domain()
-            .bind(TransposeOperation::new(permutation.to_vec()), Vec::new(), std::slice::from_ref(self))?
+            .bind(TransposeOperation::new(permutation), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
@@ -446,6 +472,13 @@ mod tests {
 
     #[test]
     fn test_permutation() {
+        // Common owned and borrowed axis collections convert to the canonical permutation representation.
+        let axes = vec![2, 0, 1];
+        assert_eq!(Permutation::from([2, 0, 1]), Permutation::from(axes.clone()));
+        assert_eq!(Permutation::from(&[2, 0, 1]), Permutation::from(axes.clone()));
+        assert_eq!(Permutation::from(axes.as_slice()), Permutation::from(axes.clone()));
+        assert_eq!(Permutation::from(&axes), Permutation::from(axes));
+
         // Empty and identity permutations are their own inverses.
         assert_eq!(Permutation::from(vec![]).inverse(), Ok(Permutation::from(vec![])));
         assert_eq!(Permutation::from(vec![0, 1, 2]).inverse(), Ok(Permutation::from(vec![0, 1, 2])));
@@ -626,6 +659,7 @@ mod tests {
                 tangent_outputs = [Array::matrix(2, 2, vec![5.0, 7.0, 6.0, 8.0])],
             }],
         );
+        
         check_operation_transposition!(
             @exact,
             operation = TransposeOperation::new(vec![1, 0]),
@@ -703,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_array() {
+    fn test_array_transpose() {
         // Rank-2 swap of a row-major 2x3 payload.
         let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
         assert_eq!(
