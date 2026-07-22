@@ -6,30 +6,31 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
+use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::{Sharding, ShardingError};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape};
 
-// TODO(eaplatanios): Review this.
-
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &str = "transpose";
 
-/// An axis permutation used by [`TransposeOperation`] and the [`Transpose`] capability. For each output axis `i`,
+/// Axis permutation used by [`TransposeOperation`] and the [`Transpose`] capability. For each output axis `i`,
 /// `permutation[i]` is the input axis routed to it. [`Permutation`] is a thin wrapper over the axis vector. It
-/// [`Deref`]s to `[usize]` and implements `AsRef<[usize]>`, and so it composes with everything that already accepts
-/// an axis slice. Also, it supports [`From`] conversion from an owned `Vec<usize>` or a borrowed `&[usize]`. Validity
-/// (i.e., being a bijection of `0..len`) is not enforced at construction time. It is validated against a concrete input
-/// rank by the type-level [`Transpose`] rule.
+/// [`Deref`]s to `[usize]` and implements [`AsRef<[usize]>`](AsRef), and so it composes with everything that already
+/// accepts an axis slice. Also, it supports [`From`] conversion from an owned [`Vec<usize>`](Vec) or a borrowed
+/// `&[usize]`. Validity (i.e., being a bijection of `0..len`) is not enforced at construction time. It is validated
+/// against a concrete input rank by the type-level [`Transpose`] rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Permutation(Vec<usize>);
 
@@ -95,8 +96,8 @@ impl From<&[usize]> for Permutation {
     }
 }
 
-/// [`Operation`] that reorders the axes of its input array according to a static permutation. Refer to the
-/// documentation of [`Transpose`] for more information.
+/// [`Operation`] that reorders the axes of its input array according to a static permutation.
+/// Refer to the documentation of [`Transpose`] for more information.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TransposeOperation {
     /// Axis [`Permutation`] of this [`TransposeOperation`].
@@ -164,8 +165,6 @@ impl<C: Domain<Type = ArrayType, Value: Transpose>> InterpretableOperation<C> fo
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> PartiallyEvaluatableOperation<C>
     for TransposeOperation
 {
@@ -173,9 +172,6 @@ impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> Partiall
 
 impl_differentiable_operation! {
     TransposeOperation,
-    /// Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the same
-    /// transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before
-    /// this rule is consulted, so the operand tangent reaching here is always live.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
@@ -183,6 +179,9 @@ impl_differentiable_operation! {
         C::Value: Transpose,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the
+            // same transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand
+            // tangent before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transpose(operation.permutation())?;
             let tangent = match inputs[0].tangent() {
@@ -215,25 +214,6 @@ impl_differentiable_operation! {
     },
 }
 
-/// Lifts an axis `permutation` through one batching level inserted at `batch_axis`.
-///
-/// The returned permutation has length `permutation.len() + 1`, places the batch axis at the
-/// same output position as it appears in the input (so the output's batch axis stays at the
-/// input's `batch_axis`), and shifts every other axis index `i` to `i + 1` when `i >= batch_axis`.
-pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> {
-    let mut lifted = Vec::with_capacity(permutation.len() + 1);
-    for output_axis in 0..=permutation.len() {
-        if output_axis == batch_axis {
-            lifted.push(batch_axis);
-        } else {
-            let original_output_axis = if output_axis < batch_axis { output_axis } else { output_axis - 1 };
-            let input_axis = permutation[original_output_axis];
-            lifted.push(if input_axis >= batch_axis { input_axis + 1 } else { input_axis });
-        }
-    }
-    lifted
-}
-
 impl<C: Context<Type = ArrayType>> BatchableOperation<C> for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<C>,
@@ -248,7 +228,20 @@ where
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
         let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
+            Some(batch_axis) => {
+                let permutation = self.permutation();
+                let mut lifted_permutation = Vec::with_capacity(permutation.len() + 1);
+                for output_axis in 0..=permutation.len() {
+                    if output_axis == batch_axis {
+                        lifted_permutation.push(batch_axis);
+                    } else {
+                        let original_output_axis = if output_axis < batch_axis { output_axis } else { output_axis - 1 };
+                        let input_axis = permutation[original_output_axis];
+                        lifted_permutation.push(if input_axis >= batch_axis { input_axis + 1 } else { input_axis });
+                    }
+                }
+                (lifted_permutation, Some(batch_axis))
+            }
             None => (self.permutation().to_vec(), None),
         };
         let lifted_op = TransposeOperation::new(lifted_permutation);
@@ -256,8 +249,8 @@ where
     }
 }
 
-/// Reorders the axes of an array according to a permutation. Output axis `i` receives input axis `permutation[i]`, so
-/// the permutation must contain every input axis exactly once. An identity permutation passes the input through
+/// Reorders the axes of an array according to a [`Permutation`]. Output axis `i` receives input axis `permutation[i]`,
+/// so the permutation must contain every input axis exactly once. An identity permutation passes the input through
 /// unchanged. Every other transposition preserves the element type, memory space, and reduction state, permutes shape
 /// and per-dimension sharding in the same way as the data, and clears an explicit physical layout because a logical
 /// axis permutation does not determine a unique output storage layout.
@@ -268,19 +261,20 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use ryft_core::backends::arrays::Array;
-/// use ryft_core::operations::manipulation::Transpose;
-///
+/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::operations::manipulation::Transpose;
+/// #
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let output = input.transpose([1, 0])?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-/// # Ok::<(), ryft_core::ProgramError>(())
 /// ```
 pub trait Transpose: Sized {
-    /// Reorders the axes of `self` according to the provided permutation, validating that the permutation is a
+    /// Reorders the axes of `self` according to the provided [`Permutation`], validating that the permutation is a
     /// bijection of the input axes. The permutation is accepted as any `AsRef<[usize]>` (for example, an owned
     /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
+    
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order. This is the
     /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html).
