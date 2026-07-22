@@ -3,21 +3,21 @@ use std::marker::PhantomData;
 use ryft_macros::Parameterized;
 
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DenseDifferentiableType, DifferentiableOperation, DifferentiationContext, DifferentiationError,
-    LinearizationTracer, TransposableOperation,
-};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext, LinearizationTracer};
+use crate::differentiation::jacobian::{Jacobian, jacobian_forward_in_context, jacobian_reverse_in_context};
+use crate::differentiation::reverse::TransposableOperation;
+use crate::differentiation::types::DenseDifferentiableType;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
 use crate::programs::types::{Type, Typed};
-use crate::programs::{ProgramError, Value};
+use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
 // TODO(eaplatanios): Review this module.
-
-use super::jacobian::{Jacobian, jacobian_forward_in_context, jacobian_reverse_in_context};
 
 /// Defines one non-auxiliary [`HessianDifferentiate`] method. It keeps the nested differentiation bounds shared while
 /// adapting its corresponding auxiliary method with a unit auxiliary value.
@@ -726,6 +726,7 @@ define_hessian_auxiliary_function!(
     /// layout, context recovery, and ordinary complex-type rules.
     hessian_with_aux,
 );
+
 define_hessian_auxiliary_function!(
     /// Materializes a holomorphic Hessian and returns nondifferentiated auxiliary outputs.
     ///
@@ -747,6 +748,7 @@ mod tests {
     use crate::operations::math::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::types::Typed;
+    use crate::types::DataType;
     use crate::types::DataType::{F32, F64};
 
     use super::*;
