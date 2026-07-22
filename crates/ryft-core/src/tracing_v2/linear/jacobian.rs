@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::marker::PhantomData;
 
 use ryft_macros::Parameterized;
@@ -692,6 +691,341 @@ define_jacobian_auxiliary_function!(
     ],
 );
 
+/// Implements forward-mode [`Jacobian`] materialization in an explicitly provided [`Context`] for a function that also
+/// returns auxiliary outputs. It linearizes the differentiated output once, packs one tangent basis direction for every
+/// input coordinate, replays the resulting pushforward over the packed batch, and returns the materialized primal
+/// auxiliary output unchanged.
+///
+/// # Parameters
+///
+///   - `context`: Context in which to trace and replay the transform.
+///   - `function`: Function returning the differentiated output and auxiliary output.
+///   - `primals`: Structured input values specifying the linearization point.
+///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
+pub(crate) fn jacobian_forward_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<ZeroOperation<C::Type>>,
+        >,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+        >,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
+    // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
+    // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
+    let input_structure = primals.parameter_structure();
+    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_types = I::To::<C::Type>::from_parameters(
+        input_structure.clone(),
+        input_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    JacobianMode::Forward.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
+    let primals = I::from_parameters(input_structure, input_values)?;
+
+    // Evaluate and linearize the differentiated output once. `linearize` returns only the differentiated output,
+    // so capture the auxiliary primals while its closure runs and move them back out after constructing the Jacobian.
+    let mut auxiliary = None;
+    let (output, pushforward) = context.linearize(
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary = Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?);
+            Ok(output)
+        },
+        primals,
+    )?;
+
+    // Recover and validate the output type tree from the primal output returned by linearization. These types later
+    // determine how each packed pushforward output is partitioned into output/input Jacobian blocks.
+    let output_structure = output.parameter_structure();
+    let output_values = output.into_parameters().collect::<Vec<_>>();
+    let output_types = O::To::<C::Type>::from_parameters(
+        output_structure,
+        output_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
+
+    // Assign each input parameter a contiguous range in the flattened input coordinate space. The final prefix offset
+    // is the total number of basis directions packed into the replay batch. Output offsets are unnecessary in forward
+    // mode, but computing them validates that every output also has a finite coordinate space.
+    let input_offsets = coordinate_prefix_offsets::<C, _>(
+        &input_types,
+        DerivativeTransform::JacobianForward,
+        DifferentiationParameterRole::Input,
+    )?;
+    coordinate_prefix_offsets::<C, _>(
+        &output_types,
+        DerivativeTransform::JacobianForward,
+        DifferentiationParameterRole::Output,
+    )?;
+    let batch_size = input_offsets.last().copied().unwrap();
+
+    // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
+    // Verify that the derived program still satisfies this contract before constructing its packed inputs.
+    let (program, residuals) = pushforward.into_parts();
+    let program_input_types = program.input_types();
+    let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "pushforward program consumes {} inputs which is fewer than its {} residuals",
+            program_input_types.len(),
+            residuals.len(),
+        ))
+    })?;
+    if tangent_input_count != input_types.parameter_count() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "pushforward program consumes {} tangent inputs but the differentiated input has {} leaves",
+            tangent_input_count,
+            input_types.parameter_count(),
+        ))
+        .into());
+    }
+    for (index, (program_input_type, (path, input_type))) in
+        program_input_types[..tangent_input_count].iter().zip(input_types.named_parameters()).enumerate()
+    {
+        let tangent_type = input_type.tangent();
+        if tangent_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableParameter {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
+                path: path.to_string(),
+                r#type: input_type.to_string(),
+            });
+        }
+        if program_input_type != &tangent_type {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward tangent input {index} has type {program_input_type} but the differentiated input \
+                parameter has tangent type {tangent_type}",
+            ))
+            .into());
+        }
+    }
+
+    // For every input parameter, construct a packed standard basis occupying that parameter's coordinate range in the
+    // shared batch. Replicate residuals because the same linearization point is reused for every tangent direction.
+    let mut packed_inputs = input_types
+        .named_parameters()
+        .enumerate()
+        .map(|(index, (path, r#type))| {
+            let tangent_type = r#type.tangent();
+            if tangent_type.is_zero_space() {
+                return Err(DifferentiationError::NonDifferentiableParameter {
+                    transform: DerivativeTransform::JacobianForward,
+                    role: DifferentiationParameterRole::Input,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            C::Type::coordinate_basis(context, r#type, &tangent_type, input_offsets[index], batch_size)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
+
+    // Replay all basis tangents together. Each packed output now contains the derivative of one output parameter
+    // with respect to every flattened input coordinate.
+    let packed_outputs =
+        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    check_count!("output", packed_outputs, output_types.parameter_count(), ProgramError);
+
+    // Slice each packed output by the coordinate range of each input parameter. Iterating outputs outside inputs
+    // produces the output-major/input-minor block order required by `Jacobian`.
+    let mut values = Vec::new();
+    for (output_index, output_type) in output_types.parameters().enumerate() {
+        for (input_index, input_type) in input_types.parameters().enumerate() {
+            let value = C::Type::extract_forward_jacobian_block(
+                &packed_outputs[output_index],
+                batch_size,
+                input_offsets[input_index],
+                input_type,
+                output_type,
+            )?;
+            values.push(value);
+        }
+    }
+
+    // Reattach the type trees to the extracted blocks and return the auxiliary primals captured during linearization.
+    let jacobian = Jacobian::new(input_types, output_types, values)?;
+    let auxiliary = auxiliary.ok_or_else(|| {
+        ProgramError::MalformedProgram(
+            "the forward-mode Jacobian computation did not evaluate its function".to_string(),
+        )
+    })?;
+    Ok((jacobian, auxiliary))
+}
+
+/// Implements reverse-mode [`Jacobian`] materialization in an explicitly provided [`Context`] for a function that also
+/// returns auxiliary outputs. It constructs the pullback of the differentiated output once, packs one cotangent basis
+/// direction for every output coordinate, replays that pullback over the packed batch, and returns the materialized
+/// primal auxiliary output unchanged.
+///
+/// # Parameters
+///
+///   - `context`: Context in which to trace and replay the transform.
+///   - `function`: Function returning the differentiated output and auxiliary output.
+///   - `primals`: Structured input values specifying the linearization point.
+///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
+pub(crate) fn jacobian_reverse_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<C>>
+                           + TransposableOperation<C::Constant, C::Operation>
+                           + From<ZeroOperation<C::Type>>
+                           + From<AddOperation>,
+        >,
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+        >,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+    Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
+    // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
+    // inputs in the ordinary case, but still requires each input parameter to have a nonzero cotangent space.
+    let input_structure = primals.parameter_structure();
+    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_types = I::To::<C::Type>::from_parameters(
+        input_structure.clone(),
+        input_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
+    let primals = I::from_parameters(input_structure, input_values)?;
+
+    // Evaluate the differentiated output once and construct its reusable pullback. `vjp` returns only the
+    // differentiated output, so capture the auxiliary primals while its closure runs and move them back out after
+    // constructing the Jacobian.
+    let mut auxiliary = None;
+    let (output, pullback) = context.vjp(
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary = Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?);
+            Ok(output)
+        },
+        primals,
+    )?;
+
+    // Recover and validate the output type tree from the primal output. In reverse mode these types determine the
+    // cotangent basis used to enumerate the rows of the Jacobian.
+    let output_structure = output.parameter_structure();
+    let output_values = output.into_parameters().collect::<Vec<_>>();
+    let output_types = O::To::<C::Type>::from_parameters(
+        output_structure,
+        output_values.iter().map(|value| value.r#type().into_owned()),
+    )?;
+    JacobianMode::Reverse.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
+
+    // Validate the input coordinate spaces and assign each output parameter a contiguous range in the flattened output
+    // coordinate space. The final output offset is the number of cotangent basis directions in the replay batch.
+    coordinate_prefix_offsets::<C, _>(
+        &input_types,
+        DerivativeTransform::JacobianReverse,
+        DifferentiationParameterRole::Input,
+    )?;
+    let output_offsets = coordinate_prefix_offsets::<C, _>(
+        &output_types,
+        DerivativeTransform::JacobianReverse,
+        DifferentiationParameterRole::Output,
+    )?;
+    let batch_size = output_offsets.last().copied().unwrap();
+
+    // A pullback program consumes one cotangent per output parameter followed by its closed-over primal residuals.
+    // Verify that the derived program exposes that input contract before constructing the packed cotangents.
+    let (program, residuals) = pullback.into_parts();
+    let program_input_types = program.input_types();
+    let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
+        ProgramError::MalformedProgram(format!(
+            "pullback program consumes {} inputs which is fewer than its {} residuals",
+            program_input_types.len(),
+            residuals.len(),
+        ))
+    })?;
+    if cotangent_input_count != output_types.parameter_count() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "pullback program consumes {} cotangent inputs but the differentiated output has {} leaves",
+            cotangent_input_count,
+            output_types.parameter_count(),
+        ))
+        .into());
+    }
+
+    // Construct one packed standard cotangent basis for each output parameter in its assigned coordinate range.
+    // Replicate residuals so every cotangent direction reuses the same primal linearization point.
+    let mut packed_inputs = output_types
+        .named_parameters()
+        .enumerate()
+        .map(|(index, (path, r#type))| {
+            let cotangent_type = r#type.cotangent();
+            if cotangent_type.is_zero_space() {
+                return Err(DifferentiationError::NonDifferentiableParameter {
+                    transform: DerivativeTransform::JacobianReverse,
+                    role: DifferentiationParameterRole::Output,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            if program_input_types[index] != cotangent_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback cotangent input {} has type {} but output parameter {} has cotangent type {}",
+                    index, program_input_types[index], path, cotangent_type,
+                ))
+                .into());
+            }
+            C::Type::coordinate_basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
+
+    // Replay all output cotangent directions together. Each packed result corresponds to one input parameter and
+    // contains that input parameter's sensitivities to every flattened output coordinate.
+    let packed_outputs =
+        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    check_count!("output", packed_outputs, input_types.parameter_count(), ProgramError);
+
+    // Slice each packed input sensitivity by output-coordinate range and orient it as an output/input block.
+    // The loop order restores the same output-major/input-minor representation produced by forward mode.
+    let mut values = Vec::new();
+    for (output_index, output_type) in output_types.parameters().enumerate() {
+        for (input_index, input_type) in input_types.parameters().enumerate() {
+            let value = C::Type::extract_reverse_jacobian_block(
+                &packed_outputs[input_index],
+                batch_size,
+                output_offsets[output_index],
+                output_type,
+                input_type,
+            )?;
+            values.push(value);
+        }
+    }
+
+    // Reattach the type trees to the extracted blocks and return the auxiliary primals captured
+    // while building the pullback.
+    let jacobian = Jacobian::new(input_types, output_types, values)?;
+    let auxiliary = auxiliary.ok_or_else(|| {
+        ProgramError::MalformedProgram(
+            "the reverse-mode Jacobian computation did not evaluate its function".to_string(),
+        )
+    })?;
+    Ok((jacobian, auxiliary))
+}
+
 /// Direction of a dense Jacobian materialization.
 #[derive(Copy, Clone)]
 enum JacobianMode {
@@ -821,331 +1155,6 @@ fn extract_auxiliary_primals<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Implements forward-mode [`Jacobian`] materialization in an explicitly provided [`Context`] for a function that also
-/// returns auxiliary outputs. It linearizes the differentiated output once, packs one tangent basis direction for every
-/// input coordinate, replays the resulting pushforward over the packed batch, and returns the materialized primal
-/// auxiliary output unchanged.
-///
-/// # Parameters
-///
-///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
-///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn jacobian_forward_in_context<
-    C: Context<
-            Type: DenseDifferentiableType<C>,
-            Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<ZeroOperation<C::Type>>,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
-        >,
-    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
->(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError> {
-    // `linearize` returns only the differentiated output, so capture the auxiliary primals while its closure runs and
-    // move them back out after constructing the Jacobian.
-    let auxiliary = RefCell::new(None);
-    let transform = DerivativeTransform::JacobianForward;
-
-    // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
-    // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
-    let input_structure = primals.parameter_structure();
-    let input_values = primals.into_parameters().collect::<Vec<_>>();
-    let input_types = I::To::<C::Type>::from_parameters(
-        input_structure.clone(),
-        input_values.iter().map(|value| value.r#type().into_owned()),
-    )?;
-    JacobianMode::Forward.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
-    let primals = I::from_parameters(input_structure, input_values)?;
-
-    // Evaluate and linearize the differentiated output once. Auxiliary tracers contribute no tangent outputs; their
-    // already-known primal components are extracted while the linearization closure is active.
-    let (output, pushforward) = context.linearize(
-        |input| {
-            let (output, value) = function(input)?;
-            auxiliary.replace(Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?));
-            Ok(output)
-        },
-        primals,
-    )?;
-
-    // Recover and validate the output type tree from the primal output returned by linearization. These types later
-    // determine how each packed pushforward output is partitioned into output/input Jacobian blocks.
-    let output_structure = output.parameter_structure();
-    let output_values = output.into_parameters().collect::<Vec<_>>();
-    let output_types = O::To::<C::Type>::from_parameters(
-        output_structure,
-        output_values.iter().map(|value| value.r#type().into_owned()),
-    )?;
-    JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
-
-    // Assign each input leaf a contiguous range in the flattened input coordinate space. The final prefix offset is
-    // the total number of basis directions packed into the replay batch. Output offsets are unnecessary in forward
-    // mode, but computing them validates that every output also has a finite coordinate space.
-    let input_offsets =
-        coordinate_prefix_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
-    coordinate_prefix_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
-    let batch_size = input_offsets.last().copied().unwrap();
-
-    // A pushforward program consumes one tangent per input leaf followed by the closed-over primal residuals. Verify
-    // that the derived program still satisfies this contract before constructing its packed inputs.
-    let (program, residuals) = pushforward.into_parts();
-    let program_input_types = program.input_types();
-    let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
-        ProgramError::MalformedProgram(format!(
-            "pushforward program consumes {} inputs which is fewer than its {} residuals",
-            program_input_types.len(),
-            residuals.len(),
-        ))
-    })?;
-    if tangent_input_count != input_types.parameter_count() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "pushforward program consumes {tangent_input_count} tangent inputs but the differentiated input has {} \
-             leaves",
-            input_types.parameter_count(),
-        ))
-        .into());
-    }
-    for (index, (program_input_type, (path, input_type))) in
-        program_input_types[..tangent_input_count].iter().zip(input_types.named_parameters()).enumerate()
-    {
-        let tangent_type = input_type.tangent();
-        if tangent_type.is_zero_space() {
-            return Err(DifferentiationError::NonDifferentiableParameter {
-                transform,
-                role: DifferentiationParameterRole::Input,
-                path: path.to_string(),
-                r#type: input_type.to_string(),
-            });
-        }
-        if program_input_type != &tangent_type {
-            return Err(ProgramError::MalformedProgram(format!(
-                "pushforward tangent input {index} has type {program_input_type} but the differentiated input leaf \
-                 has tangent type {tangent_type}",
-            ))
-            .into());
-        }
-    }
-
-    // For every input leaf, construct a packed standard basis occupying that leaf's coordinate range in the shared
-    // batch. Replicate residuals because the same linearization point is reused for every tangent direction.
-    let mut packed_inputs = input_types
-        .named_parameters()
-        .enumerate()
-        .map(|(index, (path, r#type))| {
-            let tangent_type = r#type.tangent();
-            if tangent_type.is_zero_space() {
-                return Err(DifferentiationError::NonDifferentiableParameter {
-                    transform,
-                    role: DifferentiationParameterRole::Input,
-                    path: path.to_string(),
-                    r#type: r#type.to_string(),
-                });
-            }
-            C::Type::coordinate_basis(context, r#type, &tangent_type, input_offsets[index], batch_size)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
-
-    // Replay all basis tangents together. Each packed output now contains the derivative of one output leaf with
-    // respect to every flattened input coordinate.
-    let packed_outputs =
-        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
-    check_count!("output", packed_outputs, output_types.parameter_count(), ProgramError);
-
-    // Slice each packed output by the coordinate range of each input leaf. Iterating outputs outside inputs produces
-    // the output-major/input-minor block order required by `Jacobian`.
-    let mut values = Vec::new();
-    for (output_index, output_type) in output_types.parameters().enumerate() {
-        for (input_index, input_type) in input_types.parameters().enumerate() {
-            let value = C::Type::extract_forward_jacobian_block(
-                &packed_outputs[output_index],
-                batch_size,
-                input_offsets[input_index],
-                input_type,
-                output_type,
-            )?;
-            values.push(value);
-        }
-    }
-
-    // Reattach the type trees to the extracted blocks and return the auxiliary primals captured during linearization.
-    let jacobian = Jacobian::new(input_types, output_types, values)?;
-    let auxiliary = auxiliary
-        .into_inner()
-        .ok_or_else(|| ProgramError::MalformedProgram("jacobian_forward did not evaluate its function".to_string()))?;
-    Ok((jacobian, auxiliary))
-}
-
-/// Implements reverse-mode Jacobian materialization in an explicitly provided [`Context`] for a function that also
-/// returns auxiliary outputs. It constructs the pullback of the differentiated output once, packs one cotangent basis
-/// direction for every output coordinate, replays that pullback over the packed batch, and returns the materialized
-/// primal auxiliary output unchanged.
-///
-/// # Parameters
-///
-///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
-///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn jacobian_reverse_in_context<
-    C: Context<
-            Type: DenseDifferentiableType<C>,
-            Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + DifferentiableOperation<PartialEvaluationContext<C>>
-                           + TransposableOperation<C::Constant, C::Operation>
-                           + From<ZeroOperation<C::Type>>
-                           + From<AddOperation>,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
-        >,
-    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
->(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError> {
-    // `vjp` returns only the differentiated output, so capture the auxiliary primals while its closure runs and move
-    // them back out after constructing the Jacobian.
-    let auxiliary = RefCell::new(None);
-    let transform = DerivativeTransform::JacobianReverse;
-
-    // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
-    // inputs in the ordinary case, but still requires each input leaf to have a nonzero cotangent space.
-    let input_structure = primals.parameter_structure();
-    let input_values = primals.into_parameters().collect::<Vec<_>>();
-    let input_types = I::To::<C::Type>::from_parameters(
-        input_structure.clone(),
-        input_values.iter().map(|value| value.r#type().into_owned()),
-    )?;
-    JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
-    let primals = I::from_parameters(input_structure, input_values)?;
-
-    // Evaluate the differentiated output once and construct its reusable pullback. Auxiliary tracers contribute no
-    // cotangent inputs; only their already-known primal components are retained.
-    let (output, pullback) = context.vjp(
-        |input| {
-            let (output, value) = function(input)?;
-            auxiliary.replace(Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?));
-            Ok(output)
-        },
-        primals,
-    )?;
-
-    // Recover and validate the output type tree from the primal output. In reverse mode these types determine the
-    // cotangent basis used to enumerate the rows of the Jacobian.
-    let output_structure = output.parameter_structure();
-    let output_values = output.into_parameters().collect::<Vec<_>>();
-    let output_types = O::To::<C::Type>::from_parameters(
-        output_structure,
-        output_values.iter().map(|value| value.r#type().into_owned()),
-    )?;
-    JacobianMode::Reverse.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
-
-    // Validate the input coordinate spaces and assign each output leaf a contiguous range in the flattened output
-    // coordinate space. The final output offset is the number of cotangent basis directions in the replay batch.
-    coordinate_prefix_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
-    let output_offsets =
-        coordinate_prefix_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
-    let batch_size = output_offsets.last().copied().unwrap();
-
-    // A pullback program consumes one cotangent per output leaf followed by its closed-over primal residuals. Verify
-    // that the derived program exposes that input contract before constructing the packed cotangents.
-    let (program, residuals) = pullback.into_parts();
-    let program_input_types = program.input_types();
-    let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
-        ProgramError::MalformedProgram(format!(
-            "pullback program consumes {} inputs which is fewer than its {} residuals",
-            program_input_types.len(),
-            residuals.len(),
-        ))
-    })?;
-    if cotangent_input_count != output_types.parameter_count() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "pullback program consumes {cotangent_input_count} cotangent inputs but the differentiated output has {} \
-             leaves",
-            output_types.parameter_count(),
-        ))
-        .into());
-    }
-
-    // Construct one packed standard cotangent basis for each output leaf in its assigned coordinate range. Replicate
-    // residuals so every cotangent direction reuses the same primal linearization point.
-    let mut packed_inputs = output_types
-        .named_parameters()
-        .enumerate()
-        .map(|(index, (path, r#type))| {
-            let cotangent_type = r#type.cotangent();
-            if cotangent_type.is_zero_space() {
-                return Err(DifferentiationError::NonDifferentiableParameter {
-                    transform,
-                    role: DifferentiationParameterRole::Output,
-                    path: path.to_string(),
-                    r#type: r#type.to_string(),
-                });
-            }
-            if program_input_types[index] != cotangent_type {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "pullback cotangent input {index} has type {} but output leaf {path} has cotangent type \
-                     {cotangent_type}",
-                    program_input_types[index],
-                ))
-                .into());
-            }
-            C::Type::coordinate_basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
-
-    // Replay all output cotangent directions together. Each packed result corresponds to one input leaf and contains
-    // that input leaf's sensitivities to every flattened output coordinate.
-    let packed_outputs =
-        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
-    check_count!("output", packed_outputs, input_types.parameter_count(), ProgramError);
-
-    // Slice each packed input sensitivity by output-coordinate range and orient it as an output/input block. The loop
-    // order restores the same output-major/input-minor representation produced by forward mode.
-    let mut values = Vec::new();
-    for (output_index, output_type) in output_types.parameters().enumerate() {
-        for (input_index, input_type) in input_types.parameters().enumerate() {
-            let value = C::Type::extract_reverse_jacobian_block(
-                &packed_outputs[input_index],
-                batch_size,
-                output_offsets[output_index],
-                output_type,
-                input_type,
-            )?;
-            values.push(value);
-        }
-    }
-
-    // Reattach the type trees to the extracted blocks and return the auxiliary primals captured while building the
-    // pullback.
-    let jacobian = Jacobian::new(input_types, output_types, values)?;
-    let auxiliary = auxiliary
-        .into_inner()
-        .ok_or_else(|| ProgramError::MalformedProgram("jacobian_reverse did not evaluate its function".to_string()))?;
-    Ok((jacobian, auxiliary))
-}
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1164,7 +1173,7 @@ mod tests {
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{Jacobian, coordinate_prefix_offsets, jacobian_forward, jacobian_reverse};
+    use super::*;
 
     /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
     /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
