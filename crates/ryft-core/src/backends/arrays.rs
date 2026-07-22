@@ -1541,7 +1541,11 @@ impl Pad for Array {
 }
 
 impl Concatenate for Array {
-    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
@@ -1549,8 +1553,7 @@ impl Concatenate for Array {
         };
         let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
         let axis = operation.axis();
-        let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
-        let output_type = ArrayType::concatenate(&input_types, axis)?;
+        let output_type = ArrayType::concatenate(inputs.iter().map(|input| &input.r#type), axis)?;
         // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
         // `axis` (and offset zero on every other axis) reuses the row-major odometer in `replace_block`.
         let output_element_count = Self::element_count(&output_type);
@@ -2370,16 +2373,18 @@ mod tests {
     #[test]
     fn test_array_concatenate() {
         // Three operands joined along axis 0 preserve their order.
-        let concatenated =
-            Array::concatenate(&[Array::vector(vec![1.0]), Array::vector(vec![2.0, 3.0]), Array::vector(vec![4.0])], 0)
-                .unwrap();
+        let concatenated = Array::concatenate(
+            [&Array::vector(vec![1.0]), &Array::vector(vec![2.0, 3.0]), &Array::vector(vec![4.0])],
+            0,
+        )
+        .unwrap();
         assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
 
         // A rank-3 middle-axis concatenation exercises the row-major block odometer.
         let first = Array::from_f64s(array_type(DataType::F64, &[2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
         let second =
             Array::from_f64s(array_type(DataType::F64, &[2, 2, 2]), vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let concatenated = Array::concatenate(&[first, second], 1).unwrap();
+        let concatenated = Array::concatenate([&first, &second], 1).unwrap();
         assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[2, 3, 2]));
         assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
 
@@ -2388,12 +2393,12 @@ mod tests {
         let first = Array::new(element_type.clone(), vec![Scalar::F8E8M0FNU(1)]).unwrap();
         let second = Array::new(element_type, vec![Scalar::F8E8M0FNU(2)]).unwrap();
         assert_eq!(
-            Array::concatenate(&[first, second], 0),
+            Array::concatenate([&first, &second], 0),
             Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![Scalar::F8E8M0FNU(1), Scalar::F8E8M0FNU(2)],),
         );
         let empty_type = array_type(DataType::F8E8M0FNU, &[0]);
         let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
-        assert_eq!(Array::concatenate(&[empty.clone(), empty], 0), Array::new(empty_type, Vec::new()));
+        assert_eq!(Array::concatenate([&empty, &empty], 0), Array::new(empty_type, Vec::new()));
     }
 
     #[test]

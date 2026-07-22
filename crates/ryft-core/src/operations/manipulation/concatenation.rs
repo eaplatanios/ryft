@@ -113,12 +113,11 @@ impl_differentiable_operation! {
             // Forward-mode rule for `ConcatenateOperation`. Concatenation is linear in every input, so its tangent
             // concatenates the input tangents along the same axis. Materialize structural zeros because concatenation
             // needs one concrete tangent per input; the shared all-zero fast path has already handled that case.
-            let primals = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             let tangents = inputs
                 .iter()
                 .map(|dual| dual.tangent().clone().materialize(context))
                 .collect::<Result<Vec<_>, _>>()?;
-            let primal = Concatenate::concatenate(&primals, operation.axis())?;
+            let primal = Concatenate::concatenate(inputs.iter().map(DifferentiationDual::primal), operation.axis())?;
             let tangent = Concatenate::concatenate(&tangents, operation.axis())?;
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -253,7 +252,7 @@ where
 /// # fn main() -> Result<(), ProgramError> {
 /// let left = Array::matrix(2, 1, vec![1.0, 2.0]);
 /// let right = Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0]);
-/// let output = left.concatenate_with(&[right], -1)?;
+/// let output = left.concatenate_with([&right], -1)?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 3.0, 4.0, 2.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
@@ -267,7 +266,12 @@ pub trait Concatenate: Sized {
     ///   - `inputs`: Arrays to join, in order. There must be at least one input, and all inputs must share one
     ///     data type and rank and agree on every axis other than `axis`.
     ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
-    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError>;
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError>
+    where
+        Self: 'i;
 
     /// Joins `self` followed by `others` end to end along `axis`.
     ///
@@ -275,19 +279,24 @@ pub trait Concatenate: Sized {
     ///
     ///   - `others`: Arrays to append to `self`, in order.
     ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
-    fn concatenate_with<A: Into<Axis>>(&self, others: &[Self], axis: A) -> Result<Self, ProgramError>
+    fn concatenate_with<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        &'i self,
+        others: I,
+        axis: A,
+    ) -> Result<Self, ProgramError>
     where
-        Self: Clone,
+        Self: 'i,
     {
-        let mut inputs = Vec::with_capacity(others.len() + 1);
-        inputs.push(self.clone());
-        inputs.extend_from_slice(others);
-        Self::concatenate(inputs.as_slice(), axis)
+        Self::concatenate(std::iter::once(self).chain(others), axis)
     }
 }
 
 impl Concatenate for ArrayType {
-    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
@@ -296,7 +305,7 @@ impl Concatenate for ArrayType {
         let rank = first.rank();
         let axis = ConcatenateOperation::new(axis, rank)?.axis();
         if inputs.len() == 1 {
-            return Ok(first.clone());
+            return Ok((*first).clone());
         }
         // The concatenated dimension accumulates as we scan operands: a static run sums sizes, while any dynamic
         // operand size forces a dynamic output dimension whose upper bound stays known only if every operand is
@@ -390,10 +399,10 @@ impl Concatenate for ArrayType {
         let mut reduced_axes: Option<BTreeSet<String>> = None;
         let varying_manual_axes = inputs
             .iter()
-            .filter_map(ArrayType::sharding)
+            .filter_map(|input| input.sharding())
             .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
             .collect::<BTreeSet<_>>();
-        for operand in inputs {
+        for operand in &inputs {
             let operand_varying_manual_axes =
                 operand.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
             let added_varying_manual_axes =
@@ -484,18 +493,28 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<ConcatenateOperation>,
 {
-    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
-        let Some(first) = inputs.first() else {
+    fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+        inputs: I,
+        axis: A,
+    ) -> Result<Self, ProgramError>
+    where
+        V: 'i,
+    {
+        let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+        let Some(rank) = inputs.first().map(|input| input.r#type().rank()) else {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
-        let operation = ConcatenateOperation::new(axis, first.r#type().rank())?;
+        let operation = ConcatenateOperation::new(axis, rank)?;
         if inputs.len() == 1 {
-            ArrayType::concatenate(&[first.r#type().into_owned()], operation.axis())?;
-            return Ok(first.clone());
+            let first = inputs.pop().unwrap();
+            let first_type = first.r#type();
+            ArrayType::concatenate([first_type.as_ref()], operation.axis())?;
+            return Ok(first);
         }
-        let mut outputs = first.dispatch_domain().bind(operation, Vec::new(), inputs)?;
+        let first = &inputs[0];
+        let mut outputs = first.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -524,6 +543,18 @@ mod tests {
 
     #[test]
     fn test_concatenate() {
+        #[derive(Debug, PartialEq)]
+        struct NonCloneArray(Vec<i32>);
+
+        impl Concatenate for NonCloneArray {
+            fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
+                inputs: I,
+                _axis: A,
+            ) -> Result<Self, ProgramError> {
+                Ok(Self(inputs.into_iter().flat_map(|input| input.0.iter().copied()).collect()))
+            }
+        }
+
         let operation = ConcatenateOperation::new(0, 2).unwrap();
 
         // Operation identity and accessors.
@@ -617,8 +648,12 @@ mod tests {
             .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(Array::concatenate(&[first.clone(), second.clone()], -2), Ok(output[0].clone()));
-        assert_eq!(first.concatenate_with(&[second], -2), Ok(output[0].clone()));
+        assert_eq!(Array::concatenate([&first, &second], -2), Ok(output[0].clone()));
+        assert_eq!(first.concatenate_with([&second], -2), Ok(output[0].clone()));
+        assert_eq!(
+            NonCloneArray(vec![1]).concatenate_with([&NonCloneArray(vec![2, 3])], 0),
+            Ok(NonCloneArray(vec![1, 2, 3])),
+        );
 
         // Program rendering uses the canonical operation name and includes the captured axis.
         let mut builder = ProgramBuilder::<Array, ConcatenateOperation>::new();
@@ -1038,23 +1073,23 @@ mod tests {
         let left = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
         let right = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let expected = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        assert_eq!(ArrayType::concatenate(&[left.clone(), right], -1), Ok(expected));
+        assert_eq!(ArrayType::concatenate([&left, &right], -1), Ok(expected));
 
         let placed = left
             .with_layout(Layout::Strided(StridedLayout::new(vec![8, 16])))
             .with_memory(Memory::Host { pinned: true });
-        assert_eq!(ArrayType::concatenate(std::slice::from_ref(&placed), 0), Ok(placed.clone()));
+        assert_eq!(ArrayType::concatenate([&placed], 0), Ok(placed.clone()));
 
         // Multiple inputs preserve their common memory space but clear physical layout metadata.
         let host_row = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])))
             .with_memory(Memory::Host { pinned: true });
-        let host_output = ArrayType::concatenate(&[host_row.clone(), host_row.clone()], 0).unwrap();
+        let host_output = ArrayType::concatenate([&host_row, &host_row], 0).unwrap();
         assert_eq!(host_output.memory(), Memory::Host { pinned: true });
         assert_eq!(host_output.layout(), None);
         assert_eq!(
             ArrayType::concatenate(
-                &[host_row, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))],
+                [&host_row, &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))],
                 0,
             ),
             Err(ProgramError::Type(TypeError {
@@ -1067,9 +1102,9 @@ mod tests {
         // Invalid signed axes and output-size overflow report exact type errors.
         assert_eq!(
             ArrayType::concatenate(
-                &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)])),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+                [
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
                 ],
                 -3,
             ),
@@ -1079,9 +1114,9 @@ mod tests {
         );
         assert_eq!(
             ArrayType::concatenate(
-                &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])),
+                [
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])),
                 ],
                 0,
             ),

@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(read_f32s(&updated), vec![2.0, 3.0, 3.0, 4.0]);
 
         // Concatenation joins operands end to end along the requested axis.
-        let concatenated = Array::concatenate(&[vector.clone(), sliced], 0).unwrap();
+        let concatenated = Array::concatenate([&vector, &sliced], 0).unwrap();
         assert_eq!(read_f32s(&concatenated), vec![1.0, 2.0, 3.0, 4.0, 2.0, 3.0]);
 
         // Broadcasting maps the input axis onto the trailing output axis.

@@ -191,42 +191,29 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
 // TODO(eaplatanios): Review from here onwards.
 
 #[derive(Copy, Clone)]
-enum DenseMode {
+enum JacobianMode {
     Forward,
     Reverse,
 }
 
-impl DenseMode {
-    fn transform(self) -> DerivativeTransform {
-        match self {
-            Self::Forward => DerivativeTransform::JacobianForward,
-            Self::Reverse => DerivativeTransform::JacobianReverse,
-        }
-    }
-
-    fn permits_complex_without_holomorphy(self, role: DifferentiationParameterRole) -> bool {
-        matches!(
-            (self, role),
-            (Self::Forward, DifferentiationParameterRole::Output)
-                | (Self::Reverse, DifferentiationParameterRole::Input)
-        )
-    }
-}
-
 fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
     types: &S,
-    mode: DenseMode,
+    mode: JacobianMode,
     holomorphic: bool,
     role: DifferentiationParameterRole,
 ) -> Result<(), DifferentiationError> {
+    let transform = match mode {
+        JacobianMode::Forward => DerivativeTransform::JacobianForward,
+        JacobianMode::Reverse => DerivativeTransform::JacobianReverse,
+    };
     for (path, r#type) in types.named_parameters() {
         let differential_type = match mode {
-            DenseMode::Forward => r#type.tangent(),
-            DenseMode::Reverse => r#type.cotangent(),
+            JacobianMode::Forward => r#type.tangent(),
+            JacobianMode::Reverse => r#type.cotangent(),
         };
         if differential_type.is_zero_space() {
             return Err(DifferentiationError::NonDifferentiableParameter {
-                transform: mode.transform(),
+                transform,
                 role,
                 path: path.to_string(),
                 r#type: r#type.to_string(),
@@ -234,15 +221,22 @@ fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
         }
         if holomorphic && !r#type.is_complex() {
             return Err(DifferentiationError::NonComplexParameter {
-                transform: mode.transform(),
+                transform,
                 role,
                 path: path.to_string(),
                 r#type: r#type.to_string(),
             });
         }
-        if !holomorphic && r#type.is_complex() && !mode.permits_complex_without_holomorphy(role) {
+        if !holomorphic
+            && r#type.is_complex()
+            && !matches!(
+                (mode, role),
+                (JacobianMode::Forward, DifferentiationParameterRole::Output)
+                    | (JacobianMode::Reverse, DifferentiationParameterRole::Input)
+            )
+        {
             return Err(DifferentiationError::ComplexParameter {
-                transform: mode.transform(),
+                transform,
                 role,
                 path: path.to_string(),
                 r#type: r#type.to_string(),
@@ -254,7 +248,7 @@ fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
 
 fn coordinate_offsets<C: Context, S: Parameterized<C::Type>>(
     types: &S,
-    mode: DenseMode,
+    transform: DerivativeTransform,
     role: DifferentiationParameterRole,
 ) -> Result<Vec<usize>, DifferentiationError>
 where
@@ -263,10 +257,10 @@ where
     let mut offsets = Vec::new();
     offsets.push(0usize);
     for (path, r#type) in types.named_parameters() {
-        let dimension = C::Type::coordinate_space_dimension(r#type, mode.transform(), role, &path)?;
+        let dimension = C::Type::coordinate_space_dimension(r#type, transform, role, &path)?;
         offsets.push(offsets.last().copied().unwrap().checked_add(dimension).ok_or_else(|| {
             DifferentiationError::CoordinateCountOverflow {
-                transform: mode.transform(),
+                transform,
                 role,
                 path: path.to_string(),
                 r#type: r#type.to_string(),
@@ -300,14 +294,14 @@ where
     I::To<C::Type>: Clone + Parameterized<C::Type>,
     O::To<C::Type>: Clone + Parameterized<C::Type>,
 {
-    let mode = DenseMode::Forward;
+    let transform = DerivativeTransform::JacobianForward;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, mode, holomorphic, DifferentiationParameterRole::Input)?;
+    validate_types(&input_types, JacobianMode::Forward, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pushforward) = context.linearize(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -316,10 +310,10 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, mode, holomorphic, DifferentiationParameterRole::Output)?;
+    validate_types(&output_types, JacobianMode::Forward, holomorphic, DifferentiationParameterRole::Output)?;
 
-    let input_offsets = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
-    let _ = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
+    let input_offsets = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
+    let _ = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
     let batch_size = input_offsets.last().copied().unwrap();
     let (program, residuals) = pushforward.into_parts();
     let program_input_types = program.input_types();
@@ -344,7 +338,7 @@ where
         let tangent_type = input_type.tangent();
         if tangent_type.is_zero_space() {
             return Err(DifferentiationError::NonDifferentiableParameter {
-                transform: mode.transform(),
+                transform,
                 role: DifferentiationParameterRole::Input,
                 path: path.to_string(),
                 r#type: input_type.to_string(),
@@ -365,7 +359,7 @@ where
             let tangent_type = r#type.tangent();
             if tangent_type.is_zero_space() {
                 return Err(DifferentiationError::NonDifferentiableParameter {
-                    transform: mode.transform(),
+                    transform,
                     role: DifferentiationParameterRole::Input,
                     path: path.to_string(),
                     r#type: r#type.to_string(),
@@ -422,14 +416,14 @@ where
     I::To<C::Type>: Clone + Parameterized<C::Type>,
     O::To<C::Type>: Clone + Parameterized<C::Type>,
 {
-    let mode = DenseMode::Reverse;
+    let transform = DerivativeTransform::JacobianReverse;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, mode, holomorphic, DifferentiationParameterRole::Input)?;
+    validate_types(&input_types, JacobianMode::Reverse, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pullback) = context.vjp(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -438,10 +432,10 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, mode, holomorphic, DifferentiationParameterRole::Output)?;
+    validate_types(&output_types, JacobianMode::Reverse, holomorphic, DifferentiationParameterRole::Output)?;
 
-    let _ = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
-    let output_offsets = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
+    let _ = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
+    let output_offsets = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
     let batch_size = output_offsets.last().copied().unwrap();
     let (program, residuals) = pullback.into_parts();
     let program_input_types = program.input_types();
@@ -467,7 +461,7 @@ where
             let cotangent_type = r#type.cotangent();
             if cotangent_type.is_zero_space() {
                 return Err(DifferentiationError::NonDifferentiableParameter {
-                    transform: mode.transform(),
+                    transform,
                     role: DifferentiationParameterRole::Output,
                     path: path.to_string(),
                     r#type: r#type.to_string(),
@@ -882,7 +876,7 @@ mod tests {
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{DenseMode, Jacobian, coordinate_offsets, jacfwd, jacrev};
+    use super::{Jacobian, coordinate_offsets, jacfwd, jacrev};
 
     /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
     /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
@@ -937,7 +931,7 @@ mod tests {
         assert_eq!(
             coordinate_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
                 &input_types,
-                DenseMode::Forward,
+                DerivativeTransform::JacobianForward,
                 DifferentiationParameterRole::Input,
             )
             .unwrap_err(),
@@ -954,7 +948,7 @@ mod tests {
         assert_eq!(
             coordinate_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
                 &empty_input_types,
-                DenseMode::Forward,
+                DerivativeTransform::JacobianForward,
                 DifferentiationParameterRole::Input,
             )
             .unwrap(),

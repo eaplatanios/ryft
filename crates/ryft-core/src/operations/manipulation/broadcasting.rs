@@ -508,7 +508,7 @@ impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate> + Fill<
             }
         };
         let inserted = context.parent().fill(&inserted_type, axis_size)?;
-        let output_dimensions = Concatenate::concatenate(&[inserted, inputs[1].value().clone()], 0)?;
+        let output_dimensions = Concatenate::concatenate([&inserted, inputs[1].value()], 0)?;
         let output = inputs[0].value().dynamic_broadcast(&output_dimensions, output_type.clone(), &output_axes)?;
         Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(0))?])
     }
