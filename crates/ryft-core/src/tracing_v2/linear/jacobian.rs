@@ -216,7 +216,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// the space cannot be enumerated statically and [`DifferentiationError::CoordinateCountOverflow`] when its
     /// dimension does not fit in [`usize`].
     ///
-    /// # Examples
+    /// # Example
     ///
     /// An array with shape `[2, 3]` has rank `2`, but its coordinate space has dimension `6`: one independent scalar
     /// basis direction for each array element. A scalar array has rank `0` and coordinate-space dimension `1`, while
@@ -241,13 +241,6 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// the value's scalar identity basis, while every other direction is zero). `coordinate_type` determines which
     /// coordinates are enumerated, while `value_type` determines the differential values stored in the basis.
     ///
-    /// # Example
-    ///
-    /// Suppose a differentiated structure has two array values with coordinate-space dimensions `2` and `3`.
-    /// Its packed basis has `5` directions. Constructing the second value's basis uses `coordinate_offset = 2` and
-    /// `packed_direction_count = 5` (directions `2`, `3`, and `4` contain that value's three unit basis vectors,
-    /// while directions `0` and `1` are zero for that value).
-    ///
     /// # Parameters
     ///
     ///   - `context`: Context in which to construct the basis value.
@@ -263,16 +256,10 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         coordinate_offset: usize,
         packed_direction_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError>;
-    
+
     /// Wraps an ordinary value as a packed replay value that is shared unchanged by every packed coordinate direction.
     /// Unlike [`coordinate_basis`](Self::coordinate_basis), this function does not introduce a mapped direction axis.
     /// It is instead used for derivative-program inputs such as residuals that do not vary between replay directions.
-    ///
-    /// # Example
-    ///
-    /// If a derivative replay evaluates eight coordinate directions and captures one primal residual, the residual is
-    /// represented once with this function and shared by all eight directions rather than materialized as eight logical
-    /// inputs.
     ///
     /// # Parameters
     ///
@@ -284,11 +271,6 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// inputs constructed by [`replicated`](Self::replicated) are shared. The returned values must preserve the
     /// region's declared output order and retain enough direction-axis information for Jacobian block extraction.
     /// Implementations must replay nested regions using the arena owned by `region`.
-    ///
-    /// # Example
-    ///
-    /// Replaying a pushforward over six input-coordinate directions executes the derivative region as one logical
-    /// six-way batch and returns one packed value for each pushforward output.
     ///
     /// # Parameters
     ///
@@ -303,17 +285,15 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
 
-    // TODO(eaplatanios): Review this.
-
-    /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the
-    /// values of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite
-    /// layout check is the one block validation that cannot live inside
+    /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the values
+    /// of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite layout check
+    /// is the one block validation that cannot live inside
     /// [`extract_forward_jacobian_block`](Self::extract_forward_jacobian_block) or
     /// [`extract_reverse_jacobian_block`](Self::extract_reverse_jacobian_block), which validate their own results.
     /// The expected block consists of the output coordinate axes, followed by the first input's cotangent value axes,
     /// followed by the second input's coordinate axes. Layout metadata does not affect validation.
     ///
-    /// # Examples
+    /// # Example
     ///
     /// For an output with shape `[2]` and first and second inputs with shapes `[3]` and `[4]`, respectively, the
     /// expected Hessian block shape is `[2, 3, 4]`.
@@ -380,9 +360,10 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ) -> Result<C::Value, DifferentiationError>;
 }
 
-impl<C> DenseDifferentiableType<C> for ArrayType
+// TODO(eaplatanios): Review this.
+
+impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
-    C: Context<Type = ArrayType>,
     C::Value: Broadcast + Reshape + Slice + Transpose,
     C::Operation: BatchableOperation<C>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>>

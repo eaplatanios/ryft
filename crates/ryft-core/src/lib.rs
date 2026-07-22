@@ -54,6 +54,7 @@ pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
+pub use tracing_v2::DenseDifferentiableType;
 pub use tracing_v2::linear::{Hessian, Jacobian};
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;
