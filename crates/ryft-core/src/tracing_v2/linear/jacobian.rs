@@ -188,63 +188,73 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
+/// Direction of a dense Jacobian materialization.
 #[derive(Copy, Clone)]
 enum JacobianMode {
     Forward,
     Reverse,
 }
 
-fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
-    types: &S,
-    mode: JacobianMode,
-    holomorphic: bool,
-    role: DifferentiationParameterRole,
-) -> Result<(), DifferentiationError> {
-    let transform = match mode {
-        JacobianMode::Forward => DerivativeTransform::JacobianForward,
-        JacobianMode::Reverse => DerivativeTransform::JacobianReverse,
-    };
-    for (path, r#type) in types.named_parameters() {
-        let differential_type = match mode {
-            JacobianMode::Forward => r#type.tangent(),
-            JacobianMode::Reverse => r#type.cotangent(),
+impl JacobianMode {
+    /// Validates the differential representations and complex-type requirements of the provided parameter types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `types`: Parameter types to validate.
+    ///   - `holomorphic`: Whether the Jacobian is being materialized under a holomorphy promise.
+    ///   - `role`: Role of `types` in the Jacobian transform.
+    fn validate_types<T: DifferentiableType, Types: Parameterized<T>>(
+        self,
+        types: &Types,
+        holomorphic: bool,
+        role: DifferentiationParameterRole,
+    ) -> Result<(), DifferentiationError> {
+        let transform = match self {
+            Self::Forward => DerivativeTransform::JacobianForward,
+            Self::Reverse => DerivativeTransform::JacobianReverse,
         };
-        if differential_type.is_zero_space() {
-            return Err(DifferentiationError::NonDifferentiableParameter {
-                transform,
-                role,
-                path: path.to_string(),
-                r#type: r#type.to_string(),
-            });
+        for (path, r#type) in types.named_parameters() {
+            let differential_type = match self {
+                Self::Forward => r#type.tangent(),
+                Self::Reverse => r#type.cotangent(),
+            };
+            if differential_type.is_zero_space() {
+                return Err(DifferentiationError::NonDifferentiableParameter {
+                    transform,
+                    role,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            if holomorphic && !r#type.is_complex() {
+                return Err(DifferentiationError::NonComplexParameter {
+                    transform,
+                    role,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
+            if !holomorphic
+                && r#type.is_complex()
+                && !matches!(
+                    (self, role),
+                    (Self::Forward, DifferentiationParameterRole::Output)
+                        | (Self::Reverse, DifferentiationParameterRole::Input)
+                )
+            {
+                return Err(DifferentiationError::ComplexParameter {
+                    transform,
+                    role,
+                    path: path.to_string(),
+                    r#type: r#type.to_string(),
+                });
+            }
         }
-        if holomorphic && !r#type.is_complex() {
-            return Err(DifferentiationError::NonComplexParameter {
-                transform,
-                role,
-                path: path.to_string(),
-                r#type: r#type.to_string(),
-            });
-        }
-        if !holomorphic
-            && r#type.is_complex()
-            && !matches!(
-                (mode, role),
-                (JacobianMode::Forward, DifferentiationParameterRole::Output)
-                    | (JacobianMode::Reverse, DifferentiationParameterRole::Input)
-            )
-        {
-            return Err(DifferentiationError::ComplexParameter {
-                transform,
-                role,
-                path: path.to_string(),
-                r#type: r#type.to_string(),
-            });
-        }
+        Ok(())
     }
-    Ok(())
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 fn coordinate_offsets<C: Context, S: Parameterized<C::Type>>(
     types: &S,
@@ -301,7 +311,7 @@ where
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, JacobianMode::Forward, holomorphic, DifferentiationParameterRole::Input)?;
+    JacobianMode::Forward.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pushforward) = context.linearize(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -310,7 +320,7 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, JacobianMode::Forward, holomorphic, DifferentiationParameterRole::Output)?;
+    JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
     let input_offsets = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
     let _ = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
@@ -423,7 +433,7 @@ where
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, JacobianMode::Reverse, holomorphic, DifferentiationParameterRole::Input)?;
+    JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pullback) = context.vjp(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -432,7 +442,7 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, JacobianMode::Reverse, holomorphic, DifferentiationParameterRole::Output)?;
+    JacobianMode::Reverse.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
     let _ = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
     let output_offsets = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
