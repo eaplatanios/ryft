@@ -291,10 +291,14 @@ where
 /// ```rust
 /// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::operations::manipulation::Transpose;
+/// # use ryft_core::programs::ProgramError;
 /// #
+/// # fn main() -> Result<(), ProgramError> {
 /// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 /// let output = input.transpose([1, 0])?;
 /// assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+/// # Ok(())
+/// # }
 /// ```
 pub trait Transpose: Sized {
     /// Reorders the axes of `self` according to the provided [`Permutation`], validating that the permutation is a
@@ -659,7 +663,7 @@ mod tests {
                 tangent_outputs = [Array::matrix(2, 2, vec![5.0, 7.0, 6.0, 8.0])],
             }],
         );
-        
+
         check_operation_transposition!(
             @exact,
             operation = TransposeOperation::new(vec![1, 0]),
