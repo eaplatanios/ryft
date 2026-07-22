@@ -656,15 +656,11 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
             "Jacobian or Hessian materialization requires a fully static array shape but got {expected_value_type}"
         ),
     })?;
-    let coordinate_count = if coordinate_shape.contains(&0) {
-        0
-    } else {
-        coordinate_shape.iter().try_fold(1usize, |count, size| {
-            count.checked_mul(*size).ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("coordinate shape {coordinate_shape:?} overflows usize"),
-            })
-        })?
-    };
+    let coordinate_shape = Shape::new(coordinate_shape.iter().copied().map(Size::Static).collect());
+    let coordinate_count = coordinate_shape.element_count()?.unwrap();
+    let coordinate_limit = coordinate_offset
+        .checked_add(coordinate_count)
+        .ok_or_else(|| ProgramError::InvalidArgument { message: "coordinate range overflows usize".to_string() })?;
     let physical_type = aligned.r#type();
     let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
         message: format!(
@@ -674,13 +670,17 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
     let mut start_indices = vec![0; physical_shape.rank()];
     start_indices[0] = coordinate_offset;
     let mut limit_indices = physical_shape.dimensions().to_vec();
-    limit_indices[0] = coordinate_offset
-        .checked_add(coordinate_count)
-        .ok_or_else(|| ProgramError::InvalidArgument { message: "coordinate range overflows usize".to_string() })?;
+    limit_indices[0] = coordinate_limit;
     let strides = vec![1; limit_indices.len()];
     let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
-    let reshaped_shape =
-        Shape::new(coordinate_shape.iter().chain(item_shape.dimensions()).copied().map(Size::Static).collect());
+    let reshaped_shape = Shape::new(
+        coordinate_shape
+            .dimensions()
+            .iter()
+            .copied()
+            .chain(item_shape.dimensions().iter().copied().map(Size::Static))
+            .collect(),
+    );
     sliced.reshape(reshaped_shape)
 }
 
