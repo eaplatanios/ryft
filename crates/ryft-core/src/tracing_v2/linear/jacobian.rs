@@ -202,11 +202,12 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// Intermediate representation of one logical [`C::Value`](Domain::Value) during a packed, multi-direction
     /// derivative replay. A value is either mapped over the packed coordinate directions or replicated unchanged across
     /// them. Its logical per-direction type remains `Self`, while its physical representation may carry an additional
-    /// axis that indexes those directions. [`basis`](Self::basis) and [`replicated`](Self::replicated) construct these
-    /// values, [`replay`](Self::replay) propagates them through the derivative program, and the block extraction
-    /// methods convert them back into ordinary [`C::Value`](Domain::Value)s. Implementations must preserve which
-    /// physical axis, if any, carries the packed directions.
-    type DenseValue;
+    /// axis that indexes those directions. [`coordinate_basis`](Self::coordinate_basis)
+    /// and [`replicated`](Self::replicated) construct these values,
+    /// [`replay_derivative_region`](Self::replay_derivative_region) propagates them through the derivative program,
+    /// and the block extraction methods convert them back into ordinary [`C::Value`](Domain::Value)s. Implementations
+    /// must preserve which physical axis, if any, carries the packed directions.
+    type PackedValue;
 
     /// Returns the dimension of the finite coordinate space represented by `r#type` (i.e., the number of independent
     /// scalar basis directions that a dense Jacobian or Hessian replay must pack for this value). This is distinct from
@@ -234,48 +235,88 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         path: &ParameterPath,
     ) -> Result<usize, DifferentiationError>;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Stages one leaf fragment of a packed global coordinate basis.
+    /// Constructs the portion of a packed global coordinate basis that belongs to one differentiated value. If the
+    /// value occupies `d` coordinates beginning at `coordinate_offset`, the returned value represents
+    /// `packed_direction_count` directions (i.e., directions in `coordinate_offset..coordinate_offset + d` form
+    /// the value's scalar identity basis, while every other direction is zero). `coordinate_type` determines which
+    /// coordinates are enumerated, while `value_type` determines the differential values stored in the basis.
+    ///
+    /// # Example
+    ///
+    /// Suppose a differentiated structure has two array values with coordinate-space dimensions `2` and `3`.
+    /// Its packed basis has `5` directions. Constructing the second value's basis uses `coordinate_offset = 2` and
+    /// `packed_direction_count = 5` (directions `2`, `3`, and `4` contain that value's three unit basis vectors,
+    /// while directions `0` and `1` are zero for that value).
     ///
     /// # Parameters
     ///
-    ///   - `context`: Active execution or staging context in which basis construction must remain.
-    ///   - `coordinate_type`: Type whose finite coordinates are represented by this basis fragment.
-    ///   - `value_type`: Type of the basis values. Forward bases use the primal tangent type, while reverse bases use
-    ///     the coordinate type's cotangent type.
-    ///   - `coordinate_offset`: First global basis coordinate belonging to the leaf.
-    ///   - `basis_size`: Total number of packed directions across the complete differentiated structure.
-    fn basis(
+    ///   - `context`: Context in which to construct the basis value.
+    ///   - `coordinate_type`: Type whose finite coordinate space is being enumerated.
+    ///   - `value_type`: Type of the basis values. Forward bases use the primal tangent type,
+    ///     while reverse bases use the coordinate type's cotangent type.
+    ///   - `coordinate_offset`: Index of the first packed direction belonging to `coordinate_type`.
+    ///   - `packed_direction_count`: Number of coordinate directions packed across the differentiated structure.
+    fn coordinate_basis(
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
         coordinate_offset: usize,
-        basis_size: usize,
-    ) -> Result<Self::DenseValue, DifferentiationError>;
-
-    /// Represents one replay input that is identical for every packed direction.
-    fn replicated(value: C::Value) -> Self::DenseValue;
-
-    /// Replays `region` once for all packed inputs while preserving its complete nested-region arena.
+        packed_direction_count: usize,
+    ) -> Result<Self::PackedValue, DifferentiationError>;
+    
+    /// Wraps an ordinary value as a packed replay value that is shared unchanged by every packed coordinate direction.
+    /// Unlike [`coordinate_basis`](Self::coordinate_basis), this function does not introduce a mapped direction axis.
+    /// It is instead used for derivative-program inputs such as residuals that do not vary between replay directions.
+    ///
+    /// # Example
+    ///
+    /// If a derivative replay evaluates eight coordinate directions and captures one primal residual, the residual is
+    /// represented once with this function and shared by all eight directions rather than materialized as eight logical
+    /// inputs.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Active context in which the transformed derivative program is replayed.
-    ///   - `region`: Borrowed derivative-program entry region, including access to its owning region arena.
-    ///   - `batch_size`: Number of packed coordinate directions.
-    ///   - `inputs`: Packed program inputs in the derivative region's declared order.
-    fn replay(
+    ///   - `value`: Ordinary value to share across all packed coordinate directions.
+    fn replicated(value: C::Value) -> Self::PackedValue;
+
+    /// Evaluates a derivative-[`Program`](crate::Program) [`Region`](crate::Region) once across all packed coordinate
+    /// directions. Inputs constructed by [`coordinate_basis`](Self::coordinate_basis) vary across directions, while
+    /// inputs constructed by [`replicated`](Self::replicated) are shared. The returned values must preserve the
+    /// region's declared output order and retain enough direction-axis information for Jacobian block extraction.
+    /// Implementations must replay nested regions using the arena owned by `region`.
+    ///
+    /// # Example
+    ///
+    /// Replaying a pushforward over six input-coordinate directions executes the derivative region as one logical
+    /// six-way batch and returns one packed value for each pushforward output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context in which to evaluate the derivative region.
+    ///   - `region`: Derivative-program entry region, including access to its owning nested-region arena.
+    ///   - `packed_direction_count`: Number of coordinate directions represented by `inputs`.
+    ///   - `inputs`: Packed values in the derivative region's declared input order.
+    fn replay_derivative_region(
         context: &C,
         region: RegionRef<'_, C::Constant, C::Operation>,
-        batch_size: usize,
-        inputs: Vec<Self::DenseValue>,
-    ) -> Result<Vec<Self::DenseValue>, DifferentiationError>;
+        packed_direction_count: usize,
+        inputs: Vec<Self::PackedValue>,
+    ) -> Result<Vec<Self::PackedValue>, DifferentiationError>;
+
+    // TODO(eaplatanios): Review this.
 
     /// Validates the physical type of one forward-over-reverse dense Hessian block. Hessian blocks arrive as the
     /// values of the outer forward Jacobian rather than through a Hessian-specific extractor, so this composite
-    /// layout check is the one block validation that cannot live inside [`forward_block`](Self::forward_block) or
-    /// [`reverse_block`](Self::reverse_block) (which validate their own results).
+    /// layout check is the one block validation that cannot live inside
+    /// [`extract_forward_jacobian_block`](Self::extract_forward_jacobian_block) or
+    /// [`extract_reverse_jacobian_block`](Self::extract_reverse_jacobian_block), which validate their own results.
+    /// The expected block consists of the output coordinate axes, followed by the first input's cotangent value axes,
+    /// followed by the second input's coordinate axes. Layout metadata does not affect validation.
+    ///
+    /// # Examples
+    ///
+    /// For an output with shape `[2]` and first and second inputs with shapes `[3]` and `[4]`, respectively, the
+    /// expected Hessian block shape is `[2, 3, 4]`.
     ///
     /// # Parameters
     ///
@@ -290,39 +331,50 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         second_input_type: &Self,
     ) -> Result<(), DifferentiationError>;
 
-    /// Extracts one forward-mode output/input block from a packed pushforward output, validating that the returned
-    /// block carries the output leaf's tangent values with the output coordinate axes followed by the input
-    /// coordinate axes.
+    /// Extracts one output/input Jacobian block from a packed forward-mode pushforward result. The method selects the
+    /// packed directions belonging to `input_type`, restores its coordinate axes, places those axes after the output
+    /// tangent value axes, and validates the resulting block type.
+    ///
+    /// # Examples
+    ///
+    /// For a function from an input with shape `[2]` to an output with shape `[3]`, this method extracts a Jacobian
+    /// block with shape `[3, 2]` from the two packed input-coordinate directions.
     ///
     /// # Parameters
     ///
-    ///   - `packed`: Packed pushforward result for one output leaf.
-    ///   - `batch_size`: Total number of packed input directions.
-    ///   - `coordinate_offset`: First packed direction belonging to `input_type`.
+    ///   - `packed_output`: Packed pushforward result for one output value.
+    ///   - `packed_direction_count`: Total number of packed input-coordinate directions.
+    ///   - `input_coordinate_offset`: Index of the first packed direction belonging to `input_type`.
     ///   - `input_type`: Differentiated input-leaf type.
     ///   - `output_type`: Differentiated output-leaf type.
-    fn forward_block(
-        packed: &Self::DenseValue,
-        batch_size: usize,
-        coordinate_offset: usize,
+    fn extract_forward_jacobian_block(
+        packed_output: &Self::PackedValue,
+        packed_direction_count: usize,
+        input_coordinate_offset: usize,
         input_type: &Self,
         output_type: &Self,
     ) -> Result<C::Value, DifferentiationError>;
 
-    /// Extracts one reverse-mode output/input block from a packed pullback output, validating that the returned
-    /// block carries the input leaf's cotangent values with the output coordinate axes prefixing the input axes.
+    /// Extracts one output/input Jacobian block from a packed reverse-mode pullback result. The method selects the
+    /// packed directions belonging to `output_type`, restores its coordinate axes before the input cotangent value
+    /// axes, and validates the resulting block type.
+    ///
+    /// # Examples
+    ///
+    /// For a function from an input with shape `[2]` to an output with shape `[3]`, this method extracts a Jacobian
+    /// block with shape `[3, 2]` from the three packed output-coordinate directions.
     ///
     /// # Parameters
     ///
-    ///   - `packed`: Packed pullback result for one input leaf.
-    ///   - `batch_size`: Total number of packed output directions.
-    ///   - `coordinate_offset`: First packed direction belonging to `output_type`.
+    ///   - `packed_output`: Packed pullback result for one input value.
+    ///   - `packed_direction_count`: Total number of packed output-coordinate directions.
+    ///   - `output_coordinate_offset`: Index of the first packed direction belonging to `output_type`.
     ///   - `output_type`: Differentiated output-leaf type.
     ///   - `input_type`: Differentiated input-leaf type.
-    fn reverse_block(
-        packed: &Self::DenseValue,
-        batch_size: usize,
-        coordinate_offset: usize,
+    fn extract_reverse_jacobian_block(
+        packed_output: &Self::PackedValue,
+        packed_direction_count: usize,
+        output_coordinate_offset: usize,
         output_type: &Self,
         input_type: &Self,
     ) -> Result<C::Value, DifferentiationError>;
@@ -338,7 +390,7 @@ where
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
-    type DenseValue = ArrayBatch<C::Value>;
+    type PackedValue = ArrayBatch<C::Value>;
 
     fn coordinate_space_dimension(
         r#type: &Self,
@@ -365,13 +417,13 @@ where
         })
     }
 
-    fn basis(
+    fn coordinate_basis(
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
         coordinate_offset: usize,
-        basis_size: usize,
-    ) -> Result<Self::DenseValue, DifferentiationError> {
+        packed_direction_count: usize,
+    ) -> Result<Self::PackedValue, DifferentiationError> {
         if coordinate_type.shape() != value_type.shape() {
             return Err(TypeError {
                 message: format!(
@@ -380,9 +432,9 @@ where
             }
             .into());
         }
-        let expected_type = value_type.with_inserted_dimension(0, Size::Static(basis_size))?;
+        let expected_type = value_type.with_inserted_dimension(0, Size::Static(packed_direction_count))?;
         let mut outputs = context.bind(
-            CoordinateBasisOperation::new(value_type.clone(), coordinate_offset, basis_size),
+            CoordinateBasisOperation::new(value_type.clone(), coordinate_offset, packed_direction_count),
             Vec::new(),
             &[],
         )?;
@@ -401,17 +453,17 @@ where
     }
 
     #[inline]
-    fn replicated(value: C::Value) -> Self::DenseValue {
+    fn replicated(value: C::Value) -> Self::PackedValue {
         ArrayBatch::replicated(value)
     }
 
-    fn replay(
+    fn replay_derivative_region(
         context: &C,
         region: RegionRef<'_, C::Constant, C::Operation>,
-        batch_size: usize,
-        inputs: Vec<Self::DenseValue>,
-    ) -> Result<Vec<Self::DenseValue>, DifferentiationError> {
-        Ok(BatchingContext::new(context.clone(), batch_size)
+        packed_direction_count: usize,
+        inputs: Vec<Self::PackedValue>,
+    ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
+        Ok(BatchingContext::new(context.clone(), packed_direction_count)
             .batch_region(region, inputs)
             .map_err(ProgramError::from)?)
     }
@@ -437,10 +489,10 @@ where
         )
     }
 
-    fn forward_block(
-        packed: &Self::DenseValue,
-        batch_size: usize,
-        coordinate_offset: usize,
+    fn extract_forward_jacobian_block(
+        packed_output: &Self::PackedValue,
+        packed_direction_count: usize,
+        input_coordinate_offset: usize,
         input_type: &Self,
         output_type: &Self,
     ) -> Result<C::Value, DifferentiationError> {
@@ -455,8 +507,13 @@ where
             }
             .into());
         }
-        let value =
-            basis_range_value(packed, batch_size, coordinate_offset, input_shape.dimensions(), &output_tangent_type)?;
+        let value = basis_range_value(
+            packed_output,
+            packed_direction_count,
+            input_coordinate_offset,
+            input_shape.dimensions(),
+            &output_tangent_type,
+        )?;
         let permutation = (input_shape.rank()..input_shape.rank() + output_shape.rank())
             .chain(0..input_shape.rank())
             .collect::<Vec<_>>();
@@ -471,10 +528,10 @@ where
         Ok(value)
     }
 
-    fn reverse_block(
-        packed: &Self::DenseValue,
-        batch_size: usize,
-        coordinate_offset: usize,
+    fn extract_reverse_jacobian_block(
+        packed_output: &Self::PackedValue,
+        packed_direction_count: usize,
+        output_coordinate_offset: usize,
         output_type: &Self,
         input_type: &Self,
     ) -> Result<C::Value, DifferentiationError> {
@@ -487,8 +544,13 @@ where
             }
             .into());
         }
-        let value =
-            basis_range_value(packed, batch_size, coordinate_offset, output_shape.dimensions(), &input_cotangent_type)?;
+        let value = basis_range_value(
+            packed_output,
+            packed_direction_count,
+            output_coordinate_offset,
+            output_shape.dimensions(),
+            &input_cotangent_type,
+        )?;
         validate_array_block_type(
             DerivativeTransform::JacobianReverse,
             value.r#type().as_ref(),
@@ -691,17 +753,18 @@ where
                     r#type: r#type.to_string(),
                 });
             }
-            C::Type::basis(context, r#type, &tangent_type, input_offsets[index], batch_size)
+            C::Type::coordinate_basis(context, r#type, &tangent_type, input_offsets[index], batch_size)
         })
         .collect::<Result<Vec<_>, _>>()?;
     packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
-    let packed_outputs = C::Type::replay(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    let packed_outputs =
+        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
     check_count!("output", packed_outputs, output_types.parameter_count(), ProgramError);
 
     let mut values = Vec::new();
     for (output_index, output_type) in output_types.parameters().enumerate() {
         for (input_index, input_type) in input_types.parameters().enumerate() {
-            let value = C::Type::forward_block(
+            let value = C::Type::extract_forward_jacobian_block(
                 &packed_outputs[output_index],
                 batch_size,
                 input_offsets[input_index],
@@ -800,17 +863,18 @@ where
                 ))
                 .into());
             }
-            C::Type::basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
+            C::Type::coordinate_basis(context, r#type, &cotangent_type, output_offsets[index], batch_size)
         })
         .collect::<Result<Vec<_>, _>>()?;
     packed_inputs.extend(residuals.into_iter().map(C::Type::replicated));
-    let packed_outputs = C::Type::replay(context, program.entry_region_ref(), batch_size, packed_inputs)?;
+    let packed_outputs =
+        C::Type::replay_derivative_region(context, program.entry_region_ref(), batch_size, packed_inputs)?;
     check_count!("output", packed_outputs, input_types.parameter_count(), ProgramError);
 
     let mut values = Vec::new();
     for (output_index, output_type) in output_types.parameters().enumerate() {
         for (input_index, input_type) in input_types.parameters().enumerate() {
-            let value = C::Type::reverse_block(
+            let value = C::Type::extract_reverse_jacobian_block(
                 &packed_outputs[input_index],
                 batch_size,
                 output_offsets[output_index],
@@ -1393,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_array_basis_uses_the_requested_value_type() {
+    fn test_dense_array_coordinate_basis_uses_the_requested_value_type() {
         type TestContext = EagerContext<Array, ArrayOperation<Array>>;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -1401,7 +1465,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let value_type = coordinate_type.cotangent();
-        let basis = <ArrayType as DenseDifferentiableType<TestContext>>::basis(
+        let basis = <ArrayType as DenseDifferentiableType<TestContext>>::coordinate_basis(
             &TestContext::new(),
             &coordinate_type,
             &value_type,
@@ -1430,7 +1494,7 @@ mod tests {
             ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, vec![2.0]), BatchAxis::new(0))
                 .unwrap();
         assert_eq!(
-            <ArrayType as DenseDifferentiableType<TestContext>>::forward_block(
+            <ArrayType as DenseDifferentiableType<TestContext>>::extract_forward_jacobian_block(
                 &packed,
                 1,
                 0,
@@ -1442,7 +1506,7 @@ mod tests {
             "batched derivative output has per-item type f8e8m0fnu[] but expected f32[]",
         );
         assert_eq!(
-            <ArrayType as DenseDifferentiableType<TestContext>>::reverse_block(
+            <ArrayType as DenseDifferentiableType<TestContext>>::extract_reverse_jacobian_block(
                 &packed,
                 1,
                 0,
