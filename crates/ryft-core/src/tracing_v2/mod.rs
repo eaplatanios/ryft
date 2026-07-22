@@ -27,9 +27,10 @@ pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
 pub use linear::{
-    DenseDifferentiate, Hessian, HessianBlock, Jacobian, JacobianBlock, hessian, hessian_holomorphic,
-    hessian_holomorphic_with_aux, hessian_with_aux, jacfwd, jacfwd_holomorphic, jacfwd_holomorphic_with_aux,
-    jacfwd_with_aux, jacrev, jacrev_holomorphic, jacrev_holomorphic_with_aux, jacrev_with_aux,
+    Hessian, HessianBlock, HessianDifferentiate, Jacobian, JacobianBlock, JacobianDifferentiate, hessian,
+    hessian_holomorphic, hessian_holomorphic_with_aux, hessian_with_aux, jacobian_forward,
+    jacobian_forward_holomorphic, jacobian_forward_holomorphic_with_aux, jacobian_forward_with_aux, jacobian_reverse,
+    jacobian_reverse_holomorphic, jacobian_reverse_holomorphic_with_aux, jacobian_reverse_with_aux,
 };
 pub use operations::RecomputeOperation;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;

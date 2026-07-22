@@ -2997,7 +2997,7 @@ mod tests {
 
     #[test]
     fn test_second_order_reverse_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::tracing_v2::DenseDifferentiate;
+        use crate::tracing_v2::HessianDifferentiate;
 
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
@@ -3060,15 +3060,16 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_through_rematerialization_uses_the_rematerializing_backward_program() {
-        use crate::tracing_v2::jacrev;
+    fn test_jacobian_reverse_through_rematerialization_uses_the_rematerializing_backward_program() {
+        use crate::tracing_v2::jacobian_reverse;
 
-        // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`; `jacrev` exercises
-        // the batched replay of the derived backward program.
+        // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`;
+        // `jacobian_reverse` exercises the batched replay of the derived backward program.
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let jacobian = jacrev(|x| function.call(x), Array::from_f64s(vector_type(2), vec![0.5, 1.0])).unwrap();
+        let jacobian =
+            jacobian_reverse(|x| function.call(x), Array::from_f64s(vector_type(2), vec![0.5, 1.0])).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_abs_diff_eq!(block.value().values()[0], 0.25f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);

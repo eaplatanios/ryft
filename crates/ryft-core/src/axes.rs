@@ -31,7 +31,7 @@ pub enum AxisError {
     #[error("axis {axis} is out of bounds for rank {rank}")]
     OutOfBounds { axis: Axis, rank: usize },
 
-    #[error("axes collection contain duplicate axis {axis}")]
+    #[error("axes contain duplicate axis {axis}")]
     DuplicateAxis { axis: usize },
 
     #[error("axis name '{name}' is not bound by any enclosing transform")]

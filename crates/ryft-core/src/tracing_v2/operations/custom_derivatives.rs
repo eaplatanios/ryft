@@ -679,7 +679,7 @@ impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation<C::Type>
     ) -> Result<Vec<C::Value>, ProgramError> {
         Err(TypeError {
             message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                value_and_gradient, or jacrev) instead"
+                value_and_gradient, or jacobian_reverse) instead"
                 .to_string(),
         }
         .into())
@@ -1595,14 +1595,14 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_through_custom_vjp_uses_the_custom_backward_rule() {
-        use crate::tracing_v2::jacrev;
+    fn test_jacobian_reverse_through_custom_vjp_uses_the_custom_backward_rule() {
+        use crate::tracing_v2::jacobian_reverse;
 
-        // jacrev interprets the pullback with batch-stacked cotangent bases, exercising the batched replay of the
-        // custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal matrix
-        // `diag(3 * cos(x))`.
+        // jacobian_reverse interprets the pullback with batch-stacked cotangent bases, exercising the batched replay
+        // of the custom backward program. The Jacobian of elementwise `sin` with the tripled rule is the diagonal
+        // matrix `diag(3 * cos(x))`.
         let vector = test_type(&[2]);
-        let jacobian = jacrev(
+        let jacobian = jacobian_reverse(
             |x| {
                 let (operation, operation_regions) = custom_vjp_sin(&test_type(&[2]));
                 Ok(x.context().bind(operation, operation_regions, &[x.clone()])?.into_iter().next().unwrap())

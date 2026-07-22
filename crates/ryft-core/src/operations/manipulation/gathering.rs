@@ -1071,7 +1071,7 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::jacfwd;
+    use crate::tracing_v2::jacobian_forward;
     use crate::types::{DataType, Memory};
 
     use super::*;
@@ -1352,7 +1352,7 @@ mod tests {
         );
 
         // Forward mode selects the operand coordinate feeding each gathered output.
-        let jacobian = jacfwd(
+        let jacobian = jacobian_forward(
             |operand| {
                 let indices = index_array(&operand, vec![2, 1], vec![0.0, 2.0]);
                 let operation =

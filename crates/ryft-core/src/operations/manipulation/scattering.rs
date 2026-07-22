@@ -1065,7 +1065,7 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::jacfwd;
+    use crate::tracing_v2::jacobian_forward;
     use crate::types::{DataType, Layout, Memory, Shape, Size, StridedLayout};
 
     use super::*;
@@ -1324,7 +1324,7 @@ mod tests {
         // Forward mode through `f(x) = scatter_add(x, [[1], [3]], [10, 20])` exercises the captured-index scatter-add
         // under batched basis tangents (the per-item batch rule). Scatter-add is the identity in its operand, so the
         // Jacobian with respect to `x` is the identity matrix.
-        let jacobian = jacfwd(
+        let jacobian = jacobian_forward(
             |x| {
                 let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
                 let updates = x.context().lift(Array::vector(vec![10.0, 20.0]))?;

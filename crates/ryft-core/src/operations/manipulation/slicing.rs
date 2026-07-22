@@ -2250,7 +2250,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::jacfwd;
+    use crate::tracing_v2::jacobian_forward;
     use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
@@ -3390,7 +3390,7 @@ mod tests {
 
         // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
         // batched basis tangents.
-        let jacobian = jacfwd(
+        let jacobian = jacobian_forward(
             |x| {
                 let start = index_constant(&x, 1.0);
                 Ok(x.dynamic_slice(&[start], &[2]).unwrap())

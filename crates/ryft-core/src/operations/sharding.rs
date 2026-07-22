@@ -512,7 +512,7 @@ mod tests {
     use crate::differentiation::{LinearizationTracer, vjp};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::tracing_v2::jacrev;
+    use crate::tracing_v2::jacobian_reverse;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent());
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
 
-        let jacobian = jacrev(
+        let jacobian = jacobian_reverse(
             {
                 let target = target.clone();
                 move |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.reshard(&target))

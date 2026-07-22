@@ -904,7 +904,8 @@ mod tests {
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
     use ryft_core::tracing_v2::{
-        DenseDifferentiate, ForwardModeDifferentiate, Hessian, Jacobian, ReverseModeDifferentiate,
+        ForwardModeDifferentiate, Hessian, HessianDifferentiate, Jacobian, JacobianDifferentiate,
+        ReverseModeDifferentiate,
     };
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
@@ -1021,7 +1022,7 @@ mod tests {
                     input
                         .context()
                         .clone()
-                        .jacfwd(|value| Mul::mul(&value, &value), input)
+                        .jacobian_forward(|value| Mul::mul(&value, &value), input)
                         .expect("forward Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1035,7 +1036,7 @@ mod tests {
                     input
                         .context()
                         .clone()
-                        .jacrev(|value| Mul::mul(&value, &value), input)
+                        .jacobian_reverse(|value| Mul::mul(&value, &value), input)
                         .expect("reverse Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1063,7 +1064,7 @@ mod tests {
                 input
                     .context()
                     .clone()
-                    .jacfwd(|value| Mul::mul(&value, &value), input)
+                    .jacobian_forward(|value| Mul::mul(&value, &value), input)
                     .expect("forward Jacobian should stage")
             },
             input_type.clone(),
@@ -1135,7 +1136,7 @@ mod tests {
                     .0
                     .context()
                     .clone()
-                    .jacfwd(|(scalar, vector)| scalar.atan2(&vector), inputs)
+                    .jacobian_forward(|(scalar, vector)| scalar.atan2(&vector), inputs)
                     .expect("forward Jacobian should stage")
             },
             (scalar_type.clone(), vector_type.clone()),

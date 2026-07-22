@@ -230,7 +230,10 @@ mod tests {
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
+    use ryft_core::tracing_v2::{
+        ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, ReverseModeDifferentiate,
+        jacobian_reverse,
+    };
     use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1952,16 +1955,17 @@ mod tests {
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
     }
 
-    /// Dense forward-mode Jacobian over concrete arrays: `jacfwd` of `f(x) = x * x` at `x = [1, 2, 3]` materializes
-    /// the full `3x3` Jacobian `diag(2, 4, 6)`. Basis synthesis, batched replay, and block assembly stay on device.
+    /// Dense forward-mode Jacobian over concrete arrays: `jacobian_forward` of `f(x) = x * x` at
+    /// `x = [1, 2, 3]` materializes the full `3x3` Jacobian `diag(2, 4, 6)`. Basis synthesis, batched replay, and block
+    /// assembly stay on device.
     #[test]
-    fn test_eager_jacfwd() {
+    fn test_eager_jacobian_forward() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
-        let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2020,11 +2024,11 @@ mod tests {
         );
     }
 
-    /// Dense forward-mode Jacobian over a half-precision primal: `jacfwd` of `f(x) = x * x` at `x = [1, 2, 3]`
-    /// with `f16` elements materializes the exact `3x3` Jacobian `diag(2, 4, 6)` end to end through the CPU PJRT
-    /// backend (small integers and their doubles are exactly representable in `f16`).
+    /// Dense forward-mode Jacobian over a half-precision primal: `jacobian_forward` of `f(x) = x * x` at
+    /// `x = [1, 2, 3]` with `f16` elements materializes the exact `3x3` Jacobian `diag(2, 4, 6)` end to end through the
+    /// CPU PJRT backend (small integers and their doubles are exactly representable in `f16`).
     #[test]
-    fn test_eager_jacfwd_over_f16_input() {
+    fn test_eager_jacobian_forward_over_f16_input() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
@@ -2032,7 +2036,7 @@ mod tests {
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2049,8 +2053,8 @@ mod tests {
         let input = c64_scalar(&client, &mesh, value);
         let context = input.execution_domain();
 
-        let forward = context.jacfwd_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
-        let reverse = context.jacrev_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
+        let forward = context.jacobian_forward_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
+        let reverse = context.jacobian_reverse_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
         let hessian = context.hessian_holomorphic(|input| Mul::mul(&input, &input), input).unwrap();
 
         assert_c64_close(read_c64s(forward.iter_blocks().next().unwrap().value())[0], 2.0 * value);
@@ -2061,12 +2065,12 @@ mod tests {
         );
     }
 
-    /// Dense forward-mode Jacobian over a *sharded* primal: `jacfwd` of `f(x) = x * x` at `x = [1, 2, 3, 4]`
+    /// Dense forward-mode Jacobian over a *sharded* primal: `jacobian_forward` of `f(x) = x * x` at `x = [1, 2, 3, 4]`
     /// sharded over a 2-device CPU mesh materializes the full `4x4` Jacobian `diag(2, 4, 6, 8)`. The batched basis
     /// tangents must carry the primal's sharding (with a replicated inserted batch axis) so the tangent replay
     /// type-checks against the tangent program's sharded declared input types.
     #[test]
-    fn test_eager_jacfwd_over_sharded_input() {
+    fn test_eager_jacobian_forward_over_sharded_input() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
@@ -2075,7 +2079,7 @@ mod tests {
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacfwd(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -2086,11 +2090,11 @@ mod tests {
         );
     }
 
-    /// Dense reverse-mode Jacobian over a *sharded* primal: `jacrev` of `f(x) = x * x` at `x = [1, 2, 3, 4]`
-    /// sharded over a 2-device CPU mesh matches the `jacfwd` matrix exactly, with the one-hot cotangent basis
+    /// Dense reverse-mode Jacobian over a *sharded* primal: `jacobian_reverse` of `f(x) = x * x` at `x = [1, 2, 3, 4]`
+    /// sharded over a 2-device CPU mesh matches the `jacobian_forward` matrix exactly, with the one-hot cotangent basis
     /// replayed through the pullback on device.
     #[test]
-    fn test_eager_jacrev_over_sharded_input() {
+    fn test_eager_jacobian_reverse_over_sharded_input() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
@@ -2098,7 +2102,7 @@ mod tests {
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
-        let jacobian = jacrev(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = jacobian_reverse(|x| Mul::mul(&x, &x), x).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -2109,15 +2113,16 @@ mod tests {
         );
     }
 
-    /// Dense reverse-mode Jacobian over concrete arrays: `jacrev` of `f(x) = x * x` at `x = [1, 2, 3]` replays the
-    /// one-hot basis cotangents through the pullback on device and matches the `jacfwd` matrix exactly.
+    /// Dense reverse-mode Jacobian over concrete arrays: `jacobian_reverse` of `f(x) = x * x` at
+    /// `x = [1, 2, 3]` replays the one-hot basis cotangents through the pullback on device and matches the
+    /// `jacobian_forward` matrix exactly.
     #[test]
-    fn test_eager_jacrev() {
+    fn test_eager_jacobian_reverse() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let jacobian = jacrev(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = jacobian_reverse(|x| Mul::mul(&x, &x), x).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);

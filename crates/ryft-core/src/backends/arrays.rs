@@ -1551,6 +1551,9 @@ impl Concatenate for Array {
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
+        if inputs.len() == 1 {
+            return Ok((*first).clone());
+        }
         let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
         let axis = operation.axis();
         let output_type = ArrayType::concatenate(inputs.iter().map(|input| &input.r#type), axis)?;

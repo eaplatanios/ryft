@@ -38,7 +38,10 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::{DenseDifferentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev};
+    use crate::tracing_v2::{
+        ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, ReverseModeDifferentiate,
+        jacobian_reverse,
+    };
     use crate::types::{Shape, Size};
 
     use super::*;
@@ -182,9 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_batches_basis_tangents() {
+    fn test_jacobian_forward_batches_basis_tangents() {
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
+            .jacobian_forward(
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
+            )
             .unwrap();
 
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -200,10 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_batches_basis_cotangents() {
-        let jacobian =
-            jacrev(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
-                .unwrap();
+    fn test_jacobian_reverse_batches_basis_cotangents() {
+        let jacobian = jacobian_reverse(
+            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
+            (Array::scalar(2.0), Array::scalar(3.0)),
+        )
+        .unwrap();
 
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [block_00, block_01, block_10, block_11] = blocks.as_slice() else { unreachable!() };
@@ -219,13 +227,13 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
 
-        let forward = context.jacfwd(|value| value.sin(), input.clone()).unwrap();
+        let forward = context.jacobian_forward(|value| value.sin(), input.clone()).unwrap();
         let forward_block = forward.iter_blocks().next().unwrap();
         assert_eq!(forward_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The derivative payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(forward_block.value().values()[0], 2.0f64.cos(), epsilon = 1e-6);
 
-        let reverse = context.jacrev(|value| value.sin(), input.clone()).unwrap();
+        let reverse = context.jacobian_reverse(|value| value.sin(), input.clone()).unwrap();
         let reverse_block = reverse.iter_blocks().next().unwrap();
         assert_eq!(reverse_block.value().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The derivative payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
@@ -239,24 +247,24 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_converts_promoted_cotangents_to_each_input_type() {
+    fn test_jacobian_reverse_converts_promoted_cotangents_to_each_input_type() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let f32 = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
         let f64 = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
 
-        let add = context.jacrev(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap();
+        let add = context.jacobian_reverse(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap();
         let add_blocks = add.iter_blocks().collect::<Vec<_>>();
         assert_eq!(add_blocks[0].value().r#type().data_type(), DataType::F32);
         assert_eq!(add_blocks[1].value().r#type().data_type(), DataType::F64);
         assert_abs_diff_eq!(add_blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(add_blocks[1].value().values()[0], 1.0, epsilon = 1e-9);
 
-        let sub = context.jacrev(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap();
+        let sub = context.jacobian_reverse(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap();
         let sub_blocks = sub.iter_blocks().collect::<Vec<_>>();
         assert_abs_diff_eq!(sub_blocks[0].value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(sub_blocks[1].value().values()[0], -1.0, epsilon = 1e-9);
 
-        let mul = context.jacrev(|(left, right)| Ok(left * right), (f32, f64)).unwrap();
+        let mul = context.jacobian_reverse(|(left, right)| Ok(left * right), (f32, f64)).unwrap();
         let mul_blocks = mul.iter_blocks().collect::<Vec<_>>();
         assert_abs_diff_eq!(mul_blocks[0].value().values()[0], 3.0, epsilon = 1e-9);
         assert_abs_diff_eq!(mul_blocks[1].value().values()[0], 2.0, epsilon = 1e-9);
@@ -292,8 +300,11 @@ mod tests {
     fn test_dense_jacobians_unbroadcast_scalar_elementwise_inputs() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primals = (Array::scalar(2.0), Array::vector(vec![3.0, 4.0]));
-        let forward = context.jacfwd(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals.clone()).unwrap();
-        let reverse = context.jacrev(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals).unwrap();
+        let forward = context
+            .jacobian_forward(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals.clone())
+            .unwrap();
+        let reverse =
+            context.jacobian_reverse(|(scalar, vector)| Ok(scalar.clone() * vector + scalar), primals).unwrap();
 
         for jacobian in [forward, reverse] {
             let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -312,7 +323,7 @@ mod tests {
                 input
                     .context()
                     .clone()
-                    .jacfwd(|value| Ok(value.clone() * value), input)
+                    .jacobian_forward(|value| Ok(value.clone() * value), input)
                     .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))
             },
             Array::vector(vec![1.0, 2.0, 3.0]),
@@ -332,7 +343,7 @@ mod tests {
         let input = Array::from_f64s(r#type.clone(), Vec::new());
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
-        let forward = context.jacfwd(|x| Ok(x.clone() + x), input.clone()).unwrap();
+        let forward = context.jacobian_forward(|x| Ok(x.clone() + x), input.clone()).unwrap();
         let forward_block = forward.iter_blocks().next().unwrap();
         assert_eq!(forward_block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(forward_block.input_type().static_shape().unwrap().as_slice(), &[0]);
@@ -340,7 +351,7 @@ mod tests {
         assert_eq!(forward_block.value().r#type().as_ref(), &block_type);
         assert!(forward_block.value().values().is_empty());
 
-        let reverse = jacrev(|x| Ok(x.clone() + x), input).unwrap();
+        let reverse = jacobian_reverse(|x| Ok(x.clone() + x), input).unwrap();
         let reverse_block = reverse.iter_blocks().next().unwrap();
         assert_eq!(reverse_block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(reverse_block.input_type().static_shape().unwrap().as_slice(), &[0]);
@@ -355,9 +366,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
+    fn test_jacobian_forward_iter_blocks_yields_each_output_input_pair() {
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)), (Array::scalar(2.0), Array::scalar(3.0)))
+            .jacobian_forward(
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
+            )
             .unwrap();
 
         let triples = jacobian
@@ -451,7 +465,7 @@ mod tests {
     fn test_dense_differentiation_can_differentiate_hessian_values() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let derivative = context
-            .jacfwd(
+            .jacobian_forward(
                 |input| {
                     let nested_context = input.context().clone();
                     let hessian = nested_context
@@ -470,11 +484,11 @@ mod tests {
     fn test_reverse_mode_composes_around_forward_jacobian() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let derivative = context
-            .jacrev(
+            .jacobian_reverse(
                 |input| {
                     let nested_context = input.context().clone();
                     let jacobian = nested_context
-                        .jacfwd(|value| Ok(value.clone() * value), input)
+                        .jacobian_forward(|value| Ok(value.clone() * value), input)
                         .map_err(|error| crate::ProgramError::MalformedProgram(error.to_string()))?;
                     Ok(jacobian.into_values().remove(0))
                 },
@@ -491,7 +505,7 @@ mod tests {
 
         let forward_evaluations = Cell::new(0);
         let (forward, forward_auxiliary) = context
-            .jacfwd_with_aux(
+            .jacobian_forward_with_aux(
                 |x| {
                     forward_evaluations.set(forward_evaluations.get() + 1);
                     Ok((x.clone() * x.clone(), x))
@@ -505,7 +519,7 @@ mod tests {
 
         let reverse_evaluations = Cell::new(0);
         let (reverse, reverse_auxiliary) = context
-            .jacrev_with_aux(
+            .jacobian_reverse_with_aux(
                 |x| {
                     reverse_evaluations.set(reverse_evaluations.get() + 1);
                     Ok((x.clone() * x.clone(), x))
@@ -537,13 +551,13 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         assert_eq!(
-            crate::tracing_v2::jacfwd(|inputs| Ok(inputs), Vec::<Array>::new()).unwrap_err(),
+            crate::tracing_v2::jacobian_forward(|inputs| Ok(inputs), Vec::<Array>::new()).unwrap_err(),
             DifferentiationError::EmptyInput,
         );
 
         let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]);
         assert_eq!(
-            context.jacfwd(|x| Ok(x), integer).unwrap_err(),
+            context.jacobian_forward(|x| Ok(x), integer).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -554,7 +568,7 @@ mod tests {
 
         let complex = Array::from_f64s(ArrayType::scalar(DataType::C64), vec![2.0]);
         assert_eq!(
-            context.jacfwd(|x| Ok(x), complex.clone()).unwrap_err(),
+            context.jacobian_forward(|x| Ok(x), complex.clone()).unwrap_err(),
             DifferentiationError::ComplexParameter {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -562,14 +576,14 @@ mod tests {
                 r#type: "c64[]".to_string(),
             },
         );
-        let holomorphic = context.jacfwd_holomorphic(|x| Ok(x), complex).unwrap();
+        let holomorphic = context.jacobian_forward_holomorphic(|x| Ok(x), complex).unwrap();
         assert_eq!(
             holomorphic.iter_blocks().next().unwrap().value().values(),
             &[Scalar::C64(ComplexNumber::new(1.0, 0.0))],
         );
 
         assert_eq!(
-            context.jacrev_holomorphic(|x| Ok(x), Array::scalar(2.0)).unwrap_err(),
+            context.jacobian_reverse_holomorphic(|x| Ok(x), Array::scalar(2.0)).unwrap_err(),
             DifferentiationError::NonComplexParameter {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
@@ -579,7 +593,7 @@ mod tests {
         );
 
         let complex_output_error = context
-            .jacrev(
+            .jacobian_reverse(
                 |input| Ok(input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::C64), vec![1.0]))?),
                 Array::scalar(2.0),
             )
@@ -597,7 +611,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         let dynamic = Array::with_unchecked_type(dynamic_type, vec![Scalar::F64(1.0)]);
         assert_eq!(
-            context.jacfwd(|x| Ok(x), dynamic).unwrap_err(),
+            context.jacobian_forward(|x| Ok(x), dynamic).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -609,7 +623,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
             context
-                .jacfwd(
+                .jacobian_forward(
                     |input| Ok(input
                         .context()
                         .lift(Array::with_unchecked_type(dynamic_type.clone(), vec![Scalar::F64(1.0)]))?),
@@ -626,7 +640,9 @@ mod tests {
 
         let dynamic = Array::with_unchecked_type(dynamic_type, vec![Scalar::F64(1.0)]);
         assert_eq!(
-            context.jacrev(|input| Ok(input.context().lift(Array::scalar(1.0))?), dynamic).unwrap_err(),
+            context
+                .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0))?), dynamic)
+                .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
@@ -637,10 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_handles_function_with_independent_outputs() {
+    fn test_jacobian_forward_handles_function_with_independent_outputs() {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
+            .jacobian_forward(
                 |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
                 (Array::scalar(2.0), Array::scalar(3.0)),
             )
@@ -835,13 +851,13 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_over_dot_batches_adjoint_dots() {
+    fn test_jacobian_reverse_over_dot_batches_adjoint_dots() {
         use crate::operations::math::{Dot, DotDimensionNumbers};
 
-        // jacrev internally batches the pullback's adjoint `dot` operations (their known operands riding as
+        // jacobian_reverse internally batches the pullback's adjoint `dot` operations (their known operands riding as
         // replicated pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
         // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
-        let jacobian = jacrev(
+        let jacobian = jacobian_reverse(
             |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
             (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0])),
         )
@@ -854,14 +870,14 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_over_dot_batches_basis_tangents_through_the_pushforward() {
+    fn test_jacobian_forward_over_dot_batches_basis_tangents_through_the_pushforward() {
         use crate::operations::math::{Dot, DotDimensionNumbers};
 
-        // jacfwd linearizes the function once, then replays all input-coordinate basis tangents through the
+        // jacobian_forward linearizes the function once, then replays all input-coordinate basis tangents through the
         // pushforward in one batched pass. A dot-product scalar output exercises captured-factor (product-rule)
         // linear maps instead of only elementwise tangent arithmetic.
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
+            .jacobian_forward(
                 |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
                 (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0])),
             )
@@ -1083,22 +1099,22 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_through_function_using_zero_like() {
+    fn test_jacobian_reverse_through_function_using_zero_like() {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
-        // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
+        // `ZeroLikeOperation` rule through `jacobian_reverse`'s internal Jacobian batching path. Verifies
         // that the constant-op rule composes cleanly with reverse-mode autodiff.
-        let jacobian = jacrev(|x| Ok(x.clone() + x.zero_like()), Array::scalar(2.0)).unwrap();
+        let jacobian = jacobian_reverse(|x| Ok(x.clone() + x.zero_like()), Array::scalar(2.0)).unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 0) / dx = 1 at the scalar point.
         assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
     }
 
     #[test]
-    fn test_jacfwd_through_function_using_one_like() {
+    fn test_jacobian_forward_through_function_using_one_like() {
         // `f(x) = x + one_like(x)` shifts x by a constant; the Jacobian is still 1. Exercises
-        // `OneLikeOperation` through jacfwd's internal batching.
+        // `OneLikeOperation` through jacobian_forward's internal batching.
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|x| Ok(x.clone() + x.one_like()), Array::scalar(2.0))
+            .jacobian_forward(|x| Ok(x.clone() + x.one_like()), Array::scalar(2.0))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         // d(x + 1) / dx = 1.
@@ -1150,14 +1166,14 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_composes_with_jacrev_and_jacfwd() {
+    fn test_condition_composes_with_jacobian_reverse_and_jacobian_forward() {
         // The constant `true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
         // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
-        let jacobian = jacrev(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0)).unwrap();
+        let jacobian = jacobian_reverse(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0)).unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0))
+            .jacobian_forward(|x| Ok(stage_constant_predicate_condition(x)), Array::scalar(4.0))
             .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().values()[0], 2.0, epsilon = 1e-9);
     }
@@ -1166,8 +1182,8 @@ mod tests {
     fn test_dense_jacobians_replay_runtime_condition_regions() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         for (input, expected) in [(4.0, 2.0), (-4.0, 3.0)] {
-            let forward = context.jacfwd(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
-            let reverse = context.jacrev(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
+            let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
+            let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(input)).unwrap();
             assert_abs_diff_eq!(forward.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
             assert_abs_diff_eq!(reverse.iter_blocks().next().unwrap().value().values()[0], expected, epsilon = 1e-9,);
         }
@@ -1232,14 +1248,14 @@ mod tests {
     }
 
     #[test]
-    fn test_jacfwd_through_while_batches_basis_tangents() {
-        // `jacfwd` linearizes the loop once into a pushforward containing a staged linear while, then replays
+    fn test_jacobian_forward_through_while_batches_basis_tangents() {
+        // `jacobian_forward` linearizes the loop once into a pushforward containing a staged linear while, then replays
         // the batched basis tangents through it: the pushforward is instantiated into a direct linear program and
         // interpreted over the batching rules with concrete values, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let (while_operation, while_regions) = doubling_while_operation();
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacfwd(
+            .jacobian_forward(
                 move |x| {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
@@ -1255,11 +1271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_through_bounded_while_batches_basis_cotangents() {
+    fn test_jacobian_reverse_through_bounded_while_batches_basis_cotangents() {
         let (while_operation, while_regions) = doubling_while_operation();
         let while_operation = while_operation.with_iteration_bound(5).unwrap();
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacrev(
+            .jacobian_reverse(
                 move |x| {
                     let mut outputs = x.context().bind(
                         ArrayOperation::While(while_operation),
@@ -1486,7 +1502,7 @@ mod tests {
         let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
         let (scan, body) = product_scan_operation(false);
         let forward = context
-            .jacfwd(
+            .jacobian_forward(
                 move |(initial, values)| {
                     let mut outputs = initial.context().bind(
                         ArrayOperation::Scan(scan),
@@ -1500,7 +1516,7 @@ mod tests {
             .unwrap();
         let (scan, body) = product_scan_operation(false);
         let reverse = context
-            .jacrev(
+            .jacobian_reverse(
                 move |(initial, values)| {
                     let mut outputs = initial.context().bind(
                         ArrayOperation::Scan(scan),
