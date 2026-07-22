@@ -1,6 +1,9 @@
 use std::fmt::Display;
+use std::ops::Deref;
 
 use thiserror::Error;
+
+use ryft_macros::Parameter;
 
 use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext};
@@ -10,6 +13,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::constants::{IotaOperation, ZeroOperation};
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
+use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
@@ -24,9 +28,162 @@ use crate::types::{ArrayType, DataType, Shape, Size};
 /// Represents axis-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AxisError {
+    #[error("axis {axis} is out of bounds for rank {rank}")]
+    OutOfBounds { axis: Axis, rank: usize },
+
     #[error("axis name '{name}' is not bound by any enclosing transform")]
     UnboundAxisName { name: String },
 }
+
+/// Positional array axis. Negative values index from the final axis, so `-1` denotes the trailing axis. [`Axis`]
+/// converts from signed and unsigned integer types and defers normalization until the rank of the indexed array
+/// is known.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
+pub struct Axis(i128);
+
+impl Axis {
+    /// Returns the signed positional index represented by this [`Axis`].
+    #[inline]
+    pub fn value(self) -> i128 {
+        self.0
+    }
+
+    /// Normalizes this [`Axis`] against `rank`, returning its nonnegative position. Valid axes lie in `[-rank, rank)`.
+    #[inline]
+    pub fn normalize(self, rank: usize) -> Result<usize, AxisError> {
+        let position = if self.0 >= 0 {
+            usize::try_from(self.0).ok().filter(|&axis| axis < rank)
+        } else {
+            usize::try_from(self.0.unsigned_abs()).ok().and_then(|distance| rank.checked_sub(distance))
+        };
+        position.ok_or(AxisError::OutOfBounds { axis: self, rank })
+    }
+}
+
+impl Display for Axis {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Zero or more positional array [`Axis`] values. Scalar conversions produce a one-element axis list, while vectors,
+/// arrays, and borrowed slices preserve every provided axis.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
+pub struct Axes(Vec<Axis>);
+
+impl Axes {
+    /// Returns the axes as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[Axis] {
+        self.0.as_slice()
+    }
+
+    /// Returns the number of axes in this collection.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if this collection contains no axes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Normalizes every axis in this collection against `rank`, preserving order and duplicates.
+    #[inline]
+    pub fn normalize(&self, rank: usize) -> Result<Vec<usize>, AxisError> {
+        self.iter().map(|axis| axis.normalize(rank)).collect()
+    }
+}
+
+impl Deref for Axes {
+    type Target = [Axis];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[Axis]> for Axes {
+    #[inline]
+    fn as_ref(&self) -> &[Axis] {
+        self.as_slice()
+    }
+}
+
+impl From<Axis> for Axes {
+    #[inline]
+    fn from(axis: Axis) -> Self {
+        Self(vec![axis])
+    }
+}
+
+impl From<&Axes> for Axes {
+    #[inline]
+    fn from(axes: &Axes) -> Self {
+        axes.clone()
+    }
+}
+
+impl<A: Into<Axis>> From<Vec<A>> for Axes {
+    #[inline]
+    fn from(axes: Vec<A>) -> Self {
+        Self(axes.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<A: Copy + Into<Axis>> From<&Vec<A>> for Axes {
+    #[inline]
+    fn from(axes: &Vec<A>) -> Self {
+        Self::from(axes.as_slice())
+    }
+}
+
+impl<A: Copy + Into<Axis>> From<&[A]> for Axes {
+    #[inline]
+    fn from(axes: &[A]) -> Self {
+        Self(axes.iter().copied().map(Into::into).collect())
+    }
+}
+
+impl<A: Into<Axis>, const N: usize> From<[A; N]> for Axes {
+    #[inline]
+    fn from(axes: [A; N]) -> Self {
+        Self(axes.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<A: Copy + Into<Axis>, const N: usize> From<&[A; N]> for Axes {
+    #[inline]
+    fn from(axes: &[A; N]) -> Self {
+        Self::from(axes.as_slice())
+    }
+}
+
+macro_rules! impl_axis_conversions {
+    ($($integer:ty),+ $(,)?) => {
+        $(
+            impl From<$integer> for Axis {
+                #[inline]
+                fn from(axis: $integer) -> Self {
+                    Self(axis as i128)
+                }
+            }
+
+            impl From<$integer> for Axes {
+                #[inline]
+                fn from(axis: $integer) -> Self {
+                    Axis::from(axis).into()
+                }
+            }
+        )+
+    };
+}
+
+impl_axis_conversions!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize);
 
 /// A named axis resolved by a [`NamedAxes`] context specifying what an axis name is currently bound to, and by which
 /// kind of transform, at a given trace level. This carries only the *value-free* facts about a binding (i.e., its kind
@@ -362,6 +519,32 @@ mod tests {
         assert_eq!(format!("{error:?}"), "UnboundAxisName { name: \"batch\" }");
         assert_eq!(error, AxisError::UnboundAxisName { name: "batch".to_string() });
         assert_ne!(error, AxisError::UnboundAxisName { name: "device".to_string() });
+    }
+
+    #[test]
+    fn test_axis() {
+        assert_eq!(Axis::from(0).normalize(3), Ok(0));
+        assert_eq!(Axis::from(2usize).normalize(3), Ok(2));
+        assert_eq!(Axis::from(-1).normalize(3), Ok(2));
+        assert_eq!(Axis::from(-3).normalize(3), Ok(0));
+        assert_eq!(Axis::from(usize::MAX).value(), i128::try_from(usize::MAX).unwrap());
+        assert_eq!(Axis::from(3).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(3), rank: 3 }),);
+        assert_eq!(Axis::from(-4).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 }),);
+        assert_eq!(
+            Axis::from(i128::MIN).normalize(usize::MAX),
+            Err(AxisError::OutOfBounds { axis: Axis::from(i128::MIN), rank: usize::MAX }),
+        );
+        assert_eq!(Axis::from(-1).to_string(), "-1");
+    }
+
+    #[test]
+    fn test_axes() {
+        let axes = Axes::from([0, -1, 1]);
+        assert_eq!(axes.as_slice(), &[Axis::from(0), Axis::from(-1), Axis::from(1)]);
+        assert_eq!(axes.normalize(3), Ok(vec![0, 2, 1]));
+        assert_eq!(Axes::from(Axis::from(1)).as_slice(), &[Axis::from(1)]);
+        assert_eq!(Axes::from(&axes), axes);
+        assert_eq!(Axes::default().normalize(0), Ok(Vec::new()));
     }
 
     #[test]
