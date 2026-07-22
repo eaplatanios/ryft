@@ -31,6 +31,9 @@ pub enum AxisError {
     #[error("axis {axis} is out of bounds for rank {rank}")]
     OutOfBounds { axis: Axis, rank: usize },
 
+    #[error("axes collection contain duplicate axis {axis}")]
+    DuplicateAxis { axis: usize },
+
     #[error("axis name '{name}' is not bound by any enclosing transform")]
     UnboundAxisName { name: String },
 }
@@ -91,10 +94,20 @@ impl Axes {
         self.0.is_empty()
     }
 
-    /// Normalizes every axis in this collection against `rank`, preserving order and duplicates.
-    #[inline]
+    /// Normalizes every [`Axis`] in this collection against `rank`, preserving order and rejecting duplicates
+    /// after negative axes are resolved.
     pub fn normalize(&self, rank: usize) -> Result<Vec<usize>, AxisError> {
-        self.iter().map(|axis| axis.normalize(rank)).collect()
+        let mut normalized_axes = Vec::with_capacity(self.len());
+        let mut seen = vec![false; rank];
+        for axis in self.iter() {
+            let normalized_axis = axis.normalize(rank)?;
+            if seen[normalized_axis] {
+                return Err(AxisError::DuplicateAxis { axis: normalized_axis });
+            }
+            seen[normalized_axis] = true;
+            normalized_axes.push(normalized_axis);
+        }
+        Ok(normalized_axes)
     }
 }
 
@@ -550,6 +563,7 @@ mod tests {
         let axes = Axes::from([0, -1, 1]);
         assert_eq!(axes.as_slice(), &[Axis::from(0), Axis::from(-1), Axis::from(1)]);
         assert_eq!(axes.normalize(3), Ok(vec![0, 2, 1]));
+        assert_eq!(Axes::from([0, -3]).normalize(3), Err(AxisError::DuplicateAxis { axis: 0 }));
         assert_eq!(Axes::from(Axis::from(1)).as_slice(), &[Axis::from(1)]);
         assert_eq!(Axes::from(&axes), axes);
         assert_eq!(Axes::default().normalize(0), Ok(Vec::new()));
