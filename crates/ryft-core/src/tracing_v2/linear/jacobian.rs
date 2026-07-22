@@ -23,7 +23,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Shape, Size, StaticShape};
+use crate::types::{ArrayType, Shape, Size};
 
 // TODO(eaplatanios): Should we move this?
 use super::DenseDifferentiate;
@@ -360,8 +360,6 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ) -> Result<C::Value, DifferentiationError>;
 }
 
-// TODO(eaplatanios): Review this.
-
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
     C::Value: Broadcast + Reshape + Slice + Transpose,
@@ -424,8 +422,10 @@ where
         if value.r#type().as_ref() != &expected_type {
             return Err(TypeError {
                 message: format!(
-                    "coordinate basis for leaf type {value_type} has type {} but expected {expected_type}",
+                    "coordinate basis for leaf type {} has type {} but expected {}",
+                    value_type,
                     value.r#type(),
+                    expected_type,
                 ),
             }
             .into());
@@ -438,6 +438,7 @@ where
         ArrayBatch::replicated(value)
     }
 
+    #[inline]
     fn replay_derivative_region(
         context: &C,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -461,7 +462,7 @@ where
                 TypeError { message: format!("hessian input type {first_input_type} has no cotangent type") }.into()
             );
         }
-        validate_array_block_type(
+        validate_array_derivative_block_type(
             DerivativeTransform::Hessian,
             block_type,
             &first_input_cotangent_type,
@@ -470,6 +471,8 @@ where
         )
     }
 
+    // TODO(eaplatanios): Review this.
+
     fn extract_forward_jacobian_block(
         packed_output: &Self::PackedValue,
         packed_direction_count: usize,
@@ -477,10 +480,19 @@ where
         input_type: &Self,
         output_type: &Self,
     ) -> Result<C::Value, DifferentiationError> {
-        let input_shape =
-            static_shape(input_type, DerivativeTransform::JacobianForward, DifferentiationParameterRole::Input)?;
+        let input_shape = input_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+            transform: DerivativeTransform::JacobianForward,
+            role: DifferentiationParameterRole::Input,
+            path: ParameterPath::root().to_string(),
+            r#type: input_type.to_string(),
+        })?;
         let output_shape =
-            static_shape(output_type, DerivativeTransform::JacobianForward, DifferentiationParameterRole::Output)?;
+            output_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Output,
+                path: ParameterPath::root().to_string(),
+                r#type: output_type.to_string(),
+            })?;
         let output_tangent_type = output_type.tangent();
         if output_tangent_type.is_zero_space() {
             return Err(TypeError {
@@ -499,7 +511,7 @@ where
             .chain(0..input_shape.rank())
             .collect::<Vec<_>>();
         let value = value.transpose(permutation)?;
-        validate_array_block_type(
+        validate_array_derivative_block_type(
             DerivativeTransform::JacobianForward,
             value.r#type().as_ref(),
             &output_tangent_type,
@@ -517,7 +529,12 @@ where
         input_type: &Self,
     ) -> Result<C::Value, DifferentiationError> {
         let output_shape =
-            static_shape(output_type, DerivativeTransform::JacobianReverse, DifferentiationParameterRole::Output)?;
+            output_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+                transform: DerivativeTransform::JacobianReverse,
+                role: DifferentiationParameterRole::Output,
+                path: ParameterPath::root().to_string(),
+                r#type: output_type.to_string(),
+            })?;
         let input_cotangent_type = input_type.cotangent();
         if input_cotangent_type.is_zero_space() {
             return Err(TypeError {
@@ -532,7 +549,7 @@ where
             output_shape.dimensions(),
             &input_cotangent_type,
         )?;
-        validate_array_block_type(
+        validate_array_derivative_block_type(
             DerivativeTransform::JacobianReverse,
             value.r#type().as_ref(),
             &input_cotangent_type,
@@ -541,6 +558,70 @@ where
         )?;
         Ok(value)
     }
+}
+
+/// Validates that `block_type` is the [`ArrayType`] expected for a materialized derivative block. The expected shape
+/// consists of every static coordinate dimension in `prefix_coordinate_types`, followed by the dimensions of
+/// `value_type`, followed by every static coordinate dimension in `suffix_coordinate_types`. The expected type keeps
+/// the element type, memory space, and sharding of `value_type`. Inserted coordinate dimensions are replicated in its
+/// sharding. Layout metadata is ignored because derivative materialization may change physical storage order without
+/// changing the logical block type.
+///
+/// Returns [`DifferentiationError::NonFiniteCoordinateSpace`] if a coordinate type does not have a fully static shape,
+/// or a [`TypeError`] wrapped in [`DifferentiationError`] if `block_type` differs from the expected type after removing
+/// layout metadata.
+///
+/// # Parameters
+///
+///   - `transform`: Derivative transform being materialized, used when reporting a non-static coordinate space.
+///   - `block_type`: Actual type of the materialized derivative block.
+///   - `value_type`: Per-coordinate differential value type whose dimensions form the center of the block.
+///   - `prefix_coordinate_types`: Coordinate types whose static dimensions must precede the `value_type` dimensions,
+///     in slice order.
+///   - `suffix_coordinate_types`: Coordinate types whose static dimensions must follow the `value_type` dimensions,
+///     in slice order.
+fn validate_array_derivative_block_type(
+    transform: DerivativeTransform,
+    block_type: &ArrayType,
+    value_type: &ArrayType,
+    prefix_coordinate_types: &[&ArrayType],
+    suffix_coordinate_types: &[&ArrayType],
+) -> Result<(), DifferentiationError> {
+    let mut expected_type = value_type.clone().with_layout(None);
+    let mut prefix_index = 0;
+    for coordinate_type in prefix_coordinate_types {
+        let coordinate_shape =
+            coordinate_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+                transform,
+                role: DifferentiationParameterRole::Derivative,
+                path: ParameterPath::root().to_string(),
+                r#type: coordinate_type.to_string(),
+            })?;
+        for size in coordinate_shape.dimensions() {
+            expected_type = expected_type.with_inserted_dimension(prefix_index, Size::Static(*size))?;
+            prefix_index += 1;
+        }
+    }
+    for coordinate_type in suffix_coordinate_types {
+        let coordinate_shape =
+            coordinate_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
+                transform,
+                role: DifferentiationParameterRole::Derivative,
+                path: ParameterPath::root().to_string(),
+                r#type: coordinate_type.to_string(),
+            })?;
+        for size in coordinate_shape.dimensions() {
+            expected_type = expected_type.with_inserted_dimension(expected_type.rank(), Size::Static(*size))?;
+        }
+    }
+    let block_type_without_layout = block_type.clone().with_layout(None);
+    if block_type_without_layout != expected_type {
+        return Err(TypeError {
+            message: format!("derivative block has type {block_type} but expected {expected_type}"),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Copy, Clone)]
@@ -976,50 +1057,6 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(A::To::<C::Value>::from_parameters(structure, values)?)
-}
-
-fn validate_array_block_type(
-    transform: DerivativeTransform,
-    block_type: &ArrayType,
-    value_type: &ArrayType,
-    prefix_coordinate_types: &[&ArrayType],
-    suffix_coordinate_types: &[&ArrayType],
-) -> Result<(), DifferentiationError> {
-    let mut expected_type = value_type.clone().with_layout(None);
-    let mut prefix_index = 0;
-    for coordinate_type in prefix_coordinate_types {
-        for size in static_shape(coordinate_type, transform, DifferentiationParameterRole::Derivative)?.dimensions() {
-            expected_type = expected_type.with_inserted_dimension(prefix_index, Size::Static(*size))?;
-            prefix_index += 1;
-        }
-    }
-    for coordinate_type in suffix_coordinate_types {
-        for size in static_shape(coordinate_type, transform, DifferentiationParameterRole::Derivative)?.dimensions() {
-            let rank = expected_type.rank();
-            expected_type = expected_type.with_inserted_dimension(rank, Size::Static(*size))?;
-        }
-    }
-    let block_type_without_layout = block_type.clone().with_layout(None);
-    if block_type_without_layout != expected_type {
-        return Err(TypeError {
-            message: format!("derivative block has type {block_type} but expected {expected_type}"),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-fn static_shape(
-    r#type: &ArrayType,
-    transform: DerivativeTransform,
-    role: DifferentiationParameterRole,
-) -> Result<StaticShape, DifferentiationError> {
-    r#type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
-        transform,
-        role,
-        path: ParameterPath::root().to_string(),
-        r#type: r#type.to_string(),
-    })
 }
 
 fn basis_range_value<V>(
