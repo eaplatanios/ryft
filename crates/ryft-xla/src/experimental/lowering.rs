@@ -12911,7 +12911,9 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let first = builder.add_input(first_type);
         let second = builder.add_input(second_type);
-        let joined = builder.add_instruction(ConcatenateOperation::new(0), Vec::new(), vec![first, second]).unwrap()[0];
+        let joined = builder
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -12933,7 +12935,9 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
-        let joined = builder.add_instruction(ConcatenateOperation::new(0), Vec::new(), vec![first, second]).unwrap()[0];
+        let joined = builder
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -12957,7 +12961,9 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let left = builder.add_input(left_type);
         let right = builder.add_input(right_type);
-        let joined = builder.add_instruction(ConcatenateOperation::new(0), Vec::new(), vec![left, right]).unwrap()[0];
+        let joined = builder
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right])
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();

@@ -1542,10 +1542,15 @@ impl Pad for Array {
 
 impl Concatenate for Array {
     fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
-        let axis = axis.into();
+        let Some(first) = inputs.first() else {
+            return Err(
+                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
+            );
+        };
+        let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
+        let axis = operation.axis();
         let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
         let output_type = ArrayType::concatenate(&input_types, axis)?;
-        let axis = ConcatenateOperation::normalize_axis(axis, output_type.rank()).unwrap();
         // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
         // `axis` (and offset zero on every other axis) reuses the row-major odometer in `replace_block`.
         let output_element_count = Self::element_count(&output_type);
