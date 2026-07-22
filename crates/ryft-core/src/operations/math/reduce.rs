@@ -935,12 +935,32 @@ mod tests {
 
     #[test]
     fn test_reduce_operation_interprets_sum_over_axis() {
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+        use crate::types::{Layout, Memory, StridedLayout};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = array_type(&[2, 3], DataType::F64)
+            .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
+        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
             .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         let output = outputs.into_iter().next().unwrap();
-        assert_eq!(output.r#type().shape(), &Shape::new(vec![Size::Static(2)]));
+        // The payload kernel and abstract rule must agree on the complete result type: reduction projects sharding,
+        // preserves memory placement, and clears the rank-specific layout.
+        assert_eq!(
+            output.r#type().as_ref(),
+            &array_type(&[2], DataType::F64)
+                .with_memory(Memory::Host { pinned: true })
+                .with_sharding(output_sharding)
+                .unwrap(),
+        );
         assert_eq!(output.values(), &[6.0, 15.0]);
     }
 

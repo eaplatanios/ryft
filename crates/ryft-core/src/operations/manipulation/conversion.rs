@@ -111,15 +111,15 @@ impl<C: Context<Type: ElementType, Operation: From<ConvertElementTypeOperation>>
 
 impl_differentiable_operation! {
     ConvertElementTypeOperation,
-    /// Forward-mode differentiation rule for [`ConvertElementTypeOperation`]. The primal is converted to the requested
-    /// element data type, while a live tangent is converted to the output's differential element data type. Converting
-    /// into a type with no tangent space produces a structural zero tangent.
     jvp<C>
     where
         C::Type: DifferentiableType + ElementType,
         C::Value: ConvertElementType + ElementwiseDerivativeAlignment<C::Type>,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode differentiation rule for `ConvertElementTypeOperation`. The primal is converted to the
+            // requested element data type, while a live tangent is converted to the output's differential element
+            // data type. Converting into a type with no tangent space produces a structural zero tangent.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().convert_element_type(operation.data_type)?;
             let output_tangent_type = primal.r#type().tangent();
@@ -131,9 +131,6 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transposition rule for [`ConvertElementTypeOperation`]. A live output cotangent is converted back to the input's
-    /// complete cotangent type, while a structural zero remains structural. An input with no cotangent space receives
-    /// the structural zero of that space.
     transpose<V, O>
     where
         V::Type: DifferentiableType + ElementType,
@@ -141,6 +138,9 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transposition rule for `ConvertElementTypeOperation`. A live output cotangent is converted back to the
+            // input's complete cotangent type, while a structural zero remains structural. An input with no cotangent
+            // space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             let input_cotangent_type = inputs[0].r#type().cotangent();

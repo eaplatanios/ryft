@@ -200,18 +200,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SortOper
 
 impl_differentiable_operation! {
     SortOperation,
-    /// Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys' lexicographic
-    /// order, so the live tangents ride one staged sort as extra passenger operands after the primals — the first half
-    /// of the outputs are the primal outputs and the rest are the co-permuted tangents (the same trick JAX's sort JVP
-    /// uses). The staged sort carries the original `key_count`, and because the tangents append after every primal
-    /// operand they always land in the passenger positions. Structural-zero tangents stay symbolic because any
-    /// permutation of zeros is zero.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<SortOperation>,
     {
         |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys'
+            // lexicographic order, so the live tangents ride one staged sort as extra passenger operands after the
+            // primals — the first half of the outputs are the primal outputs and the rest are the co-permuted tangents
+            // (the same trick JAX's sort JVP uses). The staged sort carries the original `key_count`, and because the
+            // tangents append after every primal operand they always land in the passenger positions. Structural-zero
+            // tangents stay symbolic because any permutation of zeros is zero.
             let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let live_indices = inputs
                 .iter()

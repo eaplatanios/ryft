@@ -213,9 +213,6 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::
 
 impl_differentiable_operation! {
     ReshardOperation,
-    /// Forward-mode rule for [`ReshardOperation`]: `reshard` is structural-linear, so the tangent is resharded by the
-    /// same target sharding as the primal. The shared all-zero fast path handles a zero operand tangent before this rule
-    /// is consulted, so the operand tangent reaching here is always live.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
@@ -223,6 +220,9 @@ impl_differentiable_operation! {
         C::Value: Reshard,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode rule for [`ReshardOperation`]: `reshard` is structural-linear, so the tangent is resharded by
+            // the same target sharding as the primal. The shared all-zero fast path handles a zero operand tangent
+            // before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().reshard(operation.sharding());
             let tangent = match inputs[0].tangent() {
@@ -232,16 +232,16 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
-    /// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input
-    /// cotangent is distributed like the input. An input that carries no sharding receives an exactly unsharded
-    /// cotangent through an identity-axis broadcast.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
         O: Operation<ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output
+            // cotangent to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so
+            // the produced input cotangent is distributed like the input. An input that carries no sharding receives
+            // an exactly unsharded cotangent through an identity-axis broadcast.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             let input_cotangent_type = inputs[0].r#type().cotangent();
@@ -429,9 +429,6 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperatio
 
 impl_differentiable_operation! {
     ShardingConstraintOperation,
-    /// Forward-mode rule for [`ShardingConstraintOperation`]: the sharding hint is linear, so the same hint applies to
-    /// the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is consulted,
-    /// so the operand tangent reaching here is always live.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
@@ -439,6 +436,9 @@ impl_differentiable_operation! {
         C::Value: ConstrainSharding,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode rule for [`ShardingConstraintOperation`]: the sharding hint is linear, so the same hint
+            // applies to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
+            // rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().constrain_sharding(operation.sharding());
             let tangent = match inputs[0].tangent() {
@@ -448,16 +448,16 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of the
-    /// output is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with
-    /// `ad.deflinear2`). Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the
-    /// operation's own.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
         O: Operation<ArrayType> + From<ShardingConstraintOperation>,
     {
         |operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of
+            // the output is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with
+            // `ad.deflinear2`). Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the
+            // operation's own.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {

@@ -108,19 +108,18 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-
-    /// Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-    /// Ryft's transposition uses over complex types, the transpose of `(re, im) ↦ re + im·i` maps the output cotangent
-    /// `ȳ` to the part cotangents `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against `(re, im)` picks out
-    /// the real part of `ȳ` for `re` and the *negated* imaginary part for `im`. Like the `Add` rule, known-ness is
-    /// ignored — a known part contributes an additive constant whose adjoint is dropped at the pullback output
-    /// boundary.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
         O: From<NegOperation> + From<RealOperation> + From<ImaginaryOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing
+            // that Ryft's transposition uses over complex types, the transpose of `(re, im) ↦ re + im·i` maps the output
+            // cotangent `ȳ` to the part cotangents `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against
+            // `(re, im)` picks out the real part of `ȳ` for `re` and the *negated* imaginary part for `im`. Like the
+            // `Add` rule, known-ness is ignored — a known part contributes an additive constant whose adjoint is dropped
+            // at the pullback output boundary.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
@@ -183,16 +182,15 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-
-    /// Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-    /// Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing `Re(ȳ · z̄)` against `z`
-    /// shows that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
         O: From<ConjugateOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free)
+            // pairing that Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing
+            // `Re(ȳ · z̄)` against `z` shows that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
@@ -250,16 +248,15 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-
-    /// Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-    /// Ryft's transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the transpose of
-    /// `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
         O: From<ComplexOperation> + From<ZeroLikeOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing
+            // that Ryft's transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the
+            // transpose of `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
@@ -319,16 +316,16 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-
-    /// Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free) pairing that
-    /// Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the transpose of
-    /// `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary part.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
         O: From<NegOperation> + From<ComplexOperation> + From<ZeroLikeOperation>,
     {
         |_operation, _context, _driver, inputs, outputs| {
+            // Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free)
+            // pairing that Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the
+            // transpose of `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary
+            // part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {

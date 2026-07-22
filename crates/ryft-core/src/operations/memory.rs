@@ -131,9 +131,6 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>> BatchableOperation<C
 
 impl_differentiable_operation! {
     TransferToMemoryOperation,
-    /// Forward-mode rule for [`TransferToMemoryOperation`]: a memory transfer is structural-linear, so the tangent is
-    /// transferred to the same destination as the primal. The shared all-zero fast path handles a zero operand tangent
-    /// before this rule is consulted, so the operand tangent reaching here is always live.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
@@ -141,6 +138,9 @@ impl_differentiable_operation! {
         C::Value: TransferToMemory,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode rule for [`TransferToMemoryOperation`]: a memory transfer is structural-linear, so the
+            // tangent is transferred to the same destination as the primal. The shared all-zero fast path handles a
+            // zero operand tangent before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transfer_to_memory(operation.destination());
             let tangent = match inputs[0].tangent() {
@@ -150,15 +150,15 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
-    /// memories, so its transpose moves the output cotangent back to the operand's source memory by staging a transfer
-    /// to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
         O: Operation<ArrayType> + From<TransferToMemoryOperation>,
     {
         |_operation, context, _driver, inputs, outputs| {
+            // Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
+            // memories, so its transpose moves the output cotangent back to the operand's source memory by staging a
+            // transfer to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {

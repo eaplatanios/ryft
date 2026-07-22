@@ -148,11 +148,6 @@ impl<C: Context<Operation: From<SelectOperation>>> PartiallyEvaluatableOperation
 
 impl_differentiable_operation! {
     SelectOperation,
-    /// Forward-mode differentiation rule for [`SelectOperation`]. The primal output is `select(condition, on_true,
-    /// on_false)` over the input primals, and the tangent selects the branch tangents under the *same* primal condition
-    /// (i.e., a `select` is piecewise linear in its branches), with the condition carried as an ordinary primal operand
-    /// edge. When both branch tangents are structural zeros, the output tangent is a structural zero of the output
-    /// type.
     jvp<C>
     where
         C: Zero<C::Value>,
@@ -161,8 +156,11 @@ impl_differentiable_operation! {
         C::Operation: From<SelectOperation>,
     {
         |_operation, context, _driver, inputs| {
-            // Bind the primal and tangent `select`s through the context rather than the value-level `Select` capability
-            // because this rule already owns the active differentiation context and must preserve its tracing behavior.
+            // Forward-mode differentiation rule for `SelectOperation`. The primal output is `select(condition, on_true,
+            // on_false)` over the input primals, and the tangent selects the branch tangents under the *same* primal
+            // condition (i.e., a `select` is piecewise linear in its branches), with the condition carried as an
+            // ordinary primal operand edge. When both branch tangents are structural zeros, the output tangent is a
+            // structural zero of the output type.
             check_count!("input", inputs, 3, ProgramError);
             let condition = &inputs[0];
             let on_true = &inputs[1];
@@ -192,17 +190,6 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Partition-aware transposition rule for [`SelectOperation`]. The Boolean condition (i.e., operand 0) has no
-    /// tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands 1 and
-    /// 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the
-    /// output cotangent into the branch the known condition selected: the `on_true` cotangent is `select(condition,
-    /// cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`, each staged as a primal
-    /// `select` over the condition read from the pullback through the known operand's value. The condition receives
-    /// a structural zero, and a zero output cotangent stays a structural zero. The rule is generic over the primary
-    /// type `V::Type` because it only reaches the branch type (i.e., `input_types[1]`), the known condition operand
-    /// value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore applies to both the
-    /// array [`ArrayOperation::Select`](crate::arrays::ArrayOperation) and the scalar
-    /// [`ScalarOperation::Select`](crate::scalars::ScalarOperation) backends.
     transpose<V, O>
     where
         V::Type: DifferentiableType,
@@ -210,6 +197,17 @@ impl_differentiable_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {
+            // Partition-aware transposition rule for `SelectOperation`. The Boolean condition (i.e., operand 0) has no
+            // tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands
+            // 1 and 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true,
+            // on_false)` routes the output cotangent into the branch the known condition selected: the `on_true`
+            // cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0,
+            // cotangent)`, each staged as a primal `select` over the condition read from the pullback through the known
+            // operand's value. The condition receives a structural zero, and a zero output cotangent stays a structural
+            // zero. The rule is generic over the primary type `V::Type` because it only reaches the branch type (i.e.,
+            // `input_types[1]`), the known condition operand value, and the primal `select`; it carries no rank- or
+            // shape-specific logic. It therefore applies to both `ArrayOperation::Select` and
+            // `ScalarOperation::Select`.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {

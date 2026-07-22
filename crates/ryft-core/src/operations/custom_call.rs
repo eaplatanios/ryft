@@ -242,15 +242,15 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CustomCa
 
 impl_differentiable_operation! {
     CustomCallOperation,
-    /// Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error directing
-    /// users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
-    /// [`custom_vjp`](crate::tracing_v2::CustomVjp), which is also how JAX handles `ffi_call` differentiation.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<CustomCallOperation>,
     {
         |operation, _context, _driver, _inputs| {
+            // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
+            // directing users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
+            // [`custom_vjp`](crate::tracing_v2::CustomVjp), which is also how JAX handles `ffi_call` differentiation.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \

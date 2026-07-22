@@ -100,9 +100,6 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeO
 
 impl_differentiable_operation! {
     ReshapeOperation,
-    /// Forward-mode rule for [`ReshapeOperation`]: `reshape` is structural-linear, so the tangent is the same reshape
-    /// applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is
-    /// consulted, so the operand tangent reaching here is always live.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
@@ -110,6 +107,9 @@ impl_differentiable_operation! {
         C::Value: Reshape,
     {
         |operation, _context, _driver, inputs| {
+            // Forward-mode differentiation rule for `ReshapeOperation`. `reshape` is structural-linear, and so the
+            // tangent is the same reshape applied to the operand tangent. The shared all-zero fast path handles a zero
+            // operand tangent before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().reshape(operation.output_shape().clone())?;
             let tangent = match inputs[0].tangent() {

@@ -902,15 +902,15 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotProdu
 
 impl_differentiable_operation! {
     DotProductAttentionOperation,
-    /// The operation is the inference fast path, so there is no differentiation rule: differentiating reports an
-    /// error directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs the
-    /// activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
     jvp<C>
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<DotProductAttentionOperation>,
     {
         |_operation, _context, _driver, _inputs| {
+            // The operation is the inference fast path, so there is no differentiation rule: differentiating reports an
+            // error directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs
+            // the activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support differentiation; use \
@@ -925,14 +925,14 @@ impl_differentiable_operation! {
 
 impl_differentiable_operation! {
     DotProductAttentionBackwardOperation,
-    /// The backward operation rejects differentiation: second-order derivatives go through an explicit attention
-    /// composition instead of the fused backward pass.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<DotProductAttentionBackwardOperation>,
     {
         |_operation, _context, _driver, _inputs| {
+            // The backward operation rejects differentiation: second-order derivatives go through an explicit attention
+            // composition instead of the fused backward pass.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support differentiation; \

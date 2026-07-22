@@ -298,17 +298,17 @@ fn pmean_factor_type(data_type: DataType) -> ArrayType {
 
 impl_differentiable_operation! {
     CollectiveOperation,
-    /// Forward-mode (JVP) rule for [`CollectiveOperation`]. `PSum`/`PMean` are linear and self-adjoint, so the tangent
-    /// is the same collective applied to the operand tangent: `tangent_out = collective(input.tangent())`. A
-    /// structural-zero operand tangent is preserved as-is rather than staging a collective on a zero, keeping
-    /// `collective(zero)` out of the tangent program. `PMax` is non-linear and reports an
-    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
     jvp<C>
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<CollectiveOperation>,
     {
         |operation, context, _driver, inputs| {
+            // Forward-mode (JVP) rule for [`CollectiveOperation`]. `PSum`/`PMean` are linear and self-adjoint, so the
+            // tangent is the same collective applied to the operand tangent: `tangent_out =
+            // collective(input.tangent())`. A structural-zero operand tangent is preserved as-is rather than staging a
+            // collective on a zero, keeping `collective(zero)` out of the tangent program. `PMax` is non-linear and
+            // reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
             check_count!("input", inputs, 1, ProgramError);
             if matches!(operation.kind, CollectiveKind::PMax) {
                 return Err(ProgramError::UnsupportedOperation {
@@ -329,16 +329,16 @@ impl_differentiable_operation! {
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
-    /// Transpose rule for [`CollectiveOperation`]. `psum`/`pmean` are self-adjoint, so the operand cotangent is the
-    /// same collective applied to the output cotangent. The single operand is linear (its [`PartialValue`] is
-    /// [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent and so receives a structural zero.
-    /// `PMax` reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
         O: Operation<ArrayType> + From<CollectiveOperation>,
     {
         |operation, context, _driver, inputs, outputs| {
+            // Transpose rule for [`CollectiveOperation`]. `psum`/`pmean` are self-adjoint, so the operand cotangent is
+            // the same collective applied to the output cotangent. The single operand is linear (its [`PartialValue`]
+            // is [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent and so receives a
+            // structural zero. `PMax` reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             if matches!(operation.kind, CollectiveKind::PMax) {
