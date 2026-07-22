@@ -1349,7 +1349,6 @@ define_value_and_gradient_auxiliary_function!(
     result = (Input::To<V>, Aux),
 );
 
-// TODO(eaplatanios): Should this be a defaulted function in `ReverseModeDifferentiate` directly?
 /// Computes a value and its gradient in `context`, selecting ordinary or holomorphic output validation.
 ///
 /// # Parameters
@@ -1377,7 +1376,6 @@ where
     Ok((output, gradient))
 }
 
-// TODO(eaplatanios): Should this be a defaulted function in `ReverseModeDifferentiate` directly?
 /// Computes a value, auxiliary outputs, and a gradient in `context`, selecting ordinary or holomorphic output
 /// validation. Only the scalar value is differentiated; auxiliary leaves receive zero cotangent seeds.
 ///
