@@ -254,16 +254,23 @@ impl JacobianMode {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-fn coordinate_offsets<C: Context, S: Parameterized<C::Type>>(
-    types: &S,
+/// Returns the exclusive prefix offsets of the flattened coordinate spaces represented by `types`. If the parameter
+/// leaves have coordinate-space dimensions `[d0, d1, ..., dn]`, the returned vector is `[0, d0, d0 + d1, ...,
+/// d0 + d1 + ... + dn]`. Consequently, element `i` is the first packed coordinate direction belonging to leaf `i`,
+/// and the final element is the total number of packed directions. Each leaf dimension is obtained from
+/// [`DenseDifferentiableType::coordinate_space_dimension`]. Returns a [`DifferentiationError`] if any
+/// leaf does not have a finite coordinate space or if a cumulative offset does not fit in [`usize`].
+///
+/// # Parameters
+///
+///   - `types`: Structured parameter types whose leaf coordinate spaces are flattened in parameter order.
+///   - `transform`: Derivative transform requesting the offsets, used in diagnostics.
+///   - `role`: Role of `types` in the derivative transform, used in diagnostics.
+fn coordinate_prefix_offsets<C: Context<Type: DenseDifferentiableType<C>>, Types: Parameterized<C::Type>>(
+    types: &Types,
     transform: DerivativeTransform,
     role: DifferentiationParameterRole,
-) -> Result<Vec<usize>, DifferentiationError>
-where
-    C::Type: DenseDifferentiableType<C>,
-{
+) -> Result<Vec<usize>, DifferentiationError> {
     let mut offsets = Vec::new();
     offsets.push(0usize);
     for (path, r#type) in types.named_parameters() {
@@ -279,6 +286,8 @@ where
     }
     Ok(offsets)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 pub(super) fn jacfwd_in<C, F, I, O>(
     context: &C,
@@ -322,8 +331,9 @@ where
     )?;
     JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
-    let input_offsets = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
-    let _ = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
+    let input_offsets =
+        coordinate_prefix_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
+    coordinate_prefix_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
     let batch_size = input_offsets.last().copied().unwrap();
     let (program, residuals) = pushforward.into_parts();
     let program_input_types = program.input_types();
@@ -444,8 +454,9 @@ where
     )?;
     JacobianMode::Reverse.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
-    let _ = coordinate_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
-    let output_offsets = coordinate_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
+    coordinate_prefix_offsets::<C, _>(&input_types, transform, DifferentiationParameterRole::Input)?;
+    let output_offsets =
+        coordinate_prefix_offsets::<C, _>(&output_types, transform, DifferentiationParameterRole::Output)?;
     let batch_size = output_offsets.last().copied().unwrap();
     let (program, residuals) = pullback.into_parts();
     let program_input_types = program.input_types();
@@ -886,7 +897,7 @@ mod tests {
     use crate::types::DataType::{F32, F64};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{Jacobian, coordinate_offsets, jacfwd, jacrev};
+    use super::{Jacobian, coordinate_prefix_offsets, jacfwd, jacrev};
 
     /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
     /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
@@ -936,10 +947,10 @@ mod tests {
     }
 
     #[test]
-    fn test_coordinate_offsets_reports_overflow_and_handles_empty_coordinate_spaces() {
+    fn test_coordinate_prefix_offsets_reports_overflow_and_handles_empty_coordinate_spaces() {
         let input_types = (ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX)])), ArrayType::scalar(F32));
         assert_eq!(
-            coordinate_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
+            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
                 &input_types,
                 DerivativeTransform::JacobianForward,
                 DifferentiationParameterRole::Input,
@@ -956,7 +967,7 @@ mod tests {
         let empty_input_types =
             ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(usize::MAX), Size::Static(0)]));
         assert_eq!(
-            coordinate_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
+            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
                 &empty_input_types,
                 DerivativeTransform::JacobianForward,
                 DifferentiationParameterRole::Input,
