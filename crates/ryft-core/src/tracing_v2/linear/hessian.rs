@@ -17,16 +17,16 @@ use crate::tracing::TracingContext;
 
 // TODO(eaplatanios): Review this module.
 
-use super::jacobian::{Jacobian, jacobian_forward_with_aux_in, jacobian_reverse_with_aux_in};
+use super::jacobian::{Jacobian, jacobian_forward_in_context, jacobian_reverse_in_context};
 
 /// Defines one non-auxiliary [`HessianDifferentiate`] method. It keeps the nested differentiation bounds shared while
-/// allowing ordinary and holomorphic entry points to select their validation mode.
+/// adapting its corresponding auxiliary method with a unit auxiliary value.
 macro_rules! define_hessian_function_in_trait {
-    // Generates one non-auxiliary Hessian context method with a statically selected holomorphy mode.
+    // Generates one non-auxiliary Hessian context method by adapting its auxiliary counterpart.
     (
         $(#[doc = $documentation:literal])*
         $method:ident,
-        holomorphic = $holomorphic:literal,
+        delegate = $delegate:ident,
     ) => {
         $(#[doc = $documentation])*
         #[inline]
@@ -58,7 +58,8 @@ macro_rules! define_hessian_function_in_trait {
             function: F,
             primals: I,
         ) -> Result<Hessian<Self::Type, Self::Value, I::To<Self::Type>, O::To<Self::Type>>, DifferentiationError> {
-            hessian_in(self, function, primals, $holomorphic)
+            let (hessian, ()) = self.$delegate(|input| Ok((function(input)?, ())), primals)?;
+            Ok(hessian)
         }
     };
 }
@@ -113,7 +114,7 @@ macro_rules! define_hessian_auxiliary_function_in_trait {
             (Hessian<Self::Type, Self::Value, I::To<Self::Type>, O::To<Self::Type>>, A::To<Self::Value>),
             DifferentiationError,
         > {
-            hessian_with_aux_in(self, function, primals, $holomorphic)
+            hessian_in_context(self, function, primals, $holomorphic)
         }
     };
 }
@@ -144,14 +145,14 @@ pub trait HessianDifferentiate:
         /// Materializes the complete output/input/input Hessian using forward-over-reverse differentiation. Refer to
         /// [`hessian`] for the mathematical interpretation and representation.
         hessian,
-        holomorphic = false,
+        delegate = hessian_with_aux,
     );
 
     define_hessian_function_in_trait!(
         /// Materializes the complete holomorphic Hessian using forward-over-reverse differentiation. Refer to
         /// [`hessian_holomorphic`] for the holomorphy contract.
         hessian_holomorphic,
-        holomorphic = true,
+        delegate = hessian_holomorphic_with_aux,
     );
 
     define_hessian_auxiliary_function_in_trait!(
@@ -194,7 +195,7 @@ where
 ///
 /// The physical representation of a block is defined by [`DenseDifferentiableType`]. For
 /// [`ArrayType`](crate::types::ArrayType), the block for shapes `O`, `I1`, and `I2` has shape `O ++ I1 ++ I2`.
-#[derive(Parameterized, Clone, Debug)]
+#[derive(Clone, Debug, Parameterized)]
 pub struct Hessian<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> {
     /// Type tree of the differentiated inputs.
     input_types: I,
@@ -406,15 +407,13 @@ pub(super) type NestedDenseContext<C> = DifferentiationContext<PartialEvaluation
 /// # Parameters
 ///
 ///   - `outer`: Forward Jacobian whose output is the reverse Jacobian of the original function.
-fn hessian_from_outer<C, I, O>(
-    outer: Jacobian<C::Type, C::Value, I, Jacobian<C::Type, C::Type, I, O>>,
-) -> Result<Hessian<C::Type, C::Value, I, O>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
+fn hessian_from_outer<
+    C: Context<Type: DenseDifferentiableType<C>>,
     I: Clone + Parameterized<C::Type>,
     O: Clone + Parameterized<C::Type>,
-{
+>(
+    outer: Jacobian<C::Type, C::Value, I, Jacobian<C::Type, C::Type, I, O>>,
+) -> Result<Hessian<C::Type, C::Value, I, O>, DifferentiationError> {
     let input_types = outer.input_type().clone();
     let output_types = outer.output_type().output_type().clone();
     let values = outer.into_values();
@@ -437,60 +436,8 @@ where
 
 /// Implements forward-over-reverse Hessian materialization in an explicitly provided [`Context`]. The inner reverse
 /// transform materializes the original Jacobian, and the outer forward transform differentiates that structured
-/// Jacobian with respect to every input coordinate.
-///
-/// # Parameters
-///
-///   - `context`: Context in which to trace and replay both derivative transforms.
-///   - `function`: Function whose Hessian is materialized.
-///   - `primals`: Structured input values specifying the linearization point.
-///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn hessian_in<C, F, I, O>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<Hessian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C> + DenseDifferentiableType<NestedDenseContext<C>>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<C::Type>
-                        + ParameterizedFamily<LinearizationTracer<C>>
-                        + ParameterizedFamily<LinearizationTracer<NestedDenseContext<C>>>,
-        >,
-    I::To<C::Type>: Clone,
-    I::To<LinearizationTracer<C>>: Parameterized<
-            LinearizationTracer<C>,
-            To<LinearizationTracer<C>> = I::To<LinearizationTracer<C>>,
-            To<LinearizationTracer<NestedDenseContext<C>>> = I::To<LinearizationTracer<NestedDenseContext<C>>>,
-            To<C::Type> = I::To<C::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<NestedDenseContext<C>>,
-            Family: ParameterizedFamily<C::Type> + ParameterizedFamily<LinearizationTracer<C>>,
-        >,
-    O::To<C::Type>: Clone,
-    F: FnOnce(I::To<LinearizationTracer<NestedDenseContext<C>>>) -> Result<O, ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<NestedDenseContext<C>>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<C>>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
-        + From<AddOperation>,
-{
-    let (hessian, ()) = hessian_with_aux_in(context, |input| Ok((function(input)?, ())), primals, holomorphic)?;
-    Ok(hessian)
-}
-
-/// Implements [`hessian_in`] for a function that also returns auxiliary outputs. Only the first component is
-/// differentiated; the auxiliary component is materialized from its primal trace and returned unchanged.
+/// Jacobian with respect to every input coordinate. Only the first component returned by `function` is differentiated;
+/// the auxiliary component is materialized from its primal trace and returned unchanged.
 ///
 /// # Parameters
 ///
@@ -498,55 +445,55 @@ where
 ///   - `function`: Function returning the differentiated output and auxiliary output.
 ///   - `primals`: Structured input values specifying the linearization point.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn hessian_with_aux_in<C, F, I, O, A>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<(Hessian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C> + DenseDifferentiableType<NestedDenseContext<C>>,
+pub(super) fn hessian_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C> + DenseDifferentiableType<NestedDenseContext<C>>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<NestedDenseContext<C>>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<C>>
+                           + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+                           + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<C>>>
+                           + TransposableOperation<C::Constant, C::Operation>
+                           + From<ZeroOperation<C::Type>>
+                           + From<AddOperation>,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<NestedDenseContext<C>>>) -> Result<(O, A), ProgramError>,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
+            To<C::Type>: Clone,
+            To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<LinearizationTracer<C>> = I::To<LinearizationTracer<C>>,
+                To<LinearizationTracer<NestedDenseContext<C>>> = I::To<LinearizationTracer<NestedDenseContext<C>>>,
+                To<C::Type> = I::To<C::Type>,
+            >,
             Family: ParameterizedFamily<C::Type>
                         + ParameterizedFamily<LinearizationTracer<C>>
                         + ParameterizedFamily<LinearizationTracer<NestedDenseContext<C>>>,
         >,
-    I::To<C::Type>: Clone,
-    I::To<LinearizationTracer<C>>: Parameterized<
-            LinearizationTracer<C>,
-            To<LinearizationTracer<C>> = I::To<LinearizationTracer<C>>,
-            To<LinearizationTracer<NestedDenseContext<C>>> = I::To<LinearizationTracer<NestedDenseContext<C>>>,
-            To<C::Type> = I::To<C::Type>,
-        >,
     O: Parameterized<
             LinearizationTracer<NestedDenseContext<C>>,
+            To<C::Type>: Clone,
             Family: ParameterizedFamily<C::Type> + ParameterizedFamily<LinearizationTracer<C>>,
         >,
-    O::To<C::Type>: Clone,
     A: Parameterized<
             LinearizationTracer<NestedDenseContext<C>>,
+            To<LinearizationTracer<C>>: Parameterized<LinearizationTracer<C>, To<C::Value> = A::To<C::Value>>,
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Value>,
         >,
-    A::To<LinearizationTracer<C>>: Parameterized<LinearizationTracer<C>, To<C::Value> = A::To<C::Value>>,
-    F: FnOnce(I::To<LinearizationTracer<NestedDenseContext<C>>>) -> Result<(O, A), ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<NestedDenseContext<C>>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<C>>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
-        + From<AddOperation>,
-{
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Hessian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError> {
     let (outer, auxiliary): (
         Jacobian<C::Type, C::Value, I::To<C::Type>, Jacobian<C::Type, C::Type, I::To<C::Type>, O::To<C::Type>>>,
         A::To<C::Value>,
-    ) = jacobian_forward_with_aux_in(
+    ) = jacobian_forward_in_context(
         context,
         |outer_primals| {
             let nested_context = outer_primals
@@ -554,7 +501,7 @@ where
                 .next()
                 .map(Value::execution_domain)
                 .ok_or(DifferentiationError::EmptyInput)?;
-            jacobian_reverse_with_aux_in(&nested_context, function, outer_primals, holomorphic)
+            jacobian_reverse_in_context(&nested_context, function, outer_primals, holomorphic)
                 .map_err(ProgramError::from)
         },
         primals,
@@ -564,142 +511,126 @@ where
     Ok((hessian_from_outer::<C, _, _>(outer)?, auxiliary))
 }
 
-/// Materializes the complete Hessian of `function` at `primals` using forward-over-reverse differentiation.
-///
-/// For `y = f(x)`, each Hessian entry is `H[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Ryft first uses
-/// [`jacobian_reverse`](crate::tracing_v2::jacobian_reverse) to materialize the inner output/first-input Jacobian, then
-/// uses [`jacobian_forward`](crate::tracing_v2::jacobian_forward) to differentiate it with respect to the second input.
-/// The resulting [`Hessian`] stores blocks in output-major/first-input-major/second-input-minor order. For arrays, a
-/// block places the output axes first, followed by the first-input axes and then the second-input axes.
-///
-/// The active context is recovered from the first value in `primals`, so the same entry point works for eager values
-/// and staged tracers. Complete materialization requires finite, statically enumerable coordinate spaces and ordinary
-/// Hessians require real input and output leaves. Use [`hessian_holomorphic`] for a complex holomorphic function.
-///
-/// # Parameters
-///
-///   - `function`: Function whose Hessian is materialized.
-///   - `primals`: Structured input values specifying the evaluation point.
-pub fn hessian<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type:
-        DenseDifferentiableType<V::ExecutionDomain> + DenseDifferentiableType<NestedDenseContext<V::ExecutionDomain>>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<V::Type>
-                        + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>
-                        + ParameterizedFamily<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>,
-        >,
-    I::To<V::Type>: Clone,
-    I::To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            To<LinearizationTracer<V::ExecutionDomain>> = I::To<LinearizationTracer<V::ExecutionDomain>>,
-            To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>> = I::To<
-                LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
-            >,
-            To<V::Type> = I::To<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-        >,
-    O::To<V::Type>: Clone,
-    F: FnOnce(I::To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<NestedDenseContext<V::ExecutionDomain>>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-        + DifferentiableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<
-            PartialEvaluationContext<
-                TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-            >,
-        > + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<V::ExecutionDomain>>>
-        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
-        + From<ZeroOperation<V::Type>>
-        + From<AddOperation>,
-{
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
+/// Defines one context-recovering Hessian function without auxiliary outputs. It centralizes the nested structured
+/// generic signature, operation requirements, empty-input handling, and same-named context-method delegation.
+macro_rules! define_hessian_function {
+    // Generates one non-auxiliary Hessian function and delegates to its same-named context method.
+    (
+        $(#[doc = $documentation:literal])*
+        $function_name:ident,
+    ) => {
+        $(#[doc = $documentation])*
+        #[inline]
+        pub fn $function_name<
+            V: Value<
+                    Type: DenseDifferentiableType<V::ExecutionDomain>
+                              + DenseDifferentiableType<NestedDenseContext<V::ExecutionDomain>>,
+                    ExecutionDomain: Context<
+                        Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                                       + PartiallyEvaluatableOperation<NestedDenseContext<V::ExecutionDomain>>
+                                       + PartiallyEvaluatableOperation<
+                            TracingContext<
+                                <V::ExecutionDomain as Domain>::Constant,
+                                <V::ExecutionDomain as Domain>::Operation,
+                            >,
+                        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                                       + DifferentiableOperation<
+                            TracingContext<
+                                <V::ExecutionDomain as Domain>::Constant,
+                                <V::ExecutionDomain as Domain>::Operation,
+                            >,
+                        > + DifferentiableOperation<
+                            PartialEvaluationContext<
+                                TracingContext<
+                                    <V::ExecutionDomain as Domain>::Constant,
+                                    <V::ExecutionDomain as Domain>::Operation,
+                                >,
+                            >,
+                        > + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<V::ExecutionDomain>>>
+                                       + TransposableOperation<
+                            <V::ExecutionDomain as Domain>::Constant,
+                            <V::ExecutionDomain as Domain>::Operation,
+                        > + From<ZeroOperation<V::Type>>
+                                       + From<AddOperation>,
+                    >,
+                >,
+            F: FnOnce(
+                I::To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>,
+            ) -> Result<O, ProgramError>,
+            I: Parameterized<
+                    V,
+                    To<V> = I,
+                    To<V::Type>: Clone,
+                    To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
+                        LinearizationTracer<V::ExecutionDomain>,
+                        To<LinearizationTracer<V::ExecutionDomain>> = I::To<
+                            LinearizationTracer<V::ExecutionDomain>,
+                        >,
+                        To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>> = I::To<
+                            LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
+                        >,
+                        To<V::Type> = I::To<V::Type>,
+                    >,
+                    Family: ParameterizedFamily<V::Type>
+                                + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>
+                                + ParameterizedFamily<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>,
+                >,
+            O: Parameterized<
+                    LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
+                    To<V::Type>: Clone,
+                    Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
+                >,
+        >(
+            function: F,
+            primals: I,
+        ) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
+            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+                return Err(DifferentiationError::EmptyInput);
+            };
+            context.$function_name(function, primals)
+        }
     };
-    context.hessian(function, primals)
 }
 
-/// Materializes the Hessian of a complex holomorphic `function` at `primals` using forward-over-reverse
-/// differentiation.
-///
-/// This has the algorithm and representation described by [`hessian`], but treats both derivative transforms as
-/// complex linear and requires every differentiated input and output leaf to be complex. Passing `function` is a
-/// promise of holomorphy; Ryft validates the leaf types but cannot prove that the function satisfies the
-/// Cauchy-Riemann equations.
-///
-/// # Parameters
-///
-///   - `function`: Holomorphic function whose complex Hessian is materialized.
-///   - `primals`: Structured complex input values specifying the evaluation point.
-pub fn hessian_holomorphic<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Hessian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type:
-        DenseDifferentiableType<V::ExecutionDomain> + DenseDifferentiableType<NestedDenseContext<V::ExecutionDomain>>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<V::Type>
-                        + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>
-                        + ParameterizedFamily<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>,
-        >,
-    I::To<V::Type>: Clone,
-    I::To<LinearizationTracer<V::ExecutionDomain>>: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            To<LinearizationTracer<V::ExecutionDomain>> = I::To<LinearizationTracer<V::ExecutionDomain>>,
-            To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>> = I::To<
-                LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
-            >,
-            To<V::Type> = I::To<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>,
-            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-        >,
-    O::To<V::Type>: Clone,
-    F: FnOnce(I::To<LinearizationTracer<NestedDenseContext<V::ExecutionDomain>>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<NestedDenseContext<V::ExecutionDomain>>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-        + DifferentiableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<
-            PartialEvaluationContext<
-                TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-            >,
-        > + DifferentiableOperation<PartialEvaluationContext<NestedDenseContext<V::ExecutionDomain>>>
-        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
-        + From<ZeroOperation<V::Type>>
-        + From<AddOperation>,
-{
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.hessian_holomorphic(function, primals)
-}
+define_hessian_function!(
+    /// Materializes the complete Hessian of `function` at `primals` using forward-over-reverse differentiation.
+    ///
+    /// For `y = f(x)`, each Hessian entry is `H[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. Ryft first uses
+    /// [`jacobian_reverse`](crate::tracing_v2::jacobian_reverse) to materialize the inner output/first-input Jacobian,
+    /// then uses [`jacobian_forward`](crate::tracing_v2::jacobian_forward) to differentiate it with respect to the
+    /// second input. The resulting [`Hessian`] stores blocks in output-major/first-input-major/second-input-minor order.
+    /// For arrays, a block places the output axes first, followed by the first-input axes and then the second-input axes.
+    ///
+    /// The active context is recovered from the first value in `primals`, so the same entry point works for eager
+    /// values and staged tracers. Complete materialization requires finite, statically enumerable coordinate spaces and
+    /// ordinary Hessians require real input and output leaves. Use [`hessian_holomorphic`] for a complex holomorphic
+    /// function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose Hessian is materialized.
+    ///   - `primals`: Structured input values specifying the evaluation point.
+    hessian,
+);
 
-/// Defines one context-recovering Hessian function with auxiliary outputs. It keeps the free-function bounds aligned
-/// with the corresponding [`HessianDifferentiate`] method.
+define_hessian_function!(
+    /// Materializes the Hessian of a complex holomorphic `function` at `primals` using forward-over-reverse
+    /// differentiation.
+    ///
+    /// This has the algorithm and representation described by [`hessian`], but treats both derivative transforms as
+    /// complex linear and requires every differentiated input and output leaf to be complex. Passing `function` is a
+    /// promise of holomorphy; Ryft validates the leaf types but cannot prove that the function satisfies the
+    /// Cauchy-Riemann equations.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Hessian is materialized.
+    ///   - `primals`: Structured complex input values specifying the evaluation point.
+    hessian_holomorphic,
+);
+
+/// Defines one context-recovering Hessian function with auxiliary outputs. It centralizes the nested structured generic
+/// signature, operation requirements, empty-input handling, and same-named context-method delegation.
 macro_rules! define_hessian_auxiliary_function {
     // Generates one auxiliary-output Hessian function and delegates to its same-named context method.
     (
