@@ -24,7 +24,7 @@ use crate::tracing::TracingContext;
 /// boundaries as well as participate in higher-order transforms. The physical representation of a block is defined by
 /// [`DenseDifferentiableType`]. For [`ArrayType`](crate::ArrayType), the block for an output leaf with shape `O` and
 /// an input leaf with shape `I` has shape `O` concatenated with `I`.
-#[derive(Parameterized, Clone, Debug)]
+#[derive(Clone, Debug, Parameterized)]
 pub struct Jacobian<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> {
     /// [`Type`] of the differentiated inputs.
     input_type: I,
@@ -419,6 +419,282 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
 }
 
 impl<C: Context<Type: DenseDifferentiableType<C>>> JacobianDifferentiate for C {}
+
+/// Defines one context-recovering Jacobian function without auxiliary outputs. It centralizes the structured generic
+/// signature and empty-input handling while keeping each variant's operation requirements explicit at its invocation.
+macro_rules! define_jacobian_function {
+    (
+        $(#[doc = $documentation:literal])*
+        $function_name:ident,
+        operation_bounds = [$($operation_bounds:tt)+],
+    ) => {
+        $(#[doc = $documentation])*
+        #[inline]
+        pub fn $function_name<
+            V: Value<
+                    Type: DenseDifferentiableType<V::ExecutionDomain>,
+                    ExecutionDomain: Context<Operation: $($operation_bounds)+>,
+                >,
+            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+            I: Parameterized<
+                    V,
+                    To<V> = I,
+                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+                >,
+            O: Parameterized<
+                    LinearizationTracer<V::ExecutionDomain>,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+                >,
+        >(
+            function: F,
+            primals: I,
+        ) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
+            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+                return Err(DifferentiationError::EmptyInput);
+            };
+            context.$function_name(function, primals)
+        }
+    };
+}
+
+/// Defines one context-recovering Jacobian function with auxiliary outputs. It centralizes the structured generic
+/// signature and empty-input handling while keeping each variant's operation requirements explicit at its invocation.
+macro_rules! define_jacobian_auxiliary_function {
+    (
+        $(#[doc = $documentation:literal])*
+        $function_name:ident,
+        operation_bounds = [$($operation_bounds:tt)+],
+    ) => {
+        $(#[doc = $documentation])*
+        #[inline]
+        pub fn $function_name<
+            V: Value<
+                    Type: DenseDifferentiableType<V::ExecutionDomain>,
+                    ExecutionDomain: Context<Operation: $($operation_bounds)+>,
+                >,
+            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
+            I: Parameterized<
+                    V,
+                    To<V> = I,
+                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
+                >,
+            O: Parameterized<
+                    LinearizationTracer<V::ExecutionDomain>,
+                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
+                >,
+            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
+        >(
+            function: F,
+            primals: I,
+        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError> {
+            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+                return Err(DifferentiationError::EmptyInput);
+            };
+            context.$function_name(function, primals)
+        }
+    };
+}
+
+define_jacobian_function!(
+    /// Materializes the complete [`Jacobian`] of `function` at `primals` using forward-mode differentiation.
+    /// For `y = f(x)`, the Jacobian is the linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This function
+    /// linearizes `function` once, applies the resulting [`Pushforward`](crate::Pushforward) to a packed basis of the
+    /// finite input coordinate space, and assembles the resulting columns into a [`Jacobian`]. Each block corresponds
+    /// to one output leaf and one input leaf; array blocks place the output axes before the input axes.
+    /// [`jacobian_reverse`] produces the same representation by applying the transposed map and is generally
+    /// preferable when the output coordinate space is smaller.
+    ///
+    /// The active context is recovered from the first value in `primals`, so the same entry point works for eager
+    /// values and staged tracers. Ordinary forward materialization requires real input leaves, although output leaves
+    /// may be complex. Use [`jacobian_forward_holomorphic`] for a complex holomorphic function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose Jacobian is materialized.
+    ///   - `primals`: Structured input values specifying the linearization point.
+    jacobian_forward,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + From<ZeroOperation<V::Type>>
+    ],
+);
+
+define_jacobian_function!(
+    /// Materializes the forward-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
+    /// the algorithm and representation described by [`jacobian_forward`], but treats the derivative as complex linear
+    /// and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
+    /// holomorphy; the function validates the leaf types but cannot prove that the function satisfies the
+    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
+    jacobian_forward_holomorphic,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + From<ZeroOperation<V::Type>>
+    ],
+);
+
+define_jacobian_auxiliary_function!(
+    /// Materializes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// `(output, auxiliary)`. Only `output` contributes to the Jacobian. `auxiliary` is materialized from its primal
+    /// trace and returned with it. Refer to [`jacobian_forward`] for the mathematical interpretation, block layout,
+    /// context recovery, and ordinary complex-type rules.
+    jacobian_forward_with_aux,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + From<ZeroOperation<V::Type>>
+    ],
+);
+
+define_jacobian_auxiliary_function!(
+    /// Materializes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// closure and auxiliary-output behavior are described by [`jacobian_forward_with_aux`]. The holomorphy promise
+    /// and complex-type requirements are the same as for [`jacobian_forward_holomorphic`].
+    jacobian_forward_holomorphic_with_aux,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + From<ZeroOperation<V::Type>>
+    ],
+);
+
+define_jacobian_function!(
+    /// Materializes the complete [`Jacobian`] of `function` at `primals` using reverse-mode differentiation.
+    /// For `y = f(x)`, the pullback maps an output cotangent `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This
+    /// function constructs that [`Pullback`](crate::Pullback) once, applies it to a packed basis of the finite output
+    /// coordinate space, and reorients the resulting rows into the same output-major/input-minor [`Jacobian`]
+    /// representation returned by [`jacobian_forward`]. Reverse materialization is generally preferable when the
+    /// output coordinate space is smaller than the input coordinate space.
+    ///
+    /// The active context is recovered from the first value in `primals`, so the same entry point works for eager
+    /// values and staged tracers. Ordinary reverse materialization requires real output leaves, although input leaves
+    /// may be complex. Use [`jacobian_reverse_holomorphic`] for a complex holomorphic function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Function whose Jacobian is materialized.
+    ///   - `primals`: Structured input values specifying the linearization point.
+    jacobian_reverse,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+            + TransposableOperation<
+                <V::ExecutionDomain as Domain>::Constant,
+                <V::ExecutionDomain as Domain>::Operation,
+            >
+            + From<ZeroOperation<V::Type>>
+            + From<AddOperation>
+    ],
+);
+
+define_jacobian_function!(
+    /// Materializes the reverse-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
+    /// the algorithm and representation described by [`jacobian_reverse`], but treats the derivative as complex linear
+    /// and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
+    /// holomorphy; the function validates the leaf types but cannot prove that the function satisfies the
+    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
+    jacobian_reverse_holomorphic,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+            + TransposableOperation<
+                <V::ExecutionDomain as Domain>::Constant,
+                <V::ExecutionDomain as Domain>::Operation,
+            >
+            + From<ZeroOperation<V::Type>>
+            + From<AddOperation>
+    ],
+);
+
+define_jacobian_auxiliary_function!(
+    /// Materializes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is materialized from its primal
+    /// trace and returned with it. Refer to [`jacobian_reverse`] for the mathematical interpretation, block layout,
+    /// context recovery, and ordinary complex-type rules.
+    jacobian_reverse_with_aux,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+            + TransposableOperation<
+                <V::ExecutionDomain as Domain>::Constant,
+                <V::ExecutionDomain as Domain>::Operation,
+            >
+            + From<ZeroOperation<V::Type>>
+            + From<AddOperation>
+    ],
+);
+
+define_jacobian_auxiliary_function!(
+    /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// closure and auxiliary-output behavior are described by [`jacobian_reverse_with_aux`]. The holomorphy promise
+    /// and complex-type requirements are the same as for [`jacobian_reverse_holomorphic`].
+    jacobian_reverse_holomorphic_with_aux,
+    operation_bounds = [
+        PartiallyEvaluatableOperation<V::ExecutionDomain>
+            + PartiallyEvaluatableOperation<
+                TracingContext<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                >,
+            >
+            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+            + TransposableOperation<
+                <V::ExecutionDomain as Domain>::Constant,
+                <V::ExecutionDomain as Domain>::Operation,
+            >
+            + From<ZeroOperation<V::Type>>
+            + From<AddOperation>
+    ],
+);
 
 /// Direction of a dense Jacobian materialization.
 #[derive(Copy, Clone)]
@@ -856,13 +1132,15 @@ pub(super) fn jacobian_reverse_in_context<
 /// # Parameters
 ///
 ///   - `auxiliary`: Structured auxiliary output produced while tracing the differentiated function.
-fn materialize_auxiliary<C, A>(auxiliary: A) -> Result<A::To<C::Value>, DifferentiationError>
-where
-    C: Context,
+fn materialize_auxiliary<
+    C: Context<
+        Operation: PartiallyEvaluatableOperation<C>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    >,
     A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-    C::Operation:
-        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-{
+>(
+    auxiliary: A,
+) -> Result<A::To<C::Value>, DifferentiationError> {
     let structure = auxiliary.parameter_structure();
     let values = auxiliary
         .into_parameters()
@@ -878,318 +1156,6 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     Ok(A::To::<C::Value>::from_parameters(structure, values)?)
 }
-
-/// Materializes the complete Jacobian of `function` at `primals` using forward-mode differentiation.
-///
-/// For `y = f(x)`, the Jacobian is the linear map `J_f(x) = ∂f/∂x` satisfying
-/// `ẏ = J_f(x) · ẋ`. This function linearizes `function` once, applies the resulting
-/// [`Pushforward`](crate::Pushforward) to a packed basis of the finite input coordinate space, and assembles the
-/// resulting columns into a [`Jacobian`]. Each block corresponds to one output leaf and one input leaf; array blocks
-/// place the output axes before the input axes. [`jacobian_reverse`] produces the same representation by applying the
-/// transposed map and is generally preferable when the output coordinate space is smaller.
-///
-/// The active context is recovered from the first value in `primals`, so the same entry point works for eager values
-/// and staged tracers. Ordinary forward materialization requires real input leaves, although output leaves may be
-/// complex. Use [`jacobian_forward_holomorphic`] for a complex holomorphic function.
-///
-/// # Parameters
-///
-///   - `function`: Function whose Jacobian is materialized.
-///   - `primals`: Structured input values specifying the linearization point.
-pub fn jacobian_forward<
-    V: Value<
-            Type: DenseDifferentiableType<V::ExecutionDomain>,
-            ExecutionDomain: Context<
-                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + From<ZeroOperation<V::Type>>,
-            >,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-        >,
->(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.jacobian_forward(function, primals)
-}
-
-/// Materializes the complete Jacobian of `function` at `primals` using reverse-mode differentiation.
-///
-/// For `y = f(x)`, the pullback maps an output cotangent `ȳ` to
-/// `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This function constructs that [`Pullback`](crate::Pullback) once,
-/// applies it to a packed basis of the finite output coordinate space, and reorients the resulting rows into the same
-/// output-major/input-minor [`Jacobian`] representation returned by [`jacobian_forward`]. Reverse materialization is
-/// generally preferable when the output coordinate space is smaller than the input coordinate space.
-///
-/// The active context is recovered from the first value in `primals`, so the same entry point works for eager values
-/// and staged tracers. Ordinary reverse materialization requires real output leaves, although input leaves may be
-/// complex. Use [`jacobian_reverse_holomorphic`] for a complex holomorphic function.
-///
-/// # Parameters
-///
-///   - `function`: Function whose Jacobian is materialized.
-///   - `primals`: Structured input values specifying the linearization point.
-pub fn jacobian_reverse<
-    V: Value<
-            Type: DenseDifferentiableType<V::ExecutionDomain>,
-            ExecutionDomain: Context<
-                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                               + TransposableOperation<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                > + From<ZeroOperation<V::Type>>
-                               + From<AddOperation>,
-            >,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-        >,
->(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.jacobian_reverse(function, primals)
-}
-
-/// Materializes the forward-mode Jacobian of a complex holomorphic `function` at `primals`.
-///
-/// This has the algorithm and representation described by [`jacobian_forward`], but treats the derivative as complex
-/// linear and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
-/// holomorphy; Ryft validates the leaf types but cannot prove that the function satisfies the Cauchy-Riemann equations.
-///
-/// # Parameters
-///
-///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-///   - `primals`: Structured complex input values specifying the linearization point.
-pub fn jacobian_forward_holomorphic<
-    V: Value<
-            Type: DenseDifferentiableType<V::ExecutionDomain>,
-            ExecutionDomain: Context<
-                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + From<ZeroOperation<V::Type>>,
-            >,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-        >,
->(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.jacobian_forward_holomorphic(function, primals)
-}
-
-/// Materializes the reverse-mode Jacobian of a complex holomorphic `function` at `primals`.
-///
-/// This has the algorithm and representation described by [`jacobian_reverse`], but treats the derivative as complex
-/// linear and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
-/// holomorphy; Ryft validates the leaf types but cannot prove that the function satisfies the Cauchy-Riemann equations.
-///
-/// # Parameters
-///
-///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-///   - `primals`: Structured complex input values specifying the linearization point.
-pub fn jacobian_reverse_holomorphic<
-    V: Value<
-            Type: DenseDifferentiableType<V::ExecutionDomain>,
-            ExecutionDomain: Context<
-                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                               + TransposableOperation<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                > + From<ZeroOperation<V::Type>>
-                               + From<AddOperation>,
-            >,
-        >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    I: Parameterized<
-            V,
-            To<V> = I,
-            Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-        >,
-    O: Parameterized<
-            LinearizationTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-        >,
->(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.jacobian_reverse_holomorphic(function, primals)
-}
-
-/// Defines one context-recovering forward-mode Jacobian function with auxiliary outputs. It keeps the free-function
-/// bounds aligned with the corresponding [`JacobianDifferentiate`] method.
-macro_rules! define_forward_jacobian_auxiliary_function {
-    // Generates one auxiliary-output forward Jacobian function and delegates to its same-named context method.
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>,
-                    ExecutionDomain: Context<
-                        Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                                       + PartiallyEvaluatableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + From<ZeroOperation<V::Type>>,
-                    >,
-                >,
-            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<V::ExecutionDomain>,
-                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-                >,
-            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
-        >(
-            function: F,
-            primals: I,
-        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError> {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-define_forward_jacobian_auxiliary_function!(
-    /// Materializes a forward-mode Jacobian and returns nondifferentiated auxiliary outputs.
-    ///
-    /// The closure returns `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is
-    /// materialized from its primal trace and returned with it. Refer to [`jacobian_forward`] for the mathematical
-    /// interpretation, block layout, context recovery, and ordinary complex-type rules.
-    jacobian_forward_with_aux,
-);
-define_forward_jacobian_auxiliary_function!(
-    /// Materializes a holomorphic forward-mode Jacobian and returns nondifferentiated auxiliary outputs.
-    ///
-    /// The closure and auxiliary-output behavior are described by [`jacobian_forward_with_aux`]. The holomorphy
-    /// promise and complex-type requirements are the same as for [`jacobian_forward_holomorphic`].
-    jacobian_forward_holomorphic_with_aux,
-);
-
-/// Defines one context-recovering reverse-mode Jacobian function with auxiliary outputs. It keeps the free-function
-/// bounds aligned with the corresponding [`JacobianDifferentiate`] method.
-macro_rules! define_reverse_jacobian_auxiliary_function {
-    // Generates one auxiliary-output reverse Jacobian function and delegates to its same-named context method.
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>,
-                    ExecutionDomain: Context<
-                        Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-                                       + PartiallyEvaluatableOperation<
-                            TracingContext<
-                                <V::ExecutionDomain as Domain>::Constant,
-                                <V::ExecutionDomain as Domain>::Operation,
-                            >,
-                        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                                       + TransposableOperation<
-                            <V::ExecutionDomain as Domain>::Constant,
-                            <V::ExecutionDomain as Domain>::Operation,
-                        > + From<ZeroOperation<V::Type>>
-                                       + From<AddOperation>,
-                    >,
-                >,
-            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<V::ExecutionDomain>,
-                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-                >,
-            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
-        >(
-            function: F,
-            primals: I,
-        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError> {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-define_reverse_jacobian_auxiliary_function!(
-    /// Materializes a reverse-mode Jacobian and returns nondifferentiated auxiliary outputs.
-    ///
-    /// The closure returns `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is
-    /// materialized from its primal trace and returned with it. Refer to [`jacobian_reverse`] for the mathematical
-    /// interpretation, block layout, context recovery, and ordinary complex-type rules.
-    jacobian_reverse_with_aux,
-);
-define_reverse_jacobian_auxiliary_function!(
-    /// Materializes a holomorphic reverse-mode Jacobian and returns nondifferentiated auxiliary outputs.
-    ///
-    /// The closure and auxiliary-output behavior are described by [`jacobian_reverse_with_aux`]. The holomorphy
-    /// promise and complex-type requirements are the same as for [`jacobian_reverse_holomorphic`].
-    jacobian_reverse_holomorphic_with_aux,
-);
 
 #[cfg(test)]
 mod tests {
