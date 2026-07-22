@@ -166,43 +166,7 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review this.
-
-/// Lifts a broadcast's output-axis mapping and target type through one batching level.
-///
-/// The mapped batch axis occupies `input_batch_axis` in the physical input type. The lifted broadcast inserts a
-/// dimension of size `axis_size` at the same position in the physical output type, shifts every existing output-axis
-/// mapping at or after that position, and maps the physical input's batch axis to the inserted output axis.
-///
-/// # Parameters
-///
-///   - `output_axes`: Per-input-axis mapping used by the unbatched broadcast.
-///   - `output_type`: Unbatched output type targeted by the broadcast.
-///   - `input_batch_axis`: Position of the mapped batch axis in the physical input type.
-///   - `axis_size`: Extent of the mapped batch axis.
-pub fn lift_broadcast(
-    output_axes: &[usize],
-    output_type: &ArrayType,
-    input_batch_axis: usize,
-    axis_size: usize,
-) -> Result<(Vec<usize>, ArrayType, usize), TypeError> {
-    let output_batch_axis = input_batch_axis;
-    let lifted_output_type = output_type.with_inserted_dimension(output_batch_axis, Size::Static(axis_size))?;
-
-    let mut lifted_output_axes = Vec::with_capacity(output_axes.len() + 1);
-    for &output_axis in output_axes {
-        let shifted_output_axis = if output_axis >= output_batch_axis { output_axis + 1 } else { output_axis };
-        lifted_output_axes.push(shifted_output_axis);
-    }
-    lifted_output_axes.insert(input_batch_axis, output_batch_axis);
-
-    Ok((lifted_output_axes, lifted_output_type, output_batch_axis))
-}
-
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for BroadcastOperation
-where
-    C::Value: Broadcast,
-{
+impl<C: Context<Type = ArrayType, Value: Broadcast>> BatchableOperation<C> for BroadcastOperation {
     fn batch<D: BatchingDriver<C>>(
         &self,
         _context: &BatchingContext<C>,
@@ -217,38 +181,41 @@ where
                 Ok(vec![ArrayBatch::replicated(output_value)])
             }
             Some(batch_axis) => {
+                // Insert the mapped axis at the same physical output position and shift every existing broadcast-axis
+                // mapping at or after that position around it.
                 let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-                let (lifted_output_axes, mut lifted_output_type, output_batch_axis) =
-                    lift_broadcast(self.output_axes(), self.output_type(), batch_axis, axis_size)?;
+                let mut output_type =
+                    self.output_type().with_inserted_dimension(batch_axis, Size::Static(axis_size))?;
+                let mut output_axes = self
+                    .output_axes()
+                    .iter()
+                    .map(|&output_axis| if output_axis >= batch_axis { output_axis + 1 } else { output_axis })
+                    .collect::<Vec<_>>();
+                output_axes.insert(batch_axis, batch_axis);
                 if let Some(sharding) = self.output_type().sharding() {
-                    lifted_output_type.sharding = Some(
+                    output_type.sharding = Some(
                         sharding
-                            .with_inserted_dimension(output_batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)
+                            .with_inserted_dimension(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)
                             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
                     );
                 }
-                let output_value =
-                    inputs[0].value().broadcast(lifted_output_type.clone(), lifted_output_axes.as_slice())?;
-                Ok(vec![ArrayBatch::new(
-                    lifted_output_type,
-                    output_value,
-                    BatchAxis::from_position(output_batch_axis),
-                )?])
+                let output_value = inputs[0].value().broadcast(output_type.clone(), output_axes.as_slice())?;
+                Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::from_position(batch_axis))?])
             }
         }
     }
 }
 
-/// Represents the ability to perform general N-dimensional broadcasting.
-/// `t.broadcast(output_type, output_axes)` expands `t` to `output_type` by mapping each input axis `i` to output axis
-/// `output_axes[i]`, replicating the value along the axes of `output_type` that are not named in `output_axes`. For
-/// each `i`, the input dimension at axis `i` must either equal the corresponding output dimension or be `1` (in which
-/// case it is replicated to match). A [`Size::Dynamic`] input dimension only maps to an identical dynamic output
-/// dimension, and every replicated axis (i.e., a static-1 input dimension or an unmapped output axis) must have a
-/// static output extent because replication requires a known count.
+/// Represents the ability to perform general N-dimensional broadcasting. `t.broadcast(output_type, output_axes)`
+/// expands `t` to `output_type` by mapping each input axis `i` to output axis `output_axes[i]`, replicating the value
+/// along the axes of `output_type` that are not named in `output_axes`. For each `i`, the input dimension at axis `i`
+/// must either equal the corresponding output dimension or be `1` (in which case it is replicated to match). A
+/// [`Size::Dynamic`] input dimension only maps to an identical dynamic output dimension, and every replicated axis
+/// (i.e., a static-1 input dimension or an unmapped output axis) must have a static output extent because replication
+/// requires a known count.
 ///
 /// [`broadcast_leading`](Broadcast::broadcast_leading) and [`broadcast_to`](Broadcast::broadcast_to) are convenience
-/// methods, implemented in terms of [`broadcast`](Broadcast::broadcast), covering two common cases: prepending new
+/// functions, implemented in terms of [`broadcast`](Broadcast::broadcast), covering two common cases: prepending new
 /// replicated leading axes, and broadcasting to a target [`Shape`] using NumPy-style right alignment. Both require the
 /// implementer to be [`Typed`] against [`ArrayType`] so they can read the input's own type.
 ///
@@ -302,11 +269,10 @@ pub trait Broadcast: Sized {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
 
     /// Broadcasts `self` by prepending leading dimensions of the provided sizes, replicating it along those new
-    /// dimensions.
-    /// `t.broadcast_leading([s0, s1, ...])` produces a value whose shape is `[s0, s1, ..., t.shape...]`, with the
-    /// original value replicated across the new leading axes. This is equivalent to
-    /// `t.broadcast(output_type, output_axes)` with `output_type` having shape `[s0, s1, ..., t.shape...]`
-    /// and `output_axes` mapping each input axis `i` to output axis `i + sizes.len()`.
+    /// dimensions. `t.broadcast_leading([s0, s1, ...])` produces a value whose shape is `[s0, s1, ..., t.shape...]`,
+    /// with the original value replicated across the new leading axes. This is equivalent to `t.broadcast(output_type,
+    /// output_axes)` with `output_type` having shape `[s0, s1, ..., t.shape...]` and `output_axes` mapping each input
+    /// axis `i` to output axis `i + sizes.len()`.
     ///
     /// # Parameters
     ///
@@ -342,19 +308,18 @@ pub trait Broadcast: Sized {
         self.broadcast(output_type, output_axes.as_slice())
     }
 
-    /// Broadcasts `self` to `shape` using the broadcasting semantics of [`Broadcastable`](crate::Broadcastable).
-    /// These semantics match NumPy's
-    /// [`numpy.broadcast_to`](https://numpy.org/doc/stable/reference/generated/numpy.broadcast_to.html).
+    /// Broadcasts `self` to `shape` using the broadcasting semantics of [`Broadcastable`](crate::Broadcastable),
+    /// like NumPy's [`numpy.broadcast_to`](https://numpy.org/doc/stable/reference/generated/numpy.broadcast_to.html).
     /// `t.broadcast_to(shape)` right-aligns the input shape with `shape`: input axis `i` corresponds to output axis
     /// `shape.rank() - input.rank() + i`. Each corresponding input dimension must equal the output dimension or be `1`,
     /// in which case it is replicated. Missing leading input dimensions are treated as size `1`, and so a smaller-rank
-    /// array can be broadcast to a larger-rank target shape. This is equivalent to
-    /// `t.broadcast(output_type, output_axes)` with `output_axes` computed as the trailing range of indices.
+    /// array can be broadcast to a larger-rank target shape. This is equivalent to `t.broadcast(output_type,
+    /// output_axes)` with `output_axes` computed as the trailing range of indices.
     ///
     /// # Parameters
     ///
-    ///   - `shape`: [`Shape`] to broadcast `self` to. This shape must have rank at least equal to the input's rank and
-    ///     must be compatible with the shape of the input in terms of broadcasting semantics.
+    ///   - `shape`: [`Shape`] to broadcast `self` to. This shape must have rank at least equal to the input's rank
+    ///     and must be compatible with the shape of the input in terms of broadcasting semantics.
     ///
     /// # Example
     ///
@@ -491,9 +456,8 @@ impl Broadcast for ArrayType {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Broadcast for V
-where
-    V::DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>,
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
+    Broadcast for V
 {
     #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
@@ -511,7 +475,7 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::contexts::EagerContext;
-    use crate::differentiation::jvp;
+    use crate::differentiation::forward::jvp;
     use crate::differentiation::reverse::TransposableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -525,7 +489,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
-    use crate::types::{DataType, Memory};
+    use crate::types::DataType;
 
     use super::*;
 
@@ -656,7 +620,7 @@ mod tests {
             ],
         );
 
-        // Broadcasting is structural-linear: its JVP broadcasts both the primal and its tangent.
+        // Broadcasting is structural-linear meaning that its JVP broadcasts both the primal and its tangent.
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-9),
             operation = BroadcastOperation::new(
@@ -698,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_transform_metadata() {
+    fn test_broadcast_with_sharding() {
         // Explicit mapped-axis sharding remains attached to the lifted batch dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
@@ -724,6 +688,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
+
         check_operation_batching!(
             @exact,
             operation = BroadcastOperation::new(logical_output_type, vec![0]),
@@ -749,14 +714,12 @@ mod tests {
         let primal_output_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)]));
         let tangent_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
-
         let (primal, tangent) = jvp(
             |value| value.broadcast(primal_output_type.clone(), &[1]),
             Array::from_f64s(primal_type, vec![2.0, 4.0]),
             Array::from_f64s(tangent_type, vec![1.0, 3.0]),
         )
         .unwrap();
-
         assert_eq!(primal.r#type().as_ref(), &primal_output_type);
         assert_eq!(tangent.r#type().as_ref(), &tangent_output_type);
         assert_eq!(tangent.to_f64s(), vec![1.0, 3.0, 1.0, 3.0]);
@@ -828,28 +791,6 @@ mod tests {
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent());
-    }
-
-    #[test]
-    fn test_lift_broadcast() {
-        // Lifting an interior batch axis shifts arbitrary existing mappings and preserves placement metadata.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]))
-                .with_sharding(
-                    Sharding::new(mesh, vec![ShardingDimension::replicated(); 3])
-                        .unwrap()
-                        .with_unreduced_axes(["x"])
-                        .unwrap(),
-                )
-                .unwrap()
-                .with_memory(Memory::Host { pinned: true });
-
-        let (output_axes, lifted_output_type, output_batch_axis) = lift_broadcast(&[2, 0], &output_type, 1, 5).unwrap();
-
-        assert_eq!(output_axes, vec![3, 1, 0]);
-        assert_eq!(lifted_output_type, output_type.with_inserted_dimension(1, Size::Static(5)).unwrap());
-        assert_eq!(output_batch_axis, 1);
     }
 
     #[test]
