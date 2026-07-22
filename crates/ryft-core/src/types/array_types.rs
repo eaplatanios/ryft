@@ -5,6 +5,7 @@ use std::ops::Index;
 
 use ryft_macros::Parameter;
 
+use crate::axes::Axis;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
@@ -155,12 +156,8 @@ impl Shape {
     /// dimension sizes using the end of the dimensions vector as the reference point. For example, an index value of
     /// `-1` will result in the last dimension (i.e., innermost) `Size` being returned.
     #[inline]
-    pub fn dimension(&self, index: isize) -> Size {
-        if index >= 0 {
-            self.dimensions[index as usize]
-        } else {
-            self.dimensions[(self.dimensions.len() as isize + index) as usize]
-        }
+    pub fn dimension<A: Into<Axis>>(&self, index: A) -> Size {
+        self[index]
     }
 
     /// Returns the number of elements in arrays with this [`Shape`]. A statically zero dimension makes the result
@@ -227,24 +224,16 @@ impl Display for Shape {
     }
 }
 
-impl Index<usize> for Shape {
+impl<A: Into<Axis>> Index<A> for Shape {
     type Output = Size;
 
     #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.dimensions[index]
-    }
-}
-
-impl Index<isize> for Shape {
-    type Output = Size;
-
-    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
-    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
-    #[inline]
-    fn index(&self, index: isize) -> &Self::Output {
-        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
-        &self.dimensions[normalized as usize]
+    fn index(&self, axis: A) -> &Self::Output {
+        let axis = axis.into();
+        let position = axis
+            .normalize(self.rank())
+            .unwrap_or_else(|_| panic!("axis {axis} is out of bounds for shape {self}"));
+        &self.dimensions[position]
     }
 }
 
@@ -288,12 +277,8 @@ impl StaticShape {
     /// dimension sizes using the end of the dimensions vector as the reference point. For example, an index value of
     /// `-1` will result in the last dimension (i.e., innermost) size being returned.
     #[inline]
-    pub fn dimension(&self, index: isize) -> usize {
-        if index >= 0 {
-            self.dimensions[index as usize]
-        } else {
-            self.dimensions[(self.dimensions.len() as isize + index) as usize]
-        }
+    pub fn dimension<A: Into<Axis>>(&self, index: A) -> usize {
+        self[index]
     }
 
     /// Returns the static dimension sizes as a slice.
@@ -328,24 +313,16 @@ impl Display for StaticShape {
     }
 }
 
-impl Index<usize> for StaticShape {
+impl<A: Into<Axis>> Index<A> for StaticShape {
     type Output = usize;
 
     #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.dimensions[index]
-    }
-}
-
-impl Index<isize> for StaticShape {
-    type Output = usize;
-
-    /// Indexes into [`Self::dimensions`] with support for negative indices. A negative index `i` resolves to
-    /// `self.dimensions.len() as isize + i`, so `shape[-1]` returns the innermost dimension.
-    #[inline]
-    fn index(&self, index: isize) -> &Self::Output {
-        let normalized = if index >= 0 { index } else { self.dimensions.len() as isize + index };
-        &self.dimensions[normalized as usize]
+    fn index(&self, axis: A) -> &Self::Output {
+        let axis = axis.into();
+        let position = axis
+            .normalize(self.rank())
+            .unwrap_or_else(|_| panic!("axis {axis} is out of bounds for static shape {self}"));
+        &self.dimensions[position]
     }
 }
 
@@ -575,7 +552,7 @@ impl ArrayType {
     /// to obtain dimension sizes using the end of the dimensions vector as the reference point. For example, an index
     /// value of `-1` will result in the last dimension (i.e., innermost) `Size` being returned.
     #[inline]
-    pub fn dimension(&self, index: isize) -> Size {
+    pub fn dimension<A: Into<Axis>>(&self, index: A) -> Size {
         self.shape.dimension(index)
     }
 

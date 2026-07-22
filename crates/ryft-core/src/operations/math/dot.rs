@@ -288,7 +288,7 @@ fn dot_abstract(
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
-        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
+        if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError {
                 message: format!(
                     "'{DOT_OPERATION_NAME}' batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
@@ -297,7 +297,7 @@ fn dot_abstract(
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
-        if lhs.dimension(*lhs_axis as isize) != rhs.dimension(*rhs_axis as isize) {
+        if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError {
                 message: format!(
                     "'{DOT_OPERATION_NAME}' contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
@@ -311,9 +311,9 @@ fn dot_abstract(
 
     let output_dimensions: Vec<Size> = lhs_batching
         .iter()
-        .map(|axis| lhs.dimension(*axis as isize))
-        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis as isize)))
-        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis as isize)))
+        .map(|axis| lhs.dimension(*axis))
+        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis)))
+        .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis)))
         .collect();
 
     // Output sharding (JAX's `_dot_general_sharding_rule`; see the rule summary above). When `output_sharding` is

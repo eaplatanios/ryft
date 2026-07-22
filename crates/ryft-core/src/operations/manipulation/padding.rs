@@ -235,7 +235,7 @@ where
                 let mut strides = Vec::with_capacity(rank);
                 let mut input_is_empty = false;
                 for axis in 0..rank {
-                    let dimension = input_type.dimension(axis as isize);
+                    let dimension = input_type.dimension(axis);
                     let Some(input_size) = dimension.value() else {
                         return Err(TypeError {
                             message: format!(
@@ -460,7 +460,7 @@ impl Pad for ArrayType {
         }
         let mut output_dimensions = Vec::with_capacity(rank);
         for axis in 0..rank {
-            let dimension = self.dimension(axis as isize);
+            let dimension = self.dimension(axis);
             let Size::Static(size) = dimension else {
                 return Err(TypeError {
                     message: format!(

@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::axes::Axis;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -210,7 +211,7 @@ where
             .into_iter()
             .map(|tracer| {
                 let physical_type = tracer.r#type().into_owned();
-                ArrayBatch::new(physical_type, tracer, None)
+                ArrayBatch::new(physical_type, tracer, BatchAxis::replicated())
             })
             .collect();
     }
@@ -248,7 +249,7 @@ pub(crate) fn batch_rewrapped_program<C: Context<Type = ArrayType>, D: BatchingD
         context,
         region,
         input_batch_axes.as_slice(),
-        ProgramBatchingOutputAxesPolicy::AlignAllTo(0),
+        ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
     )?;
     Ok(program)
 }

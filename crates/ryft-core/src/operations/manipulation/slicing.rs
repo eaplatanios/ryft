@@ -291,7 +291,7 @@ where
                 for (axis, ((&start, &limit), &stride)) in
                     self.start_indices().iter().zip(self.limit_indices()).zip(self.strides()).enumerate()
                 {
-                    let dimension = input_type.dimension(axis as isize);
+                    let dimension = input_type.dimension(axis);
                     let Some(input_size) = dimension.value() else {
                         return Err(TypeError {
                             message: format!(
@@ -521,7 +521,7 @@ impl Slice for ArrayType {
         for (axis, ((&start, &limit), &stride)) in
             start_indices.iter().zip(limit_indices.iter()).zip(strides.iter()).enumerate()
         {
-            let dimension = self.dimension(axis as isize);
+            let dimension = self.dimension(axis);
             let Size::Static(size) = dimension else {
                 return Err(TypeError {
                     message: format!(
@@ -757,8 +757,8 @@ where
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
-        let update = inputs[1].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
+        let input = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let update = inputs[1].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
         UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
@@ -851,7 +851,7 @@ impl UpdateSlice for ArrayType {
             .into());
         }
         for (axis, &start) in start_indices.iter().enumerate() {
-            let update_dimension = update.dimension(axis as isize);
+            let update_dimension = update.dimension(axis);
             let Size::Static(update_size) = update_dimension else {
                 return Err(TypeError {
                     message: format!(
@@ -861,7 +861,7 @@ impl UpdateSlice for ArrayType {
                 }
                 .into());
             };
-            let input_dimension = self.dimension(axis as isize);
+            let input_dimension = self.dimension(axis);
             let Size::Static(input_size) = input_dimension else {
                 return Err(TypeError {
                     message: format!(
@@ -1149,7 +1149,7 @@ impl DynamicSlice for ArrayType {
             // A dynamic input axis is accepted: StableHLO clamps the start index into
             // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
             // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
-            match self.dimension(axis as isize) {
+            match self.dimension(axis) {
                 Size::Static(input_size) if size > input_size => {
                     return Err(TypeError {
                         message: format!(
@@ -1351,8 +1351,8 @@ where
             return Ok(vec![inputs[1].clone()]);
         }
         let axis_size = axis_size.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
-        let update = inputs[1].match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone())?;
+        let input = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let update = inputs[1].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
         let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
@@ -1448,7 +1448,7 @@ impl DynamicUpdateSlice for ArrayType {
         }
         validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
         for axis in 0..rank {
-            let update_dimension = update.dimension(axis as isize);
+            let update_dimension = update.dimension(axis);
             let Size::Static(update_size) = update_dimension else {
                 return Err(TypeError {
                     message: format!(
@@ -1458,7 +1458,7 @@ impl DynamicUpdateSlice for ArrayType {
                 }
                 .into());
             };
-            let input_dimension = self.dimension(axis as isize);
+            let input_dimension = self.dimension(axis);
             let Size::Static(input_size) = input_dimension else {
                 return Err(TypeError {
                     message: format!(

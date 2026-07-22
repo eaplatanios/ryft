@@ -309,17 +309,15 @@ impl CompiledCallOperation<XlaConstant> for XlaOperation {
     }
 }
 
-/// Bridges canonical internal physical positions to the signed public batching declaration without reintroducing a
-/// public `usize` conversion on [`BatchAxis`].
+/// Bridges canonical internal physical positions to the public batching declaration.
 fn batch_axis_from_position(axis: Option<usize>) -> BatchAxis {
-    axis.map(|axis| BatchAxis::new(isize::try_from(axis).expect("a physical array rank fits in isize")))
-        .unwrap_or_default()
+    BatchAxis::from_optional_position(axis)
 }
 
 /// Recovers a canonical physical position returned by the core program batching pass.
 fn batch_axis_position(axis: &BatchAxis) -> Option<usize> {
     axis.axis()
-        .map(|axis| usize::try_from(axis).expect("program batching returns canonical nonnegative axes"))
+        .map(|axis| usize::try_from(axis.value()).expect("program batching returns canonical nonnegative axes"))
 }
 
 fn ensure_call_input_types(

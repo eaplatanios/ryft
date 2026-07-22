@@ -1312,6 +1312,9 @@ impl Transpose for Array {
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
+        if self.values.is_empty() {
+            return Ok(Self { r#type: output_type, values: Vec::new() });
+        }
         let shape = self.r#type.static_shape().unwrap();
         let rank = shape.rank();
         let permuted_shape = StaticShape::new(permutation.iter().map(|axis| shape[*axis]).collect());
@@ -2307,6 +2310,13 @@ mod tests {
         assert_eq!(transposed.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
         assert_eq!(transposed.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert!(matrix.transpose([0, 0]).is_err());
+
+        // Empty arrays transpose without calculating strides that may overflow for otherwise irrelevant dimensions.
+        let empty = Array::new(array_type(DataType::F64, &[0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
+        assert_eq!(
+            empty.transpose([1, 2, 0]).unwrap(),
+            Array::new(array_type(DataType::F64, &[usize::MAX, usize::MAX, 0]), Vec::new()).unwrap(),
+        );
     }
 
     #[test]

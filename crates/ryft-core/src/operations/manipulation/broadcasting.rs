@@ -282,7 +282,7 @@ impl Operation<ArrayType> for DynamicBroadcastOperation {
         if self.output_axes.len() == input_types[0].rank() {
             for (input_axis, &output_axis) in self.output_axes.iter().enumerate() {
                 if output_axis < validation_output_dimensions.len() {
-                    let input_dimension = input_types[0].dimension(input_axis as isize);
+                    let input_dimension = input_types[0].dimension(input_axis);
                     if matches!(input_dimension, Size::Dynamic(_))
                         || matches!(validation_output_dimensions[output_axis], Size::Dynamic(_))
                     {
@@ -415,7 +415,7 @@ impl_differentiable_operation! {
                 .iter()
                 .copied()
                 .enumerate()
-                .any(|(input_axis, _)| matches!(input_cotangent_type.dimension(input_axis as isize), Size::Dynamic(_)))
+                .any(|(input_axis, _)| matches!(input_cotangent_type.dimension(input_axis), Size::Dynamic(_)))
             {
                 return Err(ProgramError::UnsupportedOperation {
                     message: "transposing a dynamic broadcast with a runtime-dependent input dimension is unsupported"
@@ -744,8 +744,8 @@ impl Broadcast for ArrayType {
             }
             seen[output_axis] = true;
 
-            let input_dimension = self.dimension(input_axis as isize);
-            let output_dimension = output_type.dimension(output_axis as isize);
+            let input_dimension = self.dimension(input_axis);
+            let output_dimension = output_type.dimension(output_axis);
             match (input_dimension, output_dimension) {
                 // Identical sizes always map through, including identical dynamic sizes.
                 (input_dimension, output_dimension) if input_dimension == output_dimension => {}
@@ -786,7 +786,7 @@ impl Broadcast for ArrayType {
         // Output axes that no input axis maps to replicate the input along that axis, which requires a known
         // replication count and is therefore unsupported for dynamic output dimensions.
         for (output_axis, mapped) in seen.iter().enumerate() {
-            let output_dimension = output_type.dimension(output_axis as isize);
+            let output_dimension = output_type.dimension(output_axis);
             if !mapped && matches!(output_dimension, Size::Dynamic(_)) {
                 return Err(TypeError {
                     message: format!(

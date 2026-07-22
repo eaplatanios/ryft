@@ -761,7 +761,7 @@ impl Gather for ArrayType {
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
-        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension as isize) else {
+        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError {
                 message: format!("'{GATHER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
             }
@@ -849,7 +849,7 @@ impl Gather for ArrayType {
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
-            if let Size::Static(extent) = operand.dimension(axis as isize)
+            if let Size::Static(extent) = operand.dimension(axis)
                 && size > extent
             {
                 return Err(TypeError {
@@ -894,7 +894,7 @@ impl Gather for ArrayType {
         for (&operand_axis, &indices_axis) in
             dimensions.operand_batching_dimensions().iter().zip(dimensions.start_indices_batching_dimensions())
         {
-            if operand.dimension(operand_axis as isize) != indices.dimension(indices_axis as isize) {
+            if operand.dimension(operand_axis) != indices.dimension(indices_axis) {
                 return Err(TypeError {
                     message: format!(
                         "'{GATHER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
@@ -912,7 +912,7 @@ impl Gather for ArrayType {
             .collect();
         let batch_query_sizes: Vec<Size> = (0..indices_rank)
             .filter(|axis| *axis != index_vector_dimension)
-            .map(|axis| indices.dimension(axis as isize))
+            .map(|axis| indices.dimension(axis))
             .collect();
         let offset_position: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
         let mut offset_iterator = operand_offset_axes.iter();

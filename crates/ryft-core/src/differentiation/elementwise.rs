@@ -136,8 +136,8 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         // summation). Any other extent mismatch means that the mapping never described a valid broadcast.
         let mut kept_axes = Vec::with_capacity(target.rank());
         for (target_axis, &output_axis) in output_axes.iter().enumerate() {
-            let target_dimension = target.dimension(target_axis as isize);
-            let value_dimension = value_type.dimension(output_axis as isize);
+            let target_dimension = target.dimension(target_axis);
+            let value_dimension = value_type.dimension(output_axis);
             if target_dimension != value_dimension {
                 if target_dimension != Size::Static(1) {
                     return Err(TypeError {

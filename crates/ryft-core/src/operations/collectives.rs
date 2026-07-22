@@ -15,7 +15,7 @@ use std::ops::Mul;
 
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::backends::scalars::Scalar;
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
@@ -280,7 +280,7 @@ where
         output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
     }
     let output_type = output_value.r#type().into_owned();
-    Ok(vec![ArrayBatch::new(output_type, output_value, None)?])
+    Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::replicated())?])
 }
 
 /// Returns the static batch size for a `PMean` over the mapped batch axis of `input`, erroring when

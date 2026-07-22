@@ -161,7 +161,7 @@ where
                 let mut input_cotangents = Vec::with_capacity(inputs.len());
                 for (index, input) in inputs.iter().enumerate() {
                     let input_type = input.r#type();
-                    let dimension = input_type.dimension(axis as isize);
+                    let dimension = input_type.dimension(axis);
                     let Size::Static(operand_axis_size) = dimension else {
                         return Err(TypeError {
                             message: format!(
@@ -238,7 +238,7 @@ where
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let materialized = inputs
             .iter()
-            .map(|input| input.match_axis(batch_axis as isize, axis_size, context.axis_sharding().clone()))
+            .map(|input| input.match_axis(batch_axis, axis_size, context.axis_sharding().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         ConcatenateOperation::new(lifted_axis).interpret_with_batch_axes(
@@ -367,8 +367,8 @@ impl Concatenate for ArrayType {
                 if other_axis == axis {
                     continue;
                 }
-                let dimension = operand.dimension(other_axis as isize);
-                let first_dimension = first.dimension(other_axis as isize);
+                let dimension = operand.dimension(other_axis);
+                let first_dimension = first.dimension(other_axis);
                 if dimension != first_dimension {
                     return Err(TypeError {
                         message: format!(
@@ -379,7 +379,7 @@ impl Concatenate for ArrayType {
                     .into());
                 }
             }
-            let dimension = operand.dimension(axis as isize);
+            let dimension = operand.dimension(axis);
             match dimension {
                 Size::Static(size) => {
                     concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| TypeError {

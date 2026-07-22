@@ -476,7 +476,7 @@ where
                         slice_sizes.push(1);
                     } else {
                         let update_axis = update_window_dimensions[window_position];
-                        let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
+                        let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
                             ProgramError::from(TypeError {
                                 message: format!(
                                     "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
@@ -683,7 +683,7 @@ where
                 slice_sizes.push(1);
             } else {
                 let update_axis = update_window_dimensions[window_position];
-                let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
+                let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
                     ProgramError::from(TypeError {
                         message: format!(
                             "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
@@ -814,7 +814,7 @@ impl Scatter for ArrayType {
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
-        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension as isize) else {
+        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError {
                 message: format!("'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
             }
@@ -920,7 +920,7 @@ impl Scatter for ArrayType {
             .collect();
         for (&operand_axis, &update_axis) in operand_window_axes.iter().zip(dimensions.update_window_dimensions()) {
             if let (Size::Static(update_extent), Size::Static(operand_extent)) =
-                (updates.dimension(update_axis as isize), operand.dimension(operand_axis as isize))
+                (updates.dimension(update_axis), operand.dimension(operand_axis))
                 && update_extent > operand_extent
             {
                 return Err(TypeError {
@@ -939,7 +939,7 @@ impl Scatter for ArrayType {
         let update_scatter_axes: Vec<usize> = (0..updates_rank).filter(|axis| !update_window.contains(axis)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
-            if updates.dimension(update_axis as isize) != indices.dimension(indices_axis as isize) {
+            if updates.dimension(update_axis) != indices.dimension(indices_axis) {
                 return Err(TypeError {
                     message: format!(
                         "'{SCATTER_OPERATION_NAME}' updates scatter axis {update_axis} must match indices batch axis \
@@ -956,7 +956,7 @@ impl Scatter for ArrayType {
             .iter()
             .zip(dimensions.scatter_indices_batching_dimensions())
         {
-            if operand.dimension(operand_axis as isize) != indices.dimension(indices_axis as isize) {
+            if operand.dimension(operand_axis) != indices.dimension(indices_axis) {
                 return Err(TypeError {
                     message: format!(
                         "'{SCATTER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \

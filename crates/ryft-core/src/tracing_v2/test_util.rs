@@ -993,7 +993,9 @@ mod tests {
 
         let pred_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let pred_batch = ArrayBatch::new(pred_type.clone(), Array::from_f64s(pred_type, vec![1.0]), None).unwrap();
+        let pred_batch =
+            ArrayBatch::new(pred_type.clone(), Array::from_f64s(pred_type, vec![1.0]), BatchAxis::replicated())
+                .unwrap();
         let on_true_batch = ArrayBatch::new(operand_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let on_false_batch = ArrayBatch::new(operand_type, Array::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
 

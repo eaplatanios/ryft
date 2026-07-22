@@ -552,7 +552,7 @@ where
                                 .axes
                                 .iter()
                                 .map(|axis| {
-                                    input_shape.dimension(*axis as isize).value().ok_or(TypeError {
+                                    input_shape.dimension(*axis).value().ok_or(TypeError {
                                         message: format!(
                                             "mean transpose requires static reduced extents but axis {axis} of \
                                             {input_shape} is dynamic",

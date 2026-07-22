@@ -1335,7 +1335,9 @@ where
                 inputs[..carry_count].iter().map(|input| input.move_axis(0)).collect::<Result<Vec<_>, _>>()?;
             let stacks = inputs[carry_count..]
                 .iter()
-                .map(|input| if input.batch_axis().axis() == Some(0) { input.move_axis(1) } else { Ok(input.clone()) })
+                .map(
+                    |input| if input.batch_axis_position() == Some(0) { input.move_axis(1) } else { Ok(input.clone()) },
+                )
                 .collect::<Result<Vec<_>, _>>()?;
             let mut carry_axes = carries.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
             let slice_axes =
@@ -1407,7 +1409,7 @@ where
             // shifting its per-iteration batch axis right by one.
             let mut output_axes = carry_axes;
             output_axes.extend(y_axes.iter().map(|axis| match axis.axis() {
-                Some(axis) => BatchAxis::new(axis + 1),
+                Some(axis) => BatchAxis::new(axis.value() + 1),
                 None => BatchAxis::replicated(),
             }));
             return outputs
@@ -1457,7 +1459,7 @@ where
             {
                 let stacked_type = output_type.with_inserted_dimension(0, Size::Static(0))?;
                 let stacked_axis = match output_axis.axis() {
-                    Some(axis) => BatchAxis::new(axis + 1),
+                    Some(axis) => BatchAxis::new(axis.value() + 1),
                     None => BatchAxis::replicated(),
                 };
                 let stacked_value = context.parent().zero(&stacked_type)?;
@@ -1634,8 +1636,8 @@ where
 /// logical leading scan dimension.
 fn scan_iteration_batch_axis(batch_axis: BatchAxis) -> BatchAxis {
     match batch_axis.axis() {
-        Some(0) => BatchAxis::new(0),
-        Some(axis) => BatchAxis::new(axis - 1),
+        Some(axis) if axis.value() == 0 => BatchAxis::new(0),
+        Some(axis) => BatchAxis::new(axis.value() - 1),
         None => BatchAxis::replicated(),
     }
 }
