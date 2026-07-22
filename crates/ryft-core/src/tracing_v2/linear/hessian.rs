@@ -5,7 +5,8 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationError, LinearizationTracer, TransposableOperation,
+    DenseDifferentiableType, DifferentiableOperation, DifferentiationContext, DifferentiationError,
+    LinearizationTracer, TransposableOperation,
 };
 use crate::operations::constants::ZeroOperation;
 use crate::operations::math::AddOperation;
@@ -16,9 +17,7 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
 
 use super::DenseDifferentiate;
-use super::jacobian::{
-    DenseDifferentiableType, Jacobian, jacfwd_in, jacfwd_with_aux_in, jacrev_in, jacrev_with_aux_in,
-};
+use super::jacobian::{Jacobian, jacfwd_in, jacfwd_with_aux_in, jacrev_in, jacrev_with_aux_in};
 
 /// Dense Hessian of a structured function, represented as its complete output/input/input Cartesian product.
 ///

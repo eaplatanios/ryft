@@ -106,7 +106,7 @@ pub use reverse::{
     gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient, value_and_gradient_holomorphic,
     value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
-pub use types::DifferentiableType;
+pub use types::{DenseDifferentiableType, DifferentiableType};
 
 /// Represents differentiation-related errors.
 ///

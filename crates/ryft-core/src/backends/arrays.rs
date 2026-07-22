@@ -24,7 +24,7 @@ use ryft_macros::Operation;
 // TODO(eaplatanios): Review from here onwards.
 
 use crate::Select;
-use crate::axes::AxisIndexOperation;
+use crate::axes::{Axis, AxisIndexOperation};
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
@@ -1541,9 +1541,11 @@ impl Pad for Array {
 }
 
 impl Concatenate for Array {
-    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
-        let operand_types: Vec<ArrayType> = operands.iter().map(|operand| operand.r#type.clone()).collect();
-        let output_type = ArrayType::concatenate(&operand_types, axis)?;
+    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
+        let axis = axis.into();
+        let input_types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
+        let output_type = ArrayType::concatenate(&input_types, axis)?;
+        let axis = ConcatenateOperation::normalize_axis(axis, output_type.rank()).unwrap();
         // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
         // `axis` (and offset zero on every other axis) reuses the row-major odometer in `replace_block`.
         let output_element_count = Self::element_count(&output_type);
@@ -1553,17 +1555,17 @@ impl Concatenate for Array {
             // A nonempty concatenation result necessarily has at least one operand element. Seed the destination with
             // that representable element before `replace_block` overwrites every slot, avoiding an artificial
             // requirement that the element data type support an additive zero (e.g., `f8e8m0fnu` does not).
-            let seed = operands.iter().find_map(|operand| operand.values.first()).copied().unwrap();
+            let seed = inputs.iter().find_map(|input| input.values.first()).copied().unwrap();
             vec![seed; output_element_count]
         };
         let mut output = Self { r#type: output_type.clone(), values };
         let mut offset = 0usize;
-        for operand in operands {
-            let operand_axis_size = operand.r#type.static_shape().unwrap()[axis];
+        for input in inputs {
+            let input_axis_size = input.r#type.static_shape().unwrap()[axis];
             let mut start_indices = vec![0usize; output_type.rank()];
             start_indices[axis] = offset;
-            output = output.replace_block(operand, start_indices.as_slice());
-            offset += operand_axis_size;
+            output = output.replace_block(input, start_indices.as_slice());
+            offset += input_axis_size;
         }
         Ok(output)
     }
@@ -2362,12 +2364,31 @@ mod tests {
 
     #[test]
     fn test_array_concatenate() {
-        let concatenated = Array::concatenate(&[Array::vector(vec![1.0, 2.0]), Array::vector(vec![3.0])], 0).unwrap();
-        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0]));
-        let matrices = [Array::matrix(1, 2, vec![1.0, 2.0]), Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0])];
-        let concatenated = Array::concatenate(&matrices, 0).unwrap();
-        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
-        assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // Three operands joined along axis 0 preserve their order.
+        let concatenated =
+            Array::concatenate(&[Array::vector(vec![1.0]), Array::vector(vec![2.0, 3.0]), Array::vector(vec![4.0])], 0)
+                .unwrap();
+        assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
+
+        // A rank-3 middle-axis concatenation exercises the row-major block odometer.
+        let first = Array::from_f64s(array_type(DataType::F64, &[2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let second =
+            Array::from_f64s(array_type(DataType::F64, &[2, 2, 2]), vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let concatenated = Array::concatenate(&[first, second], 1).unwrap();
+        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[2, 3, 2]));
+        assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
+
+        // Concatenation does not require an artificial additive zero, including when the output itself is empty.
+        let element_type = array_type(DataType::F8E8M0FNU, &[1]);
+        let first = Array::new(element_type.clone(), vec![Scalar::F8E8M0FNU(1)]).unwrap();
+        let second = Array::new(element_type, vec![Scalar::F8E8M0FNU(2)]).unwrap();
+        assert_eq!(
+            Array::concatenate(&[first, second], 0),
+            Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![Scalar::F8E8M0FNU(1), Scalar::F8E8M0FNU(2)],),
+        );
+        let empty_type = array_type(DataType::F8E8M0FNU, &[0]);
+        let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
+        assert_eq!(Array::concatenate(&[empty.clone(), empty], 0), Array::new(empty_type, Vec::new()));
     }
 
     #[test]

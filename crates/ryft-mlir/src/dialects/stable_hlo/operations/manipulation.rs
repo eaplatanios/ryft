@@ -1128,6 +1128,74 @@ pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value
         })
 }
 
+/// StableHLO [`Operation`] that extracts a slice whose start indices, limit indices, and strides are provided as
+/// runtime tensors. Unlike [`SliceOperation`], this operation can preserve full extents of dynamically sized input
+/// dimensions. Refer to the [upstream operation definition](https://github.com/openxla/stablehlo/issues/8) for its
+/// provisional semantics.
+pub trait RealDynamicSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the tensor being sliced.
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the runtime inclusive start indices.
+    fn start_indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the runtime exclusive limit indices.
+    fn limit_indices(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(2)
+    }
+
+    /// Returns the runtime strides.
+    fn strides(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(3)
+    }
+}
+
+mlir_op!(RealDynamicSlice);
+mlir_op_trait!(RealDynamicSlice, OneResult);
+mlir_op_trait!(RealDynamicSlice, ZeroRegions);
+mlir_op_trait!(RealDynamicSlice, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`RealDynamicSliceOperation`] at the specified [`Location`].
+pub fn real_dynamic_slice<
+    'input,
+    'start_indices,
+    'limit_indices,
+    'strides,
+    'c: 'input + 'start_indices + 'limit_indices + 'strides,
+    't: 'c,
+    Input: Value<'input, 'c, 't>,
+    StartIndices: Value<'start_indices, 'c, 't>,
+    LimitIndices: Value<'limit_indices, 'c, 't>,
+    Strides: Value<'strides, 'c, 't>,
+    Output: Type<'c, 't>,
+    L: Location<'c, 't>,
+>(
+    input: Input,
+    start_indices: StartIndices,
+    limit_indices: LimitIndices,
+    strides: Strides,
+    output_type: Output,
+    location: L,
+) -> Result<DetachedRealDynamicSliceOperation<'c, 't>, Error> {
+    location.context().load_dialect(DialectHandle::stable_hlo()?)?;
+    OperationBuilder::new("stablehlo.real_dynamic_slice", location)
+        .add_operand(input)
+        .add_operand(start_indices)
+        .add_operand(limit_indices)
+        .add_operand(strides)
+        .add_result(output_type)
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stablehlo.real_dynamic_slice`"))
+        })
+}
+
 /// StableHLO [`Operation`] that produces a result tensor which is equal to [`DynamicUpdateSliceOperation::input`]
 /// except that the slice starting at [`DynamicUpdateSliceOperation::start_indices`] is updated with the values in
 /// [`DynamicUpdateSliceOperation::update`]. More formally, `result[result_index]` is defined as:
@@ -2063,11 +2131,11 @@ mod tests {
     use super::{
         BroadcastOperation, ConcatenateOperation, DynamicBroadcastOperation, DynamicGatherOperation,
         DynamicPadOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-        GetDimensionSizeOperation, HasPadding, PadOperation, ReshapeOperation, ScatterOperation,
-        SelectAndScatterOperation, SetDimensionSizeOperation, SliceOperation, TransposeOperation, broadcast,
-        concatenate, dynamic_broadcast, dynamic_gather, dynamic_pad, dynamic_reshape, dynamic_slice,
-        dynamic_update_slice, gather, get_dimension_size, pad, reshape, scatter, select_and_scatter,
-        set_dimension_size, slice, transpose,
+        GetDimensionSizeOperation, HasPadding, PadOperation, RealDynamicSliceOperation, ReshapeOperation,
+        ScatterOperation, SelectAndScatterOperation, SetDimensionSizeOperation, SliceOperation, TransposeOperation,
+        broadcast, concatenate, dynamic_broadcast, dynamic_gather, dynamic_pad, dynamic_reshape, dynamic_slice,
+        dynamic_update_slice, gather, get_dimension_size, pad, real_dynamic_slice, reshape, scatter,
+        select_and_scatter, set_dimension_size, slice, transpose,
     };
 
     #[test]
@@ -2749,6 +2817,80 @@ mod tests {
                   }
                 }
             "}
+        );
+    }
+
+    #[test]
+    fn test_real_dynamic_slice() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let input_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(2), Size::Dynamic], None, location)
+            .unwrap();
+        let indices_type =
+            context.tensor_type(context.signless_integer_type(64), &[Size::Static(2)], None, location).unwrap();
+        let output_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(1), Size::Dynamic], None, location)
+            .unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[
+                    (input_type, location),
+                    (indices_type, location),
+                    (indices_type, location),
+                    (indices_type, location),
+                ]);
+                let input = block.argument(0).unwrap();
+                let start_indices = block.argument(1).unwrap();
+                let limit_indices = block.argument(2).unwrap();
+                let strides = block.argument(3).unwrap();
+                let operation =
+                    real_dynamic_slice(input, start_indices, limit_indices, strides, output_type, location).unwrap();
+                assert_eq!(operation.input().unwrap(), input);
+                assert_eq!(operation.start_indices().unwrap(), start_indices);
+                assert_eq!(operation.limit_indices().unwrap(), limit_indices);
+                assert_eq!(operation.strides().unwrap(), strides);
+                assert_eq!(operation.result(0).unwrap().r#type().unwrap(), output_type);
+                let operation = block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "real_dynamic_slice_test",
+                    func::FuncAttributes {
+                        arguments: vec![
+                            input_type.into(),
+                            indices_type.into(),
+                            indices_type.into(),
+                            indices_type.into(),
+                        ],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @real_dynamic_slice_test(\
+                    %arg0: tensor<2x?xf32>, \
+                    %arg1: tensor<2xi64>, \
+                    %arg2: tensor<2xi64>, \
+                    %arg3: tensor<2xi64>\
+                  ) -> tensor<1x?xf32> {
+                    %0 = stablehlo.real_dynamic_slice %arg0, %arg1, %arg2, %arg3 \
+                      : (tensor<2x?xf32>, tensor<2xi64>, tensor<2xi64>, tensor<2xi64>) -> tensor<1x?xf32>
+                    return %0 : tensor<1x?xf32>
+                  }
+                }
+            "},
         );
     }
 

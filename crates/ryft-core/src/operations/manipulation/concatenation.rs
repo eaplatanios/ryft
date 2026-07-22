@@ -1,25 +1,28 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::axes::Axis;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
-};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::elementwise::ElementwiseDerivativeAlignment;
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
+use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Broadcast, SliceOperation, Transpose};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
@@ -29,8 +32,8 @@ use crate::types::{ArrayType, Shape, Size};
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
-/// [`Operation`] that joins one or more input arrays end to end along one axis. Refer to the documentation of
-/// [`Concatenate`] for more information.
+/// [`Operation`] that joins one or more input arrays end to end along one axis.
+/// Refer to the documentation of [`Concatenate`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConcatenateOperation {
     /// Axis along which the operands are joined.
@@ -48,6 +51,13 @@ impl ConcatenateOperation {
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
+    }
+
+    /// Normalizes `axis` against `rank` for use as this operation's canonical nonnegative axis.
+    pub(crate) fn normalize_axis(axis: Axis, rank: usize) -> Result<usize, TypeError> {
+        axis.normalize(rank).map_err(|_| TypeError {
+            message: format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"),
+        })
     }
 }
 
@@ -176,27 +186,19 @@ where
                         .shape()
                         .dimensions()
                         .iter()
-                        .enumerate()
-                        .map(|(other_axis, size)| {
-                            size.value().ok_or_else(|| {
-                                TypeError {
-                                    message: format!(
-                                        "'concatenate' transpose requires a static operand shape but operand {index} \
-                                        has size {size} on axis {other_axis}",
-                                    ),
-                                }
-                                .into()
-                            })
-                        })
-                        .collect::<Result<Vec<usize>, ProgramError>>()?;
+                        .map(|size| size.value().unwrap_or(0))
+                        .collect::<Vec<_>>();
                     start_indices[axis] = offset;
                     limit_indices[axis] = offset + operand_axis_size;
                     let strides = vec![1; rank];
-                    let outputs = context.stage_operation(
-                        SliceOperation::new(start_indices, limit_indices).with_strides(strides)?,
-                        Vec::new(),
-                        std::slice::from_ref(cotangent),
-                    )?;
+                    let full_extent_axes =
+                        input_type.shape().dimensions().iter().enumerate().filter_map(|(other_axis, size)| {
+                            (other_axis != axis && size.value().is_none()).then_some(other_axis)
+                        });
+                    let operation = SliceOperation::new(start_indices, limit_indices)
+                        .with_strides(strides)?
+                        .with_full_extent_axes(full_extent_axes)?;
+                    let outputs = context.stage_operation(operation, Vec::new(), std::slice::from_ref(cotangent))?;
                     check_count!("output", outputs, 1, ProgramError);
                     let input_cotangent =
                         outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent())?;
@@ -249,79 +251,74 @@ where
     }
 }
 
-/// Represents the ability to join one or more arrays end to end along one axis, with the semantics of StableHLO's
-/// [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation.
+/// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
+/// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of
+/// StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation.
 ///
-/// `Concatenate::concatenate(operands, axis)` returns an array whose elements along `axis` are the elements of the
-/// first operand followed by the elements of the second operand, and so on. There must be at least one operand, all
-/// operands must share one data type and one rank, and every axis other than `axis` must have the same [`Size`]
-/// across all operands. All operands must reside in the same memory space. A single operand passes through unchanged.
-/// A multi-operand result keeps the common memory placement, clears explicit physical layout metadata, keeps the
-/// shared non-concatenated dimensions, and has size along `axis` equal to the sum of the operand sizes along `axis`.
-///
-/// # Dynamic Dimensions
-///
-/// The concatenated axis may be dynamic: if any operand's `axis` dimension is [`Size::Dynamic`], the output `axis`
-/// dimension is also [`Size::Dynamic`], with a tight exclusive upper bound computed from the operands' maximum sizes
-/// when every operand is bounded and an unbounded `Size::Dynamic(None)` otherwise. So concatenating a dynamic stack
-/// with a fixed slice along the dynamic axis grows the stack while keeping its type dynamic —
-/// `[?, d] ++ [1, d] = [?, d]`
-/// along axis `0`. This is the typing that lets a dynamically-sized residual stack accumulate one iteration per loop
-/// iteration. The non-concatenated axes must still match per [`Size`] equality (a [`Size::Dynamic`] non-concatenated
-/// axis is allowed only when every operand carries the same [`Size`] there) and propagate unchanged.
+/// `Self::concatenate(inputs, axis)` preserves the inputs' order and returns an array whose extent along `axis` is the
+/// sum of their extents. There must be at least one input. All inputs must have the same element data type, rank, memory
+/// space, and dimensions other than `axis`. A single input is returned unchanged. For multiple inputs,
+/// the result preserves the common memory space, clears explicit physical layout metadata, and infers sharding,
+/// reduction state, and varying-manual axes independently. A dynamic concatenated dimension remains dynamic; its type
+/// records the tight exclusive upper bound when every operand is bounded, while the operation's runtime extent is the
+/// exact sum of the operand extents. Equal dynamic descriptors on non-concatenated axes express the runtime requirement
+/// that those extents agree; the backend validates that requirement when executing the operation.
 ///
 /// # Example
 ///
 /// The following example shows how to use [`Concatenate`] in practice:
 ///
 /// ```rust
+/// # use ryft_core::backends::arrays::Array;
 /// # use ryft_core::operations::manipulation::Concatenate;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Join two 1x2 matrices along axis 0 into a 2x2 matrix.
-/// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
-/// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
-/// let z = Concatenate::concatenate(&[x, y], 0)?;
-/// // `z` has shape [2, 2] with values [[1.0, 2.0], [3.0, 4.0]].
-/// assert_eq!(z.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
-///
-/// // Joining the same operands along axis 1 produces a 1x4 matrix instead.
-/// let x = Array::matrix(1, 2, vec![1.0, 2.0]);
-/// let y = Array::matrix(1, 2, vec![3.0, 4.0]);
-/// let z = Concatenate::concatenate(&[x, y], 1)?;
-/// assert_eq!(z.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
+/// let left = Array::matrix(2, 1, vec![1.0, 2.0]);
+/// let right = Array::matrix(2, 2, vec![3.0, 4.0, 5.0, 6.0]);
+/// let output = left.concatenate_with(&[right], -1)?;
+/// assert_eq!(output.to_f64s(), vec![1.0, 3.0, 4.0, 2.0, 5.0, 6.0]);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Concatenate: Sized {
-    /// Joins `operands` end to end along `axis`. Refer to the documentation of this trait for more information on
-    /// what this operation does.
+    /// Joins `inputs` end to end along `axis`. Negative axes index from the final axis. Refer to the documentation of
+    /// this trait for more information on what this operation does.
     ///
     /// # Parameters
     ///
-    ///   - `operands`: Arrays to join, in order. There must be at least one operand, and all operands must share one
+    ///   - `inputs`: Arrays to join, in order. There must be at least one input, and all inputs must share one
     ///     data type and rank and agree on every axis other than `axis`.
-    ///   - `axis`: Axis along which the operands are joined.
-    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError>;
+    ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
+    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError>;
+
+    /// Joins `self` followed by `others` end to end along `axis`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `others`: Arrays to append to `self`, in order.
+    ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
+    fn concatenate_with<A: Into<Axis>>(&self, others: &[Self], axis: A) -> Result<Self, ProgramError>
+    where
+        Self: Clone,
+    {
+        let mut inputs = Vec::with_capacity(others.len() + 1);
+        inputs.push(self.clone());
+        inputs.extend_from_slice(others);
+        Self::concatenate(inputs.as_slice(), axis)
+    }
 }
 
 impl Concatenate for ArrayType {
-    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
-        let Some(first) = operands.first() else {
+    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
+        let Some(first) = inputs.first() else {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
         let rank = first.rank();
-        if axis >= rank {
-            return Err(TypeError {
-                message: format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"),
-            }
-            .into());
-        }
-        if operands.len() == 1 {
+        let axis = ConcatenateOperation::normalize_axis(axis.into(), rank)?;
+        if inputs.len() == 1 {
             return Ok(first.clone());
         }
         // The concatenated dimension accumulates as we scan operands: a static run sums sizes, while any dynamic
@@ -330,7 +327,7 @@ impl Concatenate for ArrayType {
         let mut concatenated_static = 0usize;
         let mut concatenated_dynamic = false;
         let mut maximum_concatenated_size = Some(0usize);
-        for (index, operand) in operands.iter().enumerate() {
+        for (index, operand) in inputs.iter().enumerate() {
             if operand.data_type() != first.data_type() {
                 return Err(TypeError {
                     message: format!(
@@ -406,29 +403,49 @@ impl Concatenate for ArrayType {
         let mut dimensions = first.shape().dimensions().to_vec();
         dimensions[axis] = concatenated;
 
-        // Output sharding (JAX's `_concatenate_sharding_rule` + `_concatenate_(un)reduced_rule`): every sharded
-        // operand must agree, since concatenation only interleaves elements and each element keeps its operand's
-        // placement and pending-reduction status. Operands without a sharding impose no constraint, and their
-        // varying-manual axes are unioned. A disagreement is an error only when it involves an Explicit axis (see
-        // `Sharding::conflicts_on_explicit_axes_with`); a Manual/Auto-only disagreement is tolerated and the first
-        // sharded operand's placement is kept, so a `shard_map` manual body concatenating local shards is not
-        // rejected. The output adopts the common sharding (with the unioned varying-manual axes) or stays unsharded.
+        // Output sharding follows the independent concatenate rules for spatial placement, unreduced axes, and reduced
+        // axes after applying the standard varying-manual normalization used by the public concatenate capability.
+        // Spatial placement is inferred from operands with a nonempty mesh and must match exactly. Empty reduction
+        // sets are neutral while distinct nonempty sets conflict. Varying-manual axes are normalized to their union;
+        // when that turns an operand's complete reduced set into varying state, its reduced set is cleared first.
         let mut output_sharding: Option<Sharding> = None;
-        let mut varying_manual_axes = BTreeSet::new();
-        for operand in operands {
+        let mut unreduced_axes: Option<BTreeSet<String>> = None;
+        let mut reduced_axes: Option<BTreeSet<String>> = None;
+        let varying_manual_axes = inputs
+            .iter()
+            .filter_map(ArrayType::sharding)
+            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for operand in inputs {
+            let operand_varying_manual_axes =
+                operand.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+            let added_varying_manual_axes =
+                varying_manual_axes.difference(&operand_varying_manual_axes).cloned().collect::<BTreeSet<_>>();
+            let mut operand_reduced_axes = operand.reduced_axes().clone();
+            if !added_varying_manual_axes.is_empty() {
+                if operand_reduced_axes == added_varying_manual_axes {
+                    operand_reduced_axes.clear();
+                } else if !operand.unreduced_axes().is_disjoint(&added_varying_manual_axes)
+                    || !operand_reduced_axes.is_disjoint(&added_varying_manual_axes)
+                {
+                    return Err(TypeError {
+                        message: format!(
+                            "'concatenate' cannot make operand varying over axes {added_varying_manual_axes:?} while \
+                             it is reduced or unreduced over any of those axes",
+                        ),
+                    }
+                    .into());
+                }
+            }
             let Some(sharding) = operand.sharding() else {
                 continue;
             };
-            varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
-            match &output_sharding {
-                None => output_sharding = Some(sharding.clone()),
-                Some(reference) => {
-                    if reference.mesh() != sharding.mesh() {
-                        return Err(
-                            TypeError { message: "'concatenate' operands must use the same mesh".to_string() }.into()
-                        );
-                    }
-                    if reference.conflicts_on_explicit_axes_with(sharding) {
+            if sharding.mesh().rank() > 0 {
+                match &output_sharding {
+                    None => output_sharding = Some(sharding.clone()),
+                    Some(reference)
+                        if reference.mesh() != sharding.mesh() || reference.dimensions() != sharding.dimensions() =>
+                    {
                         return Err(TypeError {
                             message: format!(
                                 "'concatenate' operands must be sharded identically, but got {reference} and {sharding}"
@@ -436,11 +453,43 @@ impl Concatenate for ArrayType {
                         }
                         .into());
                     }
+                    Some(_) => {}
+                }
+            }
+            if !sharding.unreduced_axes().is_empty() {
+                match &unreduced_axes {
+                    Some(reference) if reference != sharding.unreduced_axes() => {
+                        return Err(TypeError {
+                            message: "'concatenate' operands must be unreduced over the same nonempty axis set"
+                                .to_string(),
+                        }
+                        .into());
+                    }
+                    None => unreduced_axes = Some(sharding.unreduced_axes().clone()),
+                    Some(_) => {}
+                }
+            }
+            if !operand_reduced_axes.is_empty() {
+                match &reduced_axes {
+                    Some(reference) if reference != &operand_reduced_axes => {
+                        return Err(TypeError {
+                            message: "'concatenate' operands must be reduced over the same nonempty axis set"
+                                .to_string(),
+                        }
+                        .into());
+                    }
+                    None => reduced_axes = Some(operand_reduced_axes),
+                    Some(_) => {}
                 }
             }
         }
         let output_sharding = output_sharding
-            .map(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
+            .map(|sharding| {
+                Sharding::new(sharding.mesh().clone(), sharding.dimensions().to_vec())
+                    .and_then(|sharding| sharding.with_unreduced_axes(unreduced_axes.unwrap_or_default()))
+                    .and_then(|sharding| sharding.with_reduced_axes(reduced_axes.unwrap_or_default()))
+                    .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
+            })
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
         ArrayType::new(first.data_type(), Shape::new(dimensions))
@@ -458,17 +507,18 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<ConcatenateOperation>,
 {
-    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
-        let Some(first) = operands.first() else {
+    fn concatenate<A: Into<Axis>>(inputs: &[Self], axis: A) -> Result<Self, ProgramError> {
+        let Some(first) = inputs.first() else {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
-        if operands.len() == 1 {
+        let axis = ConcatenateOperation::normalize_axis(axis.into(), first.r#type().rank())?;
+        if inputs.len() == 1 {
             ArrayType::concatenate(&[first.r#type().into_owned()], axis)?;
             return Ok(first.clone());
         }
-        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), Vec::new(), operands)?;
+        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), Vec::new(), inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -553,13 +603,34 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])))
             .with_memory(Memory::Host { pinned: true });
         assert_eq!(ArrayType::concatenate(std::slice::from_ref(&placed_type), 0), Ok(placed_type));
+        let host_row = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])))
+            .with_memory(Memory::Host { pinned: true });
+        let host_output = ArrayType::concatenate(&[host_row.clone(), host_row.clone()], 0).unwrap();
+        assert_eq!(host_output.memory(), Memory::Host { pinned: true });
+        assert_eq!(host_output.layout(), None);
+        assert_eq!(
+            ArrayType::concatenate(
+                &[host_row, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))],
+                0,
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "'concatenate' operands must share one memory space but operand 1 resides in Device and \
+                    operand 0 resides in Host[Pinned]"
+                    .to_string(),
+            })),
+        );
 
         // Interpretation joins the row-major payloads along axis 0.
         let first = Array::matrix(1, 2, vec![1.0, 2.0]);
         let second = Array::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first, second]).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[first.clone(), second.clone()])
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(Array::concatenate(&[first.clone(), second.clone()], -2), Ok(output[0].clone()));
+        assert_eq!(first.concatenate_with(&[second], -2), Ok(output[0].clone()));
 
         // Concatenating along a middle axis keeps the leading and trailing axes and sums the middle one.
         let middle = ConcatenateOperation::new(1);
@@ -607,6 +678,12 @@ mod tests {
         assert_eq!(
             ConcatenateOperation::new(2).infer_output_types(&[first_type.clone(), second_type.clone()], &[]),
             Err(TypeError { message: "'concatenate' axis 2 is out of bounds for operands of rank 2".to_string() }),
+        );
+        assert_eq!(
+            ArrayType::concatenate(&[first_type.clone(), second_type.clone()], -3),
+            Err(ProgramError::Type(TypeError {
+                message: "'concatenate' axis -3 is out of bounds for operands of rank 2".to_string(),
+            })),
         );
         // A non-concatenated dynamic axis must match per `Size` equality across operands.
         assert_eq!(
@@ -710,6 +787,28 @@ mod tests {
                     ],
                     outputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
                 },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 6.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::matrix(
+                        2,
+                        3,
+                        vec![0.0, 1.0, 4.0, 2.0, 3.0, 6.0],
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0])),
+                        (@mapped(axis = 1), Array::matrix(1, 2, vec![4.0, 5.0])),
+                    ],
+                    outputs = [(@mapped(axis = 1), Array::matrix(
+                        3,
+                        2,
+                        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                    ))],
+                },
             ],
         );
 
@@ -759,121 +858,206 @@ mod tests {
                         Array::from_f64s(placed_right_type, vec![3.0, 4.0, 5.0]),
                     ],
                 },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(
+                            DataType::F64,
+                            Shape::new(vec![Size::Static(2), Size::Dynamic(None)]),
+                        ))),
+                        (@linear(type = ArrayType::new(
+                            DataType::F64,
+                            Shape::new(vec![Size::Static(3), Size::Dynamic(None)]),
+                        ))),
+                    ],
+                    output_cotangents = [Array::matrix(
+                        5,
+                        2,
+                        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+                    )],
+                    input_cotangents = [
+                        Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+                        Array::matrix(3, 2, vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                    ],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0])],
+                    input_cotangents = [
+                        Array::from_f64s(
+                            ArrayType::new(DataType::F64, Shape::new(vec![0.into()])),
+                            Vec::new(),
+                        ),
+                        Array::vector(vec![1.0, 2.0]),
+                    ],
+                },
             ],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = ConcatenateOperation::new(1),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into()])))),
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into()])))),
+                ],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])],
+                input_cotangents = [
+                    Array::matrix(2, 1, vec![1.0, 4.0]),
+                    Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]),
+                ],
+            }],
         );
     }
 
     #[test]
-    fn test_array_type_concatenate() {
-        use std::collections::BTreeSet;
-
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-
+    fn test_array_type_concatenate_sharding() {
+        let operation = ConcatenateOperation::new(0);
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("n", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let operation = ConcatenateOperation::new(0);
-
-        // Concatenation preserves a common memory placement and rejects operands that would require an implicit
-        // transfer.
-        let host_row = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)]))
-            .with_memory(Memory::Host { pinned: true });
-        assert_eq!(
-            ArrayType::concatenate(&[host_row.clone(), host_row.clone()], 0).unwrap().memory(),
-            Memory::Host { pinned: true },
-        );
-        assert_eq!(
-            ArrayType::concatenate(
-                &[host_row, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),],
-                0,
-            ),
-            Err(ProgramError::Type(TypeError {
-                message: "'concatenate' operands must share one memory space but operand 1 resides in Device and \
-                          operand 0 resides in Host[Pinned]"
-                    .to_string(),
-            })),
-        );
-        let sharded = || {
+        let spatial =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                .unwrap()
-        };
-        let row = |sharding: Sharding| {
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 2);
+        let row = |sharding: Option<Sharding>| {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
                 .with_sharding(sharding)
                 .unwrap()
         };
 
-        // Operands sharded identically: the output (size summed on axis 0) inherits the common sharding.
-        let output = operation.infer_output_types(&[row(sharded()), row(sharded())], &[]).unwrap();
-        assert_eq!(output[0].sharding(), Some(&sharded()));
-        assert_eq!(output[0].dimension(0), Size::Static(8));
+        // Identical spatial placement is preserved, while an absent placement is neutral in either operand order.
+        let expected = row(Some(spatial.clone())).with_shape(Shape::new(vec![Size::Static(8), Size::Static(2)]));
+        assert_eq!(
+            operation.infer_output_types(&[row(Some(spatial.clone())), row(Some(spatial.clone()))], &[]),
+            Ok(vec![expected.clone()]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[row(None), row(Some(spatial.clone()))], &[]),
+            Ok(vec![expected.clone()]),
+        );
+        assert_eq!(operation.infer_output_types(&[row(Some(spatial.clone())), row(None)], &[]), Ok(vec![expected]),);
+        assert_eq!(operation.infer_output_types(&[row(None), row(None)], &[]).unwrap()[0].sharding(), None);
 
-        // Operands that differ only by varying-manual axes are tolerated and the axes are unioned on the output.
-        let varying = |axis: &str| {
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
-                .with_sharding(
-                    Sharding::new(
-                        mesh.clone(),
-                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        // Explicit, manual, and automatic placement differences all conflict; this is intentionally stricter than
+        // checking only explicit mesh axes.
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual, MeshAxisType::Auto] {
+            let placement_mesh = LogicalMesh::new(vec![MeshAxis::new("p", 2, axis_type).unwrap()]).unwrap();
+            let placed = Sharding::new(
+                placement_mesh.clone(),
+                vec![ShardingDimension::sharded(["p"]), ShardingDimension::replicated()],
+            )
+            .unwrap();
+            let unplaced = Sharding::replicated(placement_mesh, 2);
+            for operands in [
+                [row(Some(placed.clone())), row(Some(unplaced.clone()))],
+                [row(Some(unplaced.clone())), row(Some(placed.clone()))],
+            ] {
+                assert!(matches!(
+                    operation.infer_output_types(&operands, &[]),
+                    Err(TypeError { message }) if message.starts_with(
+                        "'concatenate' operands must be sharded identically, but got "
                     )
-                    .unwrap()
-                    .with_varying_manual_axes([axis])
-                    .unwrap(),
-                )
-                .unwrap()
-        };
-        let output = operation.infer_output_types(&[varying("m"), row(sharded())], &[]).unwrap();
-        assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+                ));
+            }
+        }
 
-        // A conflicting Explicit-axis placement is an error.
-        let replicated =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                .unwrap();
-        assert!(operation.infer_output_types(&[row(sharded()), row(replicated)], &[]).is_err());
+        // Empty reduction state is neutral, and each nonempty state propagates independently in either order.
+        for (with_state, expected_unreduced, expected_reduced) in [
+            (
+                replicated.clone().with_unreduced_axes(["m"]).unwrap(),
+                BTreeSet::from(["m".to_string()]),
+                BTreeSet::new(),
+            ),
+            (replicated.clone().with_reduced_axes(["n"]).unwrap(), BTreeSet::new(), BTreeSet::from(["n".to_string()])),
+        ] {
+            for operands in [
+                [row(Some(replicated.clone())), row(Some(with_state.clone()))],
+                [row(Some(with_state.clone())), row(Some(replicated.clone()))],
+            ] {
+                let output = operation.infer_output_types(&operands, &[]).unwrap();
+                let output_sharding = output[0].sharding().unwrap();
+                assert_eq!(output_sharding.unreduced_axes(), &expected_unreduced);
+                assert_eq!(output_sharding.reduced_axes(), &expected_reduced);
+            }
+        }
 
-        // Operands without a sharding leave the output unsharded.
-        let plain = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]));
-        assert_eq!(operation.infer_output_types(&[plain.clone(), plain], &[]).unwrap()[0].sharding(), None);
-    }
-
-    #[test]
-    fn test_array_concatenate() {
-        // A rank-3 concatenation along a middle axis exercises the row-major odometer: the two operands interleave
-        // their middle-axis blocks while keeping the leading and trailing axes intact.
-        let first = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(2)])),
-            vec![1.0, 2.0, 3.0, 4.0],
-        );
-        let second = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
-            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-        );
-        let output = Concatenate::concatenate(&[first, second], 1).unwrap();
+        // Distinct nonempty reduction states conflict independently and without operand-order dependence.
+        for (left, right, message) in [
+            (
+                replicated.clone().with_unreduced_axes(["m"]).unwrap(),
+                replicated.clone().with_unreduced_axes(["n"]).unwrap(),
+                "'concatenate' operands must be unreduced over the same nonempty axis set",
+            ),
+            (
+                replicated.clone().with_reduced_axes(["m"]).unwrap(),
+                replicated.clone().with_reduced_axes(["n"]).unwrap(),
+                "'concatenate' operands must be reduced over the same nonempty axis set",
+            ),
+        ] {
+            for operands in [
+                [row(Some(left.clone())), row(Some(right.clone()))],
+                [row(Some(right.clone())), row(Some(left.clone()))],
+            ] {
+                assert_eq!(operation.infer_output_types(&operands, &[]), Err(TypeError { message: message.into() }));
+            }
+        }
         assert_eq!(
-            *output.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
+            operation.infer_output_types(
+                &[
+                    row(Some(replicated.clone().with_unreduced_axes(["m"]).unwrap())),
+                    row(Some(replicated.clone().with_reduced_axes(["m"]).unwrap())),
+                ],
+                &[],
+            ),
+            Err(TypeError { message: "mesh axis name 'm' appears more than once".into() }),
         );
-        // Each leading slice gets the first operand's slice followed by the second operand's two slices.
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
 
-        // Three operands joined along axis 0 stack in order.
-        let output = Concatenate::concatenate(
-            &[Array::vector(vec![1.0]), Array::vector(vec![2.0, 3.0]), Array::vector(vec![4.0])],
-            0,
-        )
-        .unwrap();
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
-
-        // The kernel validates its operand shapes eagerly through the type-level capability.
+        // The public capability performs the standard varying normalization before applying the primitive rule.
+        let varying = replicated.clone().with_varying_manual_axes(["m"]).unwrap();
+        for operands in [
+            [row(Some(varying.clone())), row(Some(replicated.clone()))],
+            [row(Some(replicated.clone())), row(Some(varying.clone()))],
+            [row(Some(varying.clone())), row(None)],
+        ] {
+            let output = operation.infer_output_types(&operands, &[]).unwrap();
+            assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), varying.varying_manual_axes());
+        }
+        let varying_n = replicated.clone().with_varying_manual_axes(["n"]).unwrap();
+        let output = operation.infer_output_types(&[row(Some(varying.clone())), row(Some(varying_n))], &[]).unwrap();
         assert_eq!(
-            Concatenate::concatenate(&[Array::vector(vec![1.0]), Array::scalar(2.0)], 0),
-            Err(ProgramError::Type(TypeError {
-                message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 1"
-                    .to_string(),
-            })),
+            output[0].sharding().unwrap().varying_manual_axes(),
+            &BTreeSet::from(["m".to_string(), "n".to_string()]),
         );
+
+        // When standard normalization makes an operand varying over its complete reduced set, that reduced state is
+        // consumed. A partial overlap is invalid because it cannot be represented by the standard cast.
+        for operands in [
+            [row(Some(replicated.clone().with_reduced_axes(["m"]).unwrap())), row(Some(varying.clone()))],
+            [row(Some(varying.clone())), row(Some(replicated.clone().with_reduced_axes(["m"]).unwrap()))],
+        ] {
+            let output = operation.infer_output_types(&operands, &[]).unwrap();
+            let output_sharding = output[0].sharding().unwrap();
+            assert!(output_sharding.reduced_axes().is_empty());
+            assert_eq!(output_sharding.varying_manual_axes(), varying.varying_manual_axes());
+        }
+        assert!(matches!(
+            operation.infer_output_types(
+                &[
+                    row(Some(replicated.with_reduced_axes(["m", "n"]).unwrap())),
+                    row(Some(varying)),
+                ],
+                &[],
+            ),
+            Err(TypeError { message }) if message.starts_with(
+                "'concatenate' cannot make operand varying over axes"
+            )
+        ));
     }
 
     #[test]

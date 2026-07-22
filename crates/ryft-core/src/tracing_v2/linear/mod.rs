@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use crate::contexts::Context;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationError, LinearizationTracer, TransposableOperation,
+    DenseDifferentiableType, DifferentiableOperation, DifferentiationError, LinearizationTracer, TransposableOperation,
 };
 use crate::operations::constants::ZeroOperation;
 use crate::operations::math::AddOperation;
@@ -20,8 +20,8 @@ pub use hessian::{
     Hessian, HessianBlock, hessian, hessian_holomorphic, hessian_holomorphic_with_aux, hessian_with_aux,
 };
 pub use jacobian::{
-    DenseDifferentiableType, Jacobian, JacobianBlock, jacfwd, jacfwd_holomorphic, jacfwd_holomorphic_with_aux,
-    jacfwd_with_aux, jacrev, jacrev_holomorphic, jacrev_holomorphic_with_aux, jacrev_with_aux,
+    Jacobian, JacobianBlock, jacfwd, jacfwd_holomorphic, jacfwd_holomorphic_with_aux, jacfwd_with_aux, jacrev,
+    jacrev_holomorphic, jacrev_holomorphic_with_aux, jacrev_with_aux,
 };
 
 /// Jacobian and Hessian materialization operations supported by an execution or staging [`Context`].

@@ -23,8 +23,8 @@ use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperatio
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation,
-    UpdateSlice,
+    GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
+    TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -1559,6 +1559,77 @@ fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Cop
         .collect()
 }
 
+/// Lowers a static slice or its internal full-runtime-extent form.
+fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    operation: &SliceOperation,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    check_count!("input", input_values, 1, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    if operation.full_extent_axes().is_empty() {
+        let result = block.append_operation(stable_hlo::slice(
+            input_values[0],
+            operation.start_indices(),
+            operation.limit_indices(),
+            operation.strides(),
+            location,
+        )?)?;
+        return Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()]);
+    }
+
+    let rank = operation.start_indices().len();
+    let index_type = context
+        .tensor_type(context.signless_integer_type(64), &[MlirSize::Static(rank)], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType {
+            array_type: ArrayType::new(DataType::I64, Shape::new(vec![Size::Static(rank)])),
+        })?;
+    let lower_index_vector = |values: &[usize], block: &mut B| -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        let values = values.iter().map(|value| *value as i64).collect::<Vec<_>>();
+        let elements = context
+            .dense_i64_elements_attribute(index_type, values.as_slice())
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+        Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+    };
+    let start_indices = lower_index_vector(operation.start_indices(), block)?;
+    let strides = lower_index_vector(operation.strides(), block)?;
+
+    let i64_scalar_type = context
+        .tensor_type(context.signless_integer_type(64), &[], None, location)
+        .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
+    let mut limit_parts = Vec::with_capacity(rank);
+    for (axis, &limit) in operation.limit_indices().iter().enumerate() {
+        let limit = if operation.full_extent_axes().contains(&axis) {
+            let size = block.append_operation(stable_hlo::get_dimension_size(input_values[0], axis, location)?)?;
+            let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+            let converted = block.append_operation(stable_hlo::convert(size, i64_scalar_type, location)?)?;
+            converted.result(0).expect("stablehlo.convert should return one result").as_ref()
+        } else {
+            let elements = lower_constant_elements_attribute(DataType::I64, i64_scalar_type, limit as i64, context)?;
+            let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+            constant.result(0).expect("stablehlo.constant should return one result").as_ref()
+        };
+        let reshaped = block.append_operation(stable_hlo::reshape(limit, &[1], location)?)?;
+        limit_parts.push(reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref());
+    }
+    let limit_indices = block.append_operation(stable_hlo::concatenate(limit_parts.as_slice(), 0, location)?)?;
+    let limit_indices = limit_indices.result(0).expect("stablehlo.concatenate should return one result").as_ref();
+    let output_type = lower_tensor_type(&output_types[0], context, location)?;
+    let result = block.append_operation(stable_hlo::real_dynamic_slice(
+        input_values[0],
+        start_indices,
+        limit_indices,
+        strides,
+        output_type,
+        location,
+    )?)?;
+    Ok(vec![result.result(0).expect("stablehlo.real_dynamic_slice should return one result").as_ref()])
+}
+
 fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
@@ -2093,16 +2164,14 @@ where
                     lowerer,
                 )
             }
-            Self::Slice(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::slice(
-                    input_values[0],
-                    operation.start_indices(),
-                    operation.limit_indices(),
-                    operation.strides(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
-            }
+            Self::Slice(operation) => lower_slice_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             Self::UpdateSlice(operation) => {
                 let index_values = lower_static_index_constants(
                     operation.start_indices(),
@@ -2152,7 +2221,6 @@ where
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
             Self::Concatenate(operation) => {
-                reject_dynamic_concatenate_output(output_types)?;
                 let result = lowerer.block.append_operation(stable_hlo::concatenate(
                     input_values,
                     operation.axis(),
@@ -4594,16 +4662,14 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
-            ArrayOperation::Slice(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::slice(
-                    input_values[0],
-                    operation.start_indices(),
-                    operation.limit_indices(),
-                    operation.strides(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
-            }
+            ArrayOperation::Slice(operation) => lower_slice_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             ArrayOperation::UpdateSlice(operation) => {
                 let index_values = lower_static_index_constants(
                     operation.start_indices(),
@@ -4653,7 +4719,6 @@ where
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
             ArrayOperation::Concatenate(operation) => {
-                reject_dynamic_concatenate_output(output_types)?;
                 let result = lowerer.block.append_operation(stable_hlo::concatenate(
                     input_values,
                     operation.axis(),
@@ -5592,17 +5657,6 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
         }
     }
     LogicalMesh::new(merged_axes).map_err(LoweringError::from)
-}
-
-/// Rejects a `concatenate` whose output type carries a [`Size::Dynamic`] dimension. StableHLO `concatenate` lowering
-/// only supports static shapes; a dynamic-axis concatenate appears only inside unbounded-while pullbacks, which the
-/// while lowering already rejects (recommending `with_iteration_bound`), so this surfaces a precise error if a
-/// dynamic operand ever reaches the concatenate lowering directly.
-fn reject_dynamic_concatenate_output(output_types: &[ArrayType]) -> Result<(), LoweringError> {
-    for output_type in output_types {
-        static_dimensions(output_type)?;
-    }
-    Ok(())
 }
 
 /// Returns the static dimensions for one tensor type.
@@ -8091,16 +8145,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     .append_operation(stable_hlo::select(condition, on_true, on_false, lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
         }
-        XlaOperation::Slice(operation) => {
-            let result = lowerer.block.append_operation(stable_hlo::slice(
-                input_values[0],
-                operation.start_indices(),
-                operation.limit_indices(),
-                operation.strides(),
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
-        }
+        XlaOperation::Slice(operation) => lower_slice_to_mlir(
+            operation,
+            input_values,
+            output_types,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        ),
         XlaOperation::UpdateSlice(operation) => {
             let index_values = lower_static_index_constants(
                 operation.start_indices(),
@@ -8150,7 +8202,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
         }
         XlaOperation::Concatenate(operation) => {
-            reject_dynamic_concatenate_output(output_types)?;
             let result = lowerer.block.append_operation(stable_hlo::concatenate(
                 input_values,
                 operation.axis(),
@@ -12875,6 +12926,82 @@ mod tests {
                   }
                 }
             "#}
+        );
+
+        // Dynamic operands lower directly too; StableHLO carries the exact runtime sum on the concatenated axis.
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let first = builder.add_input(dynamic_type.clone());
+        let second = builder.add_input(dynamic_type);
+        let joined = builder.add_instruction(ConcatenateOperation::new(0), Vec::new(), vec![first, second]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x2xf32>, %arg1: tensor<?x2xf32>) -> tensor<?x2xf32> {
+                    %0 = stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<?x2xf32>, tensor<?x2xf32>) -> tensor<?x2xf32>
+                    return %0 : tensor<?x2xf32>
+                  }
+                }
+            "#}
+        );
+
+        // Transposing a concatenate with dynamic non-concatenated dimensions lowers its full-extent slices through
+        // `stablehlo.real_dynamic_slice`.
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Dynamic(None)]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Dynamic(None)]));
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(left_type);
+        let right = builder.add_input(right_type);
+        let joined = builder.add_instruction(ConcatenateOperation::new(0), Vec::new(), vec![left, right]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let pullback = program.transpose().unwrap();
+        let pullback_jvp = pullback.to_flat_program().jvp().unwrap();
+        let full_extent_slices = pullback_jvp
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.operation() {
+                XlaOperation::Slice(operation) => {
+                    Some(operation.full_extent_axes().iter().copied().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(full_extent_slices, vec![vec![1], vec![1], vec![1], vec![1]]);
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<5x?xf32>) -> (tensor<2x?xf32>, tensor<3x?xf32>) {
+                    %c = stablehlo.constant dense<0> : tensor<2xi64>
+                    %c_0 = stablehlo.constant dense<1> : tensor<2xi64>
+                    %c_1 = stablehlo.constant dense<2> : tensor<i64>
+                    %0 = stablehlo.reshape %c_1 : (tensor<i64>) -> tensor<1xi64>
+                    %1 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<5x?xf32>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.concatenate %0, %3, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %5 = stablehlo.real_dynamic_slice %arg0, %c, %4, %c_0 : (tensor<5x?xf32>, tensor<2xi64>, tensor<2xi64>, tensor<2xi64>) -> tensor<2x?xf32>
+                    %c_2 = stablehlo.constant dense<[2, 0]> : tensor<2xi64>
+                    %c_3 = stablehlo.constant dense<1> : tensor<2xi64>
+                    %c_4 = stablehlo.constant dense<5> : tensor<i64>
+                    %6 = stablehlo.reshape %c_4 : (tensor<i64>) -> tensor<1xi64>
+                    %7 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<5x?xf32>) -> tensor<i32>
+                    %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                    %9 = stablehlo.reshape %8 : (tensor<i64>) -> tensor<1xi64>
+                    %10 = stablehlo.concatenate %6, %9, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %11 = stablehlo.real_dynamic_slice %arg0, %c_2, %10, %c_3 : (tensor<5x?xf32>, tensor<2xi64>, tensor<2xi64>, tensor<2xi64>) -> tensor<3x?xf32>
+                    return %5, %11 : tensor<2x?xf32>, tensor<3x?xf32>
+                  }
+                }
+            "#},
         );
     }
 
