@@ -305,7 +305,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes the complete [`Jacobian`] using forward-mode differentiation.
         /// Refer to [`jacobian_forward`] for the mathematical interpretation and representation.
         jacobian_forward,
-        engine = jacobian_forward_in,
+        engine = jacobian_forward_in_context,
         holomorphic = false,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -318,7 +318,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes the complete forward-mode [`Jacobian`] under the promise that `function` is holomorphic.
         /// Refer to [`jacobian_forward_holomorphic`] for the holomorphy contract.
         jacobian_forward_holomorphic,
-        engine = jacobian_forward_in,
+        engine = jacobian_forward_in_context,
         holomorphic = true,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -331,7 +331,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
         /// Refer to [`jacobian_forward_with_aux`] for details.
         jacobian_forward_with_aux,
-        engine = jacobian_forward_with_aux_in,
+        engine = jacobian_forward_with_aux_in_context,
         holomorphic = false,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -344,7 +344,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
         /// Refer to [`jacobian_forward_holomorphic_with_aux`] for details.
         jacobian_forward_holomorphic_with_aux,
-        engine = jacobian_forward_with_aux_in,
+        engine = jacobian_forward_with_aux_in_context,
         holomorphic = true,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -357,7 +357,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes the complete [`Jacobian`] using reverse-mode differentiation.
         /// Refer to [`jacobian_reverse`] for the mathematical interpretation and representation.
         jacobian_reverse,
-        engine = jacobian_reverse_in,
+        engine = jacobian_reverse_in_context,
         holomorphic = false,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -373,7 +373,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes the complete reverse-mode [`Jacobian`] under the promise that `function` is holomorphic.
         /// Refer to [`jacobian_reverse_holomorphic`] for the holomorphy contract.
         jacobian_reverse_holomorphic,
-        engine = jacobian_reverse_in,
+        engine = jacobian_reverse_in_context,
         holomorphic = true,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -389,7 +389,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
         /// Refer to [`jacobian_reverse_with_aux`] for details.
         jacobian_reverse_with_aux,
-        engine = jacobian_reverse_with_aux_in,
+        engine = jacobian_reverse_with_aux_in_context,
         holomorphic = false,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -405,7 +405,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
         /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
         /// Refer to [`jacobian_reverse_holomorphic_with_aux`] for details.
         jacobian_reverse_holomorphic_with_aux,
-        engine = jacobian_reverse_with_aux_in,
+        engine = jacobian_reverse_with_aux_in_context,
         holomorphic = true,
         operation_bounds = [
             PartiallyEvaluatableOperation<Self>
@@ -521,36 +521,39 @@ fn coordinate_prefix_offsets<C: Context<Type: DenseDifferentiableType<C>>, Types
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Core forward-mode Jacobian materialization in an explicitly provided [`Context`]. It linearizes `function`
-/// once, packs one tangent basis direction for every input coordinate, and replays the resulting pushforward over the
-/// packed batch before extracting output/input blocks.
+/// Implements forward-mode Jacobian materialization in an explicitly provided [`Context`] for a function that also
+/// returns auxiliary outputs. It linearizes the differentiated output once, packs one tangent basis direction for every
+/// input coordinate, replays the resulting pushforward over the packed batch, and returns the materialized primal
+/// auxiliary output unchanged.
 ///
 /// # Parameters
 ///
 ///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function whose Jacobian is materialized.
+///   - `function`: Function returning the differentiated output and auxiliary output.
 ///   - `primals`: Structured input values specifying the linearization point.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-fn jacobian_forward_core<C, F, I, O>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
+pub(super) fn jacobian_forward_with_aux_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<ZeroOperation<C::Type>>,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<ZeroOperation<C::Type>>,
-{
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError> {
+    let auxiliary = RefCell::new(None);
     let transform = DerivativeTransform::JacobianForward;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
@@ -560,7 +563,14 @@ where
     )?;
     JacobianMode::Forward.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
-    let (output, pushforward) = context.linearize(function, primals)?;
+    let (output, pushforward) = context.linearize(
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            Ok(output)
+        },
+        primals,
+    )?;
     let output_structure = output.parameter_structure();
     let output_values = output.into_parameters().collect::<Vec<_>>();
     let output_types = O::To::<C::Type>::from_parameters(
@@ -644,42 +654,49 @@ where
             values.push(value);
         }
     }
-    Ok(Jacobian::new(input_types, output_types, values)?)
+    let jacobian = Jacobian::new(input_types, output_types, values)?;
+    let auxiliary = auxiliary.into_inner().ok_or_else(|| {
+        ProgramError::MalformedProgram("jacobian_forward_with_aux did not evaluate its function".to_string())
+    })?;
+    Ok((jacobian, auxiliary))
 }
 
-/// Core reverse-mode Jacobian materialization in an explicitly provided [`Context`]. It constructs the
-/// pullback once, packs one cotangent basis direction for every output coordinate, and replays that pullback over the
-/// packed batch before transposing the extracted blocks into output/input order.
+/// Implements reverse-mode Jacobian materialization in an explicitly provided [`Context`] for a function that also
+/// returns auxiliary outputs. It constructs the pullback of the differentiated output once, packs one cotangent basis
+/// direction for every output coordinate, replays that pullback over the packed batch, and returns the materialized
+/// primal auxiliary output unchanged.
 ///
 /// # Parameters
 ///
 ///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function whose Jacobian is materialized.
+///   - `function`: Function returning the differentiated output and auxiliary output.
 ///   - `primals`: Structured input values specifying the linearization point.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-fn jacobian_reverse_core<C, F, I, O>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
+pub(super) fn jacobian_reverse_with_aux_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<C>>
+                           + TransposableOperation<C::Constant, C::Operation>
+                           + From<ZeroOperation<C::Type>>
+                           + From<AddOperation>,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
-        + From<AddOperation>,
-{
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError> {
+    let auxiliary = RefCell::new(None);
     let transform = DerivativeTransform::JacobianReverse;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
@@ -689,7 +706,14 @@ where
     )?;
     JacobianMode::Reverse.validate_types(&input_types, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
-    let (output, pullback) = context.vjp(function, primals)?;
+    let (output, pullback) = context.vjp(
+        |input| {
+            let (output, value) = function(input)?;
+            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            Ok(output)
+        },
+        primals,
+    )?;
     let output_structure = output.parameter_structure();
     let output_values = output.into_parameters().collect::<Vec<_>>();
     let output_types = O::To::<C::Type>::from_parameters(
@@ -761,161 +785,68 @@ where
             values.push(value);
         }
     }
-    Ok(Jacobian::new(input_types, output_types, values)?)
+    let jacobian = Jacobian::new(input_types, output_types, values)?;
+    let auxiliary = auxiliary.into_inner().ok_or_else(|| {
+        ProgramError::MalformedProgram("jacobian_reverse_with_aux did not evaluate its function".to_string())
+    })?;
+    Ok((jacobian, auxiliary))
 }
 
 /// Implements forward-mode Jacobian materialization without auxiliary outputs by using the auxiliary-aware engine with
 /// a unit auxiliary value.
-pub(super) fn jacobian_forward_in<C, F, I, O>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
+pub(super) fn jacobian_forward_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + From<ZeroOperation<C::Type>>,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<ZeroOperation<C::Type>>,
-{
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError> {
     let (jacobian, ()) =
-        jacobian_forward_with_aux_in(context, |input| Ok((function(input)?, ())), primals, holomorphic)?;
+        jacobian_forward_with_aux_in_context(context, |input| Ok((function(input)?, ())), primals, holomorphic)?;
     Ok(jacobian)
 }
 
 /// Implements reverse-mode Jacobian materialization without auxiliary outputs by using the auxiliary-aware engine with
 /// a unit auxiliary value.
-pub(super) fn jacobian_reverse_in<C, F, I, O>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+pub(super) fn jacobian_reverse_in_context<
+    C: Context<
+            Type: DenseDifferentiableType<C>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<C>>
+                           + TransposableOperation<C::Constant, C::Operation>
+                           + From<ZeroOperation<C::Type>>
+                           + From<AddOperation>,
         >,
-    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
     F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<O, ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
-        + From<AddOperation>,
-{
+    I: Parameterized<
+            C::Value,
+            To<C::Value> = I,
+            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
+        >,
+    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
+>(
+    context: &C,
+    function: F,
+    primals: I,
+    holomorphic: bool,
+) -> Result<Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, DifferentiationError> {
     let (jacobian, ()) =
-        jacobian_reverse_with_aux_in(context, |input| Ok((function(input)?, ())), primals, holomorphic)?;
+        jacobian_reverse_with_aux_in_context(context, |input| Ok((function(input)?, ())), primals, holomorphic)?;
     Ok(jacobian)
-}
-
-/// Implements [`jacobian_forward_core`] for a function that also returns auxiliary outputs. Only the first component is
-/// differentiated; the auxiliary component is materialized from its primal trace and returned unchanged.
-///
-/// # Parameters
-///
-///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
-///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn jacobian_forward_with_aux_in<C, F, I, O, A>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
-        >,
-    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<ZeroOperation<C::Type>>,
-{
-    let auxiliary = RefCell::new(None);
-    let jacobian = jacobian_forward_core(
-        context,
-        |input| {
-            let (output, value) = function(input)?;
-            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
-            Ok(output)
-        },
-        primals,
-        holomorphic,
-    )?;
-    let auxiliary = auxiliary.into_inner().ok_or_else(|| {
-        ProgramError::MalformedProgram("jacobian_forward_with_aux did not evaluate its function".to_string())
-    })?;
-    Ok((jacobian, auxiliary))
-}
-
-/// Implements [`jacobian_reverse_core`] for a function that also returns auxiliary outputs. Only the first component is
-/// differentiated; the auxiliary component is materialized from its primal trace and returned unchanged.
-///
-/// # Parameters
-///
-///   - `context`: Context in which to trace and replay the transform.
-///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
-///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(super) fn jacobian_reverse_with_aux_in<C, F, I, O, A>(
-    context: &C,
-    function: F,
-    primals: I,
-    holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, A::To<C::Value>), DifferentiationError>
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C>,
-    I: Parameterized<
-            C::Value,
-            To<C::Value> = I,
-            Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
-        >,
-    O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, A), ProgramError>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + From<ZeroOperation<C::Type>>
-        + From<AddOperation>,
-{
-    let auxiliary = RefCell::new(None);
-    let jacobian = jacobian_reverse_core(
-        context,
-        |input| {
-            let (output, value) = function(input)?;
-            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
-            Ok(output)
-        },
-        primals,
-        holomorphic,
-    )?;
-    let auxiliary = auxiliary.into_inner().ok_or_else(|| {
-        ProgramError::MalformedProgram("jacobian_reverse_with_aux did not evaluate its function".to_string())
-    })?;
-    Ok((jacobian, auxiliary))
 }
 
 /// Extracts known primal values from auxiliary linearization tracers and reconstructs their parameter structure.
@@ -965,14 +896,17 @@ where
 ///
 ///   - `function`: Function whose Jacobian is materialized.
 ///   - `primals`: Structured input values specifying the linearization point.
-pub fn jacobian_forward<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+pub fn jacobian_forward<
+    V: Value<
+            Type: DenseDifferentiableType<V::ExecutionDomain>,
+            ExecutionDomain: Context<
+                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + From<ZeroOperation<V::Type>>,
+            >,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             To<V> = I,
@@ -982,12 +916,10 @@ where
             LinearizationTracer<V::ExecutionDomain>,
             Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + From<ZeroOperation<V::Type>>,
-{
+>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
@@ -1010,14 +942,22 @@ where
 ///
 ///   - `function`: Function whose Jacobian is materialized.
 ///   - `primals`: Structured input values specifying the linearization point.
-pub fn jacobian_reverse<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+pub fn jacobian_reverse<
+    V: Value<
+            Type: DenseDifferentiableType<V::ExecutionDomain>,
+            ExecutionDomain: Context<
+                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                               + TransposableOperation<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                > + From<ZeroOperation<V::Type>>
+                               + From<AddOperation>,
+            >,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             To<V> = I,
@@ -1027,15 +967,10 @@ where
             LinearizationTracer<V::ExecutionDomain>,
             Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
-        + From<ZeroOperation<V::Type>>
-        + From<AddOperation>,
-{
+>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
@@ -1052,14 +987,17 @@ where
 ///
 ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
 ///   - `primals`: Structured complex input values specifying the linearization point.
-pub fn jacobian_forward_holomorphic<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+pub fn jacobian_forward_holomorphic<
+    V: Value<
+            Type: DenseDifferentiableType<V::ExecutionDomain>,
+            ExecutionDomain: Context<
+                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + From<ZeroOperation<V::Type>>,
+            >,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             To<V> = I,
@@ -1069,12 +1007,10 @@ where
             LinearizationTracer<V::ExecutionDomain>,
             Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + From<ZeroOperation<V::Type>>,
-{
+>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
@@ -1091,14 +1027,22 @@ where
 ///
 ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
 ///   - `primals`: Structured complex input values specifying the linearization point.
-pub fn jacobian_reverse_holomorphic<V, F, I, O>(
-    function: F,
-    primals: I,
-) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError>
-where
-    V: Value,
-    V::ExecutionDomain: Context,
-    V::Type: DenseDifferentiableType<V::ExecutionDomain>,
+pub fn jacobian_reverse_holomorphic<
+    V: Value<
+            Type: DenseDifferentiableType<V::ExecutionDomain>,
+            ExecutionDomain: Context<
+                Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
+                               + PartiallyEvaluatableOperation<
+                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
+                > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                               + TransposableOperation<
+                    <V::ExecutionDomain as Domain>::Constant,
+                    <V::ExecutionDomain as Domain>::Operation,
+                > + From<ZeroOperation<V::Type>>
+                               + From<AddOperation>,
+            >,
+        >,
+    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<
             V,
             To<V> = I,
@@ -1108,15 +1052,10 @@ where
             LinearizationTracer<V::ExecutionDomain>,
             Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
         >,
-    F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-    <V::ExecutionDomain as Domain>::Operation: PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + PartiallyEvaluatableOperation<
-            TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-        > + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
-        + From<ZeroOperation<V::Type>>
-        + From<AddOperation>,
-{
+>(
+    function: F,
+    primals: I,
+) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
