@@ -12,7 +12,6 @@ use crate::operations::constants::Fill;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::ReshapeOperation;
-use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
@@ -437,8 +436,8 @@ impl_differentiable_operation! {
     },
 }
 
-impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate + Slice> + Fill<Scalar, C::Value>>
-    BatchableOperation<C> for DynamicBroadcastOperation
+impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate> + Fill<Scalar, C::Value>> BatchableOperation<C>
+    for DynamicBroadcastOperation
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -452,7 +451,7 @@ impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate + Slice>
                 message: "dynamic broadcast does not support batched output dimensions".to_string(),
             });
         }
-        let Some(batch_axis) = inputs[0].batch_axis_position() else {
+        let Some(input_batch_axis) = inputs[0].batch_axis_position() else {
             let output =
                 inputs[0]
                     .value()
@@ -460,20 +459,19 @@ impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate + Slice>
             return Ok(vec![ArrayBatch::replicated(output)]);
         };
 
-        let axis_size = inputs[0].batch_size()?.unwrap();
-        let mut output_type = self.output_type.with_inserted_dimension(batch_axis, Size::Static(axis_size))?;
-        let mut output_axes = self
-            .output_axes
-            .iter()
-            .map(|&output_axis| if output_axis >= batch_axis { output_axis + 1 } else { output_axis })
-            .collect::<Vec<_>>();
-        output_axes.insert(batch_axis, batch_axis);
-        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
+        // Canonicalize the result's mapped axis at the front without moving the packed input. The original logical
+        // mappings shift by one, while the packed input's existing mapped axis maps directly to output axis zero.
+        let axis_size = context.axis_size();
+        let mut output_type = self.output_type().with_inserted_dimension(0, Size::Static(axis_size))?;
+        let mut output_axes = self.output_axes().iter().map(|&output_axis| output_axis + 1).collect::<Vec<_>>();
+        output_axes.insert(input_batch_axis, 0);
+
+        let axis_sharding = context.axis_sharding();
         let input_mesh = inputs[0].r#type().sharding().map(|sharding| sharding.mesh().clone());
-        let base_sharding = match (self.output_type.sharding().cloned(), input_mesh) {
+        let base_sharding = match (self.output_type().sharding().cloned(), input_mesh) {
             (Some(sharding), _) => Some(sharding),
-            (None, Some(mesh)) if !matches!(&axis_sharding, ShardingDimension::Replicated) => {
-                Some(Sharding::replicated(mesh, self.output_type.rank()))
+            (None, Some(mesh)) if !matches!(axis_sharding, ShardingDimension::Replicated) => {
+                Some(Sharding::replicated(mesh, self.output_type().rank()))
             }
             (None, None) => None,
             (None, Some(_)) => None,
@@ -481,7 +479,7 @@ impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate + Slice>
         if let Some(sharding) = base_sharding {
             output_type.sharding = Some(
                 sharding
-                    .with_inserted_dimension(batch_axis, axis_sharding)
+                    .with_inserted_dimension(0, axis_sharding.clone())
                     .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
             );
         }
@@ -510,17 +508,9 @@ impl<C: Context<Type = ArrayType, Value: DynamicBroadcast + Concatenate + Slice>
             }
         };
         let inserted = context.parent().fill(&inserted_type, axis_size)?;
-        let mut dimension_parts = Vec::with_capacity(3);
-        if batch_axis > 0 {
-            dimension_parts.push(inputs[1].value().slice(&[0], &[batch_axis], &[1])?);
-        }
-        dimension_parts.push(inserted);
-        if batch_axis < self.output_type.rank() {
-            dimension_parts.push(inputs[1].value().slice(&[batch_axis], &[self.output_type.rank()], &[1])?);
-        }
-        let output_dimensions = Concatenate::concatenate(dimension_parts.as_slice(), 0)?;
+        let output_dimensions = Concatenate::concatenate(&[inserted, inputs[1].value().clone()], 0)?;
         let output = inputs[0].value().dynamic_broadcast(&output_dimensions, output_type.clone(), &output_axes)?;
-        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])
+        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(0))?])
     }
 }
 
@@ -1405,41 +1395,86 @@ mod tests {
             ],
         );
 
-        // Batching inserts the mapped axis into both the declared result and the runtime dimensions vector.
-        // The dimensions vector itself is a shape parameter and therefore must remain replicated.
+        // Batching prepends a canonical mapped output axis to both the declared result and the runtime dimensions
+        // vector. The dimensions vector itself is a shape parameter and therefore must remain replicated.
+        let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into(), 2.into()]));
+        let expected_values = vec![
+            1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 4.0, 4.0, 5.0,
+            5.0, 6.0, 6.0,
+        ];
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         let input = Array::from_f64s(
             ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into(), 3.into()])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         let input = ArrayBatch::new(input.r#type().into_owned(), input, BatchAxis::from_position(0)).unwrap();
-        let dimensions = ArrayBatch::replicated(dimensions.clone());
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let batched = DynamicBroadcastOperation::new(
-            ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Size::Dynamic(None), Size::Static(3), Size::Dynamic(Some(4))]),
-            ),
-            vec![2, 1],
-        )
-        .batch(&context, &EmptyRegionDriver, &[input, dimensions])
-        .unwrap()
-        .remove(0);
+        let batched = operation
+            .batch(&context, &EmptyRegionDriver, &[input, ArrayBatch::replicated(dimensions.clone())])
+            .unwrap()
+            .remove(0);
         assert_eq!(batched.batch_axis(), BatchAxis::from_position(0));
         assert_eq!(
             batched.unbatched_type().shape(),
             &Shape::new(vec![Size::Dynamic(None), Size::Static(3), Size::Dynamic(Some(4))]),
         );
-        assert_eq!(
-            *batched.value().r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 2.into(), 3.into(), 2.into()])),
+        assert_eq!(*batched.value().r#type(), expected_type);
+        assert_eq!(batched.value().to_f64s(), expected_values);
+
+        // A non-leading packed input axis maps directly to the canonical leading output axis without transposing the
+        // input or changing the per-item result.
+        let input = Array::from_f64s(
+            ArrayType::new(DataType::F64, Shape::new(vec![1.into(), 2.into(), 3.into()])),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
-        assert_eq!(
-            batched.value().to_f64s(),
-            [
-                1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 4.0, 4.0,
-                5.0, 5.0, 6.0, 6.0,
+        let input = ArrayBatch::new(input.r#type().into_owned(), input, BatchAxis::from_position(1)).unwrap();
+        let batched = operation
+            .batch(&context, &EmptyRegionDriver, &[input, ArrayBatch::replicated(dimensions.clone())])
+            .unwrap()
+            .remove(0);
+        assert_eq!(batched.batch_axis(), BatchAxis::from_position(0));
+        assert_eq!(*batched.value().r#type(), expected_type);
+        assert_eq!(batched.value().to_f64s(), expected_values);
+
+        // The canonical output axis uses the active transform's placement and the mapped input's mesh when the logical
+        // output itself has no sharding annotation.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![1.into(), 2.into(), 3.into()]))
+            .with_sharding(
+                Sharding::new(
+                    mesh.clone(),
+                    vec![
+                        ShardingDimension::replicated(),
+                        ShardingDimension::sharded(["x"]),
+                        ShardingDimension::replicated(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let input = ArrayBatch::new(
+            input_type.clone(),
+            Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            BatchAxis::from_position(1),
+        )
+        .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_sharding(ShardingDimension::sharded(["x"]));
+        let batched = operation
+            .batch(&context, &EmptyRegionDriver, &[input, ArrayBatch::replicated(dimensions.clone())])
+            .unwrap()
+            .remove(0);
+        let expected_sharding = Sharding::new(
+            mesh,
+            vec![
+                ShardingDimension::sharded(["x"]),
+                ShardingDimension::replicated(),
+                ShardingDimension::replicated(),
+                ShardingDimension::replicated(),
             ],
-        );
+        )
+        .unwrap();
+        assert_eq!(batched.r#type().sharding(), Some(&expected_sharding));
+        assert_eq!(batched.value().r#type().sharding(), Some(&expected_sharding));
 
         let mapped_dimensions = ArrayBatch::new(
             dimensions_type.clone(),
