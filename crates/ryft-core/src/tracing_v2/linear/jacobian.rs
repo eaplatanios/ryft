@@ -1153,8 +1153,6 @@ fn extract_auxiliary_primals<
     Ok(A::To::<C::Value>::from_parameters(structure, values)?)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1177,9 +1175,8 @@ mod tests {
 
     /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
     /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
-    fn piecewise_select<V>(x: V) -> V
+    fn piecewise_select<V: Value<Type = ArrayType>>(x: V) -> V
     where
-        V: Value<Type = ArrayType>,
         V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
         let condition = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
@@ -1189,25 +1186,22 @@ mod tests {
     }
 
     #[test]
-    fn test_jacobian_parameterization_with_data_types() {
+    fn test_jacobian() {
+        // Test parameterization.
         let jacobian = Jacobian::new((F32, vec![F64, F32]), F64, vec![1.0_f32, 2.0, 3.0]).unwrap();
         assert_eq!(jacobian.parameter_count(), 3);
         assert_eq!(jacobian.values(), &[1.0, 2.0, 3.0]);
-
         let reparameterized =
             <Jacobian<DataType, f64, _, _>>::from_parameters(jacobian.parameter_structure(), [4.0, 5.0, 6.0]).unwrap();
         assert_eq!(reparameterized.input_type(), &(F32, vec![F64, F32]));
         assert_eq!(reparameterized.output_type(), &F64);
         assert_eq!(reparameterized.values(), &[4.0, 5.0, 6.0]);
-    }
 
-    #[test]
-    fn test_jacobian_blocks_with_array_types() {
+        // Test block iterator.
         let input_types = (ArrayType::scalar(F32), ArrayType::new(F32, Shape::new(vec![2.into()])));
         let output_types = ArrayType::new(F32, Shape::new(vec![3.into()]));
         let jacobian = Jacobian::new(input_types.clone(), output_types.clone(), vec![10_i32, 20]).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
-
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].output_path(), &ParameterPath::root());
         assert_eq!(blocks[0].input_path().to_string(), "$.0");
@@ -1216,51 +1210,20 @@ mod tests {
         assert_eq!(*blocks[0].value(), 10);
         assert_eq!(blocks[1].input_path().to_string(), "$.1");
         assert_eq!(*blocks[1].value(), 20);
-
         let second_input_path = blocks[1].input_path().clone();
         assert_eq!(*jacobian.block(&ParameterPath::root(), &second_input_path).unwrap().value(), 20);
         assert!(jacobian.block(&ParameterPath::root(), &ParameterPath::root().field("missing")).is_none());
     }
 
-    #[test]
-    fn test_coordinate_prefix_offsets_reports_overflow_and_handles_empty_coordinate_spaces() {
-        let input_types = (ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX)])), ArrayType::scalar(F32));
-        assert_eq!(
-            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
-                &input_types,
-                DerivativeTransform::JacobianForward,
-                DifferentiationParameterRole::Input,
-            )
-            .unwrap_err(),
-            DifferentiationError::CoordinateCountOverflow {
-                transform: DerivativeTransform::JacobianForward,
-                role: DifferentiationParameterRole::Input,
-                path: "$.1".to_string(),
-                r#type: "f32[]".to_string(),
-            },
-        );
-
-        let empty_input_types =
-            ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(usize::MAX), Size::Static(0)]));
-        assert_eq!(
-            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
-                &empty_input_types,
-                DerivativeTransform::JacobianForward,
-                DifferentiationParameterRole::Input,
-            )
-            .unwrap(),
-            vec![0, 0],
-        );
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_jacobian_forward_packs_all_coordinate_directions() {
         let jacobian = jacobian_forward(|input| Ok(input), Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
-
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
             block.value().r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
+            ArrayType::new(F64, Shape::new(vec![Size::Static(3), Size::Static(3)])),
         );
         assert_eq!(block.value().values(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
@@ -1302,10 +1265,9 @@ mod tests {
 
     #[test]
     fn test_select_jacobian_reverse_unbroadcasts_mixed_precision_scalar_branches() {
-        let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![5.0]);
-        let f32_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
-        let vector =
-            Array::from_f64s(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
+        let scalar = Array::from_f64s(ArrayType::scalar(F32), vec![5.0]);
+        let f32_vector_type = ArrayType::new(F32, Shape::new(vec![Size::Static(2)]));
+        let vector = Array::from_f64s(ArrayType::new(F64, Shape::new(vec![Size::Static(2)])), vec![2.0, -3.0]);
 
         let jacobian = jacobian_reverse(
             |(scalar, vector)| {
@@ -1321,7 +1283,7 @@ mod tests {
         assert_eq!(blocks[0].value().to_f64s(), vec![1.0, 0.0]);
         assert_eq!(
             blocks[1].value().r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
         assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0]);
 
@@ -1339,8 +1301,38 @@ mod tests {
         assert_eq!(blocks[0].value().to_f64s(), vec![0.0, 1.0]);
         assert_eq!(
             blocks[1].value().r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
         );
         assert_eq!(blocks[1].value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_coordinate_prefix_offsets() {
+        let input_types = (ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX)])), ArrayType::scalar(F32));
+        assert_eq!(
+            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
+                &input_types,
+                DerivativeTransform::JacobianForward,
+                DifferentiationParameterRole::Input,
+            )
+            .unwrap_err(),
+            DifferentiationError::CoordinateCountOverflow {
+                transform: DerivativeTransform::JacobianForward,
+                role: DifferentiationParameterRole::Input,
+                path: "$.1".to_string(),
+                r#type: "f32[]".to_string(),
+            },
+        );
+        let empty_input_types =
+            ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(usize::MAX), Size::Static(0)]));
+        assert_eq!(
+            coordinate_prefix_offsets::<EagerContext<Array, ArrayOperation<Array>>, _>(
+                &empty_input_types,
+                DerivativeTransform::JacobianForward,
+                DifferentiationParameterRole::Input,
+            )
+            .unwrap(),
+            vec![0, 0],
+        );
     }
 }
