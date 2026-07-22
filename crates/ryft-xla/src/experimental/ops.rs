@@ -26,9 +26,9 @@ use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice,
-    SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    BroadcastOperation, ConcatenateOperation, ConvertElementTypeOperation, DynamicBroadcastOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation, PadOperation, Reshape, ReshapeOperation,
+    ScatterOperation, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -131,6 +131,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Reshard(ReshardOperation),
     ShardingConstraint(ShardingConstraintOperation),
     Broadcast(BroadcastOperation),
+    DynamicBroadcast(DynamicBroadcastOperation),
     Slice(SliceOperation),
     UpdateSlice(UpdateSliceOperation),
     DynamicSlice(DynamicSliceOperation),
@@ -240,6 +241,7 @@ where
             ArrayOperation::Reshard(operation) => Self::Reshard(operation),
             ArrayOperation::ShardingConstraint(operation) => Self::ShardingConstraint(operation),
             ArrayOperation::Broadcast(operation) => Self::Broadcast(operation),
+            ArrayOperation::DynamicBroadcast(operation) => Self::DynamicBroadcast(operation),
             ArrayOperation::Slice(operation) => Self::Slice(operation),
             ArrayOperation::UpdateSlice(operation) => Self::UpdateSlice(operation),
             ArrayOperation::DynamicSlice(operation) => Self::DynamicSlice(operation),

@@ -52,12 +52,13 @@ use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOpe
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation,
-    GatherScatterMode, Pad, PadOperation, Reshape, ReshapeOperation, Scatter, ScatterOperation, ScatterReductionKind,
-    Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode, Pad, PadOperation, Permutation, Reshape,
+    ReshapeOperation, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::math::dot::dot_general_evaluate;
-use crate::operations::math::reduce::reduce_evaluate;
+use crate::operations::math::reduce::{reduce_abstract, reduce_evaluate};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
     DivOperation, Dot, DotDimensionNumbers, DotOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation,
@@ -158,6 +159,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
     Broadcast(BroadcastOperation),
+    DynamicBroadcast(DynamicBroadcastOperation),
     Pad(PadOperation),
     Concatenate(ConcatenateOperation),
     Gather(GatherOperation),
@@ -1255,7 +1257,11 @@ impl Reduce for Array {
                 *value = *value / divisor;
             }
         }
-        let output_type = ArrayType::new(data_type, Shape::from(&reduced_shape));
+        // The eager payload kernel computes only the reduced shape. Reuse the operation's abstract rule for the
+        // complete result type so interpretation preserves memory placement, projects sharding, and clears the
+        // rank-specific layout exactly like tracing and compiled backends do.
+        let output_type = reduce_abstract(&self.r#type, axes, kind, "reduce").unwrap_or_else(|error| panic!("{error}"));
+        debug_assert_eq!(output_type.shape(), &Shape::from(&reduced_shape));
         Self { r#type: output_type, values }
     }
 }
@@ -1298,11 +1304,11 @@ fn extremum(left: Scalar, right: Scalar, direction: ComparisonDirection) -> Scal
 }
 
 impl Transpose for Array {
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
         // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
         // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
-        let permutation = permutation.as_ref();
-        let output_type = self.r#type.transpose(permutation)?;
+        let permutation = permutation.into();
+        let output_type = self.r#type.transpose(permutation.clone())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
@@ -1343,6 +1349,9 @@ impl Reshape for Array {
 impl Broadcast for Array {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
+        if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
+            return Ok(self.clone());
+        }
         let input_shape = self.r#type.static_shape().unwrap();
         let Some(target_shape) = r#type.static_shape() else {
             return Err(TypeError {
@@ -1353,7 +1362,7 @@ impl Broadcast for Array {
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
         let input_strides = input_shape.row_major_strides();
-        let output_count: usize = target_shape.dimensions().iter().product();
+        let output_count = Self::materialized_element_count(&r#type)?;
         let mut values = Vec::with_capacity(output_count);
         let mut target_index = vec![0usize; target_rank];
         while values.len() < output_count {
@@ -1373,6 +1382,50 @@ impl Broadcast for Array {
             }
         }
         Ok(Self { r#type, values })
+    }
+}
+
+impl DynamicBroadcast for Array {
+    fn dynamic_broadcast(
+        &self,
+        output_dimensions: &Self,
+        output_type: ArrayType,
+        output_axes: &[usize],
+    ) -> Result<Self, ProgramError> {
+        DynamicBroadcastOperation::new(output_type.clone(), output_axes.to_vec())
+            .infer_output_types(&[self.r#type.clone(), output_dimensions.r#type.clone()], &[])?;
+        let dimensions = output_dimensions
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(index, dimension)| {
+                let value = match dimension {
+                    Scalar::I8(value) => usize::try_from(*value),
+                    Scalar::I16(value) => usize::try_from(*value),
+                    Scalar::I32(value) => usize::try_from(*value),
+                    Scalar::I64(value) => usize::try_from(*value),
+                    Scalar::U8(value) => Ok(usize::from(*value)),
+                    Scalar::U16(value) => Ok(usize::from(*value)),
+                    Scalar::U32(value) => usize::try_from(*value),
+                    Scalar::U64(value) => usize::try_from(*value),
+                    _ => unreachable!("dynamic broadcast output dimension types are validated before interpretation"),
+                };
+                value.map_err(|_| TypeError {
+                    message: format!("dynamic broadcast output dimension {index} has invalid value {dimension}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+        if !output_type.shape().is_refined_by(&shape) {
+            return Err(TypeError {
+                message: format!(
+                    "dynamic broadcast runtime shape {shape} does not refine declared output shape {}",
+                    output_type.shape(),
+                ),
+            }
+            .into());
+        }
+        self.broadcast(output_type.with_shape(shape), output_axes)
     }
 }
 

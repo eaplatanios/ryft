@@ -60,6 +60,15 @@ pub enum ShardingError {
     #[error("dimension index {dimension} is out of bounds for a sharding of rank {rank}")]
     DimensionOutOfBounds { dimension: usize, rank: usize },
 
+    #[error("broadcast axis mapping has length {actual}, but the sharding has rank {expected}")]
+    BroadcastAxisCountMismatch { expected: usize, actual: usize },
+
+    #[error("broadcast output dimension {dimension} is out of bounds for rank {rank}")]
+    BroadcastDimensionOutOfBounds { dimension: usize, rank: usize },
+
+    #[error("broadcast axis mapping contains output dimension {dimension} more than once")]
+    DuplicateBroadcastDimension { dimension: usize },
+
     #[error("sharding visualization only supports rank-1 and rank-2 shapes, but got rank {rank}")]
     UnsupportedVisualizationRank { rank: usize },
 }
@@ -810,6 +819,47 @@ impl Sharding {
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
+    /// Returns a copy of this [`Sharding`] projected through an array broadcast. Each input dimension `i` is moved to
+    /// output dimension `output_dimensions[i]`, while every output dimension not named by the mapping is replicated.
+    /// The mesh and the unreduced, reduced, and varying-manual axis sets are preserved.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_rank`: Rank of the broadcast output.
+    ///   - `output_dimensions`: Output dimension corresponding to each input dimension. Its length must equal this
+    ///     sharding's rank, and its entries must be distinct and less than `output_rank`.
+    pub fn with_broadcasted_dimensions(
+        &self,
+        output_rank: usize,
+        output_dimensions: &[usize],
+    ) -> Result<Self, ShardingError> {
+        if output_dimensions.len() != self.rank() {
+            return Err(ShardingError::BroadcastAxisCountMismatch {
+                expected: self.rank(),
+                actual: output_dimensions.len(),
+            });
+        }
+        let mut dimensions = vec![ShardingDimension::Replicated; output_rank];
+        let mut mapped = vec![false; output_rank];
+        for (input_dimension, output_dimension) in output_dimensions.iter().copied().enumerate() {
+            if output_dimension >= output_rank {
+                return Err(ShardingError::BroadcastDimensionOutOfBounds {
+                    dimension: output_dimension,
+                    rank: output_rank,
+                });
+            }
+            if mapped[output_dimension] {
+                return Err(ShardingError::DuplicateBroadcastDimension { dimension: output_dimension });
+            }
+            mapped[output_dimension] = true;
+            dimensions[output_dimension] = self.dimensions[input_dimension].clone();
+        }
+        Self::new(self.mesh.clone(), dimensions)?
+            .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_reduced_axes(self.reduced_axes.clone())?
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
+    }
+
     /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting
     /// subsequent dimensions one position to the left. This is the sharding-level analogue of
     /// [`ArrayType::without_dimension`](crate::ArrayType::without_dimension). The reduction axis sets are unchanged,
@@ -1333,6 +1383,57 @@ mod tests {
         assert!(matches!(
             sharding.with_inserted_dimension(0, ShardingDimension::sharded(["data"])),
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "data",
+        ));
+    }
+
+    #[test]
+    fn test_sharding_with_broadcasted_dimensions() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("reduction", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
+        )
+        .unwrap()
+        .with_unreduced_axes(["reduction"])
+        .unwrap()
+        .with_varying_manual_axes(["model"])
+        .unwrap();
+
+        // Input dimensions can be reordered while newly introduced output dimensions remain replicated.
+        // Non-ranked reduction and manual-axis state follows the projected sharding unchanged.
+        assert_eq!(
+            sharding.with_broadcasted_dimensions(3, &[2, 0]),
+            Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::sharded(["model"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::sharded(["data"]),
+                ],
+            )
+            .unwrap()
+            .with_unreduced_axes(["reduction"])
+            .unwrap()
+            .with_varying_manual_axes(["model"]),
+        );
+
+        // Malformed mappings fail before constructing an invalid projected sharding.
+        assert!(matches!(
+            sharding.with_broadcasted_dimensions(3, &[0]),
+            Err(ShardingError::BroadcastAxisCountMismatch { expected: 2, actual: 1 }),
+        ));
+        assert!(matches!(
+            sharding.with_broadcasted_dimensions(2, &[0, 2]),
+            Err(ShardingError::BroadcastDimensionOutOfBounds { dimension: 2, rank: 2 }),
+        ));
+        assert!(matches!(
+            sharding.with_broadcasted_dimensions(2, &[1, 1]),
+            Err(ShardingError::DuplicateBroadcastDimension { dimension: 1 }),
         ));
     }
 

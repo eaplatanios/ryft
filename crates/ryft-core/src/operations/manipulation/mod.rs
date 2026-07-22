@@ -8,7 +8,10 @@ pub mod scattering;
 pub mod slicing;
 pub mod transposition;
 
-pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
+pub use broadcasting::{
+    BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, DYNAMIC_BROADCAST_OPERATION_NAME, DynamicBroadcast,
+    DynamicBroadcastOperation,
+};
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
 pub use conversion::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,

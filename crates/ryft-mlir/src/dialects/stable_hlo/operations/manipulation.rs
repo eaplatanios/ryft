@@ -66,6 +66,85 @@ pub fn get_dimension_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
         })
 }
 
+/// Name of the [`Attribute`] that is used to store [`SetDimensionSizeOperation::dimension`].
+pub const SET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE: &str = "dimension";
+
+/// StableHLO [`Operation`] that marks one dimension of its input tensor as dynamic and assigns its runtime size from
+/// an `i32` scalar tensor. The result retains the input dimension's static upper bound while exposing the supplied
+/// logical size to subsequent operations.
+///
+/// # Example
+///
+/// The following is an example of a [`SetDimensionSizeOperation`] represented using its
+/// [`Display`](std::fmt::Display) rendering:
+///
+/// ```mlir
+/// %output = stablehlo.set_dimension_size %input, %size, dim = 0
+///     : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32>
+/// ```
+///
+/// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#set_dimension_size) for more
+/// information.
+pub trait SetDimensionSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the input tensor whose runtime dimension is being assigned.
+    fn input(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the scalar tensor containing the runtime dimension size.
+    fn size(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the input dimension whose runtime size is assigned.
+    fn dimension(&self) -> Result<usize, Error> {
+        let value = self.integer_attribute(SET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE)?.signless_value();
+        usize::try_from(value)
+            .map_err(|_| Error::invalid_argument("invalid `dimension` attribute in `stablehlo.set_dimension_size`"))
+    }
+}
+
+mlir_op!(SetDimensionSize);
+mlir_op_trait!(SetDimensionSize, OneResult);
+mlir_op_trait!(SetDimensionSize, ZeroRegions);
+mlir_op_trait!(SetDimensionSize, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`SetDimensionSizeOperation`] at the specified [`Location`]. Refer to the
+/// documentation of [`SetDimensionSizeOperation`] for more information on the operation semantics.
+pub fn set_dimension_size<
+    'input,
+    'size,
+    'c: 'input + 'size,
+    't: 'c,
+    Input: Value<'input, 'c, 't>,
+    RuntimeSize: Value<'size, 'c, 't>,
+    Output: Type<'c, 't>,
+    L: Location<'c, 't>,
+>(
+    input: Input,
+    size: RuntimeSize,
+    output_type: Output,
+    dimension: usize,
+    location: L,
+) -> Result<DetachedSetDimensionSizeOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
+    OperationBuilder::new("stablehlo.set_dimension_size", location)
+        .add_operand(input)
+        .add_operand(size)
+        .add_attribute(
+            SET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), dimension as i64),
+        )
+        .add_result(output_type)
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::set_dimension_size`"))
+        })
+}
+
 /// Name of the [`Attribute`] that is used to store [`TransposeOperation::permutation`].
 pub const TRANSPOSE_PERMUTATION_ATTRIBUTE: &str = "permutation";
 
@@ -1985,9 +2064,10 @@ mod tests {
         BroadcastOperation, ConcatenateOperation, DynamicBroadcastOperation, DynamicGatherOperation,
         DynamicPadOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
         GetDimensionSizeOperation, HasPadding, PadOperation, ReshapeOperation, ScatterOperation,
-        SelectAndScatterOperation, SliceOperation, TransposeOperation, broadcast, concatenate, dynamic_broadcast,
-        dynamic_gather, dynamic_pad, dynamic_reshape, dynamic_slice, dynamic_update_slice, gather, get_dimension_size,
-        pad, reshape, scatter, select_and_scatter, slice, transpose,
+        SelectAndScatterOperation, SetDimensionSizeOperation, SliceOperation, TransposeOperation, broadcast,
+        concatenate, dynamic_broadcast, dynamic_gather, dynamic_pad, dynamic_reshape, dynamic_slice,
+        dynamic_update_slice, gather, get_dimension_size, pad, reshape, scatter, select_and_scatter,
+        set_dimension_size, slice, transpose,
     };
 
     #[test]
@@ -2033,6 +2113,58 @@ mod tests {
                   func.func @get_dimension_size_test(%arg0: tensor<2x3xi64>) -> tensor<i32> {
                     %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<2x3xi64>) -> tensor<i32>
                     return %0 : tensor<i32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_set_dimension_size() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let f32_type = context.float32_type();
+        let i32_type = context.signless_integer_type(32);
+        let input_type = context.tensor_type(f32_type, &[Size::Static(4), Size::Static(3)], None, location).unwrap();
+        let size_type = context.tensor_type(i32_type, &[], None, location).unwrap();
+        let output_type = context.tensor_type(f32_type, &[Size::Dynamic, Size::Static(3)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (size_type, location)]);
+                let input = block.argument(0).unwrap();
+                let size = block.argument(1).unwrap();
+                let operation = set_dimension_size(input, size, output_type, 0, location).unwrap();
+                assert_eq!(operation.input().unwrap(), input);
+                assert_eq!(operation.size().unwrap(), size);
+                assert_eq!(operation.dimension().unwrap(), 0);
+                assert_eq!(operation.result(0).unwrap().r#type().unwrap(), output_type);
+                let operation = block.append_operation(operation).unwrap();
+                block.append_operation(func::r#return(&[operation.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "set_dimension_size_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), size_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @set_dimension_size_test(%arg0: tensor<4x3xf32>, %arg1: tensor<i32>) -> tensor<?x3xf32> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 \
+                      : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32>
+                    return %0 : tensor<?x3xf32>
                   }
                 }
             "},
