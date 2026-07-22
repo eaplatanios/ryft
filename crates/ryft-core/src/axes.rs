@@ -164,26 +164,34 @@ impl<A: Copy + Into<Axis>, const N: usize> From<&[A; N]> for Axes {
 }
 
 macro_rules! impl_axis_conversions {
-    ($($integer:ty),+ $(,)?) => {
-        $(
-            impl From<$integer> for Axis {
-                #[inline]
-                fn from(axis: $integer) -> Self {
-                    Self(axis as i128)
-                }
+    ($integer:ty) => {
+        impl From<$integer> for Axis {
+            #[inline]
+            fn from(axis: $integer) -> Self {
+                Self(axis as i128)
             }
+        }
 
-            impl From<$integer> for Axes {
-                #[inline]
-                fn from(axis: $integer) -> Self {
-                    Axis::from(axis).into()
-                }
+        impl From<$integer> for Axes {
+            #[inline]
+            fn from(axis: $integer) -> Self {
+                Axis::from(axis).into()
             }
-        )+
+        }
     };
 }
 
-impl_axis_conversions!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize);
+impl_axis_conversions!(i8);
+impl_axis_conversions!(i16);
+impl_axis_conversions!(i32);
+impl_axis_conversions!(i64);
+impl_axis_conversions!(i128);
+impl_axis_conversions!(isize);
+impl_axis_conversions!(u8);
+impl_axis_conversions!(u16);
+impl_axis_conversions!(u32);
+impl_axis_conversions!(u64);
+impl_axis_conversions!(usize);
 
 /// A named axis resolved by a [`NamedAxes`] context specifying what an axis name is currently bound to, and by which
 /// kind of transform, at a given trace level. This carries only the *value-free* facts about a binding (i.e., its kind

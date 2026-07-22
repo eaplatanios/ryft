@@ -76,7 +76,7 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::axes::AxisError;
+use crate::axes::{Axis, AxisError};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
@@ -123,10 +123,10 @@ pub enum BatchingError {
     MisalignedBatchAxes { message: String },
 
     #[error("batch axis {axis} of array type {type} has dynamic size")]
-    DynamicBatchAxis { r#type: Box<ArrayType>, axis: isize },
+    DynamicBatchAxis { r#type: Box<ArrayType>, axis: Axis },
 
     #[error("batch axis {axis} is out of bounds for array type {type}")]
-    BatchAxisOutOfBounds { r#type: Box<ArrayType>, axis: isize },
+    BatchAxisOutOfBounds { r#type: Box<ArrayType>, axis: Axis },
 
     #[error("{message}")]
     UnsupportedOperation { message: String },
@@ -180,19 +180,19 @@ impl From<BatchingError> for ProgramError {
 /// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules
 /// route the mapped batch axis straight from the value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
-pub struct BatchAxis(Option<isize>);
+pub struct BatchAxis(Option<Axis>);
 
 impl BatchAxis {
     /// Creates a mapped [`BatchAxis`] at physical position `axis`.
     #[inline]
-    pub fn new(axis: isize) -> Self {
-        Self(Some(axis))
+    pub fn new<A: Into<Axis>>(axis: A) -> Self {
+        Self(Some(axis.into()))
     }
 
     /// Creates a mapped [`BatchAxis`] from an already-normalized physical position.
     #[inline]
     pub fn from_position(position: usize) -> Self {
-        Self::new(isize::try_from(position).expect("a physical array rank fits in isize"))
+        Self::new(position)
     }
 
     /// Creates a replicated or mapped [`BatchAxis`] from an already-normalized optional physical position.
@@ -210,7 +210,7 @@ impl BatchAxis {
 
     /// Returns the mapped batch axis position, or `None` if this [`BatchAxis`] is replicated.
     #[inline]
-    pub fn axis(&self) -> Option<isize> {
+    pub fn axis(&self) -> Option<Axis> {
         self.0
     }
 
@@ -234,14 +234,14 @@ impl Display for BatchAxis {
 impl From<Option<isize>> for BatchAxis {
     #[inline]
     fn from(axis: Option<isize>) -> Self {
-        Self(axis)
+        Self(axis.map(Axis::from))
     }
 }
 
-impl From<isize> for BatchAxis {
+impl<A: Into<Axis>> From<A> for BatchAxis {
     #[inline]
-    fn from(axis: isize) -> Self {
-        Self(Some(axis))
+    fn from(axis: A) -> Self {
+        Self(Some(axis.into()))
     }
 }
 
@@ -339,10 +339,11 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     pub fn new<A: Into<BatchAxis>>(r#type: ArrayType, value: V, batch_axis: A) -> Result<Self, BatchingError> {
         // A possibly-negative mapped axis is normalized against the physical rank, following Python/JAX indexing:
         // valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
-        let rank = r#type.rank() as isize;
         let batch_axis = match batch_axis.into().axis() {
-            Some(axis) if (-rank..rank).contains(&axis) => BatchAxis::new(if axis < 0 { axis + rank } else { axis }),
-            Some(axis) => return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type), axis }),
+            Some(axis) => match axis.normalize(r#type.rank()) {
+                Ok(position) => BatchAxis::from_position(position),
+                Err(_) => return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type), axis }),
+            },
             None => BatchAxis::replicated(),
         };
         Ok(Self { r#type, value, batch_axis })
@@ -365,7 +366,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// can use this index directly.
     #[inline]
     pub fn batch_axis_position(&self) -> Option<usize> {
-        self.batch_axis.axis().map(|axis| usize::try_from(axis).expect("stored batch axes are canonical"))
+        self.batch_axis.axis().map(|axis| axis.normalize(self.r#type.rank()).unwrap())
     }
 
     /// Returns the packed array value.
@@ -467,9 +468,9 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///   - `axis_size`: Size of the inserted batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the inserted batch axis when the value carries
     ///     sharding metadata.
-    pub fn broadcast(
+    pub fn broadcast<A: Into<Axis>>(
         &self,
-        axis: isize,
+        axis: A,
         axis_size: usize,
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
@@ -483,13 +484,13 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             });
         }
         // The insertion position is normalized against the physical output rank (i.e., the per-item rank plus the
-        // inserted batch dimension). Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
+        // inserted batch dimension).
+        let axis = axis.into();
         let per_item_type = self.unbatched_type();
-        let output_rank = per_item_type.rank() as isize + 1;
-        if !(-output_rank..output_rank).contains(&axis) {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis });
-        }
-        let position = (if axis < 0 { axis + output_rank } else { axis }) as usize;
+        let output_rank = per_item_type.rank() + 1;
+        let position = axis
+            .normalize(output_rank)
+            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis })?;
         let mut physical_type = per_item_type.with_inserted_dimension(position, Size::Static(axis_size))?;
         if let Some(sharding) = per_item_type.sharding() {
             physical_type.sharding = Some(
@@ -516,20 +517,18 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     ///   - `axis`: Possibly-negative position the mapped batch axis should occupy in the returned [`ArrayBatch`],
     ///     normalized against the (unchanged) physical rank (e.g., `-1` denotes the final axis).
-    pub fn move_axis(&self, axis: isize) -> Result<Self, BatchingError>
+    pub fn move_axis<A: Into<Axis>>(&self, axis: A) -> Result<Self, BatchingError>
     where
         V: Transpose,
     {
         let Some(current_axis) = self.batch_axis_position() else {
             return Ok(self.clone());
         };
-        // The target is normalized against the (unchanged) physical rank.
-        // Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
-        let rank = self.r#type.rank() as isize;
-        if !(-rank..rank).contains(&axis) {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis });
-        }
-        let position = (if axis < 0 { axis + rank } else { axis }) as usize;
+        // The target is normalized against the unchanged physical rank.
+        let axis = axis.into();
+        let position = axis
+            .normalize(self.r#type.rank())
+            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis })?;
         if current_axis == position {
             return Ok(self.clone());
         }
@@ -551,15 +550,16 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///   - `axis_size`: Size of the batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated value must be broadcast.
     #[inline]
-    pub fn match_axis(
+    pub fn match_axis<A: Into<Axis>>(
         &self,
-        axis: isize,
+        axis: A,
         axis_size: usize,
         axis_sharding: ShardingDimension,
     ) -> Result<Self, BatchingError>
     where
         V: Broadcast + Transpose,
     {
+        let axis = axis.into();
         if self.batch_axis().is_replicated() {
             self.broadcast(axis, axis_size, axis_sharding)
         } else {
@@ -886,7 +886,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
 
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
-        let Some(output_batch_axis) = input_axes.iter().find_map(BatchAxis::axis) else {
+        let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             let physical_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let output_count = Operation::infer_output_types(self, physical_types.as_slice(), &[])?.len();
             return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
@@ -895,7 +895,6 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
         // Preserve the first mapped input's natural position when every mapped input can represent it. Otherwise, use
         // a leading internal axis, which is valid regardless of differences in logical per-item rank, and restore the
         // natural output position after interpretation.
-        let output_batch_axis_position = usize::try_from(output_batch_axis).expect("stored batch axes are canonical");
         let batch_axis_position = if inputs
             .iter()
             .all(|input| input.batch_axis().is_replicated() || output_batch_axis_position < input.r#type().rank())
@@ -904,7 +903,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
         } else {
             0
         };
-        let batch_axis = isize::try_from(batch_axis_position).expect("a physical array rank fits in isize");
+        let batch_axis = Axis::from(batch_axis_position);
 
         // Realign every mapped input's batch axis to the common position, then broadcast every input to the common
         // batched physical shape.
@@ -984,7 +983,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
         let output_batch_axes = vec![BatchAxis::new(batch_axis); output_count];
         self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)?
             .into_iter()
-            .map(|output| output.move_axis(output_batch_axis))
+            .map(|output| output.move_axis(output_batch_axis_position))
             .collect()
     }
 }
@@ -1000,7 +999,7 @@ pub enum ProgramBatchingOutputAxesPolicy {
 
     /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with [`Transpose`]
     /// and broadcasting replicated outputs across the batch.
-    AlignAllTo(isize),
+    AlignAllTo(Axis),
 
     /// Align each output `i` to the mapped axis of the `i`-th entry, with one entry per program output. A *mapped*
     /// entry forces the output to carry its batch axis at that position, moving an already-batched output with
@@ -1372,14 +1371,9 @@ impl<
                             // with the inserted batch dimension counted). Valid axes lie in `[-rank, rank)`, with `-1`
                             // denoting the final axis.
                             let physical_rank = unbatched_type.rank() + 1;
-                            let position = usize::try_from(axis)
-                                .ok()
-                                .or_else(|| physical_rank.checked_sub(axis.unsigned_abs()))
-                                .filter(|&axis| axis < physical_rank)
-                                .ok_or_else(|| BatchingError::BatchAxisOutOfBounds {
-                                    r#type: Box::new(unbatched_type.clone()),
-                                    axis,
-                                })?;
+                            let position = axis.normalize(physical_rank).map_err(|_| {
+                                BatchingError::BatchAxisOutOfBounds { r#type: Box::new(unbatched_type.clone()), axis }
+                            })?;
                             let mut batched_type =
                                 unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?;
                             if let Some(sharding) = unbatched_type.sharding() {
@@ -1744,12 +1738,12 @@ mod tests {
         assert!(BatchAxis::replicated().is_replicated());
         assert!(!BatchAxis::new(2).is_replicated());
         assert_eq!(BatchAxis::replicated().axis(), None);
-        assert_eq!(BatchAxis::new(2).axis(), Some(2));
+        assert_eq!(BatchAxis::new(2).axis(), Some(Axis::from(2)));
         assert_eq!(BatchAxis::from(None), BatchAxis::replicated());
         assert_eq!(BatchAxis::from(Some(3)), BatchAxis::new(3));
         assert_eq!(BatchAxis::from(3), BatchAxis::new(3));
         assert_ne!(BatchAxis::new(0), BatchAxis::new(1));
-        assert_eq!(format!("{:?}", BatchAxis::new(1)), "BatchAxis(Some(1))");
+        assert_eq!(format!("{:?}", BatchAxis::new(1)), "BatchAxis(Some(Axis(1)))");
     }
 
     #[test]
@@ -1798,14 +1792,14 @@ mod tests {
         // `new` rejects an out-of-bounds mapped axis.
         assert_eq!(
             ArrayBatch::new(matrix_type.clone(), matrix, Some(2)),
-            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: 2 }),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: Axis::from(2) }),
         );
 
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let matrix_type = matrix.r#type().into_owned();
         assert_eq!(
             ArrayBatch::new(matrix_type.clone(), matrix, BatchAxis::new(-3)),
-            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: -3 }),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: Box::new(matrix_type), axis: Axis::from(-3) }),
         );
 
         // `replicated` shares the value unchanged across the batch: no mapped axis, no batch size, and the per-item
@@ -2299,7 +2293,7 @@ mod tests {
                 2,
                 ShardingDimension::Replicated,
                 &[BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(0),
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
             )
             .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
@@ -2313,7 +2307,7 @@ mod tests {
                 2,
                 ShardingDimension::Replicated,
                 &[BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(-1),
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
             )
             .unwrap();
         assert_eq!(output_axes, vec![BatchAxis::new(1)]);
@@ -2643,7 +2637,7 @@ mod tests {
             BatchAxis::new(0),
             None,
         );
-        assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
+        assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis, .. }) if axis == Axis::from(0)));
     }
 
     #[test]

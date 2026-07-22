@@ -24,7 +24,7 @@ pub mod types;
 pub mod utilities;
 
 // TODO(eaplatanios): Make all of the following more specific.
-pub use axes::{AXIS_INDEX_OPERATION_NAME, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
+pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use backends::*;
 pub use batching::{
     ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingDriver,
