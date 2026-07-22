@@ -897,8 +897,7 @@ impl Sharding {
     /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
     /// confined to [`Manual`](MeshAxisType::Manual) axes, [`Auto`](MeshAxisType::Auto) axes, and any
     /// [`varying_manual_axes`](Self::varying_manual_axes) differences are ignored. This function is used by the
-    /// operations that require their operands to be **sharded identically** (e.g., concatenation and dynamic slice
-    /// updating) to determine whether to return an error or not.
+    /// operations that need to determine whether explicit-axis state conflicts (e.g., dynamic slice updating).
     pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
         if self.dimensions.len() != other.dimensions.len() {
             return true;

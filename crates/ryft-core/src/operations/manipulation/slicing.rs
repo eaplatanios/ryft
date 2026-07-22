@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::batching::{
@@ -96,6 +97,9 @@ pub struct SliceOperation {
 
     /// Stride for each input axis (every stride is at least `1`).
     strides: Vec<usize>,
+
+    /// Axes whose slice limit is the input's runtime extent.
+    full_extent_axes: BTreeSet<usize>,
 }
 
 impl SliceOperation {
@@ -104,7 +108,7 @@ impl SliceOperation {
     #[inline]
     pub fn new(start_indices: Vec<usize>, limit_indices: Vec<usize>) -> Self {
         let strides = vec![1; start_indices.len()];
-        Self { start_indices, limit_indices, strides }
+        Self { start_indices, limit_indices, strides, full_extent_axes: BTreeSet::new() }
     }
 
     /// Replaces the strides of this [`SliceOperation`] with `strides`. There must be one stride per start index and
@@ -147,6 +151,53 @@ impl SliceOperation {
     pub fn strides(&self) -> &[usize] {
         self.strides.as_slice()
     }
+
+    /// Uses the input's runtime extent as the limit for each axis in `axes`.
+    ///
+    /// This internal form represents a full slice of a dynamic dimension. Every selected axis must have start index
+    /// `0` and unit stride; its stored static limit is ignored.
+    pub(crate) fn with_full_extent_axes(mut self, axes: impl IntoIterator<Item = usize>) -> Result<Self, ProgramError> {
+        for axis in axes {
+            if axis >= self.start_indices.len() {
+                return Err(TypeError {
+                    message: format!(
+                        "'slice' full-extent axis {axis} is out of bounds for {} slice axes",
+                        self.start_indices.len(),
+                    ),
+                }
+                .into());
+            }
+            if self.start_indices[axis] != 0 || self.strides[axis] != 1 {
+                return Err(TypeError {
+                    message: format!("'slice' full-extent axis {axis} must have start index 0 and stride 1"),
+                }
+                .into());
+            }
+            self.full_extent_axes.insert(axis);
+        }
+        Ok(self)
+    }
+
+    /// Returns the axes whose slice limit is the input's runtime extent.
+    #[inline]
+    pub fn full_extent_axes(&self) -> &BTreeSet<usize> {
+        &self.full_extent_axes
+    }
+
+    /// Resolves the effective limit indices for a concrete input value.
+    fn resolved_limit_indices<T: Typed<Type = ArrayType>>(&self, input: &T) -> Result<Vec<usize>, ProgramError> {
+        let input_type = input.r#type();
+        let mut limit_indices = self.limit_indices.clone();
+        for &axis in &self.full_extent_axes {
+            let dimension = input_type.dimension(axis);
+            limit_indices[axis] = dimension.value().ok_or_else(|| TypeError {
+                message: format!(
+                    "'slice' cannot resolve the runtime extent of dynamic input axis {axis} while interpreting a value"
+                ),
+            })?;
+        }
+        Ok(limit_indices)
+    }
 }
 
 impl Display for SliceOperation {
@@ -167,11 +218,69 @@ impl Operation<ArrayType> for SliceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        match input_types[0].slice(
-            self.start_indices.as_slice(),
-            self.limit_indices.as_slice(),
-            self.strides.as_slice(),
-        ) {
+        let result = if self.full_extent_axes.is_empty() {
+            input_types[0].slice(self.start_indices.as_slice(), self.limit_indices.as_slice(), self.strides.as_slice())
+        } else {
+            let input_type = &input_types[0];
+            if self.start_indices.len() != input_type.rank()
+                || self.limit_indices.len() != input_type.rank()
+                || self.strides.len() != input_type.rank()
+            {
+                input_type.slice(self.start_indices.as_slice(), self.limit_indices.as_slice(), self.strides.as_slice())
+            } else {
+                let mut output_dimensions = Vec::with_capacity(input_type.rank());
+                for (axis, ((&start, &limit), &stride)) in
+                    self.start_indices.iter().zip(self.limit_indices.iter()).zip(self.strides.iter()).enumerate()
+                {
+                    if self.full_extent_axes.contains(&axis) {
+                        if start != 0 || stride != 1 {
+                            return Err(TypeError {
+                                message: format!(
+                                    "'slice' full-extent axis {axis} must have start index 0 and stride 1"
+                                ),
+                            });
+                        }
+                        output_dimensions.push(input_type.dimension(axis));
+                        continue;
+                    }
+                    let dimension = input_type.dimension(axis);
+                    let Size::Static(size) = dimension else {
+                        return Err(TypeError {
+                            message: format!(
+                                "'slice' does not support dynamic input axis {axis} with size {dimension}; slice \
+                                 bounds cannot be validated against an unknown extent",
+                            ),
+                        });
+                    };
+                    if stride == 0 {
+                        return Err(TypeError {
+                            message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
+                        });
+                    }
+                    if start > limit {
+                        return Err(TypeError {
+                            message: format!(
+                                "'slice' start index {start} is greater than limit index {limit} at axis {axis}"
+                            ),
+                        });
+                    }
+                    if limit > size {
+                        return Err(TypeError {
+                            message: format!(
+                                "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
+                            ),
+                        });
+                    }
+                    output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
+                }
+                let sharding = resized_output_sharding(input_type, &output_dimensions, SLICE_OPERATION_NAME)?;
+                ArrayType::new(input_type.data_type(), Shape::new(output_dimensions))
+                    .with_memory(input_type.memory())
+                    .with_sharding(sharding)
+                    .map_err(|error| TypeError { message: error.to_string() }.into())
+            }
+        };
+        match result {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError { message: error.to_string() }),
@@ -184,6 +293,9 @@ impl Operation<ArrayType> for SliceOperation {
             operation.field("limit_indices", format_args!("{:?}", self.limit_indices))?;
             if self.strides.iter().any(|stride| *stride != 1) {
                 operation.field("strides", format_args!("{:?}", self.strides))?;
+            }
+            if !self.full_extent_axes.is_empty() {
+                operation.field("full_extent_axes", format_args!("{:?}", self.full_extent_axes))?;
             }
             Ok(())
         })
@@ -198,9 +310,10 @@ impl<C: Domain<Type = ArrayType, Value: Slice>> InterpretableOperation<C> for Sl
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
+        let limit_indices = self.resolved_limit_indices(&inputs[0])?;
         Ok(vec![inputs[0].clone().slice(
             self.start_indices.as_slice(),
-            self.limit_indices.as_slice(),
+            limit_indices.as_slice(),
             self.strides.as_slice(),
         )?])
     }
@@ -223,17 +336,23 @@ where
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
-        _context: &C,
+        context: &C,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().slice(self.start_indices(), self.limit_indices(), self.strides())?;
+        let apply = |value: &C::Value| -> Result<C::Value, ProgramError> {
+            if self.full_extent_axes().is_empty() {
+                return value.slice(self.start_indices(), self.limit_indices(), self.strides());
+            }
+            let outputs = context.bind(self.clone(), Vec::new(), std::slice::from_ref(value))?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.into_iter().next().unwrap())
+        };
+        let primal = apply(inputs[0].primal())?;
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
-            MaybeZero::Value(tangent) => {
-                MaybeZero::Value(tangent.slice(self.start_indices(), self.limit_indices(), self.strides())?)
-            }
+            MaybeZero::Value(tangent) => MaybeZero::Value(apply(tangent)?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -353,7 +472,14 @@ where
                 limit_indices.insert(batch_axis, axis_size);
                 let mut strides = self.strides().to_vec();
                 strides.insert(batch_axis, 1);
-                let lifted = SliceOperation::new(start_indices, limit_indices).with_strides(strides)?;
+                let full_extent_axes = self
+                    .full_extent_axes()
+                    .iter()
+                    .map(|axis| if *axis >= batch_axis { *axis + 1 } else { *axis })
+                    .collect::<Vec<_>>();
+                let lifted = SliceOperation::new(start_indices, limit_indices)
+                    .with_strides(strides)?
+                    .with_full_extent_axes(full_extent_axes)?;
                 lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])
             }
         }

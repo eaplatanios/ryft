@@ -1545,10 +1545,18 @@ impl Concatenate for Array {
         let operand_types: Vec<ArrayType> = operands.iter().map(|operand| operand.r#type.clone()).collect();
         let output_type = ArrayType::concatenate(&operand_types, axis)?;
         // Each operand owns a contiguous run of `axis` coordinates; writing its block at the running offset along
-        // `axis` (and offset zero on every other axis) into a zero-initialized output reuses the row-major
-        // odometer in `replace_block`.
-        let zero = Self::zero_element(output_type.data_type())?;
-        let mut output = Self { r#type: output_type.clone(), values: vec![zero; Self::element_count(&output_type)] };
+        // `axis` (and offset zero on every other axis) reuses the row-major odometer in `replace_block`.
+        let output_element_count = Self::element_count(&output_type);
+        let values = if output_element_count == 0 {
+            Vec::new()
+        } else {
+            // A nonempty concatenation result necessarily has at least one operand element. Seed the destination with
+            // that representable element before `replace_block` overwrites every slot, avoiding an artificial
+            // requirement that the element data type support an additive zero (e.g., `f8e8m0fnu` does not).
+            let seed = operands.iter().find_map(|operand| operand.values.first()).copied().unwrap();
+            vec![seed; output_element_count]
+        };
+        let mut output = Self { r#type: output_type.clone(), values };
         let mut offset = 0usize;
         for operand in operands {
             let operand_axis_size = operand.r#type.static_shape().unwrap()[axis];

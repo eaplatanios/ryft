@@ -192,8 +192,6 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// A [`Type`] that is supported by dense differentiation functions that compute [`Jacobian`](crate::Jacobian)s and
 /// [`Hessian`](crate::Hessian)s. [`Type`] and [`DifferentiableType`] describe individual primal and cotangent values,
 /// but they do not state that a leaf (i.e., a [`Parameter`]) has a finite coordinate space, that several directions
@@ -210,20 +208,33 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     /// physical axis, if any, carries the packed directions.
     type DenseValue;
 
-    /// Returns the finite coordinate count of `type`, reporting the leaf path when it cannot be enumerated.
+    /// Returns the dimension of the finite coordinate space represented by `r#type` (i.e., the number of independent
+    /// scalar basis directions that a dense Jacobian or Hessian replay must pack for this value). This is distinct from
+    /// array rank; the [`ArrayType`] implementation returns the product of all static shape extents, with dimension `1`
+    /// for a scalar and `0` when any extent is zero. Returns [`DifferentiationError::NonFiniteCoordinateSpace`] when
+    /// the space cannot be enumerated statically and [`DifferentiationError::CoordinateCountOverflow`] when its
+    /// dimension does not fit in [`usize`].
+    ///
+    /// # Examples
+    ///
+    /// An array with shape `[2, 3]` has rank `2`, but its coordinate space has dimension `6`: one independent scalar
+    /// basis direction for each array element. A scalar array has rank `0` and coordinate-space dimension `1`, while
+    /// an array with shape `[2, 0, 3]` has rank `3` and coordinate-space dimension `0`.
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Type of the leaf whose coordinates will be enumerated.
+    ///   - `r#type`: Type of the value whose coordinates will be enumerated.
     ///   - `transform`: Derivative transform requesting the coordinate space, used in diagnostics.
     ///   - `role`: Whether the parameter belongs to the transform's input or output structure.
-    ///   - `path`: Path of the leaf within that structure.
-    fn coordinate_count(
+    ///   - `path`: [`ParameterPath`] of the value within the owning [`Parameterized`] structure.
+    fn coordinate_space_dimension(
         r#type: &Self,
         transform: DerivativeTransform,
         role: DifferentiationParameterRole,
         path: &ParameterPath,
     ) -> Result<usize, DifferentiationError>;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Stages one leaf fragment of a packed global coordinate basis.
     ///
@@ -329,7 +340,7 @@ where
 {
     type DenseValue = ArrayBatch<C::Value>;
 
-    fn coordinate_count(
+    fn coordinate_space_dimension(
         r#type: &Self,
         transform: DerivativeTransform,
         role: DifferentiationParameterRole,
@@ -572,8 +583,8 @@ where
     let mut offsets = Vec::new();
     offsets.push(0usize);
     for (path, r#type) in types.named_parameters() {
-        let count = C::Type::coordinate_count(r#type, mode.transform(), role, &path)?;
-        offsets.push(offsets.last().copied().unwrap().checked_add(count).ok_or_else(|| {
+        let dimension = C::Type::coordinate_space_dimension(r#type, mode.transform(), role, &path)?;
+        offsets.push(offsets.last().copied().unwrap().checked_add(dimension).ok_or_else(|| {
             DifferentiationError::CoordinateCountOverflow {
                 transform: mode.transform(),
                 role,
