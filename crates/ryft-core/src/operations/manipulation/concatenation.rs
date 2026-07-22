@@ -25,8 +25,6 @@ use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size};
 
-// TODO(eaplatanios): Review this.
-
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
 
@@ -39,13 +37,8 @@ pub struct ConcatenateOperation {
 }
 
 impl ConcatenateOperation {
-    /// Creates a new [`ConcatenateOperation`] that joins rank-`rank` operands along `axis`. Negative axes index from
-    /// the final operand axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis`: Axis along which the operands are joined.
-    ///   - `rank`: Rank of the operands against which `axis` is normalized.
+    /// Creates a new [`ConcatenateOperation`] that joins rank-`rank` operands along `axis`.
+    #[inline]
     pub fn new<A: Into<Axis>>(axis: A, rank: usize) -> Result<Self, TypeError> {
         let axis = axis.into();
         axis.normalize(rank).map(|axis| Self { axis }).map_err(|_| TypeError {
@@ -61,6 +54,7 @@ impl ConcatenateOperation {
 }
 
 impl Display for ConcatenateOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -72,6 +66,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
         CONCATENATE_OPERATION_NAME
     }
 
+    #[inline]
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -84,6 +79,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
         }
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("axis", self.axis))
@@ -91,6 +87,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
 }
 
 impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -101,8 +98,6 @@ impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> 
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType, Operation: From<ConcatenateOperation>>> PartiallyEvaluatableOperation<C>
     for ConcatenateOperation
 {
@@ -195,16 +190,8 @@ impl_differentiable_operation! {
     },
 }
 
-/// Batching rule for [`ConcatenateOperation`].
-///
-/// All operands are aligned on one physical batch axis (replicated operands are broadcast to gain it via
-/// [`ArrayBatch::match_axis`](crate::batching::ArrayBatch::match_axis), so each batch item
-/// concatenates its own operands), and the concatenated axis is
-/// shifted past the inserted batch axis when the batch axis sits at or before it. When no operand is batched, the
-/// operation passes through unchanged.
-impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
 where
-    C::Value: Broadcast + Transpose,
     ConcatenateOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -213,10 +200,15 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Align all operands on one physical batch axis (replicated operands are broadcast to gain it via
+        // `ArrayBatch::match_axis`, so each batch item concatenates its own operands), and shift the concatenated
+        // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
+        // the operation passes through unchanged.
         if inputs.is_empty() {
-            return Err(
-                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
-            );
+            return Err(TypeError {
+                message: format!("'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"),
+            }
+            .into());
         }
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
@@ -235,18 +227,19 @@ where
     }
 }
 
+// TODO(eaplatanios): Review this.
+
 /// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
 /// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of
-/// StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation.
-///
-/// `Self::concatenate(inputs, axis)` preserves the inputs' order and returns an array whose extent along `axis` is the
-/// sum of their extents. There must be at least one input. All inputs must have the same element data type, rank, memory
-/// space, and dimensions other than `axis`. A single input is returned unchanged. For multiple inputs,
-/// the result preserves the common memory space, clears explicit physical layout metadata, and infers sharding,
-/// reduction state, and varying-manual axes independently. A dynamic concatenated dimension remains dynamic; its type
-/// records the tight exclusive upper bound when every operand is bounded, while the operation's runtime extent is the
-/// exact sum of the operand extents. Equal dynamic descriptors on non-concatenated axes express the runtime requirement
-/// that those extents agree; the backend validates that requirement when executing the operation.
+/// StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation. `Self::concatenate(inputs,
+/// axis)` preserves the inputs' order and returns an array whose extent along `axis` is the sum of their extents.
+/// There must be at least one input. All inputs must have the same element data type, rank, memory space, and
+/// dimensions other than `axis`. A single input is returned unchanged. For multiple inputs, the result preserves
+/// the common memory space, clears explicit physical layout metadata, and infers sharding, reduction state, and
+/// varying-manual axes independently. A dynamic concatenated dimension remains dynamic. Its type records the tight
+/// exclusive upper bound when every operand is bounded, while the operation's runtime extent is the exact sum of the
+/// operand extents. Equal dynamic descriptors on non-concatenated axes express the runtime requirement that those
+/// extents agree; the backend validates that requirement when executing the operation.
 ///
 /// # Example
 ///

@@ -193,41 +193,36 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
 #[derive(Copy, Clone)]
 enum DenseMode {
     Forward,
-    ForwardHolomorphic,
     Reverse,
-    ReverseHolomorphic,
 }
 
 impl DenseMode {
     fn transform(self) -> DerivativeTransform {
         match self {
-            Self::Forward | Self::ForwardHolomorphic => DerivativeTransform::JacobianForward,
-            Self::Reverse | Self::ReverseHolomorphic => DerivativeTransform::JacobianReverse,
+            Self::Forward => DerivativeTransform::JacobianForward,
+            Self::Reverse => DerivativeTransform::JacobianReverse,
         }
     }
 
-    fn is_holomorphic(self) -> bool {
-        matches!(self, Self::ForwardHolomorphic | Self::ReverseHolomorphic)
-    }
-
-    fn permits_complex_input(self) -> bool {
-        matches!(self, Self::ForwardHolomorphic | Self::Reverse | Self::ReverseHolomorphic)
-    }
-
-    fn permits_complex_output(self) -> bool {
-        matches!(self, Self::Forward | Self::ForwardHolomorphic | Self::ReverseHolomorphic)
+    fn permits_complex_without_holomorphy(self, role: DifferentiationParameterRole) -> bool {
+        matches!(
+            (self, role),
+            (Self::Forward, DifferentiationParameterRole::Output)
+                | (Self::Reverse, DifferentiationParameterRole::Input)
+        )
     }
 }
 
 fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
     types: &S,
     mode: DenseMode,
+    holomorphic: bool,
     role: DifferentiationParameterRole,
 ) -> Result<(), DifferentiationError> {
     for (path, r#type) in types.named_parameters() {
         let differential_type = match mode {
-            DenseMode::Forward | DenseMode::ForwardHolomorphic => r#type.tangent(),
-            DenseMode::Reverse | DenseMode::ReverseHolomorphic => r#type.cotangent(),
+            DenseMode::Forward => r#type.tangent(),
+            DenseMode::Reverse => r#type.cotangent(),
         };
         if differential_type.is_zero_space() {
             return Err(DifferentiationError::NonDifferentiableParameter {
@@ -237,7 +232,7 @@ fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
                 r#type: r#type.to_string(),
             });
         }
-        if mode.is_holomorphic() && !r#type.is_complex() {
+        if holomorphic && !r#type.is_complex() {
             return Err(DifferentiationError::NonComplexParameter {
                 transform: mode.transform(),
                 role,
@@ -245,12 +240,7 @@ fn validate_types<T: DifferentiableType, S: Parameterized<T>>(
                 r#type: r#type.to_string(),
             });
         }
-        let permits_complex = if role == DifferentiationParameterRole::Input {
-            mode.permits_complex_input()
-        } else {
-            mode.permits_complex_output()
-        };
-        if !mode.is_holomorphic() && r#type.is_complex() && !permits_complex {
+        if !holomorphic && r#type.is_complex() && !mode.permits_complex_without_holomorphy(role) {
             return Err(DifferentiationError::ComplexParameter {
                 transform: mode.transform(),
                 role,
@@ -310,14 +300,14 @@ where
     I::To<C::Type>: Clone + Parameterized<C::Type>,
     O::To<C::Type>: Clone + Parameterized<C::Type>,
 {
-    let mode = if holomorphic { DenseMode::ForwardHolomorphic } else { DenseMode::Forward };
+    let mode = DenseMode::Forward;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, mode, DifferentiationParameterRole::Input)?;
+    validate_types(&input_types, mode, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pushforward) = context.linearize(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -326,7 +316,7 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, mode, DifferentiationParameterRole::Output)?;
+    validate_types(&output_types, mode, holomorphic, DifferentiationParameterRole::Output)?;
 
     let input_offsets = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
     let _ = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
@@ -432,14 +422,14 @@ where
     I::To<C::Type>: Clone + Parameterized<C::Type>,
     O::To<C::Type>: Clone + Parameterized<C::Type>,
 {
-    let mode = if holomorphic { DenseMode::ReverseHolomorphic } else { DenseMode::Reverse };
+    let mode = DenseMode::Reverse;
     let input_structure = primals.parameter_structure();
     let input_values = primals.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&input_types, mode, DifferentiationParameterRole::Input)?;
+    validate_types(&input_types, mode, holomorphic, DifferentiationParameterRole::Input)?;
     let primals = I::from_parameters(input_structure, input_values)?;
     let (output, pullback) = context.vjp(function, primals)?;
     let output_structure = output.parameter_structure();
@@ -448,7 +438,7 @@ where
         output_structure,
         output_values.iter().map(|value| value.r#type().into_owned()),
     )?;
-    validate_types(&output_types, mode, DifferentiationParameterRole::Output)?;
+    validate_types(&output_types, mode, holomorphic, DifferentiationParameterRole::Output)?;
 
     let _ = coordinate_offsets::<C, _>(&input_types, mode, DifferentiationParameterRole::Input)?;
     let output_offsets = coordinate_offsets::<C, _>(&output_types, mode, DifferentiationParameterRole::Output)?;
