@@ -791,6 +791,34 @@ fn coordinate_prefix_offsets<C: Context<Type: DenseDifferentiableType<C>>, Types
     Ok(offsets)
 }
 
+/// Extracts the known underlying primal value from each auxiliary [`LinearizationTracer`] and reconstructs the
+/// auxiliary parameter structure.  This function does not evaluate or otherwise materialize the auxiliary outputs.
+/// Every tracer must already carry a known primal because auxiliary outputs are not differentiated.
+fn extract_auxiliary_primals<
+    C: Context<
+        Operation: PartiallyEvaluatableOperation<C>
+                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    >,
+    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    auxiliary: A,
+) -> Result<A::To<C::Value>, DifferentiationError> {
+    let structure = auxiliary.parameter_structure();
+    let values = auxiliary
+        .into_parameters()
+        .map(|tracer| {
+            let (primal, _) = tracer.into_dual().into_parts();
+            match primal.into_value()?.value().clone() {
+                PartialValue::Known(value) => Ok(value),
+                PartialValue::Unknown(r#type) => Err(ProgramError::MalformedProgram(format!(
+                    "auxiliary output has unknown primal type {type} but depends only on known primal inputs",
+                ))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(A::To::<C::Value>::from_parameters(structure, values)?)
+}
+
 // TODO(eaplatanios): Review from here onwards.
 
 /// Implements forward-mode Jacobian materialization in an explicitly provided [`Context`] for a function that also
@@ -838,7 +866,7 @@ pub(super) fn jacobian_forward_in_context<
     let (output, pushforward) = context.linearize(
         |input| {
             let (output, value) = function(input)?;
-            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            auxiliary.replace(Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?));
             Ok(output)
         },
         primals,
@@ -981,7 +1009,7 @@ pub(super) fn jacobian_reverse_in_context<
     let (output, pullback) = context.vjp(
         |input| {
             let (output, value) = function(input)?;
-            auxiliary.replace(Some(materialize_auxiliary(value).map_err(ProgramError::from)?));
+            auxiliary.replace(Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?));
             Ok(output)
         },
         primals,
@@ -1062,38 +1090,6 @@ pub(super) fn jacobian_reverse_in_context<
         .into_inner()
         .ok_or_else(|| ProgramError::MalformedProgram("jacobian_reverse did not evaluate its function".to_string()))?;
     Ok((jacobian, auxiliary))
-}
-
-/// Extracts known primal values from auxiliary linearization tracers and reconstructs their parameter structure.
-/// Auxiliary outputs are not differentiated, so every primal must be known after evaluating the function at the
-/// provided primal inputs.
-///
-/// # Parameters
-///
-///   - `auxiliary`: Structured auxiliary output produced while tracing the differentiated function.
-fn materialize_auxiliary<
-    C: Context<
-        Operation: PartiallyEvaluatableOperation<C>
-                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    >,
-    A: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
->(
-    auxiliary: A,
-) -> Result<A::To<C::Value>, DifferentiationError> {
-    let structure = auxiliary.parameter_structure();
-    let values = auxiliary
-        .into_parameters()
-        .map(|tracer| {
-            let (primal, _) = tracer.into_dual().into_parts();
-            match primal.into_value()?.value().clone() {
-                PartialValue::Known(value) => Ok(value),
-                PartialValue::Unknown(r#type) => Err(ProgramError::MalformedProgram(format!(
-                    "auxiliary output has unknown primal type {type} but depends only on known primal inputs",
-                ))),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(A::To::<C::Value>::from_parameters(structure, values)?)
 }
 
 #[cfg(test)]
