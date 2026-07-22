@@ -471,8 +471,6 @@ where
         )
     }
 
-    // TODO(eaplatanios): Review this.
-
     fn extract_forward_jacobian_block(
         packed_output: &Self::PackedValue,
         packed_direction_count: usize,
@@ -500,7 +498,7 @@ where
             }
             .into());
         }
-        let value = basis_range_value(
+        let value = unpack_coordinate_range(
             packed_output,
             packed_direction_count,
             input_coordinate_offset,
@@ -542,7 +540,7 @@ where
             }
             .into());
         }
-        let value = basis_range_value(
+        let value = unpack_coordinate_range(
             packed_output,
             packed_direction_count,
             output_coordinate_offset,
@@ -589,7 +587,11 @@ fn validate_array_derivative_block_type(
 ) -> Result<(), DifferentiationError> {
     let mut expected_type = value_type.clone().with_layout(None);
     let mut prefix_index = 0;
-    for coordinate_type in prefix_coordinate_types {
+    for (coordinate_type, is_prefix) in prefix_coordinate_types
+        .iter()
+        .map(|r#type| (*r#type, true))
+        .chain(suffix_coordinate_types.iter().map(|r#type| (*r#type, false)))
+    {
         let coordinate_shape =
             coordinate_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
                 transform,
@@ -598,20 +600,11 @@ fn validate_array_derivative_block_type(
                 r#type: coordinate_type.to_string(),
             })?;
         for size in coordinate_shape.dimensions() {
-            expected_type = expected_type.with_inserted_dimension(prefix_index, Size::Static(*size))?;
-            prefix_index += 1;
-        }
-    }
-    for coordinate_type in suffix_coordinate_types {
-        let coordinate_shape =
-            coordinate_type.static_shape().ok_or_else(|| DifferentiationError::NonFiniteCoordinateSpace {
-                transform,
-                role: DifferentiationParameterRole::Derivative,
-                path: ParameterPath::root().to_string(),
-                r#type: coordinate_type.to_string(),
-            })?;
-        for size in coordinate_shape.dimensions() {
-            expected_type = expected_type.with_inserted_dimension(expected_type.rank(), Size::Static(*size))?;
+            let index = if is_prefix { prefix_index } else { expected_type.rank() };
+            expected_type = expected_type.with_inserted_dimension(index, Size::Static(*size))?;
+            if is_prefix {
+                prefix_index += 1;
+            }
         }
     }
     let block_type_without_layout = block_type.clone().with_layout(None);
@@ -623,6 +616,75 @@ fn validate_array_derivative_block_type(
     }
     Ok(())
 }
+
+/// Extracts one value's coordinate directions from `packed_output` and restores their logical coordinate shape. The
+/// packed direction axis is first aligned to physical axis `0`, broadcasting a replicated output when necessary. The
+/// function then verifies that the unbatched value type equals `expected_value_type` after ignoring layout metadata,
+/// slices the consecutive directions beginning at `coordinate_offset`, and reshapes that leading range into
+/// `coordinate_shape`. The returned value therefore has `coordinate_shape` followed by the dimensions of
+/// `expected_value_type`. A coordinate shape containing a zero dimension selects an empty range, while a
+/// scalar coordinate shape selects one direction. Returns a [`ProgramError`] if axis alignment, type validation,
+/// coordinate-count arithmetic, slicing, or reshaping fails.
+///
+/// # Parameters
+///
+///   - `packed_output`: Derivative replay output whose batch representation is interpreted over the packed coordinate
+///     directions.
+///   - `packed_direction_count`: Total number of coordinate directions represented by `packed_output`.
+///   - `coordinate_offset`: Index of the first packed direction belonging to the value being extracted.
+///   - `coordinate_shape`: Static logical shape whose flattened coordinates occupy the selected direction range.
+///   - `expected_value_type`: Expected type of each unpacked derivative value, excluding the packed direction axis.
+fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose>(
+    packed_output: &ArrayBatch<V>,
+    packed_direction_count: usize,
+    coordinate_offset: usize,
+    coordinate_shape: &[usize],
+    expected_value_type: &ArrayType,
+) -> Result<V, ProgramError> {
+    let aligned = packed_output.match_axis(0, packed_direction_count, ShardingDimension::Replicated)?;
+    let actual_item_type = aligned.unbatched_type();
+    if actual_item_type.clone().with_layout(None) != expected_value_type.clone().with_layout(None) {
+        return Err(TypeError {
+            message: format!(
+                "batched derivative output has per-item type {actual_item_type} but expected {expected_value_type}",
+            ),
+        }
+        .into());
+    }
+    let item_shape = expected_value_type.static_shape().ok_or_else(|| TypeError {
+        message: format!(
+            "Jacobian or Hessian materialization requires a fully static array shape but got {expected_value_type}"
+        ),
+    })?;
+    let coordinate_count = if coordinate_shape.contains(&0) {
+        0
+    } else {
+        coordinate_shape.iter().try_fold(1usize, |count, size| {
+            count.checked_mul(*size).ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("coordinate shape {coordinate_shape:?} overflows usize"),
+            })
+        })?
+    };
+    let physical_type = aligned.r#type();
+    let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
+        message: format!(
+            "Jacobian or Hessian materialization requires a fully static array shape but got {physical_type}"
+        ),
+    })?;
+    let mut start_indices = vec![0; physical_shape.rank()];
+    start_indices[0] = coordinate_offset;
+    let mut limit_indices = physical_shape.dimensions().to_vec();
+    limit_indices[0] = coordinate_offset
+        .checked_add(coordinate_count)
+        .ok_or_else(|| ProgramError::InvalidArgument { message: "coordinate range overflows usize".to_string() })?;
+    let strides = vec![1; limit_indices.len()];
+    let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
+    let reshaped_shape =
+        Shape::new(coordinate_shape.iter().chain(item_shape.dimensions()).copied().map(Size::Static).collect());
+    sliced.reshape(reshaped_shape)
+}
+
+// TODO(eaplatanios): Review this.
 
 #[derive(Copy, Clone)]
 enum DenseMode {
@@ -1057,59 +1119,6 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(A::To::<C::Value>::from_parameters(structure, values)?)
-}
-
-fn basis_range_value<V>(
-    batch: &ArrayBatch<V>,
-    batch_size: usize,
-    basis_offset: usize,
-    basis_shape: &[usize],
-    expected_item_type: &ArrayType,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
-{
-    let aligned = batch.match_axis(0, batch_size, ShardingDimension::Replicated)?;
-    let actual_item_type = aligned.unbatched_type();
-    if actual_item_type.clone().with_layout(None) != expected_item_type.clone().with_layout(None) {
-        return Err(TypeError {
-            message: format!(
-                "batched derivative output has per-item type {actual_item_type} but expected {expected_item_type}",
-            ),
-        }
-        .into());
-    }
-    let item_shape = expected_item_type.static_shape().ok_or_else(|| TypeError {
-        message: format!(
-            "jacobian or hessian materialization requires a fully static array shape but got {expected_item_type}"
-        ),
-    })?;
-    let basis_count = if basis_shape.contains(&0) {
-        0
-    } else {
-        basis_shape.iter().try_fold(1usize, |count, size| {
-            count.checked_mul(*size).ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("coordinate basis shape {basis_shape:?} overflows usize"),
-            })
-        })?
-    };
-    let physical_type = aligned.r#type();
-    let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
-        message: format!(
-            "jacobian or hessian materialization requires a fully static array shape but got {physical_type}"
-        ),
-    })?;
-    let mut start_indices = vec![0; physical_shape.rank()];
-    start_indices[0] = basis_offset;
-    let mut limit_indices = physical_shape.dimensions().to_vec();
-    limit_indices[0] = basis_offset.checked_add(basis_count).ok_or_else(|| ProgramError::InvalidArgument {
-        message: "coordinate basis range overflows usize".to_string(),
-    })?;
-    let strides = vec![1; limit_indices.len()];
-    let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
-    let reshaped_shape =
-        Shape::new(basis_shape.iter().chain(item_shape.dimensions()).copied().map(Size::Static).collect());
-    sliced.reshape(reshaped_shape)
 }
 
 /// Materializes the complete forward-mode Jacobian, recovering the active context from `primals`.
