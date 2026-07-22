@@ -226,8 +226,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review this.
-
 /// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
 /// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of
 /// StableHLO's [`concatenate`](https://openxla.org/stablehlo/spec#concatenate) operation. `Self::concatenate(inputs,
@@ -258,14 +256,14 @@ where
 /// # }
 /// ```
 pub trait Concatenate: Sized {
-    /// Joins `inputs` end to end along `axis`. Negative axes index from the final axis. Refer to the documentation of
-    /// this trait for more information on what this operation does.
+    /// Joins `inputs` end-to-end along `axis`. Negative axes index from the final axis.
+    /// Refer to the documentation of this trait for more information on what this operation does.
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Arrays to join, in order. There must be at least one input, and all inputs must share one
-    ///     data type and rank and agree on every axis other than `axis`.
-    ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
+    ///   - `inputs`: Values to join, in order. There must be at least one input, and, for [`ArrayType`]d values, all
+    ///     inputs must share one [`DataType`](crate::DataType) and rank and agree on every axis other than `axis`.
+    ///   - `axis`: [`Axis`] along which the inputs are joined. Negative axes index from the final axis.
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         inputs: I,
         axis: A,
@@ -277,8 +275,9 @@ pub trait Concatenate: Sized {
     ///
     /// # Parameters
     ///
-    ///   - `others`: Arrays to append to `self`, in order.
-    ///   - `axis`: Axis along which the inputs are joined. Negative axes index from the final axis.
+    ///   - `others`: Values to append to `self`, in order.
+    ///   - `axis`: [`Axis`] along which the inputs are joined. Negative axes index from the final axis.
+    #[inline]
     fn concatenate_with<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
         &'i self,
         others: I,
@@ -298,16 +297,18 @@ impl Concatenate for ArrayType {
     ) -> Result<Self, ProgramError> {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
-            return Err(
-                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
-            );
+            return Err(TypeError {
+                message: format!("'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"),
+            }
+            .into());
         };
         let rank = first.rank();
         let axis = ConcatenateOperation::new(axis, rank)?.axis();
         if inputs.len() == 1 {
             return Ok((*first).clone());
         }
-        // The concatenated dimension accumulates as we scan operands: a static run sums sizes, while any dynamic
+
+        // The concatenated dimension accumulates as we scan operands. A static run sums sizes, while any dynamic
         // operand size forces a dynamic output dimension whose upper bound stays known only if every operand is
         // bounded.
         let mut concatenated_static = 0usize;
@@ -317,35 +318,42 @@ impl Concatenate for ArrayType {
             if operand.data_type() != first.data_type() {
                 return Err(TypeError {
                     message: format!(
-                        "'concatenate' operands must share one data type but operand {index} has data type {} and \
+                        "'{}' operands must share one data type but operand {} has data type {} and \
                         operand 0 has data type {}",
+                        CONCATENATE_OPERATION_NAME,
+                        index,
                         operand.data_type(),
                         first.data_type(),
                     ),
                 }
                 .into());
             }
+
             if operand.rank() != rank {
                 return Err(TypeError {
                     message: format!(
-                        "'concatenate' operands must share one rank but operand {index} has rank {} and operand 0 has \
+                        "'{}' operands must share one rank but operand {index} has rank {} and operand 0 has \
                         rank {rank}",
+                        CONCATENATE_OPERATION_NAME,
                         operand.rank(),
                     ),
                 }
                 .into());
             }
+
             if operand.memory() != first.memory() {
                 return Err(TypeError {
                     message: format!(
-                        "'concatenate' operands must share one memory space but operand {index} resides in {} and \
+                        "'{}' operands must share one memory space but operand {index} resides in {} and \
                          operand 0 resides in {}",
+                        CONCATENATE_OPERATION_NAME,
                         operand.memory(),
                         first.memory(),
                     ),
                 }
                 .into());
             }
+
             for other_axis in 0..rank {
                 if other_axis == axis {
                     continue;
@@ -355,18 +363,20 @@ impl Concatenate for ArrayType {
                 if dimension != first_dimension {
                     return Err(TypeError {
                         message: format!(
-                            "'concatenate' operands must agree on every axis other than {axis} but operand {index} has \
-                            size {dimension} on axis {other_axis} and operand 0 has size {first_dimension}",
+                            "'{CONCATENATE_OPERATION_NAME}' operands must agree on every axis other than {axis} \
+                            but operand {index} has size {dimension} on axis {other_axis} and operand 0 has size \
+                            {first_dimension}",
                         ),
                     }
                     .into());
                 }
             }
+
             let dimension = operand.dimension(axis);
             match dimension {
                 Size::Static(size) => {
                     concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| TypeError {
-                        message: format!("'concatenate' output size overflows usize on axis {axis}"),
+                        message: format!("'{CONCATENATE_OPERATION_NAME}' output size overflows usize on axis {axis}"),
                     })?;
                     maximum_concatenated_size = maximum_concatenated_size.and_then(|maximum| maximum.checked_add(size));
                 }
@@ -379,6 +389,7 @@ impl Concatenate for ArrayType {
                 }
             }
         }
+
         let concatenated = if concatenated_dynamic {
             // Bounds are exclusive. Sum each operand's maximum possible size, then add one to make the result
             // exclusive as well. If that final addition overflows, retain an unbounded dynamic result.
@@ -389,11 +400,12 @@ impl Concatenate for ArrayType {
         let mut dimensions = first.shape().dimensions().to_vec();
         dimensions[axis] = concatenated;
 
-        // Output sharding follows the independent concatenate rules for spatial placement, unreduced axes, and reduced
-        // axes after applying the standard varying-manual normalization used by the public concatenate capability.
-        // Spatial placement is inferred from operands with a nonempty mesh and must match exactly. Empty reduction
-        // sets are neutral while distinct nonempty sets conflict. Varying-manual axes are normalized to their union;
-        // when that turns an operand's complete reduced set into varying state, its reduced set is cleared first.
+        // Output sharding follows the independent concatenation rules for spatial placement, unreduced axes, and
+        // reduced axes after applying the standard varying-manual normalization used by the public concatenation
+        // capability. Spatial placement is inferred from operands with a nonempty mesh and must match exactly. Empty
+        // reduction sets are neutral while distinct nonempty sets conflict. Varying-manual axes are normalized to
+        // their union; when that turns an operand's complete reduced set into varying state, its reduced set is
+        // cleared first.
         let mut output_sharding: Option<Sharding> = None;
         let mut unreduced_axes: Option<BTreeSet<String>> = None;
         let mut reduced_axes: Option<BTreeSet<String>> = None;
@@ -416,16 +428,15 @@ impl Concatenate for ArrayType {
                 {
                     return Err(TypeError {
                         message: format!(
-                            "'concatenate' cannot make operand varying over axes {added_varying_manual_axes:?} while \
-                             it is reduced or unreduced over any of those axes",
+                            "'{CONCATENATE_OPERATION_NAME}' cannot make operand varying over axes \
+                            {added_varying_manual_axes:?} while it is reduced or unreduced over any of those axes",
                         ),
                     }
                     .into());
                 }
             }
-            let Some(sharding) = operand.sharding() else {
-                continue;
-            };
+
+            let Some(sharding) = operand.sharding() else { continue };
             if sharding.mesh().rank() > 0 {
                 match &output_sharding {
                     None => output_sharding = Some(sharding.clone()),
@@ -434,7 +445,8 @@ impl Concatenate for ArrayType {
                     {
                         return Err(TypeError {
                             message: format!(
-                                "'concatenate' operands must be sharded identically, but got {reference} and {sharding}"
+                                "'{CONCATENATE_OPERATION_NAME}' operands must be sharded identically, \
+                                but got {reference} and {sharding}"
                             ),
                         }
                         .into());
@@ -442,12 +454,15 @@ impl Concatenate for ArrayType {
                     Some(_) => {}
                 }
             }
+
             if !sharding.unreduced_axes().is_empty() {
                 match &unreduced_axes {
                     Some(reference) if reference != sharding.unreduced_axes() => {
                         return Err(TypeError {
-                            message: "'concatenate' operands must be unreduced over the same nonempty axis set"
-                                .to_string(),
+                            message: format!(
+                                "'{CONCATENATE_OPERATION_NAME}' operands must be unreduced \
+                                over the same nonempty axis set",
+                            ),
                         }
                         .into());
                     }
@@ -455,12 +470,15 @@ impl Concatenate for ArrayType {
                     Some(_) => {}
                 }
             }
+
             if !operand_reduced_axes.is_empty() {
                 match &reduced_axes {
                     Some(reference) if reference != &operand_reduced_axes => {
                         return Err(TypeError {
-                            message: "'concatenate' operands must be reduced over the same nonempty axis set"
-                                .to_string(),
+                            message: format!(
+                                "'{CONCATENATE_OPERATION_NAME}' operands must be reduced \
+                                over the same nonempty axis set",
+                            ),
                         }
                         .into());
                     }
@@ -469,6 +487,7 @@ impl Concatenate for ArrayType {
                 }
             }
         }
+
         let output_sharding = output_sharding
             .map(|sharding| {
                 Sharding::new(sharding.mesh().clone(), sharding.dimensions().to_vec())
@@ -478,12 +497,15 @@ impl Concatenate for ArrayType {
             })
             .transpose()
             .map_err(|error| TypeError { message: error.to_string() })?;
+
         ArrayType::new(first.data_type(), Shape::new(dimensions))
             .with_memory(first.memory())
             .with_sharding(output_sharding)
             .map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
+
+// TODO(eaplatanios): Review this.
 
 /// Any context-carrying value concatenates by binding a [`ConcatenateOperation`] through its own context. The
 /// `From<ConcatenateOperation>` bound makes this disjoint from the eager value types (whose context operation is
