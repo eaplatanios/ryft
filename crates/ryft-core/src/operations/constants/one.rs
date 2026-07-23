@@ -149,9 +149,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
+    use crate::operations::constants::ConstantOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
@@ -197,6 +200,20 @@ mod tests {
             ),
             Ok(vec![Scalar::from(1.0)]),
         );
+
+        // A nullary one does not acquire a physical batch axis because the same value serves every batch item.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let outputs: Vec<ArrayBatch<Array>> = OneOperation::new(scalar_type.clone())
+            .batch(
+                &BatchingContext::new(EagerContext::<Array, ConstantOperation<Array>>::new(), 2),
+                &EmptyRegionDriver,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0]);
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();

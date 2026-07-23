@@ -11,9 +11,6 @@ pub mod benchmarking;
 pub mod operations;
 pub mod rematerialization;
 
-#[cfg(test)]
-pub(crate) mod test_util;
-
 pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;

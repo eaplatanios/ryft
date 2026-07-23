@@ -1126,18 +1126,20 @@ mod tests {
 
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
-    use crate::batching::{BatchingTracer, batch};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, LinearizationTracer, jvp, linearize};
+    use crate::differentiation::jacobian::JacobianDifferentiate;
+    use crate::differentiation::{
+        DifferentiationTracer, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize,
+    };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
-    use crate::operations::math::{AddOperation, DivOperation, SinOperation};
+    use crate::operations::math::{AddOperation, DivOperation, MulOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::tracing_v2::test_util::scalar_scale_branch;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -1169,6 +1171,80 @@ mod tests {
             .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a single-input branch that scales its scalar input by `factor`.
+    fn scalar_scale_branch(factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let factor = builder.add_constant(Array::scalar(factor));
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a single-input branch that scales a vector input by `factor`.
+    fn vector_scale_branch(size: usize, factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)])));
+        let factor = builder.add_constant(Array::scalar(factor));
+        let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a vector-input branch that returns a replicated constant vector.
+    fn constant_vector_branch(values: Vec<f64>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())])));
+        let output = builder.add_constant(Array::vector(values));
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Batches a vector-valued condition whose branches scale their input by two and three.
+    fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<Array> {
+        let physical_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size), Size::Static(item_size)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
+        let predicate = ArrayBatch::new(
+            predicate_type.clone(),
+            Array::from_f64s(predicate_type, predicate_values),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let operand =
+            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, input_values), BatchAxis::new(0))
+                .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
+        let mut outputs = context
+            .bind(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![vector_scale_branch(item_size, 2.0), vector_scale_branch(item_size, 3.0)],
+                &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        outputs.remove(0).into_batch()
+    }
+
+    /// Applies a condition whose predicate is computed from `input`, retaining both attached regions during replay.
+    fn stage_runtime_predicate_condition<V: Value<Type = ArrayType>>(input: V) -> Result<V, ProgramError>
+    where
+        V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+    {
+        let context = input.dispatch_domain();
+        let zero = context.lift(Array::scalar(0.0))?;
+        let mut predicates = context.bind(
+            ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
+            Vec::new(),
+            &[input.clone(), zero],
+        )?;
+        let predicate = predicates.remove(0);
+        let mut outputs = context.bind(
+            ArrayOperation::Condition(ConditionOperation::new()),
+            vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+            &[predicate, input],
+        )?;
+        Ok(outputs.remove(0))
     }
 
     #[test]
@@ -1635,6 +1711,49 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![2.0, 12.0, 18.0]);
     }
 
+    #[test]
+    fn test_condition_batching_selects_non_scalar_outputs_per_item() {
+        // The batch size differs from the per-item vector length. The Boolean `[2]` predicate must become `[2, 1]`
+        // before selecting between the `[2, 3]` branch values.
+        let output = batch_vector_condition(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().values(), &[2.0, 4.0, 6.0, 12.0, 15.0, 18.0]);
+
+        // Equal batch and item sizes previously allowed trailing-axis broadcasting to select columns rather than
+        // rows. Pin the row-wise result explicitly.
+        let output = batch_vector_condition(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(output.batch_axis(), BatchAxis::new(0));
+        assert_eq!(output.value().values(), &[2.0, 4.0, 9.0, 12.0]);
+    }
+
+    #[test]
+    fn test_condition_batching_aligns_replicated_and_mapped_branch_outputs() {
+        let batch_size = 2;
+        let item_size = 3;
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate = ArrayBatch::new(
+            predicate_type.clone(),
+            Array::from_f64s(predicate_type, vec![1.0, 0.0]),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, BatchAxis::new(0)).unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
+
+        let outputs = context
+            .bind(
+                ArrayOperation::Condition(ConditionOperation::new()),
+                vec![constant_vector_branch(vec![10.0, 20.0, 30.0]), vector_scale_branch(item_size, 3.0)],
+                &[BatchingTracer::new(context.clone(), predicate), BatchingTracer::new(context.clone(), operand)],
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].batch().value().values(), &[10.0, 20.0, 30.0, 12.0, 15.0, 18.0]);
+    }
+
     /// Effectful branches cannot be batched under a batch-varying predicate: both branches would run for the whole
     /// batch and their observable effects cannot be selected per batch item.
     #[test]
@@ -1727,5 +1846,65 @@ mod tests {
         .unwrap();
         assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
         assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), vec![Scalar::Zero]).unwrap());
+    }
+
+    #[test]
+    fn test_condition_dense_jacobians_replay_runtime_regions() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+
+        let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
+        let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
+        assert_eq!(forward.iter_blocks().next().unwrap().value().values(), &[2.0]);
+        assert_eq!(reverse.iter_blocks().next().unwrap().value().values(), &[2.0]);
+
+        let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
+        let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
+        assert_eq!(forward.iter_blocks().next().unwrap().value().values(), &[3.0]);
+        assert_eq!(reverse.iter_blocks().next().unwrap().value().values(), &[3.0]);
+    }
+
+    #[test]
+    fn test_condition_vjp_selects_runtime_branch_cotangents() {
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(
+                |(predicate, operand)| {
+                    let mut outputs = predicate.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+                        &[predicate.clone(), operand],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]), Array::scalar(4.0)),
+            )
+            .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
+        let mut pullback_inputs = vec![Array::scalar(5.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(output.to_f64s(), vec![8.0]);
+        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
+        assert_eq!(cotangents[1].to_f64s(), vec![10.0]);
+
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(
+                |(predicate, operand)| {
+                    let mut outputs = predicate.context().bind(
+                        ArrayOperation::Condition(ConditionOperation::new()),
+                        vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
+                        &[predicate.clone(), operand],
+                    )?;
+                    Ok(outputs.remove(0))
+                },
+                (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]), Array::scalar(4.0)),
+            )
+            .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
+        let mut pullback_inputs = vec![Array::scalar(5.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(output.to_f64s(), vec![12.0]);
+        assert_eq!(cotangents[0].values(), &[Scalar::Zero]);
+        assert_eq!(cotangents[1].to_f64s(), vec![15.0]);
     }
 }

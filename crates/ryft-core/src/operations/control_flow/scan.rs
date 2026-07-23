@@ -2205,7 +2205,9 @@ mod tests {
     use crate::backends::arrays::{Array, ArrayOperation};
     use crate::batching::{BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{LinearizationTracer, jvp, linearize, vjp};
+    use crate::differentiation::hessian::HessianDifferentiate;
+    use crate::differentiation::jacobian::JacobianDifferentiate;
+    use crate::differentiation::{LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, vjp};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::operations::math::{AddOperation, DivOperation, MulOperation};
@@ -2250,6 +2252,19 @@ mod tests {
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Applies the three-iteration cumulative-product scan and returns its final carry.
+    fn stage_product_scan<V: Value<Type = ArrayType>>(initial: V, values: V) -> Result<V, ProgramError>
+    where
+        V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
+    {
+        let mut outputs = initial.dispatch_domain().bind(
+            ArrayOperation::Scan(ScanOperation::new(1, 3)),
+            vec![product_body()],
+            &[initial.clone(), values],
+        )?;
+        Ok(outputs.remove(0))
     }
 
     #[test]
@@ -2522,6 +2537,81 @@ mod tests {
         .unwrap();
         assert_eq!(final_carry, Array::scalar(24.0));
         assert_eq!(pullback.apply(Array::scalar(1.0)), Ok((Array::scalar(24.0), Array::vector(vec![12.0, 8.0, 6.0]))),);
+    }
+
+    #[test]
+    fn test_scan_vjp_stages_reusable_reversed_scan_pullback() {
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(
+                |(initial, values)| stage_product_scan(initial, values),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
+        assert_eq!(output.to_f64s(), vec![24.0]);
+        let rendered_pullback = pullback.to_string();
+        assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
+        assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
+
+        let mut pullback_inputs = vec![Array::scalar(1.0)];
+        pullback_inputs.extend(residuals.iter().cloned());
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(cotangents[0].to_f64s(), vec![24.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![12.0, 8.0, 6.0]);
+
+        let mut pullback_inputs = vec![Array::scalar(2.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(cotangents[0].to_f64s(), vec![48.0]);
+        assert_eq!(cotangents[1].to_f64s(), vec![24.0, 16.0, 12.0]);
+    }
+
+    #[test]
+    fn test_scan_dense_jacobians_replay_body_region() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
+        let forward = context
+            .jacobian_forward(|(initial, values)| stage_product_scan(initial, values), primals.clone())
+            .unwrap();
+        let reverse =
+            context.jacobian_reverse(|(initial, values)| stage_product_scan(initial, values), primals).unwrap();
+
+        let blocks = forward.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().values(), &[24.0]);
+        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+
+        let blocks = reverse.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].value().values(), &[24.0]);
+        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+    }
+
+    #[test]
+    fn test_scan_hessian_replays_body_region() {
+        // For `f(initial, values) = initial * product(values)`, same-variable second derivatives vanish. Mixed
+        // derivatives with `initial` are products excluding the corresponding value, while mixed derivatives between
+        // values are `initial` times the remaining value.
+        let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .hessian(
+                |(initial, values)| stage_product_scan(initial, values),
+                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+            )
+            .unwrap();
+
+        let blocks = hessian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].value().values(), &[0.0]);
+        assert_eq!(blocks[1].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(blocks[2].value().values(), &[12.0, 8.0, 6.0]);
+        assert_eq!(
+            blocks[3].value().values(),
+            &[
+                0.0, 4.0, 3.0, //
+                4.0, 0.0, 2.0, //
+                3.0, 2.0, 0.0, //
+            ],
+        );
     }
 
     /// A zero-length scan runs no iteration, so partial evaluation must not probe its body: a body whose known-side

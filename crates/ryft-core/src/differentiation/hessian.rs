@@ -729,11 +729,13 @@ mod tests {
 
     use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
+    use crate::differentiation::jacobian::jacobian_forward;
     use crate::operations::math::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::types::Typed;
     use crate::types::DataType;
     use crate::types::DataType::{F32, F64};
+    use crate::types::{ArrayType, Shape, Size};
 
     use super::*;
 
@@ -781,6 +783,21 @@ mod tests {
         assert_abs_diff_eq!(blocks[1].value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(blocks[2].value().values()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(blocks[3].value().values()[0], 0.0, epsilon = 1e-9);
+
+        // Narrow primal element types use their widened differential representation for dense Hessian blocks.
+        let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
+        let widened_hessian = hessian(|value| value.sin(), input).unwrap();
+        let block = widened_hessian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
+        assert_abs_diff_eq!(block.value().values()[0], -2.0f64.sin(), epsilon = 1e-6);
+
+        // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
+        let r#type = ArrayType::new(F64, Shape::new(vec![Size::Static(0)]));
+        let zero_sized_hessian =
+            hessian(|input| Ok(input.clone() * input), Array::from_f64s(r#type, Vec::new())).unwrap();
+        let block = zero_sized_hessian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().r#type().static_shape().unwrap().as_slice(), &[0, 0, 0]);
+        assert!(block.value().values().is_empty());
 
         // Structured outputs retain a distinct Hessian block for each output leaf.
         let structured_hessian =
@@ -858,5 +875,24 @@ mod tests {
             &[Scalar::C64(ComplexNumber::new(12.0, 6.0))],
         );
         assert_eq!(auxiliary.values(), input.values());
+    }
+
+    #[test]
+    fn test_hessian_nested_in_jacobian_forward() {
+        // For f(x) = x³, the Hessian is f″(x) = 6x. Differentiating that materialized Hessian with a forward
+        // Jacobian computes the third derivative f‴(x) = 6.
+        let derivative = jacobian_forward(
+            |input| {
+                let hessian = input
+                    .context()
+                    .clone()
+                    .hessian(|value| Ok(value.clone() * value.clone() * value), input)
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                Ok(hessian.into_values().remove(0))
+            },
+            Array::scalar(2.0),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().values()[0], 6.0, epsilon = 1e-9);
     }
 }

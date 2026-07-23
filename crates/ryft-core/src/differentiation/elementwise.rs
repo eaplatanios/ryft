@@ -419,12 +419,16 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::backends::arrays::Array;
+    use crate::backends::arrays::{Array, ArrayOperation};
     use crate::backends::scalars::Scalar;
+    use crate::contexts::EagerContext;
+    use crate::differentiation::reverse::ReverseModeDifferentiate;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::manipulation::ConvertElementType;
     use crate::operations::math::{AddOperation, SinOperation};
     use crate::programs::atoms::MaybeZero;
+    use crate::programs::types::Typed;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -725,5 +729,30 @@ mod tests {
             ),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 })),
         ));
+    }
+
+    #[test]
+    fn test_binary_elementwise_vjp_restores_each_input_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap();
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (output, pullback) = context
+            .vjp(
+                |(left, right)| Ok(left + right),
+                (
+                    Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
+                    Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]),
+                ),
+            )
+            .unwrap();
+        assert!(pullback.program().to_string().contains("reshard"));
+        let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
+        assert_eq!(left.r#type().as_ref(), &sharded_type);
+        assert_eq!(right.r#type().as_ref(), &replicated_type);
     }
 }

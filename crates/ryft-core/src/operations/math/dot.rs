@@ -2011,8 +2011,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::{Array, ArrayOperation};
-    use crate::batching::{BatchAxis, batch};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
@@ -3388,6 +3389,43 @@ mod tests {
         for (actual, expected) in output.to_f64s().iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
         }
+
+        // A replicated operand is broadcast across the mapped operand's batch axis before the dot dimensions are
+        // lifted. Each row therefore contracts against the same right-hand vector.
+        let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let lhs = ArrayBatch::new(lhs.r#type().into_owned(), lhs, BatchAxis::new(0)).unwrap();
+        let rhs = ArrayBatch::replicated(Array::vector(vec![10.0, 100.0, 1000.0]));
+        let outputs = DotOperation::new(DotDimensionNumbers::inner_product())
+            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().to_f64s(), vec![3210.0, 6540.0]);
+    }
+
+    #[test]
+    fn test_dot_dense_jacobians() {
+        let inputs = (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0]));
+
+        // Reverse mode batches the pullback's adjoint dots over output-coordinate cotangents.
+        let jacobian = jacobian_reverse(
+            |(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())),
+            inputs.clone(),
+        )
+        .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [left, right] = blocks.as_slice() else { unreachable!() };
+        assert_eq!(left.value().to_f64s(), vec![7.0, 11.0, 13.0]);
+        assert_eq!(right.value().to_f64s(), vec![2.0, 3.0, 5.0]);
+
+        // Forward mode batches input-coordinate basis tangents through the dot pushforward.
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())), inputs)
+            .unwrap();
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        let [left, right] = blocks.as_slice() else { unreachable!() };
+        assert_eq!(left.value().to_f64s(), vec![7.0, 11.0, 13.0]);
+        assert_eq!(right.value().to_f64s(), vec![2.0, 3.0, 5.0]);
     }
 
     #[test]
