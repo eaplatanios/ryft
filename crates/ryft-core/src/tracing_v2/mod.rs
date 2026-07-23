@@ -10,8 +10,6 @@ pub mod benchmarking;
 /// `Supports*` bundles.
 pub mod operations;
 pub mod rematerialization;
-#[cfg(test)]
-pub(crate) mod unroll;
 
 #[cfg(test)]
 pub(crate) mod test_util;
@@ -19,7 +17,6 @@ pub(crate) mod test_util;
 pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
-pub use operations::RecomputeOperation;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
