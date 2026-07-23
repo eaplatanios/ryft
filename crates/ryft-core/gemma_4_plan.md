@@ -541,7 +541,7 @@ use ryft_core::tracing_v2::operations::{
     BroadcastInDim, Concatenate, Dot, DotDimensionNumbers, Gather, GatherDimensionNumbers, Iota,
     Pad, Reduce, ReduceKind, Reshape, Select, Slice, Transpose,
 };
-use ryft_core::types::{ArrayType, DataType, Shape, Size};
+use ryft_core::types::{ArrayType, DataType, Shape};
 
 /// `x * rsqrt(mean(x*x, axis=-1, keepdims=true) + epsilon) * (1 + scale)`.
 pub fn rms_norm<V: Reduce + Mul + Rsqrt + Add + BroadcastInDim + Clone>(
