@@ -491,11 +491,11 @@ macro_rules! define_jacobian_auxiliary_function {
 }
 
 define_jacobian_function!(
-    /// Materializes the complete [`Jacobian`] of `function` at `primals` using forward-mode differentiation.
+    /// Computes the complete [`Jacobian`] of `function` at `primals` using forward-mode differentiation.
     /// For `y = f(x)`, the Jacobian is the linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This function
     /// linearizes `function` once, applies the resulting [`Pushforward`](crate::Pushforward) to a packed basis of the
     /// finite input coordinate space, and assembles the resulting columns into a [`Jacobian`]. Each block corresponds
-    /// to one output leaf and one input leaf; array blocks place the output axes before the input axes.
+    /// to one output parameter and one input parameter; array blocks place the output axes before the input axes.
     /// [`jacobian_reverse`] produces the same representation by applying the transposed map and is generally
     /// preferable when the output coordinate space is smaller.
     ///
@@ -521,10 +521,10 @@ define_jacobian_function!(
 );
 
 define_jacobian_function!(
-    /// Materializes the forward-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
+    /// Computes the forward-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
     /// the algorithm and representation described by [`jacobian_forward`], but treats the derivative as complex linear
-    /// and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
-    /// holomorphy; the function validates the leaf types but cannot prove that the function satisfies the
+    /// and requires every differentiated input and output parameter to be complex. Passing `function` is a promise of
+    /// holomorphy; this function validates the parameter types but cannot prove that the function satisfies the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
     /// # Parameters
@@ -545,10 +545,15 @@ define_jacobian_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Materializes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// Computes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
     /// `(output, auxiliary)`. Only `output` contributes to the Jacobian. `auxiliary` is materialized from its primal
     /// trace and returned with it. Refer to [`jacobian_forward`] for the mathematical interpretation, block layout,
     /// context recovery, and ordinary complex-type rules.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
     jacobian_forward_with_aux,
     operation_bounds = [
         PartiallyEvaluatableOperation<V::ExecutionDomain>
@@ -563,9 +568,14 @@ define_jacobian_auxiliary_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Materializes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// Computes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
     /// closure and auxiliary-output behavior are described by [`jacobian_forward_with_aux`]. The holomorphy promise
     /// and complex-type requirements are the same as for [`jacobian_forward_holomorphic`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
     jacobian_forward_holomorphic_with_aux,
     operation_bounds = [
         PartiallyEvaluatableOperation<V::ExecutionDomain>
@@ -580,7 +590,7 @@ define_jacobian_auxiliary_function!(
 );
 
 define_jacobian_function!(
-    /// Materializes the complete [`Jacobian`] of `function` at `primals` using reverse-mode differentiation.
+    /// Computes the complete [`Jacobian`] of `function` at `primals` using reverse-mode differentiation.
     /// For `y = f(x)`, the pullback maps an output cotangent `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This
     /// function constructs that [`Pullback`](crate::Pullback) once, applies it to a packed basis of the finite output
     /// coordinate space, and reorients the resulting rows into the same output-major/input-minor [`Jacobian`]
@@ -615,10 +625,10 @@ define_jacobian_function!(
 );
 
 define_jacobian_function!(
-    /// Materializes the reverse-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
+    /// Computes the reverse-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
     /// the algorithm and representation described by [`jacobian_reverse`], but treats the derivative as complex linear
-    /// and requires every differentiated input and output leaf to be complex. Passing `function` is a promise of
-    /// holomorphy; the function validates the leaf types but cannot prove that the function satisfies the
+    /// and requires every differentiated input and output parameter to be complex. Passing `function` is a promise of
+    /// holomorphy; this function validates the parameter types but cannot prove that the function satisfies the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
     /// # Parameters
@@ -645,10 +655,15 @@ define_jacobian_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Materializes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// Computes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
     /// `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is materialized from its primal
     /// trace and returned with it. Refer to [`jacobian_reverse`] for the mathematical interpretation, block layout,
     /// context recovery, and ordinary complex-type rules.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
     jacobian_reverse_with_aux,
     operation_bounds = [
         PartiallyEvaluatableOperation<V::ExecutionDomain>
@@ -669,9 +684,14 @@ define_jacobian_auxiliary_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// Computes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
     /// closure and auxiliary-output behavior are described by [`jacobian_reverse_with_aux`]. The holomorphy promise
     /// and complex-type requirements are the same as for [`jacobian_reverse_holomorphic`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
+    ///   - `primals`: Structured complex input values specifying the linearization point.
     jacobian_reverse_holomorphic_with_aux,
     operation_bounds = [
         PartiallyEvaluatableOperation<V::ExecutionDomain>
