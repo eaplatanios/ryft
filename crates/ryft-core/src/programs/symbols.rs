@@ -18,8 +18,9 @@ use crate::programs::types::{Type, TypeError};
 ///      metadata without capturing unrelated scopes.
 ///   4. Runtime refinement can associate an authorized expression with a concrete [`Witness`](Self::Witness).
 ///   5. The closed [`RegionSymbolSignature`] is converted to a scope-independent [`Signature`](Self::Signature),
-///      allowing alpha-equivalent region instantiations to be recognized even when their local binder identities
-///      or diagnostic names differ.
+///      allowing two region instantiations to be recognized as the same even when their variables have different
+///      identities or names (refer to the [`Signature`](Self::Signature) documentation for more information on
+///      this kind of _alpha normalization_).
 ///
 /// Type families without symbolic metadata use the dummy [`NoSymbols`] vocabulary.
 ///
@@ -58,21 +59,17 @@ use crate::programs::types::{Type, TypeError};
 ///
 /// The remaining two associated types do not usually appear in user code. A [`Constraint`](Self::Constraint)
 /// such as "`batch` is divisible by 4" is declared once on a scope via
-/// [`DimensionScope::with_constraints`](crate::DimensionScope::with_constraints) and retained by region closure,
-/// and the alpha-normalized [`Signature`](Self::Signature) is computed internally so that two regions that bind,
-/// say, `batch` and `n` in structurally identical ways are recognized as the same instantiation and share one
-/// imported copy.
+/// [`DimensionScope::with_constraints`](crate::DimensionScope::with_constraints) and retained by region closure, and
+/// a [`Signature`](Self::Signature) identity is computed internally by consistently renaming variables to canonical
+/// placeholders, so that a region declared over `batch` and one declared over `n` (identical except for that name)
+/// are recognized as the same instantiation and share one imported copy.
 pub trait Symbols: Sized {
-    // TODO(eaplatanios): Review from here onwards.
-    
-    /// Identity of one scoped symbolic binder.
-    ///
-    /// A variable identifies a symbolic unknown; it is neither an expression nor the concrete value eventually
-    /// associated with that unknown. Equality should preserve whatever scope or binder identity the vocabulary needs
-    /// for capture avoidance. For [`DimensionSymbols`](crate::DimensionSymbols), this is
-    /// [`DimensionVariable`](crate::DimensionVariable): its scope and ordinal are semantic, its optional name is only
-    /// diagnostic, and a runtime array extent such as `8usize` is not a variable.
+    /// Identity of one scoped symbolic binder. A variable identifies a symbolic unknown. It is neither an expression
+    /// nor the concrete value eventually associated with that unknown. Equality should preserve whatever scope or
+    /// binder identity the vocabulary needs for capture avoidance.
     type Variable: Clone + Debug + Display + PartialEq;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Symbolic metadata expression composed from variables and constants.
     ///
@@ -99,13 +96,17 @@ pub trait Symbols: Sized {
     /// residual constraints against concrete bindings.
     type Constraint: Clone + Debug + PartialEq;
 
-    /// Hashable, scope-independent alpha-normalized identity of a complete closed symbolic signature.
+    /// Hashable identity of a complete closed symbolic signature, independent of variable identities and names.
     ///
-    /// Two signatures may use distinct scope objects and names such as `rows` and `n` yet receive equal keys when
-    /// renaming those binders makes their complete semantics identical. A key accounts for the vocabulary's relevant
-    /// binder source classes, bounds, runtime source declarations, and retained constraints—not merely the expressions'
-    /// rendered text. Program import uses this identity to decide whether a previously imported symbolic region
-    /// instantiation can be reused safely.
+    /// The identity is *alpha-normalized*: every variable is consistently renamed to a canonical placeholder (for
+    /// example, numbered in first-occurrence order) before the identity is computed, so neither what a variable is
+    /// called nor which scope object owns it can influence the result. The name comes from the λ-calculus notion of
+    /// [alpha equivalence](https://en.wikipedia.org/wiki/Lambda_calculus#%CE%B1-conversion), under which `λx. x` and
+    /// `λy. y` denote the same function because they differ only in the name of the bound variable. Concretely, a
+    /// signature declaring `rows` and one declaring `n` receive equal keys when, after that renaming, their binder
+    /// source classes, bounds, runtime source declarations, and retained constraints also match — the key captures
+    /// the complete semantics of the signature, not merely the expressions' rendered text. Program import uses this
+    /// identity to decide whether a previously imported symbolic region instantiation can be reused safely.
     type Signature: Clone + Debug + PartialEq + Eq + Hash;
 
     /// Concrete host representation of a compiler-authorized runtime symbolic witness.
@@ -140,7 +141,9 @@ pub trait Symbols: Sized {
         substitution: &Self::Substitution,
     ) -> Result<RegionSymbolSignature<Self>, TypeError>;
 
-    /// Computes the scope-independent alpha-normalized identity of `signature`.
+    /// Computes the scope-independent identity of `signature` by consistently renaming its variables to canonical
+    /// placeholders. Refer to the documentation of [`Signature`](Self::Signature) for more information on this
+    /// alpha normalization.
     fn alpha_normalized_key(signature: &RegionSymbolSignature<Self>) -> Result<Self::Signature, TypeError>;
 }
 
