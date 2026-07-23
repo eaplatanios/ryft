@@ -275,8 +275,8 @@ macro_rules! define_jacobian_auxiliary_function_in_trait {
 /// Below we provide a cost model that drives the decision of when to use forward-mode or reverse-mode differentiation
 /// for computing a [`Jacobian`]. The cost model uses the following notation:
 ///
-///   - `n`: Total input coordinate-space dimension.
-///   - `m`: Total output coordinate-space dimension.
+///   - `n`: Total input coordinate-space dimension size.
+///   - `m`: Total output coordinate-space dimension size.
 ///   - `T_linearize`: One-time computation needed to evaluate the primal function and construct its pushforward.
 ///   - `T_pushforward`: Computation needed to propagate one input basis tangent through the constructed pushforward.
 ///   - `T_vjp`: One-time computation needed to evaluate the primal function and construct its pullback.

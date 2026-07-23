@@ -324,14 +324,41 @@ macro_rules! define_hessian_auxiliary_function_in_trait {
     };
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Extension trait for materializing dense Hessians in an execution or staging [`Context`].
+/// Extension trait carrying the value-level *Hessian* differentiation transforms on every [`Context`], mirroring
+/// how [`JacobianDifferentiate`](crate::JacobianDifferentiate) carries *Jacobian* differentiation transforms.
+/// Implementations enumerate every finite input and output coordinate and return structured second-derivative blocks.
+/// For a structured function `y = f(x)`, these methods materialize every block of `H_f(x) = ∂J_f(x)/∂x`, where
+/// `H_f(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. The inner reverse transform constructs `J_f(x)` by applying the
+/// [`Pullback`](crate::Pullback) to packed output-coordinate basis cotangents, and the outer forward transform
+/// differentiates every Jacobian entry by applying its [`Pushforward`](crate::Pushforward) to packed input-coordinate
+/// basis tangents. The result uses the output-major/first-input-major/second-input-minor [`Hessian`] representation.
 ///
-/// For a structured function `y = f(x)`, these methods materialize every block of the derivative of the Jacobian,
-/// `H_f(x) = ∂J_f/∂x`, using forward-over-reverse differentiation. The inner reverse transform constructs `J_f(x)`;
-/// the outer forward transform differentiates every one of its entries. Ordinary variants require real input and
-/// output leaves, while holomorphic variants require every differentiated leaf to be complex.
+/// Below we provide a cost model for computing a [`Hessian`] using this forward-over-reverse decomposition.
+/// The cost model uses the following notation:
+///
+///   - `n`: Total input coordinate-space dimension size.
+///   - `m`: Total output coordinate-space dimension size.
+///   - `T_inner_vjp`: One-time computation needed to evaluate the primal function and construct the inner pullback.
+///   - `T_inner_pullback`: Computation needed to propagate one output basis cotangent through the inner pullback.
+///   - `T_outer_linearize`: Additional one-time computation needed to linearize the inner reverse-Jacobian
+///     materialization and construct the outer pushforward.
+///   - `T_outer_pushforward`: Computation needed to propagate one input basis tangent through the outer pushforward,
+///     including its differentiated inner reverse-mode work.
+///   - `R_hessian`: Memory occupied by nested linearization residuals shared by all packed outer tangent directions.
+///   - `M_inner_pullback`: Additional peak intermediate memory needed by one inner pullback direction.
+///   - `M_outer_pushforward`: Additional peak intermediate memory needed by one outer pushforward direction.
+///
+/// The inner reverse transform evaluates an `m`-way packed pullback, and the outer forward transform evaluates
+/// an `n`-way packed pushforward through that reverse-Jacobian computation. The derivative work is approximately
+/// `O(T_inner_vjp + m · T_inner_pullback + T_outer_linearize + n · T_outer_pushforward)`, and the working memory
+/// excluding the result is approximately `O(R_hessian + m · M_inner_pullback + n · M_outer_pushforward)`. The
+/// materialized Hessian itself requires the unavoidable `Θ(mn²)` memory. This decomposition is particularly well
+/// suited to scalar-output functions where `m = 1`. In that case, reverse mode constructs the gradient with one
+/// output cotangent direction, and forward mode differentiates that square input-to-gradient map. Packing may
+/// execute directions in parallel but does not change these total-work or storage scalings.
+///
+/// Ordinary variants require every differentiated input and output parameter to be real. Holomorphic variants require
+/// every differentiated parameter to be complex and treat both nested transforms as complex linear.
 pub trait HessianDifferentiate:
     Context<
         Type: DenseDifferentiableType<Self> + DenseDifferentiableType<NestedDenseContext<Self>>,
@@ -349,29 +376,29 @@ pub trait HessianDifferentiate:
     >
 {
     define_hessian_function_in_trait!(
-        /// Materializes the complete output/input/input Hessian using forward-over-reverse differentiation. Refer to
-        /// [`hessian`] for the mathematical interpretation and representation.
+        /// Materializes the complete [`Hessian`] using forward-over-reverse differentiation.
+        /// Refer to [`hessian`] for the mathematical interpretation and representation.
         hessian,
         delegate = hessian_with_aux,
     );
 
     define_hessian_function_in_trait!(
-        /// Materializes the complete holomorphic Hessian using forward-over-reverse differentiation. Refer to
-        /// [`hessian_holomorphic`] for the holomorphy contract.
+        /// Materializes the complete holomorphic [`Hessian`] using forward-over-reverse differentiation.
+        /// Refer to [`hessian_holomorphic`] for the holomorphy contract.
         hessian_holomorphic,
         delegate = hessian_holomorphic_with_aux,
     );
 
     define_hessian_auxiliary_function_in_trait!(
-        /// Materializes the complete Hessian and returns nondifferentiated auxiliary outputs. Refer to
-        /// [`hessian_with_aux`] for details.
+        /// Materializes the complete [`Hessian`] and returns nondifferentiated auxiliary outputs.
+        /// Refer to [`hessian_with_aux`] for details.
         hessian_with_aux,
         holomorphic = false,
     );
 
     define_hessian_auxiliary_function_in_trait!(
-        /// Materializes the complete holomorphic Hessian and returns nondifferentiated auxiliary outputs. Refer to
-        /// [`hessian_holomorphic_with_aux`] for details.
+        /// Materializes the complete holomorphic [`Hessian`] and returns nondifferentiated auxiliary outputs.
+        /// Refer to [`hessian_holomorphic_with_aux`] for details.
         hessian_holomorphic_with_aux,
         holomorphic = true,
     );
@@ -393,6 +420,8 @@ where
         + From<AddOperation>,
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Nested differentiation context used by the inner reverse-mode Jacobian of a forward-over-reverse Hessian.
 pub(super) type NestedDenseContext<C> = DifferentiationContext<PartialEvaluationContext<C>>;
