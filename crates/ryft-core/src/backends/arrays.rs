@@ -1341,11 +1341,16 @@ impl Transpose for Array {
 }
 
 impl Reshape for Array {
-    fn reshape(&self, target_shape: Shape) -> Result<Self, ProgramError> {
-        // Delegate to the type-level reshape so that element-count mismatches and dynamic target shapes surface the
-        // canonical reshape errors instead of panicking, and reinterpret the row-major payload under the result.
-        let output_type = self.r#type.reshape(target_shape)?;
-        Ok(Self { r#type: output_type, values: self.values.clone() })
+    fn reshape_with(&self, operation: &ReshapeOperation) -> Result<Self, ProgramError> {
+        // Resolve runtime dimension expressions from the concrete eager input shape, then delegate to the type-level
+        // reshape so all element-count and sharding validation remains shared with staged execution.
+        let operation = operation.resolve_target(self.r#type.shape())?;
+        let output_type = self.r#type.reshape_with(&operation)?;
+        let values = match operation.dimensions() {
+            Some(dimensions) => self.transpose(dimensions)?.values,
+            None => self.values.clone(),
+        };
+        Ok(Self { r#type: output_type, values })
     }
 }
 

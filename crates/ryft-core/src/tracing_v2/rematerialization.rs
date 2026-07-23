@@ -1983,10 +1983,10 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Memory, Shape, Size};
 
     /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.

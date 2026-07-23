@@ -26,6 +26,7 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::hessian::HessianDifferentiate;
     use crate::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
+    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
@@ -36,7 +37,6 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{Shape, Size};
 
     use super::*;

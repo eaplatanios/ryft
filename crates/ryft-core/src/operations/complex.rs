@@ -592,7 +592,7 @@ mod tests {
         // 2·z̄ — the same value JAX's `grad` returns for real-valued functions of complex inputs.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let gradient =
-            crate::tracing_v2::gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap(), Scalar::from(z))
+            crate::differentiation::gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap(), Scalar::from(z))
                 .unwrap();
         assert_eq!(gradient, Scalar::from(z.conj() + z.conj()));
 

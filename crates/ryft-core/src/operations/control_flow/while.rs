@@ -1785,6 +1785,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::differentiation::{LinearizationTracer, jvp, linearize, value_and_gradient, vjp};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
@@ -1792,7 +1793,6 @@ mod tests {
     use crate::operations::math::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{Shape, Size};
 
     use super::*;

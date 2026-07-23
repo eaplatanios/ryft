@@ -2322,10 +2322,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{Context, StagingContext};
+    use crate::differentiation::forward::ForwardModeDifferentiate;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::tracing::Trace;
-    use crate::tracing_v2::ForwardModeDifferentiate;
 
     use super::*;
 
