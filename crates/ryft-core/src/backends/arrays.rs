@@ -47,7 +47,7 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::debugging::PrintOperation;
-use crate::operations::differentiation::{CoordinateBasisOperation, StopGradientOperation};
+use crate::operations::differentiation::{CoordinateBasisOperation, StopGradient, StopGradientOperation};
 use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::manipulation::conversion::ElementType;
 use crate::operations::manipulation::{
@@ -490,6 +490,13 @@ impl<O: Operation<ArrayType>> One<Array> for EagerContext<Array, O> {
 impl OneLike for Array {
     fn one_like(&self) -> Self {
         Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value.one_like()).collect() }
+    }
+}
+
+impl StopGradient for Array {
+    #[inline]
+    fn stop_gradient(&self) -> Self {
+        self.clone()
     }
 }
 
@@ -1512,24 +1519,65 @@ impl Pad for Array {
     fn pad(
         &self,
         padding_value: &Self,
-        edge_padding_low: &[usize],
-        edge_padding_high: &[usize],
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
         let output_type =
             self.r#type.pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
         let input_shape = self.r#type.static_shape().unwrap();
+        if edge_padding_low.iter().all(|padding| *padding == 0)
+            && edge_padding_high.iter().all(|padding| *padding == 0)
+            && input_shape
+                .dimensions()
+                .iter()
+                .zip(interior_padding)
+                .all(|(size, padding)| *padding == 0 || *size <= 1)
+        {
+            return Ok(self.clone());
+        }
         let output_shape = output_type.static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
         let rank = input_shape.rank();
         let mut values = vec![padding_value.values[0]; Self::element_count(&output_type)];
         let mut input_index = vec![0usize; rank];
         let mut written = 0usize;
-        while written < self.values.len() {
+        'elements: while written < self.values.len() {
             let mut output_flat = 0usize;
             for axis in 0..rank {
-                output_flat +=
-                    (edge_padding_low[axis] + input_index[axis] * (interior_padding[axis] + 1)) * output_strides[axis];
+                let input_coordinate = i128::try_from(input_index[axis])
+                    .map_err(|_| TypeError { message: format!("'pad' input index is too large on axis {axis}") })?;
+                let stride = i128::try_from(interior_padding[axis])
+                    .ok()
+                    .and_then(|padding| padding.checked_add(1))
+                    .ok_or_else(|| TypeError { message: format!("'pad' stride is too large on axis {axis}") })?;
+                let output_index =
+                    i128::from(edge_padding_low[axis])
+                        .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| TypeError {
+                            message: format!("'pad' output index overflows on axis {axis}"),
+                        })?)
+                        .ok_or_else(|| TypeError { message: format!("'pad' output index overflows on axis {axis}") })?;
+                let output_extent = i128::try_from(output_shape[axis])
+                    .map_err(|_| TypeError { message: format!("'pad' output extent is too large on axis {axis}") })?;
+                if output_index < 0 || output_index >= output_extent {
+                    written += 1;
+                    for position in (0..rank).rev() {
+                        input_index[position] += 1;
+                        if input_index[position] < input_shape[position] {
+                            break;
+                        }
+                        input_index[position] = 0;
+                    }
+                    continue 'elements;
+                }
+                let output_index = usize::try_from(output_index)
+                    .map_err(|_| TypeError { message: format!("'pad' output index is too large on axis {axis}") })?;
+                output_flat =
+                    output_flat
+                        .checked_add(output_index.checked_mul(output_strides[axis]).ok_or_else(|| TypeError {
+                            message: format!("'pad' output index overflows on axis {axis}"),
+                        })?)
+                        .ok_or_else(|| TypeError { message: format!("'pad' output index overflows on axis {axis}") })?;
             }
             values[output_flat] = self.values[written];
             written += 1;

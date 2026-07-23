@@ -1997,9 +1997,9 @@ mod tests {
     use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt};
+    use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::ReverseModeDifferentiate;
     use ryft_core::types::data_types::DataType;
 
     use super::*;

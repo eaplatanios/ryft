@@ -17,13 +17,14 @@ use ryft_core::compilation::{
     jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_core::contexts::Context;
-use ryft_core::differentiation::{DifferentiableType, DifferentiationError};
+use ryft_core::differentiation::{
+    DifferentiableType, DifferentiationError, ForwardModeDifferentiate, ReverseModeDifferentiate,
+};
 use ryft_core::operations::constants::Constant;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::DeviceMesh;
 use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::ArrayType;
 use ryft_core::{Batch, LinearizationTracer, Typed};
 use ryft_pjrt::Execution;
@@ -887,6 +888,9 @@ mod tests {
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::contexts::{Context, EagerContext};
     use ryft_core::differentiation::DifferentiableType;
+    use ryft_core::differentiation::hessian::{Hessian, HessianDifferentiate};
+    use ryft_core::differentiation::jacobian::{Jacobian, JacobianDifferentiate};
+    use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::constants::{Fill, Iota, OneLike, ZeroLike};
     use ryft_core::operations::control_flow::{Select, WhileOperation};
@@ -903,10 +907,6 @@ mod tests {
     use ryft_core::programs::{ProgramError, Value};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
-    use ryft_core::tracing_v2::{
-        ForwardModeDifferentiate, Hessian, HessianDifferentiate, Jacobian, JacobianDifferentiate,
-        ReverseModeDifferentiate,
-    };
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};

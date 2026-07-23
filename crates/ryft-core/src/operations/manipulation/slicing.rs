@@ -154,8 +154,9 @@ impl SliceOperation {
 
     /// Uses the input's runtime extent as the limit for each axis in `axes`.
     ///
-    /// This internal form represents a full slice of a dynamic dimension. Every selected axis must have start index
-    /// `0` and unit stride; its stored static limit is ignored.
+    /// This internal form represents a slice from zero through a dynamic dimension's runtime extent. Every selected
+    /// axis must have start index `0`; its stored static limit is ignored and its stride is applied to the runtime
+    /// extent.
     pub(crate) fn with_full_extent_axes(mut self, axes: impl IntoIterator<Item = usize>) -> Result<Self, ProgramError> {
         for axis in axes {
             if axis >= self.start_indices.len() {
@@ -167,11 +168,10 @@ impl SliceOperation {
                 }
                 .into());
             }
-            if self.start_indices[axis] != 0 || self.strides[axis] != 1 {
-                return Err(TypeError {
-                    message: format!("'slice' full-extent axis {axis} must have start index 0 and stride 1"),
-                }
-                .into());
+            if self.start_indices[axis] != 0 {
+                return Err(
+                    TypeError { message: format!("'slice' full-extent axis {axis} must have start index 0") }.into()
+                );
             }
             self.full_extent_axes.insert(axis);
         }
@@ -233,14 +233,24 @@ impl Operation<ArrayType> for SliceOperation {
                     self.start_indices.iter().zip(self.limit_indices.iter()).zip(self.strides.iter()).enumerate()
                 {
                     if self.full_extent_axes.contains(&axis) {
-                        if start != 0 || stride != 1 {
+                        if start != 0 {
                             return Err(TypeError {
-                                message: format!(
-                                    "'slice' full-extent axis {axis} must have start index 0 and stride 1"
-                                ),
+                                message: format!("'slice' full-extent axis {axis} must have start index 0"),
                             });
                         }
-                        output_dimensions.push(input_type.dimension(axis));
+                        if stride == 0 {
+                            return Err(TypeError {
+                                message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
+                            });
+                        }
+                        output_dimensions.push(match input_type.dimension(axis) {
+                            Size::Static(size) => Size::Static(size.div_ceil(stride)),
+                            Size::Dynamic(None) => Size::Dynamic(None),
+                            Size::Dynamic(Some(0)) => Size::Dynamic(Some(0)),
+                            Size::Dynamic(Some(upper_bound)) => {
+                                Size::Dynamic((upper_bound - 1).div_ceil(stride).checked_add(1))
+                            }
+                        });
                         continue;
                     }
                     let dimension = input_type.dimension(axis);
@@ -427,8 +437,12 @@ where
                         0 => input_size - start,
                         size => input_size - (start + (size - 1) * stride) - 1,
                     };
-                    edge_padding_low.push(start);
-                    edge_padding_high.push(high);
+                    edge_padding_low.push(i64::try_from(start).map_err(|_| TypeError {
+                        message: format!("'slice' transpose start index is too large on axis {axis}"),
+                    })?);
+                    edge_padding_high.push(i64::try_from(high).map_err(|_| TypeError {
+                        message: format!("'slice' transpose high padding is too large on axis {axis}"),
+                    })?);
                     interior_padding.push(stride - 1);
                 }
                 let zero = MaybeZero::Zero(

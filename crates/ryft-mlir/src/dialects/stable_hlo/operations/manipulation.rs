@@ -1,8 +1,8 @@
 use ryft_xla_sys::bindings::{MlirAttribute, stablehloGatherDimensionNumbersGet, stablehloScatterDimensionNumbersGet};
 
 use crate::{
-    Attribute, Context, DetachedOp, DetachedRegion, DialectHandle, Error, Location, OneRegion, Operation,
-    OperationBuilder, RegionRef, Size, TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op,
+    Attribute, Context, DetachedOp, DetachedRegion, DialectHandle, Error, IntegerTypeRef, Location, OneRegion,
+    Operation, OperationBuilder, RegionRef, Size, TensorTypeRef, Type, Value, ValueRef, mlir_attribute_field, mlir_op,
     mlir_op_trait, mlir_subtype_trait_impls,
 };
 
@@ -278,7 +278,9 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 
 /// StableHLO [`Operation`] that reshapes its input tensor while keeping the number of elements it contains fixed.
 /// Semantically, this operation is equivalent to [`ReshapeOperation`] except for the fact that the output shape is
-/// not statically known and is instead provided dynamically via its second input/operand.
+/// not statically known and is instead provided dynamically via its second input/operand. The shape operand must be
+/// a rank-1 integer tensor with statically known length. Its length determines the result rank, while every result
+/// dimension remains dynamically sized until runtime.
 ///
 /// # Example
 ///
@@ -312,7 +314,9 @@ mlir_op_trait!(DynamicReshape, ZeroRegions);
 mlir_op_trait!(DynamicReshape, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`DynamicReshapeOperation`] at the specified [`Location`]. Refer to the
-/// documentation of [`DynamicReshapeOperation`] for more information on the operation semantics.
+/// documentation of [`DynamicReshapeOperation`] for more information on the operation semantics. `output_bounds`
+/// must contain one optional bound per output dimension. Bounds are attached through StableHLO's tensor type
+/// extensions and enable lowering dynamically sized results to backends that require bounded allocations.
 pub fn dynamic_reshape<
     'input,
     'shape,
@@ -324,6 +328,7 @@ pub fn dynamic_reshape<
 >(
     input: Input,
     shape: Shape,
+    output_bounds: &[Option<usize>],
     location: L,
 ) -> Result<DetachedDynamicReshapeOperation<'c, 't>, Error> {
     let context = location.context();
@@ -332,13 +337,43 @@ pub fn dynamic_reshape<
         .r#type()?
         .cast::<TensorTypeRef>()
         .ok_or_else(|| Error::invalid_argument("input must have tensor type for `stable_hlo::dynamic_reshape`"))?;
+    let shape_type = shape
+        .r#type()?
+        .cast::<TensorTypeRef>()
+        .ok_or_else(|| Error::invalid_argument("shape must have tensor type for `stable_hlo::dynamic_reshape`"))?;
+    if shape_type.rank() != 1 {
+        return Err(Error::invalid_argument(format!(
+            "shape must have rank 1 for `stable_hlo::dynamic_reshape` but has rank {}",
+            shape_type.rank(),
+        )));
+    }
+    if shape_type.element_type()?.cast::<IntegerTypeRef>().is_none() {
+        return Err(Error::invalid_argument("shape must have integer element type for `stable_hlo::dynamic_reshape`"));
+    }
+    let Size::Static(output_rank) = shape_type.dimension(0)? else {
+        return Err(Error::invalid_argument(
+            "shape must have statically known length for `stable_hlo::dynamic_reshape`",
+        ));
+    };
+    if output_bounds.len() != output_rank {
+        return Err(Error::invalid_argument(format!(
+            "output bounds length must match output rank for `stable_hlo::dynamic_reshape`, but got {} and {output_rank}",
+            output_bounds.len(),
+        )));
+    }
     let element_type = input_type.element_type()?;
-    let output_shape = input_type.dimensions().map(|_| Size::Dynamic).collect::<Vec<_>>();
+    let output_shape = vec![Size::Dynamic; output_rank];
+    let output_encoding = output_bounds
+        .iter()
+        .any(Option::is_some)
+        .then(|| context.stable_hlo_tensor_type_extensions(output_bounds))
+        .transpose()?
+        .map(|attribute| attribute.as_ref());
     OperationBuilder::new("stablehlo.dynamic_reshape", location)
         .add_operand(input)
         .add_operand(shape)
         .add_result(
-            context.tensor_type(element_type, output_shape.as_slice(), None, location).map_err(|_| {
+            context.tensor_type(element_type, output_shape.as_slice(), output_encoding, location).map_err(|_| {
                 Error::invalid_argument("failed to infer result type for `stable_hlo::dynamic_reshape`")
             })?,
         )
@@ -737,16 +772,23 @@ pub fn pad<
 ) -> Result<DetachedPadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
+    let interior_padding = interior_padding
+        .iter()
+        .enumerate()
+        .map(|(axis, &padding)| {
+            i64::try_from(padding).map_err(|_| {
+                Error::invalid_argument(format!(
+                    "interior padding value {padding} at axis {axis} exceeds i64::MAX for `stablehlo.pad`",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("stablehlo.pad", location)
         .add_operand(input)
         .add_operand(padding_value)
         .add_attribute(EDGE_PADDING_LOW_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_low)?)
         .add_attribute(EDGE_PADDING_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_high)?)
-        .add_attribute(
-            INTERIOR_PADDING_ATTRIBUTE,
-            context
-                .dense_i64_array_attribute(interior_padding.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        .add_attribute(INTERIOR_PADDING_ATTRIBUTE, context.dense_i64_array_attribute(interior_padding.as_slice())?)
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -2126,15 +2168,15 @@ mod tests {
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
     use crate::dialects::{func, stable_hlo};
-    use crate::{Attribute, Block, Context, Operation, Region, Size, Value};
+    use crate::{Attribute, Block, Context, Error, Operation, Region, Size, Type, Value};
 
     use super::{
         BroadcastOperation, ConcatenateOperation, DynamicBroadcastOperation, DynamicGatherOperation,
-        DynamicPadOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-        GetDimensionSizeOperation, HasPadding, PadOperation, RealDynamicSliceOperation, ReshapeOperation,
-        ScatterOperation, SelectAndScatterOperation, SetDimensionSizeOperation, SliceOperation, TransposeOperation,
-        broadcast, concatenate, dynamic_broadcast, dynamic_gather, dynamic_pad, dynamic_reshape, dynamic_slice,
-        dynamic_update_slice, gather, get_dimension_size, pad, real_dynamic_slice, reshape, scatter,
+        DynamicPadOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        GatherOperation, GetDimensionSizeOperation, HasPadding, PadOperation, RealDynamicSliceOperation,
+        ReshapeOperation, ScatterOperation, SelectAndScatterOperation, SetDimensionSizeOperation, SliceOperation,
+        TransposeOperation, broadcast, concatenate, dynamic_broadcast, dynamic_gather, dynamic_pad, dynamic_reshape,
+        dynamic_slice, dynamic_update_slice, gather, get_dimension_size, pad, real_dynamic_slice, reshape, scatter,
         select_and_scatter, set_dimension_size, slice, transpose,
     };
 
@@ -2346,8 +2388,10 @@ mod tests {
         let module = context.module(location).unwrap();
         let i64_type = context.signless_integer_type(64);
         let input_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
-        let shape_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
-        let output_type = context.tensor_type(i64_type, &[Size::Dynamic, Size::Dynamic], None, location).unwrap();
+        let shape_type = context.tensor_type(i64_type, &[Size::Static(3)], None, location).unwrap();
+        let output_type = context
+            .tensor_type(i64_type, &[Size::Dynamic, Size::Dynamic, Size::Dynamic], None, location)
+            .unwrap();
         module
             .body()
             .unwrap()
@@ -2355,9 +2399,11 @@ mod tests {
                 let mut block = context.block(&[(input_type, location), (shape_type, location)]);
                 let input = block.argument(0).unwrap();
                 let output_shape = block.argument(1).unwrap();
-                let op = dynamic_reshape(input, output_shape, location).unwrap();
-                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
-                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
+                let op = dynamic_reshape(input, output_shape, &[None, None, None], location).unwrap();
+                assert_eq!(op.input(), Ok(input.as_ref()));
+                assert_eq!(op.shape(), Ok(output_shape.as_ref()));
+                assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+                assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
                 assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
                 let op = block.append_operation(op).unwrap();
                 block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
@@ -2379,13 +2425,56 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @dynamic_reshape_test(%arg0: tensor<2x3xi64>, %arg1: tensor<2xi64>) -> tensor<?x?xi64> {
-                    %0 = stablehlo.dynamic_reshape %arg0, %arg1 : (tensor<2x3xi64>, tensor<2xi64>) -> tensor<?x?xi64>
-                    return %0 : tensor<?x?xi64>
+                  func.func @dynamic_reshape_test(%arg0: tensor<2x3xi64>, %arg1: tensor<3xi64>) -> tensor<?x?x?xi64> {
+                    %0 = stablehlo.dynamic_reshape %arg0, %arg1 : (tensor<2x3xi64>, tensor<3xi64>) -> tensor<?x?x?xi64>
+                    return %0 : tensor<?x?x?xi64>
                   }
                 }
             "},
         );
+
+        // Test using invalid shapes.
+        let block = context.block(&[(input_type.as_ref(), location), (i64_type.as_ref(), location)]);
+        assert!(matches!(
+            dynamic_reshape(block.argument(0).unwrap(), block.argument(1).unwrap(), &[], location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "shape must have tensor type for `stable_hlo::dynamic_reshape`",
+        ));
+
+        let rank_two_shape_type =
+            context.tensor_type(i64_type, &[Size::Static(1), Size::Static(2)], None, location).unwrap();
+        let block = context.block(&[(input_type.as_ref(), location), (rank_two_shape_type.as_ref(), location)]);
+        assert!(matches!(
+            dynamic_reshape(block.argument(0).unwrap(), block.argument(1).unwrap(), &[], location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "shape must have rank 1 for `stable_hlo::dynamic_reshape` but has rank 2",
+        ));
+
+        let floating_shape_type =
+            context.tensor_type(context.float32_type(), &[Size::Static(2)], None, location).unwrap();
+        let block = context.block(&[(input_type.as_ref(), location), (floating_shape_type.as_ref(), location)]);
+        assert!(matches!(
+            dynamic_reshape(block.argument(0).unwrap(), block.argument(1).unwrap(), &[], location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "shape must have integer element type for `stable_hlo::dynamic_reshape`",
+        ));
+
+        let dynamic_shape_type = context.tensor_type(i64_type, &[Size::Dynamic], None, location).unwrap();
+        let block = context.block(&[(input_type.as_ref(), location), (dynamic_shape_type.as_ref(), location)]);
+        assert!(matches!(
+            dynamic_reshape(block.argument(0).unwrap(), block.argument(1).unwrap(), &[], location),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "shape must have statically known length for `stable_hlo::dynamic_reshape`",
+        ));
+
+        let shape_type = context.tensor_type(i64_type, &[Size::Static(2)], None, location).unwrap();
+        let block = context.block(&[(input_type.as_ref(), location), (shape_type.as_ref(), location)]);
+        assert!(matches!(
+            dynamic_reshape(block.argument(0).unwrap(), block.argument(1).unwrap(), &[None], location),
+            Err(Error::InvalidArgument { message, .. })
+                if message
+                    == "output bounds length must match output rank for `stable_hlo::dynamic_reshape`, but got 1 and 2",
+        ));
     }
 
     #[test]
@@ -2507,7 +2596,7 @@ mod tests {
         let i32_type = context.signless_integer_type(32);
         let input_type = context.tensor_type(i32_type, &[Size::Static(2), Size::Static(3)], None, location).unwrap();
         let padding_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
-        let output_type = context.tensor_type(i32_type, &[Size::Static(5), Size::Static(5)], None, location).unwrap();
+        let output_type = context.tensor_type(i32_type, &[Size::Static(4), Size::Static(5)], None, location).unwrap();
         module
             .body()
             .unwrap()
@@ -2515,10 +2604,10 @@ mod tests {
                 let mut block = context.block(&[(input_type, location), (padding_value_type, location)]);
                 let input = block.argument(0).unwrap();
                 let padding_value = block.argument(1).unwrap();
-                let op = pad(input, padding_value, &[0, 1], &[2, 1], &[1, 0], location).unwrap();
+                let op = pad(input, padding_value, &[-1, 1], &[2, 1], &[1, 0], location).unwrap();
                 assert_eq!(op.input().unwrap(), input);
                 assert_eq!(op.padding_value().unwrap(), padding_value);
-                assert_eq!(op.edge_padding_low().unwrap(), vec![0, 1]);
+                assert_eq!(op.edge_padding_low().unwrap(), vec![-1, 1]);
                 assert_eq!(op.edge_padding_high().unwrap(), vec![2, 1]);
                 assert_eq!(op.interior_padding().unwrap(), vec![1, 0]);
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
@@ -2543,19 +2632,100 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @pad_test(%arg0: tensor<2x3xi32>, %arg1: tensor<i32>) -> tensor<5x5xi32> {
+                  func.func @pad_test(%arg0: tensor<2x3xi32>, %arg1: tensor<i32>) -> tensor<4x5xi32> {
                     %0 = stablehlo.pad \
                       %arg0, \
                       %arg1, \
-                      low = [0, 1], \
+                      low = [-1, 1], \
                       high = [2, 1], \
                       interior = [1, 0] \
-                    : (tensor<2x3xi32>, tensor<i32>) -> tensor<5x5xi32>
-                    return %0 : tensor<5x5xi32>
+                    : (tensor<2x3xi32>, tensor<i32>) -> tensor<4x5xi32>
+                    return %0 : tensor<4x5xi32>
                   }
                 }
             "},
         );
+
+        // Test using a dynamic input.
+        let module = context.module(location).unwrap();
+        let i32_type = context.signless_integer_type(32);
+        let input_type = context.tensor_type(i32_type, &[Size::Dynamic, Size::Static(3)], None, location).unwrap();
+        let padding_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
+        let output_type = context.tensor_type(i32_type, &[Size::Dynamic, Size::Static(5)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (padding_value_type, location)]);
+                let input = block.argument(0).unwrap();
+                let padding_value = block.argument(1).unwrap();
+                let op = pad(input, padding_value, &[1, 0], &[2, 0], &[0, 1], location).unwrap();
+                assert_eq!(op.input().unwrap(), input);
+                assert_eq!(op.padding_value().unwrap(), padding_value);
+                assert_eq!(op.edge_padding_low().unwrap(), vec![1, 0]);
+                assert_eq!(op.edge_padding_high().unwrap(), vec![2, 0]);
+                assert_eq!(op.interior_padding().unwrap(), vec![0, 1]);
+                assert_eq!(op.result(0).unwrap().r#type().unwrap(), output_type);
+                let op = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "pad_dynamic_input_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), padding_value_type.into()],
+                        results: vec![output_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @pad_dynamic_input_test(%arg0: tensor<?x3xi32>, %arg1: tensor<i32>) -> tensor<?x5xi32> {
+                    %0 = stablehlo.pad \
+                      %arg0, \
+                      %arg1, \
+                      low = [1, 0], \
+                      high = [2, 0], \
+                      interior = [0, 1] \
+                    : (tensor<?x3xi32>, tensor<i32>) -> tensor<?x5xi32>
+                    return %0 : tensor<?x5xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_pad_with_oversized_interior_padding() {
+        let interior_padding = usize::try_from(i64::MAX).unwrap().checked_add(1).unwrap();
+        let context = Context::new();
+        let location = context.unknown_location();
+        let i32_type = context.signless_integer_type(32);
+        let input_type = context.tensor_type(i32_type, &[Size::Static(1)], None, location).unwrap();
+        let padding_value_type = context.tensor_type(i32_type, &[], None, location).unwrap();
+        let block = context.block(&[(input_type, location), (padding_value_type, location)]);
+        assert!(matches!(
+            pad(
+                block.argument(0).unwrap(),
+                block.argument(1).unwrap(),
+                &[0],
+                &[0],
+                &[interior_padding],
+                location,
+            ),
+            Err(Error::InvalidArgument { message, .. })
+                if message
+                    == format!(
+                        "interior padding value {interior_padding} at axis 0 exceeds i64::MAX for `stablehlo.pad`"
+                    ),
+        ));
     }
 
     #[test]

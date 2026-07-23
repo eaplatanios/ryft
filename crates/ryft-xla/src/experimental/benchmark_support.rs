@@ -1,13 +1,13 @@
 use ryft_core::backends::arrays::Array as CpuArray;
 use ryft_core::backends::arrays::ArrayOperation;
 use ryft_core::contexts::{Context, EagerContext};
+use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};

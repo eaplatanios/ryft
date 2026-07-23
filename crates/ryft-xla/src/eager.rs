@@ -218,6 +218,9 @@ mod tests {
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::scalars::Scalar;
     use ryft_core::batching::{BatchAxis, batch};
+    use ryft_core::differentiation::hessian::HessianDifferentiate;
+    use ryft_core::differentiation::jacobian::{JacobianDifferentiate, jacobian_reverse};
+    use ryft_core::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::operations::compare::{Compare, ComparisonDirection};
     use ryft_core::operations::constants::{OneLike, ZeroLike};
     use ryft_core::operations::differentiation::{CoordinateBasisOperation, StopGradient};
@@ -230,10 +233,6 @@ mod tests {
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::tracing_v2::{
-        ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, ReverseModeDifferentiate,
-        jacobian_reverse,
-    };
     use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1628,6 +1627,10 @@ mod tests {
         let padding_value = f32_scalar(&client, &mesh, 0.5);
         let padded = vector.pad(&padding_value, &[1], &[0], &[0]).unwrap();
         assert_eq!(read_f32s(&padded), vec![0.5, 1.0, 2.0, 3.0, 4.0]);
+        let trimmed = vector.pad(&padding_value, &[-1], &[-1], &[0]).unwrap();
+        assert_eq!(read_f32s(&trimmed), vec![2.0, 3.0]);
+        let trimmed_and_dilated = vector.pad(&padding_value, &[-1], &[1], &[1]).unwrap();
+        assert_eq!(read_f32s(&trimmed_and_dilated), vec![0.5, 2.0, 0.5, 3.0, 0.5, 4.0, 0.5]);
 
         // Reduction sums along the requested axis, and the like-constants match the receiver's shape.
         let total = vector.reduce(&[0], ReductionKind::Sum);

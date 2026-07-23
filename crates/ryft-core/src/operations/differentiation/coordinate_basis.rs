@@ -259,12 +259,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::arrays::Array;
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::differentiation::{jacobian_forward, jacobian_reverse};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::DataType::{Boolean, F8E8M0FNU, F32, I32};
+    use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
     use crate::types::{ArrayType, Shape, Size};
 
     use super::*;
@@ -292,6 +294,41 @@ mod tests {
         );
 
         assert_eq!(operation.to_string(), "coordinate_basis [leaf_type=f32[2, 3], coordinate_offset=4, basis_size=10]",);
+    }
+
+    #[test]
+    fn test_coordinate_basis_operation_interprets_fp6_packed_fragments() {
+        for (data_type, zero, one) in [
+            (F6E2M3FN, Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08)),
+            (F6E3M2FN, Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c)),
+        ] {
+            let leaf_type = ArrayType::new(data_type, Shape::new(vec![Size::Static(2)]));
+            let basis_type = leaf_type.with_inserted_dimension(0, Size::Static(4)).unwrap();
+            let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
+            let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
+
+            assert_eq!(
+                operation.interpret(&context, &EmptyRegionDriver, &[]),
+                Ok(vec![Array::new(basis_type, vec![zero, zero, one, zero, zero, one, zero, zero],).unwrap()]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_coordinate_basis_operation_supports_fp6_dense_jacobians() {
+        for (zero, one, two) in [
+            (Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08), Scalar::F6E2M3FN(0x10)),
+            (Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c), Scalar::F6E3M2FN(0x10)),
+        ] {
+            let input = Array::vector(vec![one, two]);
+            let expected = Array::matrix(2, 2, vec![one, zero, zero, one]);
+
+            let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
+            assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
+
+            let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
+            assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
+        }
     }
 
     #[test]

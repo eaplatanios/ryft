@@ -11,22 +11,23 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::constants::{Zero, ZeroOperation};
-use crate::operations::manipulation::{Broadcast, Reshape, Slice, SliceOperation, Transpose, UpdateSlice};
-use crate::operations::math::{ReduceOperation, ReductionKind, SubOperation};
-use crate::operations::sharding::Reshard;
+use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
+use crate::operations::control_flow::{Select, SelectOperation};
+use crate::operations::manipulation::{Broadcast, SliceOperation, Transpose};
+use crate::operations::math::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
+use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Shape, Size};
-
-use super::slicing::{batch_by_item_expansion, resized_output_sharding};
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 // TODO(eaplatanios): Review this.
+
+use super::slicing::resized_output_sharding;
 
 /// Canonical operation name for [`PadOperation`].
 pub const PAD_OPERATION_NAME: &str = "pad";
@@ -36,10 +37,10 @@ pub const PAD_OPERATION_NAME: &str = "pad";
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PadOperation {
     /// Padding added before the first element of each input axis.
-    edge_padding_low: Vec<usize>,
+    edge_padding_low: Vec<i64>,
 
     /// Padding added after the last element of each input axis.
-    edge_padding_high: Vec<usize>,
+    edge_padding_high: Vec<i64>,
 
     /// Padding added between any two adjacent elements of each input axis.
     interior_padding: Vec<usize>,
@@ -50,8 +51,8 @@ impl PadOperation {
     /// share one length (one entry per input axis); whether that shared length matches the input rank is validated
     /// during type inference, once an input type is known.
     pub fn new(
-        edge_padding_low: Vec<usize>,
-        edge_padding_high: Vec<usize>,
+        edge_padding_low: Vec<i64>,
+        edge_padding_high: Vec<i64>,
         interior_padding: Vec<usize>,
     ) -> Result<Self, ProgramError> {
         if edge_padding_low.len() != edge_padding_high.len() || edge_padding_low.len() != interior_padding.len() {
@@ -71,13 +72,13 @@ impl PadOperation {
 
     /// Returns the padding added before the first element of each input axis.
     #[inline]
-    pub fn edge_padding_low(&self) -> &[usize] {
+    pub fn edge_padding_low(&self) -> &[i64] {
         self.edge_padding_low.as_slice()
     }
 
     /// Returns the padding added after the last element of each input axis.
     #[inline]
-    pub fn edge_padding_high(&self) -> &[usize] {
+    pub fn edge_padding_high(&self) -> &[i64] {
         self.edge_padding_high.as_slice()
     }
 
@@ -191,25 +192,21 @@ where
 /// `low + i * (interior + 1)` along each axis and the padding value everywhere else, so its pullback splits the
 /// output cotangent into two contributions:
 ///
-///   - **Input cotangent**: the strided slice of the cotangent at the pad geometry — `start = low`,
-///     `stride = interior + 1`, and `limit = low + (d - 1) * (interior + 1) + 1` for input dimension `d > 0`
-///     (`limit = low` for `d == 0`, an empty slice) — which reads back exactly the positions the forward map wrote
-///     input elements to. For example, padding `d = 3` elements with `low = 1`, `high = 2`, and `interior = 1`
-///     produces an output of dimension `1 + (3 - 1) * 2 + 1 + 2 = 8` whose positions `1`, `3`, and `5` hold the
-///     input elements, and the pullback slices the cotangent with `start = 1`, `limit = 6`, and `stride = 2`,
-///     reading positions `1`, `3`, and `5`.
-///   - **Padding-value cotangent**: the sum of the cotangent over every *padding* position, computed as the full
-///     sum of the cotangent minus the sum of the strided-slice region (two staged full reductions and a
-///     subtraction, which avoids materializing a mask). When the input has no elements (some dimension is `0`),
-///     the sliced region is empty and its sum is a staged scalar zero.
+///   - **Input cotangent**: edge-unpad the output cotangent and take a full-extent slice with stride
+///     `interior + 1`, recovering both cropped and dilated input positions.
+///   - **Padding-value cotangent**: pad an all-false input-shaped mask with `true`, select the output cotangent only
+///     at those padding positions, and sum the selected tensor. Selection rather than subtraction keeps non-finite
+///     cotangents at input positions from contaminating this contribution.
 ///
 /// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation
 where
     O: Operation<ArrayType>
+        + From<OneOperation<ArrayType>>
+        + From<PadOperation>
+        + From<SelectOperation>
         + From<SliceOperation>
         + From<ReduceOperation>
-        + From<SubOperation>
         + From<ZeroOperation<ArrayType>>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
@@ -228,73 +225,97 @@ where
                 MaybeZero::Zero(inputs[1].r#type().cotangent()),
             ]),
             MaybeZero::Value(cotangent) => {
-                let input_type = inputs[0].r#type();
-                let rank = input_type.rank();
-                let mut start_indices = Vec::with_capacity(rank);
-                let mut limit_indices = Vec::with_capacity(rank);
-                let mut strides = Vec::with_capacity(rank);
-                let mut input_is_empty = false;
-                for axis in 0..rank {
-                    let dimension = input_type.dimension(axis);
-                    let Some(input_size) = dimension.value() else {
-                        return Err(TypeError {
-                            message: format!(
-                                "'pad' transpose requires a static input shape but axis {axis} has size {dimension}",
-                            ),
-                        }
-                        .into());
-                    };
-                    let low = self.edge_padding_low()[axis];
-                    let stride = self.interior_padding()[axis] + 1;
-                    let limit = match input_size {
-                        0 => low,
-                        size => low + (size - 1) * stride + 1,
-                    };
-                    input_is_empty |= input_size == 0;
-                    start_indices.push(low);
-                    limit_indices.push(limit);
-                    strides.push(stride);
-                }
-                let input_cotangents = context.stage_operation(
-                    SliceOperation::new(start_indices, limit_indices).with_strides(strides)?,
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", input_cotangents, 1, ProgramError);
-                let input_cotangent =
-                    input_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
-                let all_axes: Vec<usize> = (0..cotangent.r#type().as_ref().rank()).collect();
-                let total_sums = context.stage_operation(
-                    ReduceOperation::new(all_axes.clone(), ReductionKind::Sum),
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", total_sums, 1, ProgramError);
-                let sliced_sum = if input_is_empty {
-                    // The strided slice covered no positions, so its sum is a scalar zero of the padding value's
-                    // type.
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?
+                let input_cotangent = if inputs[0].is_unknown() {
+                    let inverse_edge_padding_low = self
+                        .edge_padding_low()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, padding)| {
+                            padding.checked_neg().ok_or_else(|| TypeError {
+                                message: format!(
+                                    "'pad' transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
+                                ),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let inverse_edge_padding_high = self
+                        .edge_padding_high()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, padding)| {
+                            padding.checked_neg().ok_or_else(|| TypeError {
+                                message: format!(
+                                    "'pad' transpose cannot negate edge_padding_high at axis {axis} with value \
+                                     {padding}",
+                                ),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let zero_type = dependency_scalar_type(cotangent.r#type().as_ref())?;
+                    let zero = MaybeZero::Zero(zero_type).materialize(context)?;
+                    let mut unpadded = context.stage_operation(
+                        PadOperation::new(
+                            inverse_edge_padding_low,
+                            inverse_edge_padding_high,
+                            vec![0; self.interior_padding().len()],
+                        )?,
+                        Vec::new(),
+                        &[cotangent.clone(), zero],
+                    )?;
+                    check_count!("output", unpadded, 1, ProgramError);
+                    let unpadded = unpadded.remove(0);
+                    let strides = self
+                        .interior_padding()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, padding)| {
+                            padding.checked_add(1).ok_or_else(|| TypeError {
+                                message: format!("'pad' transpose stride overflows usize on axis {axis}"),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let rank = strides.len();
+                    let slice = SliceOperation::new(vec![0; rank], vec![0; rank])
+                        .with_strides(strides)?
+                        .with_full_extent_axes(0..rank)?;
+                    let mut sliced = context.stage_operation(slice, Vec::new(), std::slice::from_ref(&unpadded))?;
+                    check_count!("output", sliced, 1, ProgramError);
+                    MaybeZero::Value(sliced.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent())?)
                 } else {
-                    let sliced_sums = context.stage_operation(
+                    MaybeZero::Zero(inputs[0].r#type().cotangent())
+                };
+                let padding_value_cotangent = if inputs[1].is_unknown() {
+                    let mask_input_type =
+                        inputs[0].r#type().cotangent().with_data_type(DataType::Boolean).with_layout(None);
+                    let mask_padding_type =
+                        inputs[1].r#type().cotangent().with_data_type(DataType::Boolean).with_layout(None);
+                    let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
+                    let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
+                    let mut mask_padding =
+                        context.stage_operation(OneOperation::new(mask_padding_type), Vec::new(), &no_inputs)?;
+                    check_count!("output", mask_padding, 1, ProgramError);
+                    let mut mask =
+                        context.stage_operation(self.clone(), Vec::new(), &[mask_input, mask_padding.remove(0)])?;
+                    check_count!("output", mask, 1, ProgramError);
+                    let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
+                    let mut selected = context.stage_operation(
+                        SelectOperation,
+                        Vec::new(),
+                        &[mask.remove(0), cotangent.clone(), zero],
+                    )?;
+                    check_count!("output", selected, 1, ProgramError);
+                    let all_axes = (0..cotangent.r#type().rank()).collect::<Vec<_>>();
+                    let mut reduced = context.stage_operation(
                         ReduceOperation::new(all_axes, ReductionKind::Sum),
                         Vec::new(),
-                        std::slice::from_ref(&input_cotangent),
+                        &[selected.remove(0)],
                     )?;
-                    check_count!("output", sliced_sums, 1, ProgramError);
-                    sliced_sums.into_iter().next().unwrap()
+                    check_count!("output", reduced, 1, ProgramError);
+                    MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent())?)
+                } else {
+                    MaybeZero::Zero(inputs[1].r#type().cotangent())
                 };
-                let padding_value_cotangents = context.stage_operation(
-                    O::from(SubOperation),
-                    Vec::new(),
-                    &[total_sums.into_iter().next().unwrap(), sliced_sum],
-                )?;
-                check_count!("output", padding_value_cotangents, 1, ProgramError);
-                let padding_value_cotangent = padding_value_cotangents
-                    .into_iter()
-                    .next()
-                    .unwrap()
-                    .unalign_cotangent(&inputs[1].r#type().cotangent())?;
-                Ok(vec![MaybeZero::Value(input_cotangent), MaybeZero::Value(padding_value_cotangent)])
+                Ok(vec![input_cotangent, padding_value_cotangent])
             }
         }
     }
@@ -304,16 +325,13 @@ where
 ///
 /// A batched input with a replicated padding value keeps its batch axis by padding it with zero amounts: the
 /// lifted operation inserts `0` into all three padding vectors at the batch axis position. A batch-varying (batched)
-/// padding value cannot ride along structurally — the lifted operation would need a rank-1 padding operand, which
-/// the operation cannot represent — so the rule falls back to per-item expansion via `batch_by_item_expansion`:
-/// the batch size is static, so each batch item's input and padding value are extracted, padded independently, and
-/// restacked along a fresh leading batch axis (`O(batch)` staged operations, the same trade the batch-varying
-/// dynamic-slice start-index rules make). This keeps the direct batched JVP path (dense forward Jacobians and
-/// batched pullbacks) total even though the padding-value tangent is represented as a per-item batch there.
+/// padding value is vectorized with a constant-size mask construction: pad the operand with zero, pad an all-true
+/// input mask with false, broadcast the per-item padding values over the padded result, and select those values at
+/// padding positions.
 impl<C> BatchableOperation<C> for PadOperation
 where
-    C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
+    C::Value: Broadcast + Pad + Select + Transpose,
     PadOperation: InterpretableOperation<C>,
 {
     fn batch<D: BatchingDriver<C>>(
@@ -337,16 +355,44 @@ where
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
             return lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)]);
         }
-        // Batch-varying padding value: pad each batch item independently and restack along a fresh leading batch axis.
         let axis_size = axis_size.expect("a mapped input pins the batch size");
-        batch_by_item_expansion(context, crate::operations::manipulation::PAD_OPERATION_NAME, self, inputs, axis_size)
+        let batch_axis = inputs[0].batch_axis_position().unwrap_or(0);
+        let operand = inputs[0].match_axis(batch_axis, axis_size, context.axis_sharding().clone())?;
+        let mut edge_padding_low = self.edge_padding_low().to_vec();
+        edge_padding_low.insert(batch_axis, 0);
+        let mut edge_padding_high = self.edge_padding_high().to_vec();
+        edge_padding_high.insert(batch_axis, 0);
+        let mut interior_padding = self.interior_padding().to_vec();
+        interior_padding.insert(batch_axis, 0);
+
+        let padding_type = inputs[1].unbatched_type();
+        let zero_padding = context.parent().zero(&padding_type)?;
+        let padded = operand.value().pad(
+            &zero_padding,
+            edge_padding_low.as_slice(),
+            edge_padding_high.as_slice(),
+            interior_padding.as_slice(),
+        )?;
+        let mask_input_type = operand.r#type().into_owned().with_data_type(DataType::Boolean).with_layout(None);
+        let mask_input = context.parent().one(&mask_input_type)?;
+        let mask_padding_type = padding_type.with_data_type(DataType::Boolean).with_layout(None);
+        let mask_padding = context.parent().zero(&mask_padding_type)?;
+        let mask = mask_input.pad(
+            &mask_padding,
+            edge_padding_low.as_slice(),
+            edge_padding_high.as_slice(),
+            interior_padding.as_slice(),
+        )?;
+        let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
+        let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
+        let output_type = output.r#type().into_owned();
+        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])
     }
 }
 
-/// Represents the ability to expand an array by adding edge and interior padding filled with a scalar padding value,
-/// with the semantics of StableHLO's [`pad`](https://openxla.org/stablehlo/spec#pad) operation restricted to
-/// non-negative padding amounts. StableHLO also allows negative edge padding, which trims elements instead; that form
-/// is not supported.
+/// Represents the ability to resize an array by adding edge and interior padding filled with a scalar padding value,
+/// with the semantics of StableHLO's [`pad`](https://openxla.org/stablehlo/spec#pad) operation. Negative edge padding
+/// crops the dilated input, while interior padding remains non-negative.
 ///
 /// `t.pad(padding_value, edge_padding_low, edge_padding_high, interior_padding)` returns an array that holds the
 /// input element with index `i` at output index `edge_padding_low + i * (interior_padding + 1)` along each axis and
@@ -358,10 +404,11 @@ where
 ///     `interior_padding` padding elements between each adjacent pair).
 ///
 /// All three padding slices must have length equal to the input rank, and the padding value must be a rank-0 scalar
-/// with the input's data type in the same memory space. Padding requires static input extents: inputs with dynamic
-/// dimensions are rejected because the padded extent cannot be computed from an unknown extent. A zero-padding
-/// operation passes its input through unchanged. Any non-identity output keeps the input memory space, clears explicit
-/// physical layout metadata, and preserves compatible sharding and reduction state.
+/// with the input's data type in the same memory space. Dynamic extents remain dynamic. A bounded dynamic output keeps
+/// a transformed bound when the largest permitted input extent has a non-negative representable result; smaller
+/// runtime extents must still satisfy the padding geometry. An effective identity passes its input through unchanged.
+/// Any non-identity output keeps the input memory space, clears explicit physical layout metadata, and preserves
+/// compatible sharding and distributed dependency state.
 ///
 /// [`Pad`] is the transpose dual of strided [`Slice`]: slicing with stride
 /// `s` keeps every `s`-th element, while padding with `interior_padding = s - 1` puts elements back at every `s`-th
@@ -399,18 +446,97 @@ pub trait Pad: Sized {
     fn pad(
         &self,
         padding_value: &Self,
-        edge_padding_low: &[usize],
-        edge_padding_high: &[usize],
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError>;
+}
+
+/// Returns whether this padding geometry leaves every possible element and its position unchanged.
+fn is_effective_identity(
+    input_type: &ArrayType,
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_padding: &[usize],
+) -> bool {
+    edge_padding_low.iter().all(|padding| *padding == 0)
+        && edge_padding_high.iter().all(|padding| *padding == 0)
+        && input_type.shape().dimensions().iter().zip(interior_padding).all(|(dimension, padding)| {
+            *padding == 0
+                || matches!(dimension, Size::Static(0 | 1))
+                || matches!(dimension, Size::Dynamic(Some(upper_bound)) if *upper_bound <= 2)
+        })
+}
+
+/// Constructs a scalar type on the same mesh with the same non-dimensional dependency metadata as `source`.
+fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
+    let sharding = source
+        .sharding()
+        .map(|sharding| {
+            Sharding::replicated(sharding.mesh().clone(), 0)
+                .with_unreduced_axes(sharding.unreduced_axes().clone())
+                .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                .map_err(|error| TypeError {
+                    message: format!("'pad' dependency scalar sharding construction failed: {error}"),
+                })
+        })
+        .transpose()?;
+    ArrayType::scalar(source.data_type())
+        .with_memory(source.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError { message: error.to_string() })
+}
+
+/// Computes one concrete padded extent in a wide signed representation.
+fn padded_extent(
+    input_size: usize,
+    edge_padding_low: i64,
+    edge_padding_high: i64,
+    interior_padding: usize,
+    axis: usize,
+) -> Result<i128, TypeError> {
+    let gap_count = input_size.saturating_sub(1);
+    let input_size = i128::try_from(input_size)
+        .map_err(|_| TypeError { message: format!("'pad' input size is too large on axis {axis}") })?;
+    let gap_count = i128::try_from(gap_count)
+        .map_err(|_| TypeError { message: format!("'pad' input size is too large on axis {axis}") })?;
+    let interior_padding = i128::try_from(interior_padding)
+        .map_err(|_| TypeError { message: format!("'pad' interior padding is too large on axis {axis}") })?;
+    let dilated_size = input_size
+        .checked_add(
+            gap_count
+                .checked_mul(interior_padding)
+                .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?,
+        )
+        .and_then(|size| size.checked_add(i128::from(edge_padding_low)))
+        .and_then(|size| size.checked_add(i128::from(edge_padding_high)))
+        .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?;
+    Ok(dilated_size)
+}
+
+/// Computes one concrete padded extent and validates that it is representable by [`Size::Static`].
+fn static_padded_extent(
+    input_size: usize,
+    edge_padding_low: i64,
+    edge_padding_high: i64,
+    interior_padding: usize,
+    axis: usize,
+) -> Result<usize, TypeError> {
+    let output_size = padded_extent(input_size, edge_padding_low, edge_padding_high, interior_padding, axis)?;
+    if output_size < 0 {
+        return Err(TypeError { message: format!("'pad' output size is negative ({output_size}) on axis {axis}") });
+    }
+    usize::try_from(output_size)
+        .map_err(|_| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })
 }
 
 impl Pad for ArrayType {
     fn pad(
         &self,
         padding_value: &Self,
-        edge_padding_low: &[usize],
-        edge_padding_high: &[usize],
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
         if self.data_type() != padding_value.data_type() {
@@ -440,53 +566,110 @@ impl Pad for ArrayType {
             .into());
         }
         let rank = self.rank();
-        for (name, padding) in [
-            ("edge_padding_low", edge_padding_low),
-            ("edge_padding_high", edge_padding_high),
-            ("interior_padding", interior_padding),
+        for (name, length) in [
+            ("edge_padding_low", edge_padding_low.len()),
+            ("edge_padding_high", edge_padding_high.len()),
+            ("interior_padding", interior_padding.len()),
         ] {
-            if padding.len() != rank {
+            if length != rank {
                 return Err(TypeError {
-                    message: format!("'pad' {name} has length {} but input has rank {rank}", padding.len()),
+                    message: format!("'pad' {name} has length {length} but input has rank {rank}"),
                 }
                 .into());
             }
         }
-        if edge_padding_low.iter().all(|padding| *padding == 0)
-            && edge_padding_high.iter().all(|padding| *padding == 0)
-            && interior_padding.iter().all(|padding| *padding == 0)
-        {
+        if is_effective_identity(self, edge_padding_low, edge_padding_high, interior_padding) {
             return Ok(self.clone());
         }
         let mut output_dimensions = Vec::with_capacity(rank);
         for axis in 0..rank {
             let dimension = self.dimension(axis);
-            let Size::Static(size) = dimension else {
+            let output_dimension = match dimension {
+                Size::Static(size) => Size::Static(static_padded_extent(
+                    size,
+                    edge_padding_low[axis],
+                    edge_padding_high[axis],
+                    interior_padding[axis],
+                    axis,
+                )?),
+                Size::Dynamic(upper_bound) => {
+                    let output_upper_bound = match upper_bound {
+                        None => None,
+                        Some(upper_bound) => {
+                            let maximum_input_size = upper_bound.saturating_sub(1);
+                            match padded_extent(
+                                maximum_input_size,
+                                edge_padding_low[axis],
+                                edge_padding_high[axis],
+                                interior_padding[axis],
+                                axis,
+                            ) {
+                                Ok(maximum) if maximum < 0 => {
+                                    return Err(TypeError {
+                                        message: format!(
+                                            "'pad' output size is negative ({maximum}) on dynamic axis {axis} even at \
+                                         its maximum input extent {maximum_input_size}",
+                                        ),
+                                    }
+                                    .into());
+                                }
+                                Ok(maximum) => usize::try_from(maximum).ok().and_then(|maximum| maximum.checked_add(1)),
+                                Err(_) => None,
+                            }
+                        }
+                    };
+                    Size::Dynamic(output_upper_bound)
+                }
+            };
+            output_dimensions.push(output_dimension);
+        }
+        let padding_positions_may_exist = self.shape().dimensions().iter().enumerate().any(|(axis, dimension)| {
+            edge_padding_low[axis] > 0
+                || edge_padding_high[axis] > 0
+                || (interior_padding[axis] > 0
+                    && !matches!(dimension, Size::Static(0 | 1))
+                    && !matches!(dimension, Size::Dynamic(Some(upper_bound)) if *upper_bound <= 2))
+        });
+        let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
+        if padding_positions_may_exist {
+            if self.unreduced_axes() != padding_value.unreduced_axes()
+                || self.reduced_axes() != padding_value.reduced_axes()
+            {
                 return Err(TypeError {
                     message: format!(
-                        "'pad' does not support dynamic input axis {axis} with size {dimension}; the padded extent \
-                        cannot be computed from an unknown extent",
+                        "'pad' input and padding value must have matching reduced and unreduced mesh axes but got \
+                         input type {self} and padding value type {padding_value}",
                     ),
                 }
                 .into());
-            };
-            let output_size = if size == 0 {
-                edge_padding_low[axis].checked_add(edge_padding_high[axis])
-            } else {
-                interior_padding[axis]
-                    .checked_add(1)
-                    .and_then(|stride| (size - 1).checked_mul(stride))
-                    .and_then(|interior| interior.checked_add(1))
-                    .and_then(|interior| edge_padding_low[axis].checked_add(interior))
-                    .and_then(|size| size.checked_add(edge_padding_high[axis]))
             }
-            .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?;
-            output_dimensions.push(Size::Static(output_size));
+            let input_varying_manual_axes = self.sharding().map(|sharding| sharding.varying_manual_axes());
+            let padding_varying_manual_axes = padding_value.sharding().map(|sharding| sharding.varying_manual_axes());
+            if input_varying_manual_axes.cloned().unwrap_or_default()
+                != padding_varying_manual_axes.cloned().unwrap_or_default()
+            {
+                return Err(TypeError {
+                    message: format!(
+                        "'pad' input and padding value must have matching varying manual axes but got input type \
+                         {self} and padding value type {padding_value}",
+                    ),
+                }
+                .into());
+            }
+            let has_distributed_dependencies = !self.unreduced_axes().is_empty()
+                || !self.reduced_axes().is_empty()
+                || input_varying_manual_axes.is_some_and(|axes| !axes.is_empty());
+            if has_distributed_dependencies
+                && self.sharding().map(|sharding| sharding.mesh())
+                    != padding_value.sharding().map(|sharding| sharding.mesh())
+            {
+                return Err(TypeError {
+                    message: "'pad' input and padding value with distributed dependencies must use the same mesh"
+                        .to_string(),
+                }
+                .into());
+            }
         }
-        // Padding resizes dimensions in place, so the operand sharding (placement and reduction state) carries
-        // through, with the same divisibility check on padded sharded dimensions that `slice` applies. The scalar
-        // padding value's sharding does not affect the output.
-        let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_memory(self.memory())
             .with_sharding(sharding)
@@ -505,17 +688,13 @@ where
     fn pad(
         &self,
         padding_value: &Self,
-        edge_padding_low: &[usize],
-        edge_padding_high: &[usize],
+        edge_padding_low: &[i64],
+        edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
-        let output_type = self.r#type().pad(
-            padding_value.r#type().as_ref(),
-            edge_padding_low,
-            edge_padding_high,
-            interior_padding,
-        )?;
-        if output_type.eq(self.r#type().as_ref()) {
+        self.r#type()
+            .pad(padding_value.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding)?;
+        if is_effective_identity(self.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
             return Ok(self.clone());
         }
         let mut outputs = self.dispatch_domain().bind(
@@ -591,8 +770,14 @@ mod tests {
                         ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
                         padding_value_type.clone(),
                     ],
-                    error = "'pad' does not support dynamic input axis 0 with size *; the padded extent cannot be \
-                        computed from an unknown extent",
+                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]))],
+                },
+                {
+                    input_types = [
+                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])),
+                        padding_value_type.clone(),
+                    ],
+                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(9))]))],
                 },
                 {
                     input_types = [
@@ -604,6 +789,57 @@ mod tests {
             ],
         );
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
+        assert_eq!(
+            input_type.pad(&padding_value_type, &[], &[0], &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "'pad' edge_padding_low has length 0 but input has rank 1".to_string(),
+            })),
+        );
+        assert_eq!(
+            input_type.pad(&padding_value_type, &[0], &[], &[0]),
+            Err(ProgramError::Type(TypeError {
+                message: "'pad' edge_padding_high has length 0 but input has rank 1".to_string(),
+            })),
+        );
+        assert_eq!(
+            input_type.pad(&padding_value_type, &[0], &[0], &[]),
+            Err(ProgramError::Type(TypeError {
+                message: "'pad' interior_padding has length 0 but input has rank 1".to_string(),
+            })),
+        );
+        // Negative inverse edges remain valid for dynamic dimensions. Runtime values must satisfy the resulting
+        // non-negative extent, but rejecting the abstract operation would make the transpose of positive padding
+        // impossible to stage. For an input extent below 9, cropping 1 and 2 yields an output extent below 6.
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(9))])).pad(
+                &padding_value_type,
+                &[-1],
+                &[-2],
+                &[0]
+            ),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(6))]))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])).pad(
+                &padding_value_type,
+                &[-1],
+                &[-2],
+                &[0]
+            ),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]))),
+        );
+        assert_eq!(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2))])).pad(
+                &padding_value_type,
+                &[-5],
+                &[0],
+                &[0]
+            ),
+            Err(ProgramError::Type(TypeError {
+                message: "'pad' output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1"
+                    .to_string(),
+            })),
+        );
 
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
@@ -688,13 +924,29 @@ mod tests {
                         (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
                         (@known, padding_value.clone()),
                     ],
-                    outputs = [(@residual, expected)],
+                    outputs = [(@residual, expected.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, input.clone()),
+                        (@unknown(type = padding_value.r#type().into_owned(), replay = padding_value.clone())),
+                    ],
+                    outputs = [(@residual, expected.clone())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@unknown(type = padding_value.r#type().into_owned(), replay = padding_value.clone())),
+                    ],
+                    outputs = [(@residual, expected.clone())],
                     residual_instructions = 1,
                 },
             ],
         );
 
-        // Batching inserts zero padding on the mapped axis and expands per item for a mapped padding value.
+        // Batching inserts zero padding on the mapped axis and vectorizes a mapped padding value.
         check_operation_batching!(
             @exact,
             operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
@@ -740,6 +992,17 @@ mod tests {
                         vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0],
                     ))],
                 },
+                {
+                    inputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 0), Array::vector(vec![8.0, 9.0])),
+                    ],
+                    outputs = [(@mapped(axis = 1), Array::matrix(
+                        3,
+                        2,
+                        vec![8.0, 9.0, 1.0, 2.0, 3.0, 4.0],
+                    ))],
+                },
             ],
         );
 
@@ -758,13 +1021,149 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]), Array::scalar(24.0)],
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
+                        (@known, Array::scalar(9.0)),
+                    ],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+                    input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0])],
+                },
+                {
+                    inputs = [
+                        (@known, Array::vector(vec![1.0, 2.0, 3.0])),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
+                    input_cotangents = [Array::scalar(24.0)],
+                },
+            ],
+        );
+        // Selecting padding positions before reduction avoids the `infinity - infinity` contamination that a
+        // total-sum-minus-input-sum formulation would introduce.
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap(),
+            cases = [
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::vector(vec![5.0, f64::INFINITY, 7.0])],
+                    input_cotangents = [Array::vector(vec![f64::INFINITY, 7.0]), Array::scalar(5.0)],
+                },
+                {
+                    inputs = [
+                        (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()])))),
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                    ],
+                    output_cotangents = [Array::vector(vec![3.0, 1e20, -1e20])],
+                    input_cotangents = [Array::vector(vec![1e20, -1e20]), Array::scalar(3.0)],
+                },
+            ],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![-1], vec![1], vec![0]).unwrap(),
             cases = [{
                 inputs = [
                     (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()])))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])],
-                input_cotangents = [Array::vector(vec![2.0, 4.0, 6.0]), Array::scalar(24.0)],
+                output_cotangents = [Array::vector(vec![2.0, 3.0, 5.0])],
+                input_cotangents = [Array::vector(vec![0.0, 2.0, 3.0]), Array::scalar(5.0)],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new(DataType::F64, Shape::new(vec![0.into()])))),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::vector(vec![1.0, 2.0, 3.0])],
+                input_cotangents = [Array::vector(Vec::<f64>::new()), Array::scalar(6.0)],
+            }],
+        );
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(Vec::new(), Vec::new(), Vec::new()).unwrap(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::scalar(f64::INFINITY)],
+                input_cotangents = [Array::scalar(f64::INFINITY), Array::scalar(0.0)],
+            }],
+        );
+
+        // Positive edge padding over a bounded-dynamic operand must produce a fully stageable dynamic pullback: the
+        // inverse signed pad crops the cotangent and the full-extent slice applies the interior stride.
+        let dynamic_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let dynamic_input = builder.add_input(dynamic_input_type);
+        let dynamic_padding = builder.add_input(ArrayType::scalar(DataType::F64));
+        let dynamic_output = builder
+            .add_instruction(
+                PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
+                Vec::new(),
+                vec![dynamic_input, dynamic_padding],
+            )
+            .unwrap()[0];
+        let dynamic_program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![dynamic_output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let dynamic_pullback = dynamic_program.transpose_with_respect_to(&[0, 1]).unwrap();
+        assert_eq!(
+            dynamic_pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[<9] .
+                let %1:f64[] = zero [type=f64[]]
+                    %2:f64[<6] = pad [edge_padding_low=[-1], edge_padding_high=[-2], interior_padding=[0]] %0 %1
+                    %3:f64[<4] = slice [start_indices=[0], limit_indices=[0], strides=[2], full_extent_axes={0}] %2
+                    %4:bool[<4] = zero [type=bool[<4]]
+                    %5:bool[] = one [type=bool[]]
+                    %6:bool[<9] = pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]] %4 %5
+                    %7:f64[<9] = zero [type=f64[<9]]
+                    %8:f64[<9] = select %6 %0 %7
+                    %9:f64[] = reduce_sum [axes=[0]] %8
+                in (%3, %9)
+            "}
+            .trim_end(),
+        );
+
+        // A pure crop never reads the padding scalar, so its dependency metadata may differ from the operand's. The
+        // inverse pad nevertheless introduces zeros for cropped input positions and must derive that internal zero's
+        // dependencies from the operand cotangent rather than from the unused primal padding scalar.
+        let crop_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let crop_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+            .with_sharding(Sharding::replicated(crop_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let crop_padding_type =
+            ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(crop_mesh, 0)).unwrap();
+        let crop_output_type = crop_input_type.pad(&crop_padding_type, &[-1], &[0], &[0]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = PadOperation::new(vec![-1], vec![0], vec![0]).unwrap(),
+            cases = [{
+                inputs = [
+                    (@linear(type = crop_input_type.clone())),
+                    (@known, Array::from_f64s(crop_padding_type, vec![9.0])),
+                ],
+                output_cotangents = [Array::from_f64s(crop_output_type, vec![2.0, 3.0])],
+                input_cotangents = [Array::from_f64s(crop_input_type, vec![0.0, 2.0, 3.0])],
             }],
         );
 
@@ -804,6 +1203,37 @@ mod tests {
         assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
         assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0],);
 
+        // Signed edge padding crops the dilated operand. Cropping can be asymmetric, can combine with interior
+        // dilation, and must not be elided merely because the output shape happens to equal the input shape.
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])
+                .pad(&Array::scalar(0.0), &[-1], &[-2], &[0])
+                .unwrap()
+                .to_f64s(),
+            vec![2.0, 3.0],
+        );
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0, 3.0]).pad(&Array::scalar(9.0), &[-1], &[1], &[1]).unwrap().to_f64s(),
+            vec![9.0, 2.0, 9.0, 3.0, 9.0],
+        );
+        assert_eq!(
+            Array::vector(vec![1.0, 2.0, 3.0]).pad(&Array::scalar(9.0), &[-1], &[1], &[0]).unwrap().to_f64s(),
+            vec![2.0, 3.0, 9.0],
+        );
+        assert_eq!(
+            Array::vector(vec![1.0]).pad(&Array::scalar(0.0), &[-2], &[0], &[0]),
+            Err(ProgramError::Type(TypeError { message: "'pad' output size is negative (-1) on axis 0".to_string() })),
+        );
+
+        // Interior padding is an effective identity on singleton axes. The eager and abstract fast paths preserve
+        // the complete type and avoid overflowing `interior + 1` for a value that can never be used as a stride.
+        let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]))
+            .with_layout(Layout::Strided(StridedLayout::new(vec![7])));
+        let singleton = Array::from_f64s(singleton_type.clone(), vec![3.0]);
+        let identity = singleton.pad(&Array::scalar(0.0), &[0], &[0], &[usize::MAX]).unwrap();
+        assert_eq!(*identity.r#type(), singleton_type);
+        assert_eq!(identity.to_f64s(), vec![3.0]);
+
         // The kernel validates the padding value shape eagerly.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).pad(&Array::vector(vec![0.0]), &[0], &[0], &[0]),
@@ -830,7 +1260,9 @@ mod tests {
         let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let pad_value = ArrayType::scalar(DataType::F32);
+        let pad_value = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["m"]).unwrap())
+            .unwrap();
 
         // Padding preserves a common memory placement and rejects a padding scalar that would require an implicit
         // transfer.
@@ -854,6 +1286,43 @@ mod tests {
         assert_eq!(input.pad(&pad_value, &[0], &[4], &[0]).unwrap().sharding(), Some(&sharding));
         // Padding to a size not divisible by the explicit mesh-axis size (output 0 + 4 + 1 = 5) is rejected.
         assert!(input.pad(&pad_value, &[0], &[1], &[0]).is_err());
+
+        // JAX requires exact dependency metadata whenever the padding value can contribute. Neither reduced axes nor
+        // varying manual axes are implicitly unioned from the scalar.
+        let plain_padding = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(sharding.mesh().clone(), 0))
+            .unwrap();
+        assert!(input.pad(&plain_padding, &[0], &[4], &[0]).is_err());
+        let reduced_padding = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(sharding.mesh().clone(), 0).with_reduced_axes(["m"]).unwrap())
+            .unwrap();
+        assert!(input.pad(&reduced_padding, &[0], &[4], &[0]).is_err());
+        let varying_input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(
+                Sharding::new(sharding.mesh().clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["m"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(varying_input.pad(&pad_value, &[0], &[4], &[0]).is_err());
+
+        // Mesh identity is irrelevant for an ordinary scalar when neither side carries VMA or reduction metadata;
+        // the result placement is derived solely from the operand. Effective identities do not consult the unused
+        // padding value's dependency metadata at all.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let ordinary_input_sharding =
+            Sharding::new(sharding.mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let ordinary_input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(ordinary_input_sharding.clone())
+            .unwrap();
+        let other_mesh_padding =
+            ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
+        assert_eq!(
+            ordinary_input.pad(&other_mesh_padding, &[0], &[4], &[0]).unwrap().sharding(),
+            Some(&ordinary_input_sharding),
+        );
+        assert_eq!(varying_input.pad(&plain_padding, &[0], &[0], &[0]), Ok(varying_input));
     }
 
     #[test]
@@ -905,7 +1374,7 @@ mod tests {
             assert_eq!(outputs[0].value().to_f64s(), vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
         }
 
-        // Per-item expansion handles an empty batch without inventing values or dropping the mapped placement.
+        // The vectorized mapped-padding rule handles an empty batch without inventing values or dropping placement.
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =
