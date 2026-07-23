@@ -17,7 +17,216 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-// TODO(eaplatanios): Review this module.
+/// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
+/// [`Parameter`] leaves. `I` and `O` retain the input and output [`Type`] trees. Derivative values are stored in
+/// deterministic output-major / first-input-major / second-input-minor order and remain [`Parameter`]s so that the
+/// complete Hessian can cross tracing and compilation boundaries as well as participate in higher-order transforms.
+/// The physical representation of a block is defined by [`DenseDifferentiableType`].
+/// For [`ArrayType`](crate::ArrayType), the block for an output leaf with shape `O` and
+/// input leaves with shapes `I1` and `I2` has shape `O` concatenated with `I1` and `I2`.
+#[derive(Clone, Debug, Parameterized)]
+pub struct Hessian<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> {
+    /// [`Type`] of the differentiated inputs.
+    input_types: I,
+
+    /// [`Type`] of the differentiated outputs.
+    output_types: O,
+
+    /// Derivative values in output-major/first-input-major/second-input-minor order.
+    values: Vec<V>,
+
+    /// [`PhantomData`] marker for `T`, needed because the input and output fields use `T` only through their bounds.
+    _type: PhantomData<fn() -> T>,
+}
+
+impl<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> Hessian<T, V, I, O> {
+    /// Creates a new [`Hessian`].
+    pub fn new(input_types: I, output_types: O, values: Vec<V>) -> Result<Self, ProgramError> {
+        let input_count = input_types.parameter_count();
+        let expected_count = output_types
+            .parameter_count()
+            .checked_mul(input_count)
+            .and_then(|count| count.checked_mul(input_count))
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: "Hessian block count overflows usize".to_string(),
+            })?;
+        if values.len() != expected_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("Hessian requires {} derivative values but got {}", expected_count, values.len()),
+            });
+        }
+        Ok(Self { input_types, output_types, values, _type: PhantomData })
+    }
+
+    /// Returns the [`Type`] of the differentiated inputs.
+    #[inline]
+    pub fn input_types(&self) -> &I {
+        &self.input_types
+    }
+
+    /// Returns the [`Type`] of the differentiated outputs.
+    #[inline]
+    pub fn output_types(&self) -> &O {
+        &self.output_types
+    }
+
+    /// Returns derivative values in output-major/first-input-major/second-input-minor order.
+    #[inline]
+    pub fn values(&self) -> &[V] {
+        self.values.as_slice()
+    }
+
+    /// Consumes this [`Hessian`] and returns its derivative values in output-major/first-input-major/second-input-minor
+    /// order.
+    #[inline]
+    pub fn into_values(self) -> Vec<V> {
+        self.values
+    }
+
+    /// Returns the [`HessianBlock`] of this [`Hessian`] for the specified output, first input, and second input
+    /// [`ParameterPath`]s, or `None` if any of the provided paths is absent.
+    pub fn block(
+        &self,
+        output_path: &ParameterPath,
+        first_input_path: &ParameterPath,
+        second_input_path: &ParameterPath,
+    ) -> Option<HessianBlock<'_, T, V>> {
+        let (output_index, (_, output_type)) =
+            self.output_types.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
+        let input_count = self.input_types.parameter_count();
+        let (first_input_index, (_, first_input_type)) =
+            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == first_input_path)?;
+        let (second_input_index, (_, second_input_type)) =
+            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == second_input_path)?;
+        Some(HessianBlock {
+            output_path: output_path.clone(),
+            output_type,
+            first_input_path: first_input_path.clone(),
+            first_input_type,
+            second_input_path: second_input_path.clone(),
+            second_input_type,
+            value: &self.values
+                [output_index * input_count * input_count + first_input_index * input_count + second_input_index],
+        })
+    }
+
+    /// Returns borrowed views of all [`HessianBlock`]s of this [`Hessian`] in
+    /// output-major/first-input-major/second-input-minor order.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = HessianBlock<'_, T, V>> {
+        let input_count = self.input_types.parameter_count();
+        self.output_types
+            .named_parameters()
+            .enumerate()
+            .flat_map(move |(output_index, (output_path, output_type))| {
+                self.input_types.named_parameters().enumerate().flat_map(
+                    move |(first_input_index, (first_input_path, first_input_type))| {
+                        let output_path = output_path.clone();
+                        self.input_types.named_parameters().enumerate().map(
+                            move |(second_input_index, (second_input_path, second_input_type))| HessianBlock {
+                                output_path: output_path.clone(),
+                                output_type,
+                                first_input_path: first_input_path.clone(),
+                                first_input_type,
+                                second_input_path,
+                                second_input_type,
+                                value: &self.values[output_index * input_count * input_count
+                                    + first_input_index * input_count
+                                    + second_input_index],
+                            },
+                        )
+                    },
+                )
+            })
+    }
+}
+
+/// Borrowed view of one output/input/input block in a [`Hessian`].
+#[derive(Debug)]
+pub struct HessianBlock<'o, T: Type, V> {
+    /// [`ParameterPath`] of the differentiated output [`Parameter`] that this [`HessianBlock`] corresponds to.
+    output_path: ParameterPath,
+
+    /// [`Type`] of the differentiated output [`Parameter`] that this [`HessianBlock`] corresponds to.
+    output_type: &'o T,
+
+    /// [`ParameterPath`] of the first differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    first_input_path: ParameterPath,
+
+    /// [`Type`] of the first differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    first_input_type: &'o T,
+
+    /// [`ParameterPath`] of the second differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    second_input_path: ParameterPath,
+
+    /// [`Type`] of the second differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    second_input_type: &'o T,
+
+    /// Derivative value for this [`HessianBlock`].
+    value: &'o V,
+}
+
+impl<'o, T: Type, V> HessianBlock<'o, T, V> {
+    /// Returns the [`ParameterPath`] of the differentiated output [`Parameter`] that this [`HessianBlock`]
+    /// corresponds to.
+    #[inline]
+    pub fn output_path(&self) -> &ParameterPath {
+        &self.output_path
+    }
+
+    /// Returns the [`Type`] of the differentiated output [`Parameter`] that this [`HessianBlock`] corresponds to.
+    #[inline]
+    pub fn output_type(&self) -> &'o T {
+        self.output_type
+    }
+
+    /// Returns the [`ParameterPath`] of the first differentiated input [`Parameter`] that this [`HessianBlock`]
+    /// corresponds to.
+    #[inline]
+    pub fn first_input_path(&self) -> &ParameterPath {
+        &self.first_input_path
+    }
+
+    /// Returns the [`Type`] of the first differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    #[inline]
+    pub fn first_input_type(&self) -> &'o T {
+        self.first_input_type
+    }
+
+    /// Returns the [`ParameterPath`] of the second differentiated input [`Parameter`] that this [`HessianBlock`]
+    /// corresponds to.
+    #[inline]
+    pub fn second_input_path(&self) -> &ParameterPath {
+        &self.second_input_path
+    }
+
+    /// Returns the [`Type`] of the second differentiated input [`Parameter`] that this [`HessianBlock`] corresponds to.
+    #[inline]
+    pub fn second_input_type(&self) -> &'o T {
+        self.second_input_type
+    }
+
+    /// Returns the derivative value for this [`HessianBlock`].
+    #[inline]
+    pub fn value(&self) -> &'o V {
+        self.value
+    }
+}
+
+impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            output_path: self.output_path.clone(),
+            output_type: self.output_type,
+            first_input_path: self.first_input_path.clone(),
+            first_input_type: self.first_input_type,
+            second_input_path: self.second_input_path.clone(),
+            second_input_type: self.second_input_type,
+            value: self.value,
+        }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Defines one non-auxiliary [`HessianDifferentiate`] method. It keeps the nested differentiation bounds shared while
 /// adapting its corresponding auxiliary method with a unit auxiliary value.
@@ -185,217 +394,6 @@ where
         + From<ZeroOperation<C::Type>>
         + From<AddOperation>,
 {
-}
-
-/// Dense Hessian of a structured function, represented as its complete output/input/input Cartesian product.
-///
-/// `I` and `O` retain the input and output type trees. Derivative values are stored in deterministic
-/// output-major/first-input-major/second-input-minor order and remain parameters so that the Hessian can cross tracing
-/// and compilation boundaries or participate in higher-order transforms.
-///
-/// The physical representation of a block is defined by [`DenseDifferentiableType`]. For
-/// [`ArrayType`](crate::types::ArrayType), the block for shapes `O`, `I1`, and `I2` has shape `O ++ I1 ++ I2`.
-#[derive(Clone, Debug, Parameterized)]
-pub struct Hessian<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> {
-    /// Type tree of the differentiated inputs.
-    input_types: I,
-
-    /// Type tree of the differentiated outputs.
-    output_types: O,
-
-    /// Derivative values in output-major/first-input-major/second-input-minor order.
-    values: Vec<V>,
-
-    /// Descriptor-family marker. The input and output fields use `T` only through their bounds.
-    _type: PhantomData<fn() -> T>,
-}
-
-impl<T: Type, V: Parameter, I: Parameterized<T>, O: Parameterized<T>> Hessian<T, V, I, O> {
-    /// Constructs a [`Hessian`] from its input/output type trees and derivative values.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Type tree of the differentiated inputs.
-    ///   - `output_types`: Type tree of the differentiated outputs.
-    ///   - `values`: Derivative values in output-major/first-input-major/second-input-minor order. Its length must
-    ///     equal the output leaf count multiplied by the square of the input leaf count.
-    pub(super) fn new(input_types: I, output_types: O, values: Vec<V>) -> Result<Self, ProgramError> {
-        let input_count = input_types.parameter_count();
-        let expected_count = output_types
-            .parameter_count()
-            .checked_mul(input_count)
-            .and_then(|count| count.checked_mul(input_count))
-            .ok_or_else(|| ProgramError::InvalidArgument {
-                message: "hessian block count overflows usize".to_string(),
-            })?;
-        if values.len() != expected_count {
-            return Err(ProgramError::InvalidArgument {
-                message: format!("hessian requires {expected_count} derivative values but got {}", values.len()),
-            });
-        }
-        Ok(Self { input_types, output_types, values, _type: PhantomData })
-    }
-
-    /// Returns the type tree of the differentiated inputs.
-    #[inline]
-    pub fn input_types(&self) -> &I {
-        &self.input_types
-    }
-
-    /// Returns the type tree of the differentiated outputs.
-    #[inline]
-    pub fn output_types(&self) -> &O {
-        &self.output_types
-    }
-
-    /// Returns derivative values in output-major/first-input-major/second-input-minor order.
-    #[inline]
-    pub fn values(&self) -> &[V] {
-        self.values.as_slice()
-    }
-
-    /// Consumes this [`Hessian`] and returns its derivative values.
-    #[inline]
-    pub fn into_values(self) -> Vec<V> {
-        self.values
-    }
-
-    /// Returns borrowed views of all derivative blocks in deterministic Cartesian-product order.
-    pub fn iter_blocks(&self) -> impl Iterator<Item = HessianBlock<'_, T, V>> {
-        let input_count = self.input_types.parameter_count();
-        self.output_types
-            .named_parameters()
-            .enumerate()
-            .flat_map(move |(output_index, (output_path, output_type))| {
-                self.input_types.named_parameters().enumerate().flat_map(
-                    move |(first_input_index, (first_input_path, first_input_type))| {
-                        let output_path = output_path.clone();
-                        self.input_types.named_parameters().enumerate().map(
-                            move |(second_input_index, (second_input_path, second_input_type))| HessianBlock {
-                                output_path: output_path.clone(),
-                                output_type,
-                                first_input_path: first_input_path.clone(),
-                                first_input_type,
-                                second_input_path,
-                                second_input_type,
-                                value: &self.values[output_index * input_count * input_count
-                                    + first_input_index * input_count
-                                    + second_input_index],
-                            },
-                        )
-                    },
-                )
-            })
-    }
-
-    /// Returns the derivative block for the specified output and two input paths.
-    pub fn block(
-        &self,
-        output_path: &ParameterPath,
-        first_input_path: &ParameterPath,
-        second_input_path: &ParameterPath,
-    ) -> Option<HessianBlock<'_, T, V>> {
-        let (output_index, (_, output_type)) =
-            self.output_types.named_parameters().enumerate().find(|(_, (path, _))| path == output_path)?;
-        let input_count = self.input_types.parameter_count();
-        let (first_input_index, (_, first_input_type)) =
-            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == first_input_path)?;
-        let (second_input_index, (_, second_input_type)) =
-            self.input_types.named_parameters().enumerate().find(|(_, (path, _))| path == second_input_path)?;
-        Some(HessianBlock {
-            output_path: output_path.clone(),
-            output_type,
-            first_input_path: first_input_path.clone(),
-            first_input_type,
-            second_input_path: second_input_path.clone(),
-            second_input_type,
-            value: &self.values
-                [output_index * input_count * input_count + first_input_index * input_count + second_input_index],
-        })
-    }
-}
-
-/// Borrowed view of one output/input/input block in a [`Hessian`].
-#[derive(Debug)]
-pub struct HessianBlock<'a, T: Type, V> {
-    /// Path of the differentiated output leaf.
-    output_path: ParameterPath,
-
-    /// Type of the differentiated output leaf.
-    output_type: &'a T,
-
-    /// Path of the first differentiated input leaf.
-    first_input_path: ParameterPath,
-
-    /// Type of the first differentiated input leaf.
-    first_input_type: &'a T,
-
-    /// Path of the second differentiated input leaf.
-    second_input_path: ParameterPath,
-
-    /// Type of the second differentiated input leaf.
-    second_input_type: &'a T,
-
-    /// Derivative value for this output/input/input triple.
-    value: &'a V,
-}
-
-impl<'a, T: Type, V> Clone for HessianBlock<'a, T, V> {
-    fn clone(&self) -> Self {
-        Self {
-            output_path: self.output_path.clone(),
-            output_type: self.output_type,
-            first_input_path: self.first_input_path.clone(),
-            first_input_type: self.first_input_type,
-            second_input_path: self.second_input_path.clone(),
-            second_input_type: self.second_input_type,
-            value: self.value,
-        }
-    }
-}
-
-impl<'a, T: Type, V> HessianBlock<'a, T, V> {
-    /// Returns the path of the differentiated output leaf.
-    #[inline]
-    pub fn output_path(&self) -> &ParameterPath {
-        &self.output_path
-    }
-
-    /// Returns the type of the differentiated output leaf.
-    #[inline]
-    pub fn output_type(&self) -> &'a T {
-        self.output_type
-    }
-
-    /// Returns the path of the first differentiated input leaf.
-    #[inline]
-    pub fn first_input_path(&self) -> &ParameterPath {
-        &self.first_input_path
-    }
-
-    /// Returns the type of the first differentiated input leaf.
-    #[inline]
-    pub fn first_input_type(&self) -> &'a T {
-        self.first_input_type
-    }
-
-    /// Returns the path of the second differentiated input leaf.
-    #[inline]
-    pub fn second_input_path(&self) -> &ParameterPath {
-        &self.second_input_path
-    }
-
-    /// Returns the type of the second differentiated input leaf.
-    #[inline]
-    pub fn second_input_type(&self) -> &'a T {
-        self.second_input_type
-    }
-
-    /// Returns the derivative value for this output/input/input triple.
-    #[inline]
-    pub fn value(&self) -> &'a V {
-        self.value
-    }
 }
 
 /// Nested differentiation context used by the inner reverse-mode Jacobian of a forward-over-reverse Hessian.
