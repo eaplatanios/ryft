@@ -1456,7 +1456,7 @@ where
         }
 
         // Advance one iteration by replaying the body directly over dual values. This is deliberately not routed
-        // through `unroll_concretizable_whiles`: that rewrite interprets the body to discover concrete nested-loop
+        // through a program-level unroll pre-pass: such a rewrite interprets the body to discover concrete nested-loop
         // trip counts, after which replaying its fused JVP would execute primal effects a second time. Direct dual
         // interpretation lets a nested while recurse through this eager rule and executes every primal operation once.
         let input_duals = primal_carries
