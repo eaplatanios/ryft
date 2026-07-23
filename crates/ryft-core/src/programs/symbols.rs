@@ -20,7 +20,7 @@ use crate::programs::types::{Type, TypeError};
 ///   5. The closed [`RegionSymbolSignature`] is converted to a scope-independent [`Signature`](Self::Signature),
 ///      allowing two region instantiations to be recognized as the same even when their variables have different
 ///      identities or names (refer to the [`Signature`](Self::Signature) documentation for more information on
-///      this kind of _alpha normalization_).
+///      this kind of _alpha-normalization_).
 ///
 /// Type families without symbolic metadata use the dummy [`NoSymbols`] vocabulary.
 ///
@@ -69,54 +69,46 @@ pub trait Symbols: Sized {
     /// binder identity the vocabulary needs for capture avoidance.
     type Variable: Clone + Debug + Display + PartialEq;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Symbolic metadata expression composed from variables and constants.
-    ///
-    /// Expressions are the objects embedded in types, operation metadata, and symbolic source declarations. Depending
-    /// on the vocabulary, an expression may reference no variables, one variable, or several variables. For
-    /// [`DimensionSymbols`](crate::DimensionSymbols), the expression type is [`Dimension`](crate::Dimension), and
-    /// `2 * batch + 1` is one expression over the `batch` variable while the static extent `32` is a variable-free
+    /// Symbolic metadata expression composed from variables and constants. Expressions are the objects embedded in
+    /// types, operation metadata, and symbolic source declarations. Depending on the vocabulary, an expression may
+    /// reference no variables, one variable, or several variables.
     /// expression.
     type Expression: Clone + Debug + Display + PartialEq;
 
-    /// Capture-avoiding symbolic replacement of variables with expressions.
-    ///
-    /// Substitutions rebind metadata across scopes during program import, replay, and nested transformations. For
-    /// example, a dimension substitution can replace a callee's `batch` variable with the caller expression
-    /// `caller_batch + 1`. This remains symbolic; assigning the concrete runtime value `caller_batch = 7` belongs to a
-    /// concrete binding/refinement environment, not to `Substitution`.
+    /// Capture-avoiding symbolic replacement of variables with expressions. Substitutions rebind metadata across scopes
+    /// during program import, replay, and nested transformations. For example, a dimension substitution can replace a
+    /// callee's `batch` variable with the caller expression `caller_batch + 1`. This remains symbolic; assigning the
+    /// concrete runtime value `caller_batch = 7` belongs to a concrete binding/refinement environment, and not to
+    /// `Substitution`.
     type Substitution: Clone + Debug;
 
-    /// Semantic predicate over expressions retained by a closed symbolic signature.
-    ///
-    /// Constraints restrict the concrete assignments admitted by a scope without becoming part of structural
-    /// expression equality. Dimension examples include `rows == columns`, `batch <= 64`, and `elements % 8 == 0`.
-    /// The concrete vocabulary is responsible for proving constraints statically when possible and validating any
-    /// residual constraints against concrete bindings.
+    /// Semantic predicate over expressions retained by a closed symbolic signature. Constraints restrict the concrete
+    /// assignments admitted by a scope without becoming part of structural expression equality. Dimension examples
+    /// include `rows == columns`, `batch <= 64`, and `elements % 8 == 0`. The concrete vocabulary is responsible for
+    /// proving constraints statically when possible and validating any residual constraints against concrete bindings.
     type Constraint: Clone + Debug + PartialEq;
 
     /// Hashable identity of a complete closed symbolic signature, independent of variable identities and names.
-    ///
-    /// The identity is *alpha-normalized*: every variable is consistently renamed to a canonical placeholder (for
-    /// example, numbered in first-occurrence order) before the identity is computed, so neither what a variable is
-    /// called nor which scope object owns it can influence the result. The name comes from the λ-calculus notion of
-    /// [alpha equivalence](https://en.wikipedia.org/wiki/Lambda_calculus#%CE%B1-conversion), under which `λx. x` and
-    /// `λy. y` denote the same function because they differ only in the name of the bound variable. Concretely, a
-    /// signature declaring `rows` and one declaring `n` receive equal keys when, after that renaming, their binder
-    /// source classes, bounds, runtime source declarations, and retained constraints also match — the key captures
-    /// the complete semantics of the signature, not merely the expressions' rendered text. Program import uses this
+    /// The identity is *alpha-normalized*: every variable is consistently renamed to a canonical placeholder (e.g.,
+    /// numbered in first-occurrence order) before the identity is computed, so neither what a variable is called
+    /// nor which scope object owns it can influence the result. The name comes from the λ-calculus notion of
+    /// [alpha equivalence](https://en.wikipedia.org/wiki/Lambda_calculus#%CE%B1-conversion), under which `λx. x`
+    /// and `λy. y` denote the same function because they differ only in the name of the bound variable. Concretely,
+    /// a signature declaring `rows` and one declaring `n` receive equal keys when, after that renaming, their binder
+    /// source classes, bounds, runtime source declarations, and retained constraints also match (the key captures
+    /// the complete semantics of the signature, not merely the expressions' rendered text). Program import uses this
     /// identity to decide whether a previously imported symbolic region instantiation can be reused safely.
     type Signature: Clone + Debug + PartialEq + Eq + Hash;
 
-    /// Concrete host representation of a compiler-authorized runtime symbolic witness.
-    ///
-    /// A witness pairs this value with an exact [`Expression`](Self::Expression), allowing
-    /// [`Type::refinements_with_witnesses`] to refine or validate symbolic metadata. For dimension symbols the witness
-    /// value is a `usize`, so an expression such as `2 * batch + 1` might be witnessed by `17`. The `usize` is the
-    /// concrete value; the expression records what it means. A witness is also distinct from an arbitrary ordinary
-    /// program data value: it is supplied only through a symbolic source authorized by the closed region signature.
+    /// Concrete host representation of a compiler-authorized runtime symbolic witness. A witness pairs this value with
+    /// an exact [`Expression`](Self::Expression), allowing [`Type::refinements_with_witnesses`] to refine or validate
+    /// symbolic metadata. For dimension symbols the witness value is a `usize`, so an expression such as `2 * batch`
+    /// might be witnessed by `16`. The `usize` is the concrete value; the expression records what it means. A witness
+    /// is also distinct from an arbitrary ordinary program data value: it is supplied only through a symbolic source
+    /// authorized by the closed region signature.
     type Witness: Copy + Clone + Debug + Display + PartialEq;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the variables referenced by `expression` in deterministic order.
     fn expression_variables(expression: &Self::Expression) -> Vec<Self::Variable>;
