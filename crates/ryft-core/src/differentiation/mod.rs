@@ -82,6 +82,7 @@
 
 pub mod elementwise;
 pub mod forward;
+pub mod hessian;
 pub mod jacobian;
 pub mod reverse;
 pub mod types;
@@ -101,6 +102,10 @@ pub use elementwise::{
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
     ForwardModeDifferentiate, Linearization, LinearizationTracer, Pushforward, jvp, linearize,
+};
+pub use hessian::{
+    Hessian, HessianBlock, HessianDifferentiate, hessian, hessian_holomorphic, hessian_holomorphic_with_aux,
+    hessian_with_aux,
 };
 pub use jacobian::{
     Jacobian, JacobianBlock, JacobianDifferentiate, jacobian_forward, jacobian_forward_holomorphic,

@@ -2997,7 +2997,7 @@ mod tests {
 
     #[test]
     fn test_second_order_reverse_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::tracing_v2::HessianDifferentiate;
+        use crate::differentiation::hessian::HessianDifferentiate;
 
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
