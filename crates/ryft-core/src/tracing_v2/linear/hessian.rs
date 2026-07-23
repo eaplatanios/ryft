@@ -226,12 +226,9 @@ impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Defines one non-auxiliary [`HessianDifferentiate`] method. It keeps the nested differentiation bounds shared while
 /// adapting its corresponding auxiliary method with a unit auxiliary value.
 macro_rules! define_hessian_function_in_trait {
-    // Generates one non-auxiliary Hessian context method by adapting its auxiliary counterpart.
     (
         $(#[doc = $documentation:literal])*
         $method:ident,
@@ -276,7 +273,6 @@ macro_rules! define_hessian_function_in_trait {
 /// Defines one auxiliary-output [`HessianDifferentiate`] method. It centralizes the nested auxiliary parameter bounds
 /// so the ordinary and holomorphic variants cannot drift apart.
 macro_rules! define_hessian_auxiliary_function_in_trait {
-    // Generates one auxiliary Hessian context method with a statically selected holomorphy mode.
     (
         $(#[doc = $documentation:literal])*
         $method:ident,
@@ -327,6 +323,8 @@ macro_rules! define_hessian_auxiliary_function_in_trait {
         }
     };
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Extension trait for materializing dense Hessians in an execution or staging [`Context`].
 ///
