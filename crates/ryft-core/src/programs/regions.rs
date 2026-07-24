@@ -181,6 +181,11 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
             .ok_or_else(|| ProgramError::MalformedProgram(format!("region {id} is out of range")))
     }
 
+    /// Returns a view rooted at `id` in the same source region arena.
+    pub(crate) fn reroot(self, id: RegionId) -> Result<Self, ProgramError> {
+        Self::new(self.regions, id)
+    }
+
     /// Returns the [`RegionId`] identifying this rooted [`Region`] in its source arena.
     #[inline]
     pub fn id(self) -> RegionId {
@@ -516,7 +521,7 @@ impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
         mappings: &'r RegionReplayMappings<V, O>,
     ) -> Result<Self, ProgramError> {
         for root in roots {
-            RegionRef::new(source.regions(), *root)?;
+            source.reroot(*root)?;
         }
         Ok(Self { source, roots, mappings })
     }
@@ -529,7 +534,7 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<
         V: 'r,
         O: 'r,
     {
-        self.roots.iter().map(|root| RegionRef::new(self.source.regions(), *root).unwrap())
+        self.roots.iter().map(|root| self.source.reroot(*root).unwrap())
     }
 }
 
@@ -551,7 +556,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
         self.roots
             .iter()
             .map(|root| {
-                let region = RegionRef::new(self.source.regions(), *root)?;
+                let region = self.source.reroot(*root)?;
                 Ok(builder.import_region_with_remapping(region, remapping))
             })
             .collect()
@@ -704,6 +709,22 @@ mod tests {
         let program = identity_program(DataType::F64);
         assert!(matches!(
             RegionRef::new(program.regions(), RegionId::new(42)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
+        ));
+    }
+
+    #[test]
+    fn test_region_ref_reroot() {
+        let program = program_with_reused_region();
+        let entry = program.entry_region_ref();
+        let nested_id = entry.instructions()[0].regions()[0];
+        let nested = entry.reroot(nested_id).unwrap();
+        assert_eq!(nested.id(), nested_id);
+        assert!(std::ptr::eq(nested.regions(), entry.regions()));
+        assert_eq!(nested.input_types(), vec![DataType::F64]);
+        assert_eq!(nested.output_types(), vec![DataType::F64]);
+        assert!(matches!(
+            entry.reroot(RegionId::new(42)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
         ));
     }

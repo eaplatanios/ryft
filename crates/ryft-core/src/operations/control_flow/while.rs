@@ -1472,7 +1472,7 @@ where
                 let programs = instruction
                     .regions()
                     .iter()
-                    .map(|region| RegionRef::new(body_region.regions(), *region).map(RegionRef::to_program))
+                    .map(|region| body_region.reroot(*region).map(RegionRef::to_program))
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero())
                 {
