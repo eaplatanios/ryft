@@ -656,12 +656,12 @@ Run once, in order, in the owner checkout, with the owner present. Do not procee
       git worktree add ../ryft-1-dimensions u/eaplatanios/wip/dimensions-remainder
       ```
 
-- [ ] From the staging worktree, run `S0`: restore this plan from the immutable archive, create
+- [x] From the staging worktree, run `S0`: restore this plan from the immutable archive, create
       `.tasks/dimensions_cleanup_ledger.md`, and apply only the narrow staging-worktree `git restore` exception to the
       integration version of `AGENTS.md` rather than restoring the archive's unrelated `AGENTS.md` edits. Force-add
       both ignored `.tasks` files and take the increment through the complete no-PR staged-review workflow. This
       rehearses recovery, verification, handoff, direct integration, and remainder reconciliation before code moves.
-- [ ] Gate: the owner checkout is clean on the integration branch; the immutable archive and mutable remainder exist
+- [x] Gate: the owner checkout is clean on the integration branch; the immutable archive and mutable remainder exist
       on `origin`; the immutable archive manifest matches the captured manifest; the staging worktree compiles; and
       `S0` has landed with the plan and ledger tracked on `u/eaplatanios/dynamic-shapes`.
 
@@ -674,8 +674,8 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | ID     | Scope                                                                     | Review method             |
 | ------ | ------------------------------------------------------------------------- | ------------------------- |
 | `S0`   | This plan, delivery ledger, and narrow `AGENTS.md` restore exception        | Line by line              |
-| `S1`   | `region_ref` to `reroot` region-API rename                                 | Line by line              |
-| `S2`   | `tracing_v2::operations::*` module move                                    | Line by line              |
+| `B0`   | Repair the incomplete custom-derivatives module move                       | Line by line              |
+| `S1`   | `RegionRef` arena-reroot helper and call-site cleanup                       | Line by line              |
 | `S3`   | Elementwise-macro restructure                                              | Line by line              |
 | `S4`   | Structured `TypeError` core, then mechanical `Invalid(String)` call sites   | Core plus sampled sites  |
 | `S5a`  | Pure `Size` to `Dimension` rename and `Shape` module move, semantics intact | Pattern, residual, sample |
@@ -692,13 +692,20 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `P10`  | Persistence and measured performance closure                              | Evidence review           |
 | `P11`  | Deletion, minimality, and empty-remainder proof                            | Final architecture review |
 
-Each increment depends on the one above it. Precise scopes: `S2` renames `tracing_v2::operations::*` to
-`tracing_v2::*`; `S3` covers `macros.rs` and `differentiation/elementwise.rs`; `S5a` renames `Size` to `Dimension` and
-moves `Shape` and `StaticShape` into `types::dimensions` without changing representation or behavior.
+Each increment depends on the one above it. `B0` reconstructs the physical custom-derivatives move from the last
+compiling pre-move implementation, updates every direct module path, and excludes the symbolic-dimension semantics
+accidentally mixed into the original move commit. `S3` covers `macros.rs` and `differentiation/elementwise.rs`; `S5a`
+renames `Size` to `Dimension` and moves `Shape` and `StaticShape` into `types::dimensions` without changing
+representation or behavior.
 
-`S1` through `S3` are refactors unrelated to dimensions that are present only because they were in flight
-concurrently. They must be extracted first: they are cheap, they reduce the archived remainder, and they are the
-lowest-risk possible rehearsal of the workflow.
+`B0`, `S1`, and `S3` are refactors unrelated to dimensions that are present only because they were in flight
+concurrently. They must land first: they are bounded, they reduce the archived remainder, and they provide low-risk
+rehearsals of the workflow.
+
+`S1` is not a global rename of `Program::region_ref` or `ProgramBuilder::region_ref`. It introduces
+`RegionRef::reroot` as the one way to select another root from an existing borrowed arena and replaces only
+`RegionRef::new(existing_ref.regions(), id)` reconstruction sites. Initial arena entry through `Program` and
+`ProgramBuilder` remains named `region_ref`.
 
 `S4` has two review strata in one coherent increment: review the semantic enum core and typed conversions line by line,
 then review the uniform tuple-call-site rewrite by transformation command, empty residual search, and representative
@@ -1317,5 +1324,36 @@ The bootstrap preserved the original working tree before any extraction:
 - created `/Users/eaplatanios/Development/Repositories/ryft-1-dimensions` on the remainder branch; and
 - verified the archived baseline with isolated `cargo check -p ryft-core`, which completed successfully.
 
-`S0` is being prepared on `u/eaplatanios/increment/s0-bootstrap`. Its final bootstrap and gate checkboxes remain open
-until the no-commit merge is staged for owner review and then landed.
+### Execution: S0 landed
+
+The owner committed and pushed the staged S0 merge as `fbf43052ec04ea2822f3b3753883b68b0bb42c7e`. The mutable
+remainder was reconciled and pushed as `979d9dd171ffab30944e80d4ab666614d96cf834`; the immutable archive still points
+to `770e77d001547c72150a44843c170ea6417ab41e`. Both final bootstrap checkboxes are therefore complete.
+
+### Execution: pre-S1 integration-baseline blocker
+
+The focused S1 test exposed a failure before the compiler reached the S1 code. Integration commit
+`8105cfd26817ab728bb2799c889021f240345993` already contains the physical move of
+`tracing_v2/operations/custom_derivatives.rs` one level up, but its production use sites still import the deleted
+`tracing_v2::operations` module. The moved file also includes 187 insertions from the later symbolic-dimension work,
+referencing `OperationSymbols`, `SymbolSubstitution`, `Dimension`, and operation hooks that do not exist on
+integration. The archived dirty tree compiled only because it supplied those later dependencies.
+
+Do not widen S1 around this unrelated break. Preserve S1 on its increment branch, land `B0` as a separate baseline
+repair reconstructed from the last compiling pre-move implementation plus direct path updates, then merge that repair
+into S1 and resume its verification. `B0` supersedes the previously planned `S2`: the physical move was already
+committed, but the commit neither updated its consumers nor separated later symbolic-dimension changes.
+
+### Execution: B0 baseline repair
+
+`B0` restores the last compiling pre-move `custom_derivatives.rs` implementation at its already-committed canonical
+path, retains the root module documentation, and updates every production import and rustdoc link directly. It removes
+the 187 later symbolic-dimension insertions that made the move depend on APIs absent from integration. Verification:
+
+- `cargo check -p ryft-core` passed;
+- `cargo check -p ryft-xla` passed;
+- `cargo test -p ryft-core --lib` passed all 911 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; and
+- `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored.
+
+The residual search found no `tracing_v2::operations` reference in Rust source under `crates/`.
