@@ -99,9 +99,10 @@ fn validated_branch_interfaces<'i, T: Type>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
     if region_interfaces.len() != 2 {
-        return Err(TypeError {
-            message: format!("condition expects 2 attached regions but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::Invalid(format!(
+            "condition expects 2 attached regions but got {}",
+            region_interfaces.len()
+        )));
     }
     let true_interface = &region_interfaces[0];
     let false_interface = &region_interfaces[1];
@@ -133,9 +134,10 @@ where
         let (true_interface, _) = validated_branch_interfaces(region_interfaces)?;
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
         if !input_types[0].is_scalar() || !input_types[0].element_type().is_boolean() {
-            return Err(TypeError {
-                message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
-            });
+            return Err(TypeError::Invalid(format!(
+                "condition predicate type must be a scalar boolean, but got {}",
+                input_types[0]
+            )));
         }
         check_types!(@same, "condition input", [true_interface.input_types(), &input_types[1..]]);
         Ok(true_interface.output_types().to_vec())
@@ -1276,33 +1278,31 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[predicate_type.clone(), operand_type.clone()], &[]),
-            Err(TypeError { message: "condition expects 2 attached regions but got 0".to_string() }),
+            Err(TypeError::Invalid("condition expects 2 attached regions but got 0".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(&[], interfaces.as_slice()),
-            Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
+            Err(TypeError::Invalid("expected 2 inputs but got 0".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(&[operand_type.clone(), operand_type.clone()], interfaces.as_slice()),
-            Err(TypeError { message: "condition predicate type must be a scalar boolean, but got f64[]".to_string() }),
+            Err(TypeError::Invalid("condition predicate type must be a scalar boolean, but got f64[]".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])), operand_type.clone()],
                 interfaces.as_slice(),
             ),
-            Err(TypeError {
-                message: "condition predicate type must be a scalar boolean, but got bool[2]".to_string(),
-            }),
+            Err(TypeError::Invalid("condition predicate type must be a scalar boolean, but got bool[2]".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[predicate_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
                 interfaces.as_slice(),
             ),
-            Err(TypeError {
-                message: "condition input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "condition input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string()
+            )),
         );
 
         // Inference rejects branch interfaces with mismatched output signatures.
@@ -1318,10 +1318,9 @@ mod tests {
                 &[predicate_type.clone(), operand_type.clone()],
                 &[branch_interface(&true_branch), branch_interface(&boolean_branch)],
             ),
-            Err(TypeError {
-                message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
-                    .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]".to_string()
+            )),
         );
 
         // Eager binding interprets the predicate-selected branch through detached region access, and interpretation

@@ -214,12 +214,10 @@ impl<
             let declared = declared.r#type();
             let actual = input.r#type();
             if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError {
-                    message: format!(
-                        "encountered input type {actual} which is incompatible with the program's \
+                return Err(TypeError::Invalid(format!(
+                    "encountered input type {actual} which is incompatible with the program's \
                         declared type {declared}",
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -304,12 +302,10 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
                 self.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: *input_id })?.r#type();
             let actual = input.r#type();
             if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError {
-                    message: format!(
-                        "encountered input type {actual} which is incompatible with the region's declared type \
+                return Err(TypeError::Invalid(format!(
+                    "encountered input type {actual} which is incompatible with the region's declared type \
                          {declared}",
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -567,7 +563,7 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError { message })) if message
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message
                 == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
         ));
 
@@ -581,7 +577,7 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0, 3.0])).unwrap().to_f64s(), vec![2.0, 4.0, 6.0]);
         assert!(matches!(
             program.interpret(Array::scalar(1.0)),
-            Err(ProgramError::Type(TypeError { message })) if message
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message
                 == "encountered input type f64[] which is incompatible with the program's declared type f64[*]",
         ));
 
@@ -593,7 +589,7 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError { message })) if message
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message
                 == "encountered input type f64[3] which is incompatible with the program's declared type f64[<3]",
         ));
     }

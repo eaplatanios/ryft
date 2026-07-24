@@ -123,23 +123,19 @@ impl Operation<ArrayType> for ReshardOperation {
         check_count!("input", input_types, 1, TypeError);
         let input = &input_types[0];
         if input.rank() != self.sharding.rank() {
-            return Err(TypeError {
-                message: format!(
-                    "{RESHARD_OPERATION_NAME} target sharding rank ({}) does not match the input rank ({})",
-                    self.sharding.rank(),
-                    input.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "{RESHARD_OPERATION_NAME} target sharding rank ({}) does not match the input rank ({})",
+                self.sharding.rank(),
+                input.rank(),
+            )));
         }
         if referenced_axes(&self.sharding)
             .any(|axis| self.sharding.mesh().axis_type(axis) == Some(crate::sharding::MeshAxisType::Auto))
         {
-            return Err(TypeError {
-                message: format!(
-                    "{RESHARD_OPERATION_NAME} cannot target auto mesh axes; use a sharding constraint to hint \
+            return Err(TypeError::Invalid(format!(
+                "{RESHARD_OPERATION_NAME} cannot target auto mesh axes; use a sharding constraint to hint \
                      propagation over auto axes"
-                ),
-            });
+            )));
         }
         // The resharded value still varies across whatever manual axes the input varied across; that fact is
         // orthogonal to the requested placement, so it is carried over rather than taken from the target.
@@ -149,13 +145,13 @@ impl Operation<ArrayType> for ReshardOperation {
             .sharding
             .clone()
             .with_varying_manual_axes(varying_manual_axes)
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         Ok(vec![
             ArrayType::new(input.data_type(), input.shape().clone())
                 .with_layout(input.layout().cloned())
                 .with_memory(input.memory())
                 .with_sharding(sharding)
-                .map_err(|error| TypeError { message: error.to_string() })?,
+                .map_err(|error| TypeError::Invalid(error.to_string()))?,
         ])
     }
 
@@ -344,13 +340,11 @@ impl Operation<ArrayType> for ShardingConstraintOperation {
         check_count!("input", input_types, 1, TypeError);
         let input = &input_types[0];
         if input.rank() != self.sharding.rank() {
-            return Err(TypeError {
-                message: format!(
-                    "{SHARDING_CONSTRAINT_OPERATION_NAME} hint rank ({}) does not match the input rank ({})",
-                    self.sharding.rank(),
-                    input.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "{SHARDING_CONSTRAINT_OPERATION_NAME} hint rank ({}) does not match the input rank ({})",
+                self.sharding.rank(),
+                input.rank(),
+            )));
         }
         // The hint may only place ranked dimensions over auto axes (the axes the compiler propagates); naming an
         // explicit or manual axis is the inverse error of `reshard`'s auto-axis rejection.
@@ -358,12 +352,10 @@ impl Operation<ArrayType> for ShardingConstraintOperation {
             if let ShardingDimension::Sharded(axis_names) = dimension {
                 for axis_name in axis_names {
                     if self.sharding.mesh().axis_type(axis_name) != Some(crate::sharding::MeshAxisType::Auto) {
-                        return Err(TypeError {
-                            message: format!(
-                                "{SHARDING_CONSTRAINT_OPERATION_NAME} can only hint placement over auto mesh axes, \
+                        return Err(TypeError::Invalid(format!(
+                            "{SHARDING_CONSTRAINT_OPERATION_NAME} can only hint placement over auto mesh axes, \
                                  but '{axis_name}' is not auto; use reshard for explicit or manual axes"
-                            ),
-                        });
+                        )));
                     }
                 }
             }
@@ -566,11 +558,11 @@ mod tests {
         let auto_target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         assert_eq!(
             ReshardOperation::new(auto_target).infer_output_types(&[vector_type(8)], &[]),
-            Err(TypeError {
-                message: "reshard cannot target auto mesh axes; use a sharding constraint to hint propagation over \
+            Err(TypeError::Invalid(
+                "reshard cannot target auto mesh axes; use a sharding constraint to hint propagation over \
                           auto axes"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
 
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -579,9 +571,7 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2)]),)],
                 &[]
             ),
-            Err(TypeError {
-                message: "reshard target sharding rank (1) does not match the input rank (2)".to_string(),
-            }),
+            Err(TypeError::Invalid("reshard target sharding rank (1) does not match the input rank (2)".to_string())),
         );
     }
 
@@ -606,11 +596,11 @@ mod tests {
         let explicit_hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
             ShardingConstraintOperation::new(explicit_hint).infer_output_types(&[vector_type(8)], &[]),
-            Err(TypeError {
-                message: "sharding_constraint can only hint placement over auto mesh axes, but 'x' is not auto; use \
+            Err(TypeError::Invalid(
+                "sharding_constraint can only hint placement over auto mesh axes, but 'x' is not auto; use \
                           reshard for explicit or manual axes"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
     }
 

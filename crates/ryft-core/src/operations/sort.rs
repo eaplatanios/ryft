@@ -139,40 +139,42 @@ impl Operation<ArrayType> for SortOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         let Some(key_type) = input_types.first() else {
-            return Err(TypeError { message: "'sort' needs at least one input".to_string() });
+            return Err(TypeError::Invalid("'sort' needs at least one input".to_string()));
         };
         if self.key_count > input_types.len() {
-            return Err(TypeError {
-                message: format!("'sort' key_count {} exceeds operand count {}", self.key_count, input_types.len()),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'sort' key_count {} exceeds operand count {}",
+                self.key_count,
+                input_types.len()
+            )));
         }
         for input_type in &input_types[..self.key_count] {
             let data_type = input_type.data_type();
             if data_type.is_token() || data_type.is_zero() || data_type.is_complex() {
-                return Err(TypeError { message: format!("'sort' does not support key data type {data_type}") });
+                return Err(TypeError::Invalid(format!("'sort' does not support key data type {data_type}")));
             }
         }
         if self.axis >= key_type.rank() {
-            return Err(TypeError {
-                message: format!("'sort' axis {} is out of bounds for rank {}", self.axis, key_type.rank()),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'sort' axis {} is out of bounds for rank {}",
+                self.axis,
+                key_type.rank()
+            )));
         }
         for input_type in input_types {
             if input_type.shape() != key_type.shape() {
-                return Err(TypeError {
-                    message: format!(
-                        "'sort' operands must agree on shape but got {} and {}",
-                        key_type.shape(),
-                        input_type.shape(),
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'sort' operands must agree on shape but got {} and {}",
+                    key_type.shape(),
+                    input_type.shape(),
+                )));
             }
             if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError { message: "'sort' does not support unreduced operands".to_string() });
+                return Err(TypeError::Invalid("'sort' does not support unreduced operands".to_string()));
             }
             if let Some(sharding) = input_type.sharding() {
                 if matches!(sharding.dimensions()[self.axis], ShardingDimension::Sharded(_)) {
-                    return Err(TypeError { message: format!("'sort' cannot sort along sharded axis {}", self.axis) });
+                    return Err(TypeError::Invalid(format!("'sort' cannot sort along sharded axis {}", self.axis)));
                 }
             }
         }
@@ -543,7 +545,7 @@ where
     if let Some(sharding) = value_type.sharding() {
         iota_type = iota_type
             .with_sharding(sharding.clone())
-            .map_err(|error| ProgramError::from(TypeError { message: error.to_string() }))?;
+            .map_err(|error| ProgramError::from(TypeError::Invalid(error.to_string())))?;
     }
     let indices = value.dispatch_domain().bind(IotaOperation::new(iota_type, axis), Vec::new(), &[])?.remove(0);
     Ok((indices, dimensions))
@@ -770,7 +772,7 @@ mod tests {
         // The eager implementation validates the key count like type inference does.
         assert!(matches!(
             Sort::sort_with_key_count(&operands[..1], 0, SortDirection::Ascending, 2),
-            Err(ProgramError::Type(TypeError { message })) if message == "'sort' key_count 2 exceeds operand count 1",
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message == "'sort' key_count 2 exceeds operand count 1",
         ));
         assert!(matches!(
             Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 0),

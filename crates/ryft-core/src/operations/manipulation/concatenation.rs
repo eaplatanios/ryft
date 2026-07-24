@@ -41,8 +41,8 @@ impl ConcatenateOperation {
     #[inline]
     pub fn new<A: Into<Axis>>(axis: A, rank: usize) -> Result<Self, TypeError> {
         let axis = axis.into();
-        axis.normalize(rank).map(|axis| Self { axis }).map_err(|_| TypeError {
-            message: format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"),
+        axis.normalize(rank).map(|axis| Self { axis }).map_err(|_| {
+            TypeError::Invalid(format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"))
         })
     }
 
@@ -75,7 +75,7 @@ impl Operation<ArrayType> for ConcatenateOperation {
         match ArrayType::concatenate(input_types, self.axis) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::Invalid(error.to_string())),
         }
     }
 
@@ -134,9 +134,7 @@ impl_differentiable_operation! {
             // be static so those offsets are known. Symbolic-zero cotangents remain symbolic for every input.
             check_count!("output", outputs, 1, ProgramError);
             if inputs.is_empty() {
-                return Err(TypeError {
-                    message: "'concatenate' transpose expects at least one operand but got none".to_string(),
-                }
+                return Err(TypeError::Invalid("'concatenate' transpose expects at least one operand but got none".to_string())
                 .into());
             }
             let axis = operation.axis();
@@ -152,12 +150,10 @@ impl_differentiable_operation! {
                         let input_type = input.r#type();
                         let dimension = input_type.dimension(axis);
                         let Size::Static(input_axis_size) = dimension else {
-                            return Err(TypeError {
-                                message: format!(
+                            return Err(TypeError::Invalid(format!(
                                     "'concatenate' transpose requires a static size along the concatenated axis \
                                     {axis} but operand {index} has size {dimension}",
-                                ),
-                            }
+                                ))
                             .into());
                         };
                         let mut start_indices = vec![0usize; rank];
@@ -204,9 +200,9 @@ where
         // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
         // the operation passes through unchanged.
         if inputs.is_empty() {
-            return Err(TypeError {
-                message: format!("'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"
+            ))
             .into());
         }
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
@@ -298,9 +294,9 @@ impl Concatenate for ArrayType {
     ) -> Result<Self, ProgramError> {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
-            return Err(TypeError {
-                message: format!("'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"
+            ))
             .into());
         };
         if inputs.len() == 1 {
@@ -313,7 +309,7 @@ impl Concatenate for ArrayType {
         ArrayType::new(first.data_type(), Shape::new(dimensions))
             .with_memory(first.memory())
             .with_sharding(infer_concatenation_sharding(&inputs)?)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::Invalid(error.to_string()).into())
     }
 }
 
@@ -333,9 +329,9 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         // implementations.
         let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
         let Some(rank) = inputs.first().map(|input| input.r#type().rank()) else {
-            return Err(TypeError {
-                message: format!("'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none"
+            ))
             .into());
         };
         if inputs.len() == 1 {
@@ -358,58 +354,52 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
     let mut maximum_concatenated_size = Some(0usize);
     for (index, operand) in inputs.iter().enumerate() {
         if operand.data_type() != first.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' operands must share one data type but operand {} has data type {} and operand 0 has data \
+            return Err(TypeError::Invalid(format!(
+                "'{}' operands must share one data type but operand {} has data type {} and operand 0 has data \
                      type {}",
-                    CONCATENATE_OPERATION_NAME,
-                    index,
-                    operand.data_type(),
-                    first.data_type(),
-                ),
-            });
+                CONCATENATE_OPERATION_NAME,
+                index,
+                operand.data_type(),
+                first.data_type(),
+            )));
         }
 
         if operand.rank() != rank {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' operands must share one rank but operand {index} has rank {} and operand 0 has rank {rank}",
-                    CONCATENATE_OPERATION_NAME,
-                    operand.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{}' operands must share one rank but operand {index} has rank {} and operand 0 has rank {rank}",
+                CONCATENATE_OPERATION_NAME,
+                operand.rank(),
+            )));
         }
 
         if operand.memory() != first.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' operands must share one memory space but operand {index} resides in {} and operand 0 \
+            return Err(TypeError::Invalid(format!(
+                "'{}' operands must share one memory space but operand {index} resides in {} and operand 0 \
                      resides in {}",
-                    CONCATENATE_OPERATION_NAME,
-                    operand.memory(),
-                    first.memory(),
-                ),
-            });
+                CONCATENATE_OPERATION_NAME,
+                operand.memory(),
+                first.memory(),
+            )));
         }
 
         for other_axis in 0..rank {
             let dimension = operand.dimension(other_axis);
             let first_dimension = first.dimension(other_axis);
             if other_axis != axis && dimension != first_dimension {
-                return Err(TypeError {
-                    message: format!(
-                        "'{CONCATENATE_OPERATION_NAME}' operands must agree on every axis other than {axis} but \
+                return Err(TypeError::Invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' operands must agree on every axis other than {axis} but \
                          operand {index} has size {dimension} on axis {other_axis} and operand 0 has size \
                          {first_dimension}",
-                    ),
-                });
+                )));
             }
         }
 
         match operand.dimension(axis) {
             Size::Static(size) => {
-                concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| TypeError {
-                    message: format!("'{CONCATENATE_OPERATION_NAME}' output size overflows usize on axis {axis}"),
+                concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| {
+                    TypeError::Invalid(format!(
+                        "'{CONCATENATE_OPERATION_NAME}' output size overflows usize on axis {axis}"
+                    ))
                 })?;
                 maximum_concatenated_size = maximum_concatenated_size.and_then(|maximum| maximum.checked_add(size));
             }
@@ -454,12 +444,10 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         } else if !operand.unreduced_axes().is_disjoint(&added_varying_manual_axes)
             || !normalized_reduced_axes.is_disjoint(&added_varying_manual_axes)
         {
-            return Err(TypeError {
-                message: format!(
-                    "'{CONCATENATE_OPERATION_NAME}' cannot make operand varying over axes \
+            return Err(TypeError::Invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' cannot make operand varying over axes \
                      {added_varying_manual_axes:?} while it is reduced or unreduced over any of those axes",
-                ),
-            });
+            )));
         }
         unreduced_axes = merge_concatenation_axis_set(unreduced_axes, operand.unreduced_axes(), "unreduced")?;
         reduced_axes = merge_concatenation_axis_set(reduced_axes, &normalized_reduced_axes, "reduced")?;
@@ -472,12 +460,10 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
             Some(reference)
                 if reference.mesh() != sharding.mesh() || reference.dimensions() != sharding.dimensions() =>
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'{CONCATENATE_OPERATION_NAME}' operands must be sharded identically, but got {reference} \
+                return Err(TypeError::Invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' operands must be sharded identically, but got {reference} \
                          and {sharding}",
-                    ),
-                });
+                )));
             }
             None => spatial_sharding = Some(sharding),
             Some(_) => {}
@@ -490,7 +476,7 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         .and_then(|sharding| sharding.with_reduced_axes(reduced_axes.unwrap_or_default()))
         .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
         .map(Some)
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::Invalid(error.to_string()))
 }
 
 /// Merges one nonempty reduced or unreduced axis set into the corresponding concatenation result state.
@@ -503,9 +489,9 @@ fn merge_concatenation_axis_set(
         return Ok(current);
     }
     match current {
-        Some(reference) if &reference != axes => Err(TypeError {
-            message: format!("'{CONCATENATE_OPERATION_NAME}' operands must be {state} over the same nonempty axis set"),
-        }),
+        Some(reference) if &reference != axes => Err(TypeError::Invalid(format!(
+            "'{CONCATENATE_OPERATION_NAME}' operands must be {state} over the same nonempty axis set"
+        ))),
         None => Ok(Some(axes.clone())),
         current => Ok(current),
     }
@@ -628,7 +614,7 @@ mod tests {
         assert_eq!(ConcatenateOperation::new(-1, 2).unwrap().axis(), 1);
         assert_eq!(
             ConcatenateOperation::new(2, 2),
-            Err(TypeError { message: "'concatenate' axis 2 is out of bounds for operands of rank 2".to_string() }),
+            Err(TypeError::Invalid("'concatenate' axis 2 is out of bounds for operands of rank 2".to_string())),
         );
 
         // Interpretation joins the row-major payloads along axis 0, while the sole-input fast path returns its input
@@ -921,7 +907,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     operation.infer_output_types(&operands, &[]),
-                    Err(TypeError { message }) if message.starts_with(
+                    Err(TypeError::Invalid(message)) if message.starts_with(
                         "'concatenate' operands must be sharded identically, but got "
                     )
                 ));
@@ -965,7 +951,7 @@ mod tests {
                 [row(Some(left.clone())), row(Some(right.clone()))],
                 [row(Some(right.clone())), row(Some(left.clone()))],
             ] {
-                assert_eq!(operation.infer_output_types(&operands, &[]), Err(TypeError { message: message.into() }));
+                assert_eq!(operation.infer_output_types(&operands, &[]), Err(TypeError::Invalid(message.into())));
             }
         }
         assert_eq!(
@@ -976,7 +962,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError { message: "mesh axis name 'm' appears more than once".into() }),
+            Err(TypeError::Invalid("mesh axis name 'm' appears more than once".into())),
         );
 
         // The public capability performs the standard varying normalization before applying the primitive rule.
@@ -1015,7 +1001,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError { message }) if message.starts_with(
+            Err(TypeError::Invalid(message)) if message.starts_with(
                 "'concatenate' cannot make operand varying over axes"
             )
         ));
@@ -1087,11 +1073,11 @@ mod tests {
                 [&host_row, &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))],
                 0,
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "'concatenate' operands must share one memory space but operand 1 resides in Device and \
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'concatenate' operands must share one memory space but operand 1 resides in Device and \
                     operand 0 resides in Host[Pinned]"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
 
         // Invalid signed axes and output-size overflow report exact type errors.
@@ -1103,9 +1089,9 @@ mod tests {
                 ],
                 -3,
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "'concatenate' axis -3 is out of bounds for operands of rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'concatenate' axis -3 is out of bounds for operands of rank 2".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::concatenate(
@@ -1115,9 +1101,9 @@ mod tests {
                 ],
                 0,
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "'concatenate' output size overflows usize on axis 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'concatenate' output size overflows usize on axis 0".to_string()
+            ))),
         );
     }
 }

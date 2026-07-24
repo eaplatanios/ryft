@@ -1,15 +1,58 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::errors::CustomError;
 use crate::parameters::Parameter;
+use crate::programs::ProgramError;
 
-/// Error returned when type inference fails.
+/// Represents errors produced while inferring or validating types.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
-#[error("{message}")]
-pub struct TypeError {
-    pub message: String,
+pub enum TypeError {
+    /// A generic type contract was invalid.
+    #[error("{0}")]
+    Invalid(String),
+
+    /// A heterogeneous type projection encountered a different type kind than the requested one.
+    #[error("expected {expected} type but got {actual} type")]
+    WrongKind { expected: &'static str, actual: &'static str },
+
+    /// A type family produced an error with a concrete, recoverable type.
+    #[error("{0}")]
+    Custom(Arc<dyn CustomError>),
+}
+
+impl TypeError {
+    /// Wraps a type-family-specific error in a [`Custom`](TypeError::Custom) variant. The concrete error can later be
+    /// recovered using [`TypeError::downcast_custom`].
+    #[inline]
+    pub fn custom(error: impl CustomError) -> Self {
+        Self::Custom(Arc::new(error))
+    }
+
+    /// Returns the wrapped custom error downcast to `T` when this is a [`Custom`](TypeError::Custom) variant holding a
+    /// `T`, and [`None`] otherwise.
+    #[inline]
+    pub fn downcast_custom<T: CustomError>(&self) -> Option<&T> {
+        match self {
+            // Deref through the `Arc` to the `dyn CustomError`, upcast to `&dyn std::error::Error`, and then use the
+            // standard error downcast. Going through the `Arc` directly would downcast the `Arc` instead of the error.
+            Self::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+
+    /// Converts `error` into a type error, preserving an existing [`TypeError`] and rendering every other program
+    /// error as a generic invalid-type diagnostic.
+    #[inline]
+    pub fn from_program(error: ProgramError) -> Self {
+        match error {
+            ProgramError::Type(error) => error,
+            error => Self::Invalid(error.to_string()),
+        }
+    }
 }
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
@@ -91,4 +134,58 @@ pub trait Typed {
     /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
     /// [`Cow::into_owned`] to clone on demand.
     fn r#type(&self) -> Cow<'_, Self::Type>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use crate::programs::ProgramError;
+
+    use super::TypeError;
+
+    #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
+    #[error("custom type error {code}")]
+    struct CustomTypeError {
+        code: usize,
+    }
+
+    #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
+    #[error("other custom type error")]
+    struct OtherCustomTypeError;
+
+    #[test]
+    fn test_type_error_variants() {
+        let invalid = TypeError::Invalid("invalid type".to_owned());
+        assert_eq!(invalid.to_string(), "invalid type");
+        assert_eq!(invalid.downcast_custom::<CustomTypeError>(), None);
+
+        let wrong_kind = TypeError::WrongKind { expected: "array", actual: "dimension" };
+        assert_eq!(wrong_kind.to_string(), "expected array type but got dimension type");
+        assert_eq!(wrong_kind.downcast_custom::<CustomTypeError>(), None);
+
+        let custom = TypeError::custom(CustomTypeError { code: 1 });
+        let equal = TypeError::custom(CustomTypeError { code: 1 });
+        assert_eq!(custom, equal);
+        assert_ne!(custom, TypeError::custom(CustomTypeError { code: 2 }));
+        assert_ne!(custom, TypeError::custom(OtherCustomTypeError));
+
+        let cloned = custom.clone();
+        assert_eq!(cloned.downcast_custom::<CustomTypeError>(), Some(&CustomTypeError { code: 1 }));
+        assert_eq!(cloned.downcast_custom::<OtherCustomTypeError>(), None);
+
+        let mut errors = HashSet::new();
+        errors.insert(custom);
+        assert!(errors.contains(&equal));
+    }
+
+    #[test]
+    fn test_type_error_from_program() {
+        let type_error = TypeError::custom(CustomTypeError { code: 7 });
+        assert_eq!(TypeError::from_program(ProgramError::Type(type_error.clone())), type_error);
+        assert_eq!(
+            TypeError::from_program(ProgramError::InvalidArgument { message: "invalid argument".to_owned() }),
+            TypeError::Invalid("invalid argument".to_owned()),
+        );
+    }
 }

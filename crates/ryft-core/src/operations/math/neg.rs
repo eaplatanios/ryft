@@ -20,7 +20,7 @@ define_elementwise_operation!(
         check_types!(@numeric, NEG_OPERATION_NAME, input_types);
         let input_type = input_types[0];
         if input_type == DataType::F8E8M0FNU {
-            return Err(TypeError { message: "'neg' does not support input data type f8e8m0fnu".to_string() });
+            return Err(TypeError::Invalid("'neg' does not support input data type f8e8m0fnu".to_string()));
         }
         Ok(vec![input_type])
     },

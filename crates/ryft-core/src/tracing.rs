@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error.clone()));
         assert!(matches!(
             tracing_context.stage_operation(AddOperation, Vec::new(), &[&tracer]),
-            Err(ProgramError::Type(TypeError { message })) if message == "expected 2 inputs but got 1",
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message == "expected 2 inputs but got 1",
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
 
@@ -1185,12 +1185,12 @@ mod tests {
         let result = tracing_context.stage_operation(AddOperation, Vec::new(), &[&lhs, &rhs]);
         assert!(matches!(
             result,
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "'add' input types are not broadcast-compatible",
         ));
         assert!(matches!(
             builder.borrow().error().cloned(),
-            Some(ProgramError::Type(TypeError { message }))
+            Some(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "'add' input types are not broadcast-compatible",
         ));
 
@@ -1268,7 +1268,7 @@ mod tests {
         // Test that `TypeError`s are returned in certain cases.
         assert!(matches!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "'add' input types are not broadcast-compatible",
         ));
     }

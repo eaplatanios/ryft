@@ -39,14 +39,13 @@ ledger disagrees with Git.
 
 ## S1: region arena ID selection
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/s1-region-reroot`
 - Source commit: `389f1eb56c226e2779c993ae26267bed555061ab`
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Integration commit: `048150c170ed19d3138a2d3b5c7eb8bc4d3706ee`
+- Remainder reconciliation commit: `5b4c473316beda0f356ade1ad8fff8d4ca99db75`
 - Immutable archive unchanged: yes
-- Landed: pending; introduce public `RegionRef::with_id` and replace reconstruction from an existing `RegionRef`'s
-  arena
+- Landed: introduced public `RegionRef::with_id` and replaced reconstruction from an existing `RegionRef`'s arena
 - Deferred: identity-signature retention remains in `P1`; `S1` provides the metadata-preserving seam without
   introducing identity machinery
 - Verification: formatting passed; the focused `with_id` test passed; all 912 core library tests passed; core doctests
@@ -54,7 +53,47 @@ ledger disagrees with Git.
   the B1 integration baseline
 - Residual search: the production change leaves only initial arena-entry `RegionRef::new` calls and its direct
   constructor error test
-- Next action: push S1 and stage its no-commit merge on `u/eaplatanios/dynamic-shapes`
+- Next action: none
+
+## S3: former elementwise-macro restructure
+
+- Status: absorbed
+- Branch: none
+- Source commit: none
+- Integration commit: not applicable; the independent restructure is already ancestral to integration
+- Remainder reconciliation commit: not applicable
+- Immutable archive unchanged: yes
+- Landed: the historical restructure is already present
+- Deferred: explicit elementwise inference result types and `TypeError::Invalid` rewrites belong to S4; `Size` to
+  `Dimension` rewrites belong to S5a
+- Verification: classified every remaining archive diff hunk in `macros.rs` and `differentiation/elementwise.rs`
+- Residual search: no standalone S3-owned hunk remains
+- Next action: complete S4
+
+## S4: structured type errors
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/s4-type-error`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: replaces the single-field `TypeError` struct with `Invalid(String)`, structured `WrongKind`, and typed
+  `Custom` variants; adds typed custom recovery and program-error preservation; migrates all 759 existing construction
+  and destructuring sites; and adds the elementwise inference annotations formerly assigned to S3
+- Deferred: `DimensionError` remains owned by the later dimension implementation and will travel through `Custom`;
+  all dimension representation and identity semantics remain in S5a and P1; the inherited `arrays` root-glob warning
+  remains assigned to P9
+- Verification: `cargo fmt --all -- --check` and `git diff --check` passed; `cargo check -p ryft-core` and
+  `cargo check -p ryft-xla` passed;
+  `cargo test -p ryft-core --lib` passed all 914 tests; `cargo test -p ryft-core --doc` passed 43 tests with 13
+  ignored; `cargo test -p ryft-macros -p ryft-macros-tests` passed all 53 macro unit tests and all 17 operation
+  integration tests, while one parameter compile-fail snapshot retained its independently reproduced integration
+  baseline mismatch because the compiler now lists `Axes`; `cargo test -p ryft-xla --lib` passed 395 tests with 1
+  ignored
+- Residual search: `rg -n 'TypeError\s*\{|TypeError::Invalid\s*\{' --glob '*.rs' .` leaves only the `TypeError`
+  enum/impl declarations and unrelated type names; no old struct construction or named `Invalid` variant remains
+- Next action: push this increment and stage its no-commit merge on `u/eaplatanios/dynamic-shapes` for owner review
 
 ## B0: repair the custom-derivatives module move
 

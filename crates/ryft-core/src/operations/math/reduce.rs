@@ -108,26 +108,26 @@ pub fn reduce_abstract(
     let mut reduce_mask = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
-            return Err(TypeError { message: format!("'{op}' axis {axis} is out of bounds for rank {rank}") });
+            return Err(TypeError::Invalid(format!("'{op}' axis {axis} is out of bounds for rank {rank}")));
         }
         if reduce_mask[*axis] {
-            return Err(TypeError { message: format!("'{op}' contains duplicate axis {axis}") });
+            return Err(TypeError::Invalid(format!("'{op}' contains duplicate axis {axis}")));
         }
         reduce_mask[*axis] = true;
     }
 
     let data_type = input.data_type();
     if kind.requires_boolean() && !data_type.is_boolean() {
-        return Err(TypeError { message: format!("'{op}' kind {kind} requires Boolean inputs but got {data_type}") });
+        return Err(TypeError::Invalid(format!("'{op}' kind {kind} requires Boolean inputs but got {data_type}")));
     }
     if !kind.requires_boolean() && data_type.is_boolean() {
-        return Err(TypeError { message: format!("'{op}' kind {kind} requires numeric inputs but got {data_type}") });
+        return Err(TypeError::Invalid(format!("'{op}' kind {kind} requires numeric inputs but got {data_type}")));
     }
     // Min/max reductions select elements by order, and complex element types are unordered.
     if matches!(kind, ReductionKind::Max | ReductionKind::Min) && data_type.is_complex() {
-        return Err(TypeError {
-            message: format!("'{op}' kind {kind} is not defined for the unordered complex element type {data_type}"),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{op}' kind {kind} is not defined for the unordered complex element type {data_type}"
+        )));
     }
 
     let dimensions = input
@@ -141,7 +141,7 @@ pub fn reduce_abstract(
     ArrayType::new(data_type, Shape::new(dimensions))
         .with_memory(input.memory())
         .with_sharding(sharding)
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::Invalid(error.to_string()))
 }
 
 /// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
@@ -164,7 +164,7 @@ fn reduce_sharding(
                 .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                .map_err(|error| TypeError { message: format!("'{op}' output sharding construction failed: {error}") })
+                .map_err(|error| TypeError::Invalid(format!("'{op}' output sharding construction failed: {error}")))
         })
         .transpose()
 }
@@ -260,7 +260,7 @@ impl Operation<ArrayType> for ReduceOperation {
         Ok(vec![
             output
                 .with_sharding(output_sharding.clone())
-                .map_err(|error| TypeError { message: error.to_string() })?,
+                .map_err(|error| TypeError::Invalid(error.to_string()))?,
         ])
     }
 
@@ -291,23 +291,22 @@ fn validate_reduce_output_sharding(
     use crate::sharding::{MeshAxisType, ShardingDimension};
 
     if kind != ReductionKind::Sum {
-        return Err(TypeError {
-            message: format!("{} does not support a requested output sharding (only reduce_sum does)", kind.name()),
-        });
+        return Err(TypeError::Invalid(format!(
+            "{} does not support a requested output sharding (only reduce_sum does)",
+            kind.name()
+        )));
     }
     if output_sharding.rank() != reduced_output.rank() {
-        return Err(TypeError {
-            message: format!(
-                "reduce_sum output sharding rank ({}) does not match the output rank ({})",
-                output_sharding.rank(),
-                reduced_output.rank(),
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "reduce_sum output sharding rank ({}) does not match the output rank ({})",
+            output_sharding.rank(),
+            reduced_output.rank(),
+        )));
     }
     if let Some(input_sharding) = input.sharding()
         && output_sharding.mesh() != input_sharding.mesh()
     {
-        return Err(TypeError { message: "reduce_sum output sharding must use the same mesh as the operand".into() });
+        return Err(TypeError::Invalid("reduce_sum output sharding must use the same mesh as the operand".into()));
     }
     let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
     referenced_axes.extend(output_sharding.reduced_axes());
@@ -320,7 +319,7 @@ fn validate_reduce_output_sharding(
         .iter()
         .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
     {
-        return Err(TypeError { message: "reduce_sum output sharding cannot reference auto mesh axes".into() });
+        return Err(TypeError::Invalid("reduce_sum output sharding cannot reference auto mesh axes".into()));
     }
 
     if !output_sharding.unreduced_axes().is_empty() {
@@ -341,11 +340,11 @@ fn validate_reduce_output_sharding(
             reducible_axes.extend(input_sharding.unreduced_axes().iter().map(String::as_str));
         }
         if !output_sharding.unreduced_axes().iter().all(|name| reducible_axes.contains(name.as_str())) {
-            return Err(TypeError {
-                message: "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
+            return Err(TypeError::Invalid(
+                "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
                           reduced dimensions or the operand's unreduced axes"
                     .into(),
-            });
+            ));
         }
     }
     Ok(())
@@ -552,23 +551,21 @@ where
                                 .axes
                                 .iter()
                                 .map(|axis| {
-                                    input_shape.dimension(*axis).value().ok_or(TypeError {
-                                        message: format!(
-                                            "mean transpose requires static reduced extents but axis {axis} of \
+                                    input_shape.dimension(*axis).value().ok_or(TypeError::Invalid(format!(
+                                        "mean transpose requires static reduced extents but axis {axis} of \
                                             {input_shape} is dynamic",
-                                        ),
-                                    })
+                                    )))
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
                             let element_count = if reduced_extents.contains(&0) {
                                 0
                             } else {
                                 reduced_extents.iter().try_fold(1usize, |count, extent| {
-                                    count.checked_mul(*extent).ok_or_else(|| TypeError {
-                                        message: format!(
+                                    count.checked_mul(*extent).ok_or_else(|| {
+                                        TypeError::Invalid(format!(
                                             "mean transpose reduced element count overflows usize for input shape \
                                              {input_shape}",
-                                        ),
+                                        ))
                                     })
                                 })?
                             };
@@ -591,12 +588,10 @@ where
                     };
                     Ok(vec![MaybeZero::Value(cotangent_input)])
                 }
-                other => Err(TypeError {
-                    message: format!(
-                        "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
+                other => Err(TypeError::Invalid(format!(
+                    "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
                         (Max/Min need argmax-style gather; Any/All are not differentiable)"
-                    ),
-                }
+                ))
                 .into()),
             },
         }
@@ -850,9 +845,9 @@ mod tests {
         let complex = array_type(&[2, 3], DataType::C64);
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Max, "reduce_max"),
-            Err(TypeError {
-                message: "'reduce_max' kind max is not defined for the unordered complex element type c64".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'reduce_max' kind max is not defined for the unordered complex element type c64".to_string()
+            )),
         );
         assert!(reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min").is_err());
         assert_eq!(
@@ -870,7 +865,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![array_type(&[3], DataType::F64)]));
         assert_eq!(
             operation.infer_output_types(&[array_type(&[3], DataType::F64)], &[]),
-            Err(TypeError { message: "'reduce_sum' axis 1 is out of bounds for rank 1".to_string() }),
+            Err(TypeError::Invalid("'reduce_sum' axis 1 is out of bounds for rank 1".to_string())),
         );
     }
 
@@ -915,11 +910,11 @@ mod tests {
             ReduceOperation::new(vec![0], ReductionKind::Sum)
                 .with_output_sharding(wrong)
                 .infer_output_types(std::slice::from_ref(&input), &[]),
-            Err(TypeError {
-                message: "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
+            Err(TypeError::Invalid(
+                "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
                           reduced dimensions or the operand's unreduced axes"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
 
         // Only reduce_sum accepts a requested output sharding.
@@ -927,9 +922,9 @@ mod tests {
             ReduceOperation::new(vec![0], ReductionKind::Max)
                 .with_output_sharding(unreduced)
                 .infer_output_types(std::slice::from_ref(&input), &[]),
-            Err(TypeError {
-                message: "max does not support a requested output sharding (only reduce_sum does)".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "max does not support a requested output sharding (only reduce_sum does)".to_string()
+            )),
         );
     }
 
@@ -1159,7 +1154,7 @@ mod tests {
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Value(output_cotangent)],
             ),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid(message))))
                 if message == format!(
                     "mean transpose reduced element count overflows usize for input shape {input_shape}",
                 ),

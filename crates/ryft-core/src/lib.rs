@@ -111,13 +111,11 @@ pub(crate) mod tests {
                 Self::WithRegions(names) => {
                     check_count!("input", input_types, 1, TypeError);
                     if region_interfaces.len() != names.len() {
-                        return Err(TypeError {
-                            message: format!(
-                                "expected {} region interfaces but got {}",
-                                names.len(),
-                                region_interfaces.len(),
-                            ),
-                        });
+                        return Err(TypeError::Invalid(format!(
+                            "expected {} region interfaces but got {}",
+                            names.len(),
+                            region_interfaces.len(),
+                        )));
                     }
                     Ok(region_interfaces[0].output_types().to_vec())
                 }

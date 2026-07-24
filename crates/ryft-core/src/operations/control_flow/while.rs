@@ -125,7 +125,7 @@ impl WhileOperation {
     pub fn with_iteration_bound(mut self, bound: impl Into<Option<usize>>) -> Result<Self, ProgramError> {
         let bound = bound.into();
         if bound == Some(0) {
-            return Err(TypeError { message: "while iteration bound must be at least 1".to_string() }.into());
+            return Err(TypeError::Invalid("while iteration bound must be at least 1".to_string()).into());
         }
         self.iteration_bound = bound;
         Ok(self)
@@ -180,9 +180,9 @@ pub trait WhileTypeSemantics: Type {
 impl WhileTypeSemantics for ArrayType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         if !condition_output.data_type().is_boolean() {
-            return Err(TypeError {
-                message: format!("'while' condition output type must be a Boolean array, but got {condition_output}"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'while' condition output type must be a Boolean array, but got {condition_output}"
+            )));
         }
         let predicate_shape = condition_output.shape();
         for state_type in state_types {
@@ -190,12 +190,10 @@ impl WhileTypeSemantics for ArrayType {
             let is_prefix = predicate_shape.rank() <= state_shape.rank()
                 && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
             if !is_prefix {
-                return Err(TypeError {
-                    message: format!(
-                        "'while' condition predicate shape must be a prefix of every state shape, but predicate \
+                return Err(TypeError::Invalid(format!(
+                    "'while' condition predicate shape must be a prefix of every state shape, but predicate \
                          {condition_output} is not a prefix of state {state_type}",
-                    ),
-                });
+                )));
             }
         }
         Ok(())
@@ -209,9 +207,9 @@ impl WhileTypeSemantics for ArrayType {
 impl WhileTypeSemantics for DataType {
     fn validate_while_condition_output(condition_output: &Self, _state_types: &[Self]) -> Result<(), TypeError> {
         if !condition_output.is_boolean() {
-            return Err(TypeError {
-                message: format!("'while' condition output type must be bool, but got {condition_output}"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'while' condition output type must be bool, but got {condition_output}"
+            )));
         }
         Ok(())
     }
@@ -232,9 +230,10 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
     if region_interfaces.len() != 2 {
-        return Err(TypeError {
-            message: format!("while expects 2 attached regions but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::Invalid(format!(
+            "while expects 2 attached regions but got {}",
+            region_interfaces.len()
+        )));
     }
     let condition_interface = &region_interfaces[0];
     let body_interface = &region_interfaces[1];
@@ -242,23 +241,21 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     check_types!(@same, "while condition/body input", [state_types, condition_interface.input_types()]);
     let condition_output_types = condition_interface.output_types();
     if condition_output_types.len() != 1 {
-        return Err(TypeError {
-            message: format!(
-                "while condition must return exactly one predicate leaf but returned {}",
-                condition_output_types.len()
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "while condition must return exactly one predicate leaf but returned {}",
+            condition_output_types.len()
+        )));
     }
     T::validate_while_condition_output(&condition_output_types[0], state_types)?;
     check_types!(@same, "while body output", [state_types, body_interface.output_types()]);
     if T::is_batched_predicate(&condition_output_types[0])
         && (!condition_interface.effects().is_pure() || !body_interface.effects().is_pure())
     {
-        return Err(TypeError {
-            message: "'while' loop with a batched predicate must be pure because observable effects cannot be \
+        return Err(TypeError::Invalid(
+            "'while' loop with a batched predicate must be pure because observable effects cannot be \
                       masked for finished batch items"
                 .to_string(),
-        });
+        ));
     }
     Ok((condition_interface, body_interface))
 }
@@ -1544,11 +1541,9 @@ where
     let mask_stack_type = stacked_scan_type(&boolean_scalar_type, bound);
     for residual_type in residual_types {
         if residual_type.static_shape().is_none() {
-            return Err(TypeError {
-                message: format!(
-                    "jvp of a bounded while loop requires statically shaped body residuals but got {residual_type}",
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "jvp of a bounded while loop requires statically shaped body residuals but got {residual_type}",
+            ))
             .into());
         }
     }
@@ -1844,20 +1839,20 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&state_type), &[]),
-            Err(TypeError { message: "while expects 2 attached regions but got 0".to_string() }),
+            Err(TypeError::Invalid("while expects 2 attached regions but got 0".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(&[], interfaces.as_slice()),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+            Err(TypeError::Invalid("expected 1 input but got 0".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
                 interfaces.as_slice(),
             ),
-            Err(TypeError {
-                message: "while input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "while input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string()
+            )),
         );
 
         // Inference rejects mismatched condition/body state signatures, non-Boolean condition outputs,
@@ -1871,19 +1866,16 @@ mod tests {
                 std::slice::from_ref(&state_type),
                 &[region_interface(&condition), region_interface(&vector_body)],
             ),
-            Err(TypeError {
-                message: "while condition/body input type signature mismatch: expected [f64[2]] but got [f64[]]"
-                    .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "while condition/body input type signature mismatch: expected [f64[2]] but got [f64[]]".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&state_type),
                 &[region_interface(&subtract_one_body()), region_interface(&body)],
             ),
-            Err(TypeError {
-                message: "'while' condition output type must be a Boolean array, but got f64[]".to_string(),
-            }),
+            Err(TypeError::Invalid("'while' condition output type must be a Boolean array, but got f64[]".to_string())),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1894,18 +1886,18 @@ mod tests {
                 std::slice::from_ref(&state_type),
                 &[region_interface(&multi_output_condition), region_interface(&body)],
             ),
-            Err(TypeError {
-                message: "while condition must return exactly one predicate leaf but returned 2".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "while condition must return exactly one predicate leaf but returned 2".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&state_type),
                 &[region_interface(&condition), region_interface(&greater_than_zero_condition())],
             ),
-            Err(TypeError {
-                message: "while body output type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "while body output type signature mismatch: expected [f64[]] but got [bool[]]".to_string()
+            )),
         );
 
         // The semantic iteration bound defaults to absent, must be at least one, may be cleared with `None`, and is
@@ -1916,7 +1908,7 @@ mod tests {
         assert_eq!(bounded.with_iteration_bound(None).unwrap().iteration_bound(), None);
         assert_eq!(
             WhileOperation::new().with_iteration_bound(0).map(|_| ()),
-            Err(ProgramError::Type(TypeError { message: "while iteration bound must be at least 1".to_string() })),
+            Err(ProgramError::Type(TypeError::Invalid("while iteration bound must be at least 1".to_string()))),
         );
 
         // The bound renders as an `iteration_bound=` field on the operation itself.
@@ -2388,11 +2380,11 @@ mod tests {
                 std::slice::from_ref(&state_type),
                 &[region_interface(&condition), region_interface(&effectful_body)],
             ),
-            Err(TypeError {
-                message: "'while' loop with a batched predicate must be pure because observable effects cannot be \
+            Err(TypeError::Invalid(
+                "'while' loop with a batched predicate must be pure because observable effects cannot be \
                           masked for finished batch items"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
     }
 
@@ -2420,11 +2412,11 @@ mod tests {
                 std::slice::from_ref(&state_type),
                 &[region_interface(&condition), region_interface(&body)],
             ),
-            Err(TypeError {
-                message: "'while' condition predicate shape must be a prefix of every state shape, but predicate \
+            Err(TypeError::Invalid(
+                "'while' condition predicate shape must be a prefix of every state shape, but predicate \
                           bool[3] is not a prefix of state f64[2]"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
     }
 
@@ -2490,9 +2482,9 @@ mod tests {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(false)),
                 DataType::F64 => Ok(TestValue::Number(0.0)),
-                _ => Err(crate::programs::types::TypeError {
-                    message: format!("test value cannot synthesize zero for {value_type}"),
-                }
+                _ => Err(crate::programs::types::TypeError::Invalid(format!(
+                    "test value cannot synthesize zero for {value_type}"
+                ))
                 .into()),
             }
         }
@@ -2503,9 +2495,9 @@ mod tests {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(true)),
                 DataType::F64 => Ok(TestValue::Number(1.0)),
-                _ => Err(crate::programs::types::TypeError {
-                    message: format!("test value cannot synthesize one for {value_type}"),
-                }
+                _ => Err(crate::programs::types::TypeError::Invalid(format!(
+                    "test value cannot synthesize one for {value_type}"
+                ))
                 .into()),
             }
         }
@@ -2598,11 +2590,11 @@ mod tests {
             match self {
                 Self::Sub => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left - right)]),
-                    _ => Err(TypeError { message: ("sub expected numeric inputs").into() }.into()),
+                    _ => Err(TypeError::Invalid(("sub expected numeric inputs").into()).into()),
                 },
                 Self::IsPositive => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
-                    _ => Err(TypeError { message: ("is_positive expected a numeric input").into() }.into()),
+                    _ => Err(TypeError::Invalid(("is_positive expected a numeric input").into()).into()),
                 },
                 Self::While(while_operation) => while_operation.interpret(context, driver, inputs),
             }

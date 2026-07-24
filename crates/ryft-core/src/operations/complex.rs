@@ -28,7 +28,7 @@ fn part_to_complex_data_type(part: DataType, op: &'static str) -> Result<DataTyp
     match part {
         DataType::F32 => Ok(DataType::C64),
         DataType::F64 => Ok(DataType::C128),
-        other => Err(TypeError { message: format!("'{op}' requires f32 or f64 parts but got {other}") }),
+        other => Err(TypeError::Invalid(format!("'{op}' requires f32 or f64 parts but got {other}"))),
     }
 }
 
@@ -38,7 +38,7 @@ fn complex_to_part_data_type(complex: DataType, op: &'static str) -> Result<Data
     match complex {
         DataType::C64 => Ok(DataType::F32),
         DataType::C128 => Ok(DataType::F64),
-        other => Err(TypeError { message: format!("'{op}' requires a complex operand but got {other}") }),
+        other => Err(TypeError::Invalid(format!("'{op}' requires a complex operand but got {other}"))),
     }
 }
 
@@ -56,23 +56,19 @@ define_elementwise_operation!(
     Complex, complex,
     infer_data_types = |input_types: &[DataType]| {
         if input_types[0] != input_types[1] {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
                     input_types[0], input_types[1],
-                ),
-            });
+                )));
         }
         Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
     },
     infer_array_types = |input_types: &[ArrayType]| {
         if input_types[0] != input_types[1] {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'{COMPLEX_OPERATION_NAME}' requires identical part types but got {} and {}",
                     input_types[0], input_types[1],
-                ),
-            });
+                )));
         }
         let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
         Ok(vec![ArrayType { data_type, ..input_types[0].clone() }])

@@ -226,14 +226,12 @@ impl Operation<ArrayType> for DotProductAttentionOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if !matches!(input_types.len(), 3..=6) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' expects 3 (query, key, value), 4 (query, key, value, \
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' expects 3 (query, key, value), 4 (query, key, value, \
                      bias), 5 (query, key, value, query sequence lengths, key/value sequence lengths), or 6 (query, \
                      key, value, bias, query sequence lengths, key/value sequence lengths) inputs but got {}",
-                    input_types.len(),
-                ),
-            });
+                input_types.len(),
+            )));
         }
         let bias_type = matches!(input_types.len(), 4 | 6).then(|| &input_types[3]);
         let dimensions = validated_attention_operands(
@@ -256,9 +254,9 @@ impl Operation<ArrayType> for DotProductAttentionOperation {
         validated_dropout(DOT_PRODUCT_ATTENTION_OPERATION_NAME, self.dropout)?;
         for input_type in input_types {
             if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError {
-                    message: format!("'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support unreduced operands"),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support unreduced operands"
+                )));
             }
         }
         // The attended output is query-shaped at the query data type, so the inferred output type is the query type
@@ -398,14 +396,12 @@ impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if !matches!(input_types.len(), 6..=9) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects 6 (query, key, value, output, \
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects 6 (query, key, value, output, \
                      activation, output cotangent), 7 (adding a bias after the value), 8 (adding trailing query and \
                      key/value sequence lengths), or 9 (adding both) inputs but got {}",
-                    input_types.len(),
-                ),
-            });
+                input_types.len(),
+            )));
         }
         let bias_type = matches!(input_types.len(), 7 | 9).then(|| &input_types[3]);
         let dimensions = validated_attention_operands(
@@ -435,32 +431,26 @@ impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
         let expected_output_type = attention_output_type(&dimensions);
         for (descriptor, index) in [("output", offset), ("output cotangent", offset + 2)] {
             if !matches_expected(&input_types[index], &expected_output_type) {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' {descriptor} type {} does not match the \
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' {descriptor} type {} does not match the \
                          expected forward output type {expected_output_type}",
-                        input_types[index],
-                    ),
-                });
+                    input_types[index],
+                )));
             }
         }
         let expected_activation_type = attention_activation_type(&dimensions, &input_types[0])?;
         if !matches_expected(&input_types[offset + 1], &expected_activation_type) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' activation type {} does not match the \
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' activation type {} does not match the \
                      expected activation type {expected_activation_type}",
-                    input_types[offset + 1],
-                ),
-            });
+                input_types[offset + 1],
+            )));
         }
         for input_type in input_types {
             if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support unreduced operands"
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support unreduced operands"
+                )));
             }
         }
         let mut output_types = vec![input_types[0].clone(), input_types[1].clone(), input_types[2].clone()];
@@ -479,13 +469,14 @@ fn static_attention_dimensions(
     value_type: &ArrayType,
 ) -> Result<[usize; 4], TypeError> {
     let Some(shape) = value_type.static_shape() else {
-        return Err(TypeError { message: format!("'{operation_name}' {descriptor} must have a static shape") });
+        return Err(TypeError::Invalid(format!("'{operation_name}' {descriptor} must have a static shape")));
     };
     match *shape.dimensions() {
         [batch, sequence, heads, head_dimension] => Ok([batch, sequence, heads, head_dimension]),
-        ref dimensions => Err(TypeError {
-            message: format!("'{operation_name}' {descriptor} must have rank 4 but got rank {}", dimensions.len(),),
-        }),
+        ref dimensions => Err(TypeError::Invalid(format!(
+            "'{operation_name}' {descriptor} must have rank 4 but got rank {}",
+            dimensions.len(),
+        ))),
     }
 }
 
@@ -531,125 +522,101 @@ fn validated_attention_operands(
     let value = static_attention_dimensions(operation_name, "value", value_type)?;
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
-        return Err(TypeError {
-            message: format!("'{operation_name}' requires floating-point operands but got data type {data_type}"),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' requires floating-point operands but got data type {data_type}"
+        )));
     }
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
         if input_type.data_type() != data_type {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' {descriptor} data type {} does not match the query data type {data_type}",
-                    input_type.data_type(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {descriptor} data type {} does not match the query data type {data_type}",
+                input_type.data_type(),
+            )));
         }
         if dimensions[0] != query[0] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' {descriptor} batch dimension ({}) does not match the query batch dimension \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {descriptor} batch dimension ({}) does not match the query batch dimension \
                      ({})",
-                    dimensions[0], query[0],
-                ),
-            });
+                dimensions[0], query[0],
+            )));
         }
         if dimensions[3] != query[3] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' {descriptor} head dimension ({}) does not match the query head dimension \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {descriptor} head dimension ({}) does not match the query head dimension \
                      ({})",
-                    dimensions[3], query[3],
-                ),
-            });
+                dimensions[3], query[3],
+            )));
         }
     }
     if value[1] != key[1] {
-        return Err(TypeError {
-            message: format!(
-                "'{operation_name}' value sequence dimension ({}) does not match the key sequence dimension ({})",
-                value[1], key[1],
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' value sequence dimension ({}) does not match the key sequence dimension ({})",
+            value[1], key[1],
+        )));
     }
     if value[2] != key[2] {
-        return Err(TypeError {
-            message: format!(
-                "'{operation_name}' value heads dimension ({}) does not match the key heads dimension ({})",
-                value[2], key[2],
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' value heads dimension ({}) does not match the key heads dimension ({})",
+            value[2], key[2],
+        )));
     }
     if key[2] == 0 || query[2] % key[2] != 0 {
-        return Err(TypeError {
-            message: format!(
-                "'{operation_name}' key/value heads dimension ({}) must divide the query heads dimension ({})",
-                key[2], query[2],
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' key/value heads dimension ({}) must divide the query heads dimension ({})",
+            key[2], query[2],
+        )));
     }
     if let Some(bias_type) = bias_type {
         let Some(bias_shape) = bias_type.static_shape() else {
-            return Err(TypeError { message: format!("'{operation_name}' bias must have a static shape") });
+            return Err(TypeError::Invalid(format!("'{operation_name}' bias must have a static shape")));
         };
         let [bias_batch, bias_heads, bias_rows, bias_columns] = *bias_shape.dimensions() else {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias must have rank 4 but got rank {}",
-                    bias_shape.dimensions().len(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias must have rank 4 but got rank {}",
+                bias_shape.dimensions().len(),
+            )));
         };
         if bias_type.data_type() != data_type {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias data type {} does not match the query data type {data_type}",
-                    bias_type.data_type(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias data type {} does not match the query data type {data_type}",
+                bias_type.data_type(),
+            )));
         }
         if bias_batch != 1 && bias_batch != query[0] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias batch dimension ({bias_batch}) must be 1 or match the query batch \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias batch dimension ({bias_batch}) must be 1 or match the query batch \
                      dimension ({})",
-                    query[0],
-                ),
-            });
+                query[0],
+            )));
         }
         if bias_heads != 1 && bias_heads != query[2] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias heads dimension ({bias_heads}) must be 1 or match the query heads \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias heads dimension ({bias_heads}) must be 1 or match the query heads \
                      dimension ({})",
-                    query[2],
-                ),
-            });
+                query[2],
+            )));
         }
         if bias_rows != query[1] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias query-sequence dimension ({bias_rows}) does not match the query \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias query-sequence dimension ({bias_rows}) does not match the query \
                      sequence dimension ({})",
-                    query[1],
-                ),
-            });
+                query[1],
+            )));
         }
         if bias_columns != key[1] {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' bias key/value-sequence dimension ({bias_columns}) does not match the key \
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' bias key/value-sequence dimension ({bias_columns}) does not match the key \
                      sequence dimension ({})",
-                    key[1],
-                ),
-            });
+                key[1],
+            )));
         }
     }
     match (sliding_window, mask) {
         (Some(0), _) => {
-            return Err(TypeError { message: format!("'{operation_name}' sliding window must be positive") });
+            return Err(TypeError::Invalid(format!("'{operation_name}' sliding window must be positive")));
         }
         (Some(_), AttentionMask::None) => {
-            return Err(TypeError { message: format!("'{operation_name}' sliding window requires the causal mask") });
+            return Err(TypeError::Invalid(format!("'{operation_name}' sliding window requires the causal mask")));
         }
         _ => {}
     }
@@ -677,32 +644,26 @@ fn validated_sequence_length_operands(
         [("query sequence lengths", query_lengths_type), ("key/value sequence lengths", key_value_lengths_type)]
     {
         if value_type.data_type() != DataType::I32 {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' {descriptor} must have data type i32 but got {}",
-                    value_type.data_type(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {descriptor} must have data type i32 but got {}",
+                value_type.data_type(),
+            )));
         }
         let Some(shape) = value_type.static_shape() else {
-            return Err(TypeError { message: format!("'{operation_name}' {descriptor} must have a static shape") });
+            return Err(TypeError::Invalid(format!("'{operation_name}' {descriptor} must have a static shape")));
         };
         match *shape.dimensions() {
             [size] if size == batch => {}
             [size] => {
-                return Err(TypeError {
-                    message: format!(
-                        "'{operation_name}' {descriptor} size ({size}) does not match the batch dimension ({batch})",
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{operation_name}' {descriptor} size ({size}) does not match the batch dimension ({batch})",
+                )));
             }
             ref dimensions => {
-                return Err(TypeError {
-                    message: format!(
-                        "'{operation_name}' {descriptor} must have rank 1 but got rank {}",
-                        dimensions.len(),
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{operation_name}' {descriptor} must have rank 1 but got rank {}",
+                    dimensions.len(),
+                )));
             }
         }
     }
@@ -714,9 +675,9 @@ fn validated_sequence_length_operands(
 fn validated_dropout(operation_name: &str, dropout: Option<(f64, u64)>) -> Result<(), TypeError> {
     if let Some((rate, _)) = dropout {
         if !(rate > 0.0 && rate < 1.0) {
-            return Err(TypeError {
-                message: format!("'{operation_name}' dropout rate must lie in the open interval (0, 1) but got {rate}",),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' dropout rate must lie in the open interval (0, 1) but got {rate}",
+            )));
         }
     }
     Ok(())
@@ -752,7 +713,7 @@ fn attention_activation_type(dimensions: &AttentionDimensions, query_type: &Arra
         vec![query_dimensions[0].clone(), query_dimensions[2].clone(), query_dimensions[1].clone()],
     )
     .and_then(|sharding| activation_type.with_sharding(sharding))
-    .map_err(|error| TypeError { message: error.to_string() })?;
+    .map_err(|error| TypeError::Invalid(error.to_string()))?;
     Ok(sharding)
 }
 
@@ -781,12 +742,10 @@ impl<C: Domain<Type = ArrayType, Value: DotProductAttention>> InterpretableOpera
                 (query, key, value, Some(bias), Some((query_lengths, key_value_lengths)))
             }
             _ => {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' expects 3 to 6 inputs but got {}",
-                        inputs.len(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' expects 3 to 6 inputs but got {}",
+                    inputs.len(),
+                ))
                 .into());
             }
         };
@@ -855,12 +814,10 @@ impl<C: Domain<Type = ArrayType, Value: DotProductAttentionBackward>> Interpreta
                 Some((query_lengths, key_value_lengths)),
             ),
             _ => {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects 6 to 9 inputs but got {}",
-                        inputs.len(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects 6 to 9 inputs but got {}",
+                    inputs.len(),
+                ))
                 .into());
             }
         };
@@ -984,9 +941,10 @@ where
     let static_dimensions = |value_type: &ArrayType| -> Result<Vec<usize>, BatchingError> {
         match value_type.static_shape() {
             Some(shape) => Ok(shape.dimensions().to_vec()),
-            None => Err(ProgramError::from(TypeError {
-                message: format!("'{}' batching requires statically shaped operands", operation.name()),
-            })
+            None => Err(ProgramError::from(TypeError::Invalid(format!(
+                "'{}' batching requires statically shaped operands",
+                operation.name()
+            )))
             .into()),
         }
     };
@@ -1508,7 +1466,7 @@ where
         let mut causal_visible = columns.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
         if let Some(window) = sliding_window {
             let window = i32::try_from(window)
-                .map_err(|_| TypeError { message: "sliding window must fit in a 32-bit integer".to_string() })?;
+                .map_err(|_| TypeError::Invalid("sliding window must fit in a 32-bit integer".to_string()))?;
             let lower_bound = rows.sub(&context.fill(&index_type, Scalar::from(window))?)?;
             causal_visible = causal_visible.and(&columns.compare(&lower_bound, ComparisonDirection::GreaterThan)?)?;
         }

@@ -180,9 +180,10 @@ fn infer_shard_map_output_types(
         .zip(captured_input_types.iter())
         .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
     {
-        return Err(TypeError {
-            message: format!("{} input types do not match the captured shard-map boundary", operation_name),
-        });
+        return Err(TypeError::Invalid(format!(
+            "{} input types do not match the captured shard-map boundary",
+            operation_name
+        )));
     }
     Ok(captured_output_types
         .iter()
@@ -815,7 +816,7 @@ fn transpose_shard_map_body<V: Value<Type = ArrayType>, D: TranspositionDriver<V
 }
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> ProgramError {
-    ProgramError::Type(TypeError { message: error.to_string() })
+    ProgramError::Type(TypeError::Invalid(error.to_string()))
 }
 
 fn trace_flat_shard_map<

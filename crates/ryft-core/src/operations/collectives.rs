@@ -443,10 +443,10 @@ fn shape_changing_collective_dimensions(
 ) -> Result<Vec<usize>, TypeError> {
     check_count!("input", input_types, 1, TypeError);
     if !input_types[0].unreduced_axes().is_empty() {
-        return Err(TypeError { message: format!("'{operation_name}' does not support unreduced operands") });
+        return Err(TypeError::Invalid(format!("'{operation_name}' does not support unreduced operands")));
     }
     let Some(shape) = input_types[0].static_shape() else {
-        return Err(TypeError { message: format!("'{operation_name}' does not support dynamically shaped operands") });
+        return Err(TypeError::Invalid(format!("'{operation_name}' does not support dynamically shaped operands")));
     };
     Ok(shape.dimensions().to_vec())
 }
@@ -716,13 +716,11 @@ shape_changing_collective! {
     infer = |operation, dimensions| {
         let mut output_dimensions = dimensions;
         let Some(dimension) = output_dimensions.get_mut(operation.concat_axis) else {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'all_gather' concat axis {} is out of bounds for rank {}",
                     operation.concat_axis,
                     output_dimensions.len(),
-                ),
-            });
+                )));
         };
         *dimension *= operation.axis_size;
         Ok::<_, TypeError>(output_dimensions)
@@ -758,23 +756,19 @@ shape_changing_collective! {
     infer = |operation, dimensions| {
         let mut output_dimensions = dimensions;
         let Some(dimension) = output_dimensions.get_mut(operation.scatter_axis) else {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'psum_scatter' scatter axis {} is out of bounds for rank {}",
                     operation.scatter_axis,
                     output_dimensions.len(),
-                ),
-            });
+                )));
         };
         if *dimension % operation.axis_size != 0 {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'psum_scatter' scatter axis {} size {} is not divisible by axis size {}",
                     operation.scatter_axis,
                     *dimension,
                     operation.axis_size,
-                ),
-            });
+                )));
         }
         *dimension /= operation.axis_size;
         Ok::<_, TypeError>(output_dimensions)
@@ -812,19 +806,15 @@ shape_changing_collective! {
         let mut seen_targets = std::collections::BTreeSet::new();
         for (source, target) in &operation.source_target_pairs {
             if *source >= operation.axis_size || *target >= operation.axis_size {
-                return Err(TypeError {
-                    message: format!(
+                return Err(TypeError::Invalid(format!(
                         "'ppermute' pair ({source}, {target}) is out of bounds for axis size {}",
                         operation.axis_size,
-                    ),
-                });
+                    )));
             }
             if !seen_sources.insert(*source) || !seen_targets.insert(*target) {
-                return Err(TypeError {
-                    message: format!(
+                return Err(TypeError::Invalid(format!(
                         "'ppermute' pairs must have unique sources and targets but ({source}, {target}) repeats one",
-                    ),
-                });
+                    )));
             }
         }
         Ok::<_, TypeError>(dimensions)
@@ -865,23 +855,19 @@ shape_changing_collective! {
         let mut output_dimensions = dimensions;
         let rank = output_dimensions.len();
         if operation.split_axis >= rank || operation.concat_axis >= rank {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'all_to_all' split axis {} or concat axis {} is out of bounds for rank {rank}",
                     operation.split_axis,
                     operation.concat_axis,
-                ),
-            });
+                )));
         }
         if output_dimensions[operation.split_axis] % operation.axis_size != 0 {
-            return Err(TypeError {
-                message: format!(
+            return Err(TypeError::Invalid(format!(
                     "'all_to_all' split axis {} size {} is not divisible by axis size {}",
                     operation.split_axis,
                     output_dimensions[operation.split_axis],
                     operation.axis_size,
-                ),
-            });
+                )));
         }
         output_dimensions[operation.split_axis] /= operation.axis_size;
         output_dimensions[operation.concat_axis] *= operation.axis_size;

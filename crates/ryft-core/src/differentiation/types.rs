@@ -344,11 +344,9 @@ where
         packed_direction_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError> {
         if coordinate_type.shape() != value_type.shape() {
-            return Err(TypeError {
-                message: format!(
-                    "coordinate basis type {coordinate_type} and value type {value_type} have different shapes",
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "coordinate basis type {coordinate_type} and value type {value_type} have different shapes",
+            ))
             .into());
         }
         let expected_type = value_type.with_inserted_dimension(0, Size::Static(packed_direction_count))?;
@@ -360,14 +358,12 @@ where
         check_count!("output", outputs, 1, ProgramError);
         let value = outputs.remove(0);
         if value.r#type().as_ref() != &expected_type {
-            return Err(TypeError {
-                message: format!(
-                    "coordinate basis for leaf type {} has type {} but expected {}",
-                    value_type,
-                    value.r#type(),
-                    expected_type,
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "coordinate basis for leaf type {} has type {} but expected {}",
+                value_type,
+                value.r#type(),
+                expected_type,
+            ))
             .into());
         }
         Ok(ArrayBatch::new(expected_type, value, Some(0)).map_err(ProgramError::from)?)
@@ -399,7 +395,7 @@ where
         let first_input_cotangent_type = first_input_type.cotangent();
         if first_input_cotangent_type.is_zero_space() {
             return Err(
-                TypeError { message: format!("hessian input type {first_input_type} has no cotangent type") }.into()
+                TypeError::Invalid(format!("hessian input type {first_input_type} has no cotangent type")).into()
             );
         }
         validate_array_derivative_block_type(
@@ -433,10 +429,9 @@ where
             })?;
         let output_tangent_type = output_type.tangent();
         if output_tangent_type.is_zero_space() {
-            return Err(TypeError {
-                message: format!("forward Jacobian output type {output_type} has no tangent type"),
-            }
-            .into());
+            return Err(
+                TypeError::Invalid(format!("forward Jacobian output type {output_type} has no tangent type")).into()
+            );
         }
         let value = unpack_coordinate_range(
             packed_output,
@@ -475,10 +470,9 @@ where
             })?;
         let input_cotangent_type = input_type.cotangent();
         if input_cotangent_type.is_zero_space() {
-            return Err(TypeError {
-                message: format!("reverse Jacobian input type {input_type} has no cotangent type"),
-            }
-            .into());
+            return Err(
+                TypeError::Invalid(format!("reverse Jacobian input type {input_type} has no cotangent type")).into()
+            );
         }
         let value = unpack_coordinate_range(
             packed_output,
@@ -549,10 +543,9 @@ fn validate_array_derivative_block_type(
     }
     let block_type_without_layout = block_type.clone().with_layout(None);
     if block_type_without_layout != expected_type {
-        return Err(TypeError {
-            message: format!("derivative block has type {block_type} but expected {expected_type}"),
-        }
-        .into());
+        return Err(
+            TypeError::Invalid(format!("derivative block has type {block_type} but expected {expected_type}")).into()
+        );
     }
     Ok(())
 }
@@ -584,17 +577,15 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
     let aligned = packed_output.match_axis(0, packed_direction_count, ShardingDimension::Replicated)?;
     let actual_item_type = aligned.unbatched_type();
     if actual_item_type.clone().with_layout(None) != expected_value_type.clone().with_layout(None) {
-        return Err(TypeError {
-            message: format!(
-                "batched derivative output has per-item type {actual_item_type} but expected {expected_value_type}",
-            ),
-        }
+        return Err(TypeError::Invalid(format!(
+            "batched derivative output has per-item type {actual_item_type} but expected {expected_value_type}",
+        ))
         .into());
     }
-    let item_shape = expected_value_type.static_shape().ok_or_else(|| TypeError {
-        message: format!(
+    let item_shape = expected_value_type.static_shape().ok_or_else(|| {
+        TypeError::Invalid(format!(
             "Jacobian or Hessian materialization requires a fully static array shape but got {expected_value_type}"
-        ),
+        ))
     })?;
     let coordinate_shape = Shape::new(coordinate_shape.iter().copied().map(Size::Static).collect());
     let coordinate_count = coordinate_shape.element_count()?.unwrap();
@@ -602,10 +593,10 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
         .checked_add(coordinate_count)
         .ok_or_else(|| ProgramError::InvalidArgument { message: "coordinate range overflows usize".to_string() })?;
     let physical_type = aligned.r#type();
-    let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
-        message: format!(
+    let physical_shape = physical_type.static_shape().ok_or_else(|| {
+        TypeError::Invalid(format!(
             "Jacobian or Hessian materialization requires a fully static array shape but got {physical_type}"
-        ),
+        ))
     })?;
     let mut start_indices = vec![0; physical_shape.rank()];
     start_indices[0] = coordinate_offset;

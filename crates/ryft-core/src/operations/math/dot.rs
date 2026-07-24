@@ -241,24 +241,20 @@ fn dot_abstract(
     output_sharding: Option<&Sharding>,
 ) -> Result<ArrayType, TypeError> {
     if lhs.data_type() != rhs.data_type() {
-        return Err(TypeError { message: format!("'{DOT_OPERATION_NAME}' input element types are incompatible") });
+        return Err(TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' input element types are incompatible")));
     }
     if let Some(accumulation_type) = accumulation_type {
         if output_sharding.is_some() {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_OPERATION_NAME}' does not support combining an accumulation type with a requested \
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' does not support combining an accumulation type with a requested \
                      output sharding yet"
-                ),
-            });
+            )));
         }
         if !accumulation_type_is_compatible(lhs.data_type(), accumulation_type) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_OPERATION_NAME}' operand data type {} cannot accumulate at data type {accumulation_type}",
-                    lhs.data_type(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' operand data type {} cannot accumulate at data type {accumulation_type}",
+                lhs.data_type(),
+            )));
         }
     }
     let lhs_rank = lhs.rank();
@@ -269,40 +265,34 @@ fn dot_abstract(
     let rhs_contracting = dimensions.rhs_contracting_dimensions();
 
     if lhs_batching.len() != rhs_batching.len() {
-        return Err(TypeError {
-            message: format!("'{DOT_OPERATION_NAME}' batching dimensions have different lengths on the two operands"),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{DOT_OPERATION_NAME}' batching dimensions have different lengths on the two operands"
+        )));
     }
     if lhs_contracting.len() != rhs_contracting.len() {
-        return Err(TypeError {
-            message: format!(
-                "'{DOT_OPERATION_NAME}' contracting dimensions have different lengths on the two operands"
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{DOT_OPERATION_NAME}' contracting dimensions have different lengths on the two operands"
+        )));
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
-        return Err(TypeError { message: format!("'{DOT_OPERATION_NAME}' LHS dimension index out of bounds") });
+        return Err(TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' LHS dimension index out of bounds")));
     }
     if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
-        return Err(TypeError { message: format!("'{DOT_OPERATION_NAME}' RHS dimension index out of bounds") });
+        return Err(TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' RHS dimension index out of bounds")));
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_OPERATION_NAME}' batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+            )));
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_OPERATION_NAME}' contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+            )));
         }
     }
 
@@ -333,15 +323,13 @@ fn dot_abstract(
             .iter()
             .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
         {
-            return Err(TypeError { message: format!("'{DOT_OPERATION_NAME}' operands cannot be unreduced") });
+            return Err(TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' operands cannot be unreduced")));
         }
     }
 
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
-            return Err(TypeError {
-                message: format!("'{DOT_OPERATION_NAME}' operand shardings must use the same mesh"),
-            });
+            return Err(TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' operand shardings must use the same mesh")));
         }
         (Some(left), _) => Some(left.mesh()),
         (_, Some(right)) => Some(right.mesh()),
@@ -356,19 +344,17 @@ fn dot_abstract(
     let sharding = if let Some(output_sharding) = output_sharding {
         let output_rank = dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len();
         if output_sharding.rank() != output_rank {
-            return Err(TypeError {
-                message: format!(
-                    "'{DOT_OPERATION_NAME}' output sharding rank ({}) does not match the output rank ({output_rank})",
-                    output_sharding.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' output sharding rank ({}) does not match the output rank ({output_rank})",
+                output_sharding.rank(),
+            )));
         }
         if let Some(mesh) = mesh
             && output_sharding.mesh() != mesh
         {
-            return Err(TypeError {
-                message: format!("'{DOT_OPERATION_NAME}' output sharding must use the same mesh as the operands"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' output sharding must use the same mesh as the operands"
+            )));
         }
         let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
         referenced_axes.extend(output_sharding.reduced_axes());
@@ -381,9 +367,9 @@ fn dot_abstract(
             .iter()
             .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
         {
-            return Err(TypeError {
-                message: format!("'{DOT_OPERATION_NAME}' output sharding cannot reference auto mesh axes"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{DOT_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
+            )));
         }
         // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh axes
         // leaves each device holding only a partial product-sum over its shard of the contraction, whose true value is
@@ -402,11 +388,9 @@ fn dot_abstract(
                 .map(|axis| dimension_of(rhs_sharding, *axis))
                 .collect();
             if lhs_contracting_spec != rhs_contracting_spec {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_OPERATION_NAME}' contracting dimensions must be sharded identically when the output sharding is unreduced"
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_OPERATION_NAME}' contracting dimensions must be sharded identically when the output sharding is unreduced"
+                )));
             }
             let mut contracting_axes = BTreeSet::new();
             for dimension in &lhs_contracting_spec {
@@ -415,11 +399,9 @@ fn dot_abstract(
                 }
             }
             if output_sharding.unreduced_axes() != &contracting_axes {
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_OPERATION_NAME}' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_OPERATION_NAME}' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                )));
             }
         }
         Some(output_sharding.clone())
@@ -439,18 +421,14 @@ fn dot_abstract(
                     unreachable!("dimension_has_explicit_axis only returns true for sharded dimensions")
                 };
                 if left_axes != right_axes {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{DOT_OPERATION_NAME}' contracting dimensions must have consistent shardings, but got {left} and {right}"
-                        ),
-                    });
+                    return Err(TypeError::Invalid(format!(
+                        "'{DOT_OPERATION_NAME}' contracting dimensions must have consistent shardings, but got {left} and {right}"
+                    )));
                 }
-                return Err(TypeError {
-                    message: format!(
-                        "'{DOT_OPERATION_NAME}' contracting dimensions are sharded, making the output sharding ambiguous; request an \
+                return Err(TypeError::Invalid(format!(
+                    "'{DOT_OPERATION_NAME}' contracting dimensions are sharded, making the output sharding ambiguous; request an \
                          explicit output sharding (e.g., one with unreduced axes) to resolve it"
-                    ),
-                });
+                )));
             }
             // A contracting dimension sharded on only one operand (or only over Manual/Auto axes) is allowed and its
             // sharding is dropped from the output, matching JAX (the partitioner inserts the necessary communication).
@@ -468,11 +446,9 @@ fn dot_abstract(
                 // A batch-dimension conflict is an error only when an Explicit axis is involved; a conflict purely over
                 // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
                 None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{DOT_OPERATION_NAME}' batching dimensions must have consistent shardings, but got {left} and {right}"
-                        ),
-                    });
+                    return Err(TypeError::Invalid(format!(
+                        "'{DOT_OPERATION_NAME}' batching dimensions must have consistent shardings, but got {left} and {right}"
+                    )));
                 }
                 None => ShardingDimension::Replicated,
             };
@@ -494,8 +470,8 @@ fn dot_abstract(
         let sharding = Sharding::new(mesh.clone(), placement)
             .and_then(|output| output.with_reduced_axes(reduced_axes))
             .and_then(|output| output.with_varying_manual_axes(varying_manual_axes))
-            .map_err(|error| TypeError {
-                message: format!("'{DOT_OPERATION_NAME}' output sharding construction failed: {error}"),
+            .map_err(|error| {
+                TypeError::Invalid(format!("'{DOT_OPERATION_NAME}' output sharding construction failed: {error}"))
             })?;
         Some(sharding.without_auto_axes())
     } else {
@@ -504,7 +480,7 @@ fn dot_abstract(
 
     ArrayType::new(accumulation_type.unwrap_or(lhs.data_type()), Shape::new(output_dimensions))
         .with_sharding(sharding)
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::Invalid(error.to_string()))
 }
 
 /// Primitive representing a generalized dot (tensor contraction).
@@ -1070,12 +1046,10 @@ impl Operation<ArrayType> for ScaledDotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() != 4 && input_types.len() != 5 {
-            return Err(TypeError {
-                message: format!(
-                    "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                    input_types.len(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
+                input_types.len(),
+            )));
         }
         let lhs = static_scaled_dot_dimensions("'scaled_dot' left operand", &input_types[0])?;
         let lhs_scales = static_scaled_dot_dimensions("'scaled_dot' left scales", &input_types[1])?;
@@ -1086,79 +1060,66 @@ impl Operation<ArrayType> for ScaledDotOperation {
             [("left scales", &lhs_scales), ("right operand", &rhs), ("right scales", &rhs_scales)]
         {
             if dimensions.len() != rank {
-                return Err(TypeError {
-                    message: format!(
-                        "'scaled_dot' operands must share one rank, but got rank {rank} for the left operand and \
+                return Err(TypeError::Invalid(format!(
+                    "'scaled_dot' operands must share one rank, but got rank {rank} for the left operand and \
                          rank {} for the {descriptor}",
-                        dimensions.len(),
-                    ),
-                });
+                    dimensions.len(),
+                )));
             }
         }
         if rank == 3 && lhs[0] != rhs[0] {
-            return Err(TypeError {
-                message: format!("'scaled_dot' batch dimension sizes do not match: {} versus {}", lhs[0], rhs[0]),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'scaled_dot' batch dimension sizes do not match: {} versus {}",
+                lhs[0], rhs[0]
+            )));
         }
         let contracting = rank - 1;
         if lhs[contracting] != rhs[contracting] {
-            return Err(TypeError {
-                message: format!(
-                    "'scaled_dot' contracting dimension sizes do not match: {} versus {}",
-                    lhs[contracting], rhs[contracting],
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'scaled_dot' contracting dimension sizes do not match: {} versus {}",
+                lhs[contracting], rhs[contracting],
+            )));
         }
         if self.block_size == 0 || lhs[contracting] % self.block_size != 0 {
-            return Err(TypeError {
-                message: format!(
-                    "'scaled_dot' contracting dimension size {} is not divisible by block size {}",
-                    lhs[contracting], self.block_size,
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'scaled_dot' contracting dimension size {} is not divisible by block size {}",
+                lhs[contracting], self.block_size,
+            )));
         }
         for (descriptor, elements, scales) in [("left", &lhs, &lhs_scales), ("right", &rhs, &rhs_scales)] {
             let mut expected = elements.clone();
             expected[contracting] = elements[contracting] / self.block_size;
             if *scales != expected {
-                return Err(TypeError {
-                    message: format!(
-                        "'scaled_dot' {descriptor} scales must have shape {expected:?} but got {scales:?}"
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'scaled_dot' {descriptor} scales must have shape {expected:?} but got {scales:?}"
+                )));
             }
         }
         if let Some(global_scale) = input_types.get(4) {
             if global_scale.static_shape().is_none_or(|shape| shape.rank() != 0) {
-                return Err(TypeError {
-                    message: format!(
-                        "'scaled_dot' global scale must be a static scalar but got shape {}",
-                        global_scale.shape(),
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'scaled_dot' global scale must be a static scalar but got shape {}",
+                    global_scale.shape(),
+                )));
             }
             if global_scale.data_type() != self.accumulation_type {
-                return Err(TypeError {
-                    message: format!(
-                        "'scaled_dot' global scale data type {} must match the accumulation type {}",
-                        global_scale.data_type(),
-                        self.accumulation_type,
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'scaled_dot' global scale data type {} must match the accumulation type {}",
+                    global_scale.data_type(),
+                    self.accumulation_type,
+                )));
             }
         }
         for input_type in input_types {
             if !accumulation_type_is_compatible(input_type.data_type(), self.accumulation_type) {
-                return Err(TypeError {
-                    message: format!(
-                        "'scaled_dot' operand data type {} cannot accumulate at data type {}",
-                        input_type.data_type(),
-                        self.accumulation_type,
-                    ),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'scaled_dot' operand data type {} cannot accumulate at data type {}",
+                    input_type.data_type(),
+                    self.accumulation_type,
+                )));
             }
             if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError { message: "'scaled_dot' does not support unreduced operands".to_string() });
+                return Err(TypeError::Invalid("'scaled_dot' does not support unreduced operands".to_string()));
             }
         }
         let mut output_dimensions = Vec::with_capacity(rank);
@@ -1190,12 +1151,10 @@ impl<C: Domain<Type = ArrayType, Value: ScaledDot>> InterpretableOperation<C> fo
                 self.block_size,
                 self.accumulation_type,
             )?]),
-            inputs => Err(TypeError {
-                message: format!(
-                    "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                    inputs.len(),
-                ),
-            }
+            inputs => Err(TypeError::Invalid(format!(
+                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
+                inputs.len(),
+            ))
             .into()),
         }
     }
@@ -1228,12 +1187,10 @@ where
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if inputs.len() != 4 && inputs.len() != 5 {
-            return Err(ProgramError::from(TypeError {
-                message: format!(
-                    "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                    inputs.len(),
-                ),
-            })
+            return Err(ProgramError::from(TypeError::Invalid(format!(
+                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
+                inputs.len(),
+            )))
             .into());
         }
         let lhs_scales = inputs[1].primal();
@@ -1301,12 +1258,10 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         if inputs.len() != 4 && inputs.len() != 5 {
-            return Err(ProgramError::from(TypeError {
-                message: format!(
-                    "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                    inputs.len(),
-                ),
-            })
+            return Err(ProgramError::from(TypeError::Invalid(format!(
+                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
+                inputs.len(),
+            )))
             .into());
         }
         check_count!("output", outputs, 1, ProgramError);
@@ -1571,33 +1526,29 @@ where
 {
     let element_type = elements.r#type().into_owned();
     let Some(element_shape) = element_type.static_shape() else {
-        return Err(TypeError { message: "'scaled_dot' operand must have a static shape".to_string() }.into());
+        return Err(TypeError::Invalid("'scaled_dot' operand must have a static shape".to_string()).into());
     };
     let element_dimensions = element_shape.dimensions().to_vec();
     let Some(scale_shape) = scales.r#type().static_shape() else {
-        return Err(TypeError { message: "'scaled_dot' scales must have a static shape".to_string() }.into());
+        return Err(TypeError::Invalid("'scaled_dot' scales must have a static shape".to_string()).into());
     };
     let scale_dimensions = scale_shape.dimensions().to_vec();
     let Some(&contracting_size) = element_dimensions.last() else {
-        return Err(TypeError { message: "'scaled_dot' operand must have rank at least 1".to_string() }.into());
+        return Err(TypeError::Invalid("'scaled_dot' operand must have rank at least 1".to_string()).into());
     };
     if block_size == 0 || contracting_size % block_size != 0 {
-        return Err(TypeError {
-            message: format!(
-                "'scaled_dot' contracting dimension size {contracting_size} is not divisible by block size \
+        return Err(TypeError::Invalid(format!(
+            "'scaled_dot' contracting dimension size {contracting_size} is not divisible by block size \
                  {block_size}"
-            ),
-        }
+        ))
         .into());
     }
     let mut expected_scale_dimensions = element_dimensions.clone();
     *expected_scale_dimensions.last_mut().unwrap() = contracting_size / block_size;
     if scale_dimensions != expected_scale_dimensions {
-        return Err(TypeError {
-            message: format!(
-                "'scaled_dot' scales must have shape {expected_scale_dimensions:?} but got {scale_dimensions:?}"
-            ),
-        }
+        return Err(TypeError::Invalid(format!(
+            "'scaled_dot' scales must have shape {expected_scale_dimensions:?} but got {scale_dimensions:?}"
+        ))
         .into());
     }
     let expanded_type = ArrayType::new(
@@ -1623,13 +1574,14 @@ where
 /// 2 or 3 (the rank-3 form carries one leading batch dimension shared by all operands).
 fn static_scaled_dot_dimensions(descriptor: &str, value_type: &ArrayType) -> Result<Vec<usize>, TypeError> {
     let Some(shape) = value_type.static_shape() else {
-        return Err(TypeError { message: format!("{descriptor} must have a static shape") });
+        return Err(TypeError::Invalid(format!("{descriptor} must have a static shape")));
     };
     match shape.dimensions() {
         dimensions @ (&[_, _] | &[_, _, _]) => Ok(dimensions.to_vec()),
-        dimensions => Err(TypeError {
-            message: format!("{descriptor} must have rank 2 or rank 3 but got rank {}", dimensions.len()),
-        }),
+        dimensions => Err(TypeError::Invalid(format!(
+            "{descriptor} must have rank 2 or rank 3 but got rank {}",
+            dimensions.len()
+        ))),
     }
 }
 
@@ -1702,41 +1654,37 @@ where
             DataType::F8E4M3FN => (448.0, 8.0),
             DataType::F8E5M2 => (57344.0, 15.0),
             element_type => {
-                return Err(TypeError {
-                    message: format!("'block_quantize' does not support element data type {element_type}"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'block_quantize' does not support element data type {element_type}"
+                ))
                 .into());
             }
         };
         let input_type = self.r#type().into_owned();
         let compute_type = input_type.data_type();
         if !matches!(compute_type, DataType::F32 | DataType::F64) {
-            return Err(TypeError {
-                message: format!("'block_quantize' expects an f32 or f64 input but got {compute_type}"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'block_quantize' expects an f32 or f64 input but got {compute_type}"
+            ))
             .into());
         }
         let Some(shape) = input_type.static_shape() else {
-            return Err(TypeError { message: "'block_quantize' input must have a static shape".to_string() }.into());
+            return Err(TypeError::Invalid("'block_quantize' input must have a static shape".to_string()).into());
         };
         let dimensions = shape.dimensions().to_vec();
         if dimensions.is_empty() || dimensions.len() > 3 {
-            return Err(TypeError {
-                message: format!(
-                    "'block_quantize' input must have rank between 1 and 3 but got rank {}",
-                    dimensions.len(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'block_quantize' input must have rank between 1 and 3 but got rank {}",
+                dimensions.len(),
+            ))
             .into());
         }
         let trailing_size = *dimensions.last().unwrap();
         if block_size == 0 || trailing_size % block_size != 0 {
-            return Err(TypeError {
-                message: format!(
-                    "'block_quantize' trailing dimension size {trailing_size} is not divisible by block size \
+            return Err(TypeError::Invalid(format!(
+                "'block_quantize' trailing dimension size {trailing_size} is not divisible by block size \
                      {block_size}"
-                ),
-            }
+            ))
             .into());
         }
         let mut scale_dimensions = dimensions.clone();
@@ -1772,9 +1720,9 @@ where
                 (exponent.mul(&log_2)?.exp()?, (-127.0f64).exp2())
             }
             scale_type => {
-                return Err(TypeError {
-                    message: format!("'block_quantize' does not support scale data type {scale_type}"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'block_quantize' does not support scale data type {scale_type}"
+                ))
                 .into());
             }
         };
@@ -2090,13 +2038,11 @@ mod tests {
                 &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
                 &[],
             ),
-            Err(TypeError {
-                message: "'scaled_dot' contracting dimension size 4 is not divisible by block size 3".to_string(),
-            }),
+            Err(TypeError::Invalid("'scaled_dot' contracting dimension size 4 is not divisible by block size 3".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs_type.clone(), rhs_type.clone(), rhs_type, scale_type.clone()], &[]),
-            Err(TypeError { message: "'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string() }),
+            Err(TypeError::Invalid("'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2108,9 +2054,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'scaled_dot' right operand must have rank 2 or rank 3 but got rank 1".to_string(),
-            }),
+            Err(TypeError::Invalid("'scaled_dot' right operand must have rank 2 or rank 3 but got rank 1".to_string())),
         );
 
         // Batching lifts the rank-2 form to the operation's own rank-3 batched form, so the batched program stays a
@@ -2193,17 +2137,17 @@ mod tests {
                 &[element_type.clone(), scale_type.clone(), rank_2_element_type, scale_type.clone()],
                 &[],
             ),
-            Err(TypeError {
-                message: "'scaled_dot' operands must share one rank, but got rank 3 for the left operand and rank 2 \
+            Err(TypeError::Invalid(
+                "'scaled_dot' operands must share one rank, but got rank 3 for the left operand and rank 2 \
                           for the right operand"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         let mismatched_batch_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)]));
         assert_eq!(
             operation.infer_output_types(&[element_type, scale_type.clone(), mismatched_batch_type, scale_type], &[],),
-            Err(TypeError { message: "'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string() }),
+            Err(TypeError::Invalid("'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string())),
         );
     }
 
@@ -2249,9 +2193,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'scaled_dot' global scale must be a static scalar but got shape [2]".to_string()
-            }),
+            Err(TypeError::Invalid("'scaled_dot' global scale must be a static scalar but got shape [2]".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2264,15 +2206,15 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'scaled_dot' global scale data type f64 must match the accumulation type f32".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'scaled_dot' global scale data type f64 must match the accumulation type f32".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(&[element_type, scale_type.clone(), scale_type], &[]),
-            Err(TypeError {
-                message: "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got 3".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got 3".to_string()
+            )),
         );
     }
 
@@ -2878,9 +2820,9 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(4), Size::Static(3)]));
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), static_rhs], &[]),
-            Err(TypeError {
-                message: "'dot' contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string()
+            )),
         );
         let mismatched_batch_rhs = ArrayType::new(
             DataType::F64,
@@ -2888,9 +2830,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[lhs, mismatched_batch_rhs], &[]),
-            Err(TypeError {
-                message: "'dot' batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string(),
-            }),
+            Err(TypeError::Invalid("'dot' batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string())),
         );
     }
 
@@ -2995,10 +2935,9 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[lhs, rhs], &[]),
-            Err(TypeError {
-                message: "'dot' batching dimensions must have consistent shardings, but got {'b'} and {'m'}"
-                    .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' batching dimensions must have consistent shardings, but got {'b'} and {'m'}".to_string()
+            )),
         );
     }
 
@@ -3013,21 +2952,20 @@ mod tests {
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["k"]), ShardingDimension::replicated()]);
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), rhs], &[]),
-            Err(TypeError {
-                message: "'dot' contracting dimensions are sharded, making the output sharding ambiguous; request an \
+            Err(TypeError::Invalid(
+                "'dot' contracting dimensions are sharded, making the output sharding ambiguous; request an \
                           explicit output sharding (e.g., one with unreduced axes) to resolve it"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         // Differently sharded contracting dimensions are inconsistent.
         let mismatched_rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), mismatched_rhs], &[]),
-            Err(TypeError {
-                message: "'dot' contracting dimensions must have consistent shardings, but got {'k'} and {'m'}"
-                    .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' contracting dimensions must have consistent shardings, but got {'k'} and {'m'}".to_string()
+            )),
         );
         // A contracting dimension sharded on only one operand is allowed, and its sharding is dropped.
         let replicated_rhs =
@@ -3056,7 +2994,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[lhs, rhs], &[]),
-            Err(TypeError { message: "'dot' operand shardings must use the same mesh".to_string() }),
+            Err(TypeError::Invalid("'dot' operand shardings must use the same mesh".to_string())),
         );
     }
 
@@ -3075,7 +3013,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             operation.infer_output_types(&[unreduced_lhs, plain_array(&[8, 16])], &[]),
-            Err(TypeError { message: "'dot' operands cannot be unreduced".to_string() }),
+            Err(TypeError::Invalid("'dot' operands cannot be unreduced".to_string())),
         );
 
         // Reduced operands are legal (this is what lets adjoint dots consume reduced cotangents), and their reduced
@@ -3157,7 +3095,7 @@ mod tests {
             .with_output_sharding(rank_mismatched);
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
-            Err(TypeError { message: "'dot' output sharding rank (1) does not match the output rank (3)".to_string() }),
+            Err(TypeError::Invalid("'dot' output sharding rank (1) does not match the output rank (3)".to_string())),
         );
 
         // Mesh validation.
@@ -3167,7 +3105,7 @@ mod tests {
             .with_output_sharding(other_mesh_sharding);
         assert_eq!(
             operation.infer_output_types(&[lhs, rhs], &[]),
-            Err(TypeError { message: "'dot' output sharding must use the same mesh as the operands".to_string() }),
+            Err(TypeError::Invalid("'dot' output sharding must use the same mesh as the operands".to_string())),
         );
 
         // Auto mesh axes cannot be requested explicitly.
@@ -3177,7 +3115,7 @@ mod tests {
         let operation = DotOperation::matmul().with_output_sharding(auto_sharding);
         assert_eq!(
             operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])], &[]),
-            Err(TypeError { message: "'dot' output sharding cannot reference auto mesh axes".to_string() }),
+            Err(TypeError::Invalid("'dot' output sharding cannot reference auto mesh axes".to_string())),
         );
     }
 
@@ -3206,11 +3144,10 @@ mod tests {
         let operation = DotOperation::matmul().with_output_sharding(unreduced.clone());
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), replicated_rhs.clone()], &[]),
-            Err(TypeError {
-                message:
-                    "'dot' contracting dimensions must be sharded identically when the output sharding is unreduced"
-                        .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' contracting dimensions must be sharded identically when the output sharding is unreduced"
+                    .to_string()
+            )),
         );
 
         // The unreduced set must equal the axes that shard the contracting dimensions.
@@ -3222,11 +3159,10 @@ mod tests {
         let operation = DotOperation::matmul().with_output_sharding(mismatched);
         assert_eq!(
             operation.infer_output_types(&[lhs, rhs], &[]),
-            Err(TypeError {
-                message:
-                    "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
-                        .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                    .to_string()
+            )),
         );
 
         // Unsharded contracting dimensions cannot produce an unreduced output.
@@ -3243,11 +3179,10 @@ mod tests {
                 ],
                 &[]
             ),
-            Err(TypeError {
-                message:
-                    "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
-                        .to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                    .to_string()
+            )),
         );
     }
 

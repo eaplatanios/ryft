@@ -212,8 +212,8 @@ impl ReshapeDimensionMonomial {
 
     /// Multiplies this monomial by `other` with overflow checking.
     fn checked_mul(mut self, other: Self) -> Result<Self, TypeError> {
-        self.coefficient = self.coefficient.checked_mul(other.coefficient).ok_or_else(|| TypeError {
-            message: "'reshape' dimension expression coefficient does not fit in usize".to_string(),
+        self.coefficient = self.coefficient.checked_mul(other.coefficient).ok_or_else(|| {
+            TypeError::Invalid("'reshape' dimension expression coefficient does not fit in usize".to_string())
         })?;
         if self.coefficient == 0 {
             self.dynamic_dimensions.clear();
@@ -221,8 +221,8 @@ impl ReshapeDimensionMonomial {
         }
         for (dimension, exponent) in other.dynamic_dimensions {
             let current = self.dynamic_dimensions.entry(dimension).or_default();
-            *current = current.checked_add(exponent).ok_or_else(|| TypeError {
-                message: "'reshape' dimension expression exponent does not fit in usize".to_string(),
+            *current = current.checked_add(exponent).ok_or_else(|| {
+                TypeError::Invalid("'reshape' dimension expression exponent does not fit in usize".to_string())
             })?;
         }
         Ok(self)
@@ -279,11 +279,9 @@ fn invert_symbolic_reshape_target(
                         monomial.dynamic_dimensions.len() == 1
                             && monomial.dynamic_dimensions.get(&input_dimension) == Some(&1)
                     })
-                    .ok_or_else(|| TypeError {
-                        message: format!(
+                    .ok_or_else(|| TypeError::Invalid(format!(
                             "'reshape' transpose cannot recover dynamic input dimension {input_dimension} from the output shape",
-                        ),
-                    })?;
+                        )))?;
                 let output = ReshapeDimensionExpression::InputDimension(output_dimension);
                 if monomial.coefficient == 1 {
                     Ok(output)
@@ -312,11 +310,11 @@ fn normalize_reshape_dimension_expression(
             Ok(ReshapeDimensionMonomial { coefficient: *value, dynamic_dimensions: BTreeMap::new() })
         }
         ReshapeDimensionExpression::InputDimension(dimension) => {
-            let size = input_shape.dimensions().get(*dimension).ok_or_else(|| TypeError {
-                message: format!(
+            let size = input_shape.dimensions().get(*dimension).ok_or_else(|| {
+                TypeError::Invalid(format!(
                     "'reshape' dimension expression references input dimension {dimension}, but the input rank is {}",
                     input_shape.rank(),
-                ),
+                ))
             })?;
             match size {
                 Size::Static(value) => {
@@ -337,15 +335,15 @@ fn normalize_reshape_dimension_expression(
             let mut numerator = normalize_reshape_dimension_expression(numerator, input_shape)?;
             let denominator = normalize_reshape_dimension_expression(denominator, input_shape)?;
             if !denominator.dynamic_dimensions.is_empty() {
-                return Err(TypeError {
-                    message: "'reshape' cannot prove exact division by a dynamic dimension".to_string(),
-                });
+                return Err(TypeError::Invalid(
+                    "'reshape' cannot prove exact division by a dynamic dimension".to_string(),
+                ));
             }
             if denominator.coefficient == 0 {
-                return Err(TypeError { message: "'reshape' dimension expression divides by zero".to_string() });
+                return Err(TypeError::Invalid("'reshape' dimension expression divides by zero".to_string()));
             }
             if numerator.coefficient % denominator.coefficient != 0 {
-                return Err(TypeError { message: "'reshape' dimension expression division is not exact".to_string() });
+                return Err(TypeError::Invalid("'reshape' dimension expression division is not exact".to_string()));
             }
             numerator.coefficient /= denominator.coefficient;
             Ok(numerator)
@@ -373,7 +371,7 @@ fn infer_symbolic_reshape_shape(
         .cloned()
         .try_fold(ReshapeDimensionMonomial::one(), ReshapeDimensionMonomial::checked_mul)?;
     if input_elements != output_elements {
-        return Err(TypeError { message: "'reshape' changes the number of elements".to_string() });
+        return Err(TypeError::Invalid("'reshape' changes the number of elements".to_string()));
     }
     Ok(Shape::new(output_dimensions.iter().map(|dimension| dimension.to_size(input_shape)).collect()))
 }
@@ -386,25 +384,25 @@ fn evaluate_reshape_dimension_expression(
     match expression {
         ReshapeDimensionExpression::Constant(value) => Ok(*value),
         ReshapeDimensionExpression::InputDimension(dimension) => {
-            input_shape.dimensions().get(*dimension).and_then(Size::value).ok_or_else(|| TypeError {
-                message: format!("cannot evaluate input dimension {dimension} from non-concrete shape {input_shape}"),
+            input_shape.dimensions().get(*dimension).and_then(Size::value).ok_or_else(|| {
+                TypeError::Invalid(format!(
+                    "cannot evaluate input dimension {dimension} from non-concrete shape {input_shape}"
+                ))
             })
         }
-        ReshapeDimensionExpression::Product(factors) => {
-            factors.iter().try_fold(1usize, |product, factor| {
-                product.checked_mul(evaluate_reshape_dimension_expression(factor, input_shape)?).ok_or_else(|| {
-                    TypeError { message: "'reshape' dimension expression value does not fit in usize".to_string() }
-                })
+        ReshapeDimensionExpression::Product(factors) => factors.iter().try_fold(1usize, |product, factor| {
+            product.checked_mul(evaluate_reshape_dimension_expression(factor, input_shape)?).ok_or_else(|| {
+                TypeError::Invalid("'reshape' dimension expression value does not fit in usize".to_string())
             })
-        }
+        }),
         ReshapeDimensionExpression::ExactDivision { numerator, denominator } => {
             let numerator = evaluate_reshape_dimension_expression(numerator, input_shape)?;
             let denominator = evaluate_reshape_dimension_expression(denominator, input_shape)?;
             if denominator == 0 {
-                return Err(TypeError { message: "'reshape' dimension expression divides by zero".to_string() });
+                return Err(TypeError::Invalid("'reshape' dimension expression divides by zero".to_string()));
             }
             if numerator % denominator != 0 {
-                return Err(TypeError { message: "'reshape' dimension expression division is not exact".to_string() });
+                return Err(TypeError::Invalid("'reshape' dimension expression division is not exact".to_string()));
             }
             Ok(numerator / denominator)
         }
@@ -432,7 +430,7 @@ impl Operation<ArrayType> for ReshapeOperation {
         match input_types[0].reshape_with(self) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::Invalid(error.to_string())),
         }
     }
 
@@ -714,31 +712,29 @@ impl Reshape for ArrayType {
             ReshapeTarget::Shape(shape) => {
                 if permuted_input.shape() != shape {
                     if shape.dimensions().iter().any(|size| matches!(size, Size::Dynamic(_))) {
-                        return Err(TypeError {
-                            message: "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-                        }
+                        return Err(TypeError::Invalid(
+                            "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
+                        )
                         .into());
                     }
                     let Some(input_elements) =
-                        permuted_input.element_count().map_err(|error| TypeError { message: error.to_string() })?
+                        permuted_input.element_count().map_err(|error| TypeError::Invalid(error.to_string()))?
                     else {
-                        return Err(TypeError {
-                            message: "'reshape' requires dimension expressions for a dynamic input shape".to_string(),
-                        }
+                        return Err(TypeError::Invalid(
+                            "'reshape' requires dimension expressions for a dynamic input shape".to_string(),
+                        )
                         .into());
                     };
                     let Some(output_elements) =
-                        shape.element_count().map_err(|error| TypeError { message: error.to_string() })?
+                        shape.element_count().map_err(|error| TypeError::Invalid(error.to_string()))?
                     else {
-                        return Err(TypeError {
-                            message: "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-                        }
+                        return Err(TypeError::Invalid(
+                            "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
+                        )
                         .into());
                     };
                     if input_elements != output_elements {
-                        return Err(
-                            TypeError { message: "'reshape' changes the number of elements".to_string() }.into()
-                        );
+                        return Err(TypeError::Invalid("'reshape' changes the number of elements".to_string()).into());
                     }
                 }
                 shape.clone()
@@ -757,16 +753,13 @@ impl Reshape for ArrayType {
         };
 
         if operation.has_identity_dimensions(self.rank()) && self.shape() == &shape {
-            return self
-                .clone()
-                .with_sharding(sharding)
-                .map_err(|error| TypeError { message: error.to_string() }.into());
+            return self.clone().with_sharding(sharding).map_err(|error| TypeError::Invalid(error.to_string()).into());
         }
 
         ArrayType::new(self.data_type(), shape)
             .with_memory(self.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::Invalid(error.to_string()).into())
     }
 }
 
@@ -777,39 +770,37 @@ fn validate_requested_reshape_sharding(
     requested: &Sharding,
 ) -> Result<Sharding, TypeError> {
     if requested.rank() != output_shape.rank() {
-        return Err(TypeError {
-            message: format!(
-                "'reshape' requested output sharding rank ({}) does not match the output rank ({})",
-                requested.rank(),
-                output_shape.rank(),
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'reshape' requested output sharding rank ({}) does not match the output rank ({})",
+            requested.rank(),
+            output_shape.rank(),
+        )));
     }
     if input.sharding().is_some_and(|input| input.mesh() != requested.mesh()) {
-        return Err(TypeError { message: "'reshape' requested output sharding uses a different mesh".to_string() });
+        return Err(TypeError::Invalid("'reshape' requested output sharding uses a different mesh".to_string()));
     }
     if references_auto_axis(requested) {
-        return Err(TypeError {
-            message: "'reshape' requested output sharding cannot reference auto mesh axes".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requested output sharding cannot reference auto mesh axes".to_string(),
+        ));
     }
     let input_unreduced = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
     let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
     let input_varying = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     if requested.unreduced_axes() != &input_unreduced {
-        return Err(TypeError {
-            message: "'reshape' requested output sharding changes the unreduced mesh axes".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requested output sharding changes the unreduced mesh axes".to_string(),
+        ));
     }
     if requested.reduced_axes() != &input_reduced {
-        return Err(TypeError {
-            message: "'reshape' requested output sharding changes the reduced mesh axes".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requested output sharding changes the reduced mesh axes".to_string(),
+        ));
     }
     if requested.varying_manual_axes() != &input_varying {
-        return Err(TypeError {
-            message: "'reshape' requested output sharding changes the varying manual mesh axes".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requested output sharding changes the varying manual mesh axes".to_string(),
+        ));
     }
     Ok(requested.clone())
 }
@@ -861,7 +852,7 @@ fn infer_reshape_sharding(input: &ArrayType, output_shape: &Shape, sharding: &Sh
         return rebuild_reshape_sharding(sharding, output_sharding_dimensions);
     }
 
-    let alignment_error = || TypeError { message: "'reshape' could not align reshape dimension groups".to_string() };
+    let alignment_error = || TypeError::Invalid("'reshape' could not align reshape dimension groups".to_string());
     let mut input_start = 0usize;
     let mut output_start = 0usize;
     while input_start < input_dimensions.len() || output_start < output_dimensions.len() {
@@ -900,9 +891,9 @@ fn infer_reshape_sharding(input: &ArrayType, output_shape: &Shape, sharding: &Sh
 fn static_positive_size(size: Size) -> Result<usize, TypeError> {
     match size {
         Size::Static(value) if value > 0 => Ok(value),
-        Size::Static(_) | Size::Dynamic(_) => Err(TypeError {
-            message: "'reshape' requires explicit output sharding for unaligned zero or dynamic dimensions".to_string(),
-        }),
+        Size::Static(_) | Size::Dynamic(_) => Err(TypeError::Invalid(
+            "'reshape' requires explicit output sharding for unaligned zero or dynamic dimensions".to_string(),
+        )),
     }
 }
 
@@ -939,16 +930,16 @@ fn propagate_zero_reshape_sharding(
         .iter()
         .any(|(axis, _)| sharding.dimensions()[*axis] != ShardingDimension::Replicated)
     {
-        return Err(TypeError {
-            message: "'reshape' requires explicit output sharding for an ambiguous zero-sized reshape".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requires explicit output sharding for an ambiguous zero-sized reshape".to_string(),
+        ));
     }
     if input_dimensions[prefix..input_end].iter().any(|(_, size)| matches!(size, Size::Dynamic(_)))
         || output_dimensions[prefix..output_end].iter().any(|(_, size)| matches!(size, Size::Dynamic(_)))
     {
-        return Err(TypeError {
-            message: "'reshape' requires explicit output sharding for unaligned dynamic dimensions".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' requires explicit output sharding for unaligned dynamic dimensions".to_string(),
+        ));
     }
     Ok(())
 }
@@ -971,15 +962,15 @@ fn propagate_static_reshape_group(
         match &sharding.dimensions()[*axis] {
             ShardingDimension::Replicated => saw_replicated = true,
             ShardingDimension::Unconstrained => {
-                return Err(TypeError {
-                    message: "'reshape' requires explicit output sharding for unconstrained dimensions".to_string(),
-                });
+                return Err(TypeError::Invalid(
+                    "'reshape' requires explicit output sharding for unconstrained dimensions".to_string(),
+                ));
             }
             ShardingDimension::Sharded(axis_names) => {
                 if saw_replicated {
-                    return Err(TypeError {
-                        message: "'reshape' cannot preserve non-contiguous sharding across a merge".to_string(),
-                    });
+                    return Err(TypeError::Invalid(
+                        "'reshape' cannot preserve non-contiguous sharding across a merge".to_string(),
+                    ));
                 }
                 mesh_axes.extend(axis_names.iter().cloned());
             }
@@ -992,13 +983,14 @@ fn propagate_static_reshape_group(
         let start = mesh_axis_index;
         while remaining > 1 && mesh_axis_index < mesh_axes.len() {
             let mesh_axis = &mesh_axes[mesh_axis_index];
-            let mesh_axis_size = sharding.mesh().axis_size(mesh_axis).ok_or_else(|| TypeError {
-                message: format!("'reshape' references unknown mesh axis '{mesh_axis}'"),
-            })?;
+            let mesh_axis_size = sharding
+                .mesh()
+                .axis_size(mesh_axis)
+                .ok_or_else(|| TypeError::Invalid(format!("'reshape' references unknown mesh axis '{mesh_axis}'")))?;
             if remaining % mesh_axis_size != 0 {
-                return Err(TypeError {
-                    message: "'reshape' cannot distribute sharding across the requested split factors".to_string(),
-                });
+                return Err(TypeError::Invalid(
+                    "'reshape' cannot distribute sharding across the requested split factors".to_string(),
+                ));
             }
             remaining /= mesh_axis_size;
             mesh_axis_index += 1;
@@ -1009,9 +1001,9 @@ fn propagate_static_reshape_group(
         }
     }
     if mesh_axis_index != mesh_axes.len() {
-        return Err(TypeError {
-            message: "'reshape' cannot distribute all input mesh axes across the output dimensions".to_string(),
-        });
+        return Err(TypeError::Invalid(
+            "'reshape' cannot distribute all input mesh axes across the output dimensions".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1022,7 +1014,7 @@ fn rebuild_reshape_sharding(input: &Sharding, dimensions: Vec<ShardingDimension>
         .and_then(|output| output.with_unreduced_axes(input.unreduced_axes().clone()))
         .and_then(|output| output.with_reduced_axes(input.reduced_axes().clone()))
         .and_then(|output| output.with_varying_manual_axes(input.varying_manual_axes().clone()))
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::Invalid(error.to_string()))
 }
 
 /// Any context-carrying value reshapes by binding a [`ReshapeOperation`] through its own context. The
@@ -1112,9 +1104,9 @@ mod tests {
         // The optional dimensions permutation is applied before the row-major reshape.
         assert_eq!(
             input.reshape_with_dimensions(Shape::new(vec![Size::Static(6)]), [1, 0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation has length 2 but input has rank 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation has length 2 but input has rank 1".to_string()
+            ))),
         );
         assert_eq!(
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -1358,16 +1350,15 @@ mod tests {
                 ReshapeDimensionExpression::InputDimension(0),
                 ReshapeDimensionExpression::Constant(2),
             ])),
-            Err(ProgramError::Type(TypeError { message: "'reshape' changes the number of elements".to_string() })),
+            Err(ProgramError::Type(TypeError::Invalid("'reshape' changes the number of elements".to_string()))),
         );
         assert_eq!(
             input_type.reshape_with(&ReshapeOperation::from_dimension_expressions(vec![
                 ReshapeDimensionExpression::InputDimension(2),
             ])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' dimension expression references input dimension 2, but the input rank is 2"
-                    .to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' dimension expression references input dimension 2, but the input rank is 2".to_string()
+            ))),
         );
         assert_eq!(
             input_type.reshape_with(&ReshapeOperation::from_dimension_expressions(vec![
@@ -1377,9 +1368,9 @@ mod tests {
                 },
                 ReshapeDimensionExpression::Constant(4),
             ])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' cannot prove exact division by a dynamic dimension".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' cannot prove exact division by a dynamic dimension".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])).reshape_with(
@@ -1391,9 +1382,9 @@ mod tests {
                     ReshapeDimensionExpression::Constant(2),
                 ]),
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' dimension expression division is not exact".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' dimension expression division is not exact".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::scalar(DataType::F32).reshape_with(&ReshapeOperation::from_dimension_expressions(vec![
@@ -1402,9 +1393,9 @@ mod tests {
                     ReshapeDimensionExpression::Constant(2),
                 ]),
             ])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' dimension expression coefficient does not fit in usize".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' dimension expression coefficient does not fit in usize".to_string()
+            ))),
         );
 
         // An empty expression list is the rank-0 shape and preserves scalar payloads.
@@ -1438,27 +1429,25 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, dynamic_shape.clone());
         assert_eq!(
             dynamic_type.reshape(Shape::new(vec![Size::Static(6)])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requires dimension expressions for a dynamic input shape".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requires dimension expressions for a dynamic input shape".to_string()
+            ))),
         );
         assert_eq!(
             static_type.reshape(dynamic_shape.clone()),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+            ))),
         );
         assert_eq!(
             ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type), &[]),
-            Err(TypeError {
-                message: "'reshape' requires dimension expressions for a dynamic output shape".to_string()
-            }),
+            Err(TypeError::Invalid("'reshape' requires dimension expressions for a dynamic output shape".to_string())),
         );
         assert_eq!(
             Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+            ))),
         );
 
         // Reshaping a dynamically sized type to its own shape short-circuits as the identity.
@@ -1469,9 +1458,9 @@ mod tests {
         let zero_dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Dynamic(None)]));
         assert_eq!(
             zero_dynamic_type.reshape(Shape::new(vec![Size::Dynamic(None), Size::Static(0)])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+            ))),
         );
         assert_eq!(
             zero_dynamic_type.reshape(Shape::new(vec![Size::Static(0)])),
@@ -1637,9 +1626,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             input_type.reshape(Shape::new(vec![Size::Static(8)])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' cannot preserve non-contiguous sharding across a merge".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' cannot preserve non-contiguous sharding across a merge".to_string()
+            ))),
         );
 
         // Many-to-many regrouping is supported when every participating dimension is replicated.
@@ -1701,9 +1690,9 @@ mod tests {
         assert_eq!(
             input_type
                 .reshape_with_output_sharding(Shape::new(vec![Size::Static(2), Size::Static(4)]), &other_requested,),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requested output sharding uses a different mesh".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requested output sharding uses a different mesh".to_string()
+            ))),
         );
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto_requested =
@@ -1712,9 +1701,9 @@ mod tests {
         assert_eq!(
             unsharded_input
                 .reshape_with_output_sharding(Shape::new(vec![Size::Static(2), Size::Static(4)]), &auto_requested,),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requested output sharding cannot reference auto mesh axes".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requested output sharding cannot reference auto mesh axes".to_string()
+            ))),
         );
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto_input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
@@ -1764,9 +1753,9 @@ mod tests {
                 .unwrap();
         assert_eq!(
             sharded_dynamic_input.reshape(Shape::new(vec![Size::Static(0)])),
-            Err(ProgramError::Type(TypeError {
-                message: "'reshape' requires explicit output sharding for an ambiguous zero-sized reshape".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'reshape' requires explicit output sharding for an ambiguous zero-sized reshape".to_string()
+            ))),
         );
         let zero_requested = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(

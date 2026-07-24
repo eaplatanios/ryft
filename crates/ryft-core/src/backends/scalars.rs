@@ -214,9 +214,9 @@ impl Scalar {
         if let Some(bit_width) = bit_width
             && bits >= 1 << bit_width
         {
-            return Err(TypeError {
-                message: format!("raw {type} value 0x{bits:02x} does not fit in {bit_width} bits", type = r#type),
-            }
+            return Err(TypeError::Invalid(
+                format!("raw {type} value 0x{bits:02x} does not fit in {bit_width} bits", type = r#type),
+            )
             .into());
         }
         Ok(match r#type {
@@ -232,7 +232,7 @@ impl Scalar {
             DataType::F8E5M2FNUZ => Scalar::F8E5M2FNUZ(bits),
             DataType::F8E8M0FNU => Scalar::F8E8M0FNU(bits),
             other => {
-                return Err(TypeError { message: format!("data type {other} is not a low-precision float") }.into());
+                return Err(TypeError::Invalid(format!("data type {other} is not a low-precision float")).into());
             }
         })
     }
@@ -399,14 +399,12 @@ impl Scalar {
         if value.is_nan() {
             return match canonical_nan {
                 Some(bits) => Scalar::from_low_precision_float_bits(r#type, bits),
-                None => {
-                    Err(TypeError { message: format!("data type {type} cannot represent NaN", type = r#type) }.into())
-                }
+                None => Err(TypeError::Invalid(format!("data type {type} cannot represent NaN", type = r#type)).into()),
             };
         }
         if value == 0.0 {
             if r#type == DataType::F8E8M0FNU {
-                return Err(TypeError { message: "data type f8e8m0fnu cannot represent zero".to_string() }.into());
+                return Err(TypeError::Invalid("data type f8e8m0fnu cannot represent zero".to_string()).into());
             }
             let has_signed_zero =
                 !matches!(r#type, DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ);
@@ -434,9 +432,8 @@ impl Scalar {
                 best_distance = distance;
             }
         }
-        let bits = best_bits.ok_or_else(|| TypeError {
-            message: format!("data type {type} cannot represent {value}", type = r#type),
-        })?;
+        let bits = best_bits
+            .ok_or_else(|| TypeError::Invalid(format!("data type {type} cannot represent {value}", type = r#type)))?;
         Self::from_low_precision_float_bits(r#type, bits)
     }
 }
@@ -711,7 +708,7 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
             DataType::C64 => Scalar::C64(Complex::new(0.0, 0.0)),
             DataType::C128 => Scalar::C128(Complex::new(0.0, 0.0)),
             other => {
-                return Err(TypeError { message: format!("data type {other} cannot represent zero") }.into());
+                return Err(TypeError::Invalid(format!("data type {other} cannot represent zero")).into());
             }
         })
     }
@@ -784,7 +781,7 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
             DataType::C64 => Scalar::C64(Complex::new(1.0, 0.0)),
             DataType::C128 => Scalar::C128(Complex::new(1.0, 0.0)),
             other => {
-                return Err(TypeError { message: format!("data type {other} cannot represent one") }.into());
+                return Err(TypeError::Invalid(format!("data type {other} cannot represent one")).into());
             }
         })
     }
@@ -857,9 +854,10 @@ impl Abs for Scalar {
             Scalar::C64(value) => Scalar::F32(value.norm()),
             Scalar::C128(value) => Scalar::F64(value.norm()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the absolute value of a scalar of data type {}", other.r#type(),),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the absolute value of a scalar of data type {}",
+                    other.r#type(),
+                ))
                 .into());
             }
         })
@@ -871,7 +869,7 @@ impl Neg for Scalar {
     fn neg(&self) -> Result<Scalar, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             if r#type == DataType::F8E8M0FNU {
-                return Err(TypeError { message: "cannot negate a scalar of data type f8e8m0fnu".to_string() }.into());
+                return Err(TypeError::Invalid("cannot negate a scalar of data type f8e8m0fnu".to_string()).into());
             }
             return Self::encode_low_precision_float(r#type, -Self::decode_low_precision_float(r#type, bits));
         }
@@ -905,7 +903,7 @@ impl Neg for Scalar {
             Scalar::C128(value) => Scalar::C128(-value),
             other => {
                 return Err(
-                    TypeError { message: format!("cannot negate a scalar of data type {}", other.r#type()) }.into()
+                    TypeError::Invalid(format!("cannot negate a scalar of data type {}", other.r#type())).into()
                 );
             }
         })
@@ -929,7 +927,7 @@ fn promote_scalar_arithmetic_operands(
 ) -> Result<(Scalar, Scalar), ProgramError> {
     let input_types = [left.r#type().into_owned(), right.r#type().into_owned()];
     check_types!(@numeric, operation_name, input_types);
-    let target = DataType::promoted(&input_types).map_err(|error| TypeError { message: error.to_string() })?;
+    let target = DataType::promoted(&input_types).map_err(|error| TypeError::Invalid(error.to_string()))?;
     Ok((left.convert_element_type(target)?, right.convert_element_type(target)?))
 }
 
@@ -969,14 +967,12 @@ macro_rules! impl_binary_arithmetic_for_scalar {
                     (Scalar::C64(left), Scalar::C64(right)) => Scalar::C64(left $operator right),
                     (Scalar::C128(left), Scalar::C128(right)) => Scalar::C128(left $operator right),
                     (left, right) => {
-                        return Err(TypeError {
-                            message: format!(
+                        return Err(TypeError::Invalid(format!(
                                 "cannot apply `{}` to scalars of data types {} and {}",
                                 stringify!($method),
                                 left.r#type(),
                                 right.r#type(),
-                            ),
-                        }
+                            ))
                         .into());
                     }
                 })
@@ -1056,21 +1052,17 @@ impl Div for Scalar {
         macro_rules! divide_signed_integer {
             ($left:expr, $right:expr, $variant:ident, $data_type:ident, $primitive:ty) => {{
                 if $right == 0 {
-                    return Err(TypeError {
-                        message: format!(
-                            "cannot divide an integer scalar of data type {} by zero",
-                            DataType::$data_type
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "cannot divide an integer scalar of data type {} by zero",
+                        DataType::$data_type
+                    ))
                     .into());
                 }
                 if $left == <$primitive>::MIN && $right == -1 {
-                    return Err(TypeError {
-                        message: format!(
-                            "cannot divide the minimum integer scalar of data type {} by -1",
-                            DataType::$data_type,
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "cannot divide the minimum integer scalar of data type {} by -1",
+                        DataType::$data_type,
+                    ))
                     .into());
                 }
                 Scalar::$variant($left / $right)
@@ -1080,12 +1072,10 @@ impl Div for Scalar {
         macro_rules! divide_unsigned_integer {
             ($left:expr, $right:expr, $variant:ident, $data_type:ident) => {{
                 if $right == 0 {
-                    return Err(TypeError {
-                        message: format!(
-                            "cannot divide an integer scalar of data type {} by zero",
-                            DataType::$data_type
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "cannot divide an integer scalar of data type {} by zero",
+                        DataType::$data_type
+                    ))
                     .into());
                 }
                 Scalar::$variant($left / $right)
@@ -1108,13 +1098,11 @@ impl Div for Scalar {
             (Scalar::C64(left), Scalar::C64(right)) => Scalar::C64(divide_complex_scalars!(left, right)),
             (Scalar::C128(left), Scalar::C128(right)) => Scalar::C128(divide_complex_scalars!(left, right)),
             (left, right) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot apply `div` to scalars of data types {} and {}",
-                        left.r#type(),
-                        right.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot apply `div` to scalars of data types {} and {}",
+                    left.r#type(),
+                    right.r#type(),
+                ))
                 .into());
             }
         })
@@ -1165,9 +1153,10 @@ impl Sin for Scalar {
                 ))
             }
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the sine of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the sine of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1203,9 +1192,10 @@ impl Cos for Scalar {
                 Scalar::C128(Complex::new(real, if value.re == 0.0 { 0.0 } else { -value.re.sin() * sinh_imaginary }))
             }
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the cosine of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1244,13 +1234,11 @@ impl Atan2 for Scalar {
                 Scalar::C128(-imaginary_unit * divide_complex_scalars!(x + imaginary_unit * y, radius).ln())
             }
             (y, x) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the arc tangent of scalars of data types {} and {}",
-                        y.r#type(),
-                        x.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the arc tangent of scalars of data types {} and {}",
+                    y.r#type(),
+                    x.r#type(),
+                ))
                 .into());
             }
         })
@@ -1273,9 +1261,10 @@ impl Exp for Scalar {
             Scalar::C64(value) => Scalar::C64(value.exp()),
             Scalar::C128(value) => Scalar::C128(value.exp()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the exponential of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the exponential of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1298,9 +1287,10 @@ impl Log for Scalar {
             Scalar::C64(value) => Scalar::C64(value.ln()),
             Scalar::C128(value) => Scalar::C128(value.ln()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the logarithm of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the logarithm of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1323,9 +1313,10 @@ impl Sqrt for Scalar {
             Scalar::C64(value) => Scalar::C64(value.sqrt()),
             Scalar::C128(value) => Scalar::C128(value.sqrt()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the square root of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the square root of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1351,12 +1342,10 @@ impl Rsqrt for Scalar {
             Scalar::C64(value) => Scalar::C64(value.sqrt().inv()),
             Scalar::C128(value) => Scalar::C128(value.sqrt().inv()),
             other => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the reciprocal square root of a scalar of data type {}",
-                        other.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the reciprocal square root of a scalar of data type {}",
+                    other.r#type(),
+                ))
                 .into());
             }
         })
@@ -1379,12 +1368,10 @@ impl Tanh for Scalar {
             Scalar::C64(value) => Scalar::C64(value.tanh()),
             Scalar::C128(value) => Scalar::C128(value.tanh()),
             other => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the hyperbolic tangent of a scalar of data type {}",
-                        other.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the hyperbolic tangent of a scalar of data type {}",
+                    other.r#type(),
+                ))
                 .into());
             }
         })
@@ -1408,9 +1395,10 @@ impl Logistic for Scalar {
             Scalar::C64(value) => Scalar::C64(((-value).exp() + 1.0).inv()),
             Scalar::C128(value) => Scalar::C128(((-value).exp() + 1.0).inv()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the logistic of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the logistic of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1582,9 +1570,10 @@ impl Erf for Scalar {
             Scalar::F32(value) => Scalar::F32(erf(f64::from(*value)) as f32),
             Scalar::F64(value) => Scalar::F64(erf(*value)),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the error function of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the error function of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1619,13 +1608,11 @@ impl Pow for Scalar {
             (Scalar::C64(base), Scalar::C64(exponent)) => Scalar::C64(base.powc(exponent)),
             (Scalar::C128(base), Scalar::C128(exponent)) => Scalar::C128(base.powc(exponent)),
             (base, exponent) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the power of scalars of data types {} and {}",
-                        base.r#type(),
-                        exponent.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the power of scalars of data types {} and {}",
+                    base.r#type(),
+                    exponent.r#type(),
+                ))
                 .into());
             }
         })
@@ -1667,9 +1654,10 @@ impl Sign for Scalar {
                 Scalar::C128(if norm == 0.0 { *value } else { value / norm })
             }
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the sign of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the sign of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1689,9 +1677,10 @@ impl Floor for Scalar {
             Scalar::F32(value) => Scalar::F32(value.floor()),
             Scalar::F64(value) => Scalar::F64(value.floor()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the floor of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the floor of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1711,9 +1700,10 @@ impl Ceil for Scalar {
             Scalar::F32(value) => Scalar::F32(value.ceil()),
             Scalar::F64(value) => Scalar::F64(value.ceil()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot compute the ceiling of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the ceiling of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1737,9 +1727,7 @@ impl Round for Scalar {
             Scalar::F32(value) => Scalar::F32(value.round_ties_even()),
             Scalar::F64(value) => Scalar::F64(value.round_ties_even()),
             other => {
-                return Err(
-                    TypeError { message: format!("cannot round a scalar of data type {}", other.r#type()) }.into()
-                );
+                return Err(TypeError::Invalid(format!("cannot round a scalar of data type {}", other.r#type())).into());
             }
         })
     }
@@ -1813,13 +1801,11 @@ impl Maximum for Scalar {
             }
             (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(maximum_float(left, right)),
             (left, right) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the maximum of scalars of data types {} and {}",
-                        left.r#type(),
-                        right.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the maximum of scalars of data types {} and {}",
+                    left.r#type(),
+                    right.r#type(),
+                ))
                 .into());
             }
         })
@@ -1864,13 +1850,11 @@ impl Minimum for Scalar {
             }
             (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(minimum_float(left, right)),
             (left, right) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the minimum of scalars of data types {} and {}",
-                        left.r#type(),
-                        right.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the minimum of scalars of data types {} and {}",
+                    left.r#type(),
+                    right.r#type(),
+                ))
                 .into());
             }
         })
@@ -1898,12 +1882,10 @@ impl Remainder for Scalar {
         macro_rules! integer_remainder {
             ($left:expr, $right:expr, $variant:ident, $data_type:ident) => {{
                 if $right == 0 {
-                    return Err(TypeError {
-                        message: format!(
-                            "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
-                            DataType::$data_type,
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "cannot compute the remainder of an integer scalar of data type {} with a zero divisor",
+                        DataType::$data_type,
+                    ))
                     .into());
                 }
                 Scalar::$variant($left.wrapping_rem($right))
@@ -1924,13 +1906,11 @@ impl Remainder for Scalar {
             (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left % right),
             (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left % right),
             (left, right) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot compute the remainder of scalars of data types {} and {}",
-                        left.r#type(),
-                        right.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compute the remainder of scalars of data types {} and {}",
+                    left.r#type(),
+                    right.r#type(),
+                ))
                 .into());
             }
         })
@@ -1953,9 +1933,10 @@ impl Not for Scalar {
             Scalar::U32(value) => Scalar::U32(!value),
             Scalar::U64(value) => Scalar::U64(!value),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot apply `not` to a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot apply `not` to a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -1991,14 +1972,12 @@ macro_rules! impl_binary_logical_for_scalar {
                     (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
                     (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
                     (left, right) => {
-                        return Err(TypeError {
-                            message: format!(
+                        return Err(TypeError::Invalid(format!(
                                 "cannot apply `{}` to scalars of data types {} and {}",
                                 stringify!($method),
                                 left.r#type(),
                                 right.r#type(),
-                            ),
-                        }
+                            ))
                         .into());
                     }
                 })
@@ -2030,13 +2009,11 @@ impl crate::operations::complex::Complex for Scalar {
             (Scalar::F32(real), Scalar::F32(imaginary)) => Scalar::C64(Complex::new(real, imaginary)),
             (Scalar::F64(real), Scalar::F64(imaginary)) => Scalar::C128(Complex::new(real, imaginary)),
             (real, imaginary) => {
-                return Err(TypeError {
-                    message: format!(
-                        "cannot construct a complex scalar from parts of data types {} and {}",
-                        real.r#type(),
-                        imaginary.r#type(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot construct a complex scalar from parts of data types {} and {}",
+                    real.r#type(),
+                    imaginary.r#type(),
+                ))
                 .into());
             }
         })
@@ -2051,10 +2028,9 @@ impl Conjugate for Scalar {
             Scalar::C64(value) => Scalar::C64(value.conj()),
             Scalar::C128(value) => Scalar::C128(value.conj()),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot conjugate a scalar of data type {}", other.r#type()),
-                }
-                .into());
+                return Err(
+                    TypeError::Invalid(format!("cannot conjugate a scalar of data type {}", other.r#type())).into()
+                );
             }
         })
     }
@@ -2068,9 +2044,10 @@ impl Real for Scalar {
             Scalar::C64(value) => Scalar::F32(value.re),
             Scalar::C128(value) => Scalar::F64(value.re),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot extract the real part of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot extract the real part of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -2085,9 +2062,10 @@ impl Imaginary for Scalar {
             Scalar::C64(value) => Scalar::F32(value.im),
             Scalar::C128(value) => Scalar::F64(value.im),
             other => {
-                return Err(TypeError {
-                    message: format!("cannot extract the imaginary part of a scalar of data type {}", other.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot extract the imaginary part of a scalar of data type {}",
+                    other.r#type()
+                ))
                 .into());
             }
         })
@@ -2120,9 +2098,9 @@ impl Compare for Scalar {
             (self.low_precision_float_parts(), rhs.low_precision_float_parts())
         {
             if left_type != right_type {
-                return Err(TypeError {
-                    message: format!("cannot compare scalars of data types {left_type} and {right_type}"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compare scalars of data types {left_type} and {right_type}"
+                ))
                 .into());
             }
             let ordering = Self::decode_low_precision_float(left_type, left_bits)
@@ -2130,18 +2108,16 @@ impl Compare for Scalar {
             return Ok(Scalar::Bool(evaluate(ordering, direction)));
         }
         if matches!(self, Scalar::Token) || matches!(rhs, Scalar::Token) {
-            return Err(TypeError { message: "cannot compare token scalars".to_string() }.into());
+            return Err(TypeError::Invalid("cannot compare token scalars".to_string()).into());
         }
         if let (Scalar::C64(_), Scalar::C64(_)) | (Scalar::C128(_), Scalar::C128(_)) = (self, rhs) {
             return match direction {
                 ComparisonDirection::Equal => Ok(Scalar::Bool(self == rhs)),
                 ComparisonDirection::NotEqual => Ok(Scalar::Bool(self != rhs)),
-                _ => Err(TypeError {
-                    message: format!(
-                        "cannot apply an ordered comparison to unordered complex scalars of data type {}",
-                        self.r#type(),
-                    ),
-                }
+                _ => Err(TypeError::Invalid(format!(
+                    "cannot apply an ordered comparison to unordered complex scalars of data type {}",
+                    self.r#type(),
+                ))
                 .into()),
             };
         }
@@ -2160,9 +2136,11 @@ impl Compare for Scalar {
             (Scalar::F32(left), Scalar::F32(right)) => left.partial_cmp(right),
             (Scalar::F64(left), Scalar::F64(right)) => left.partial_cmp(right),
             (left, right) => {
-                return Err(TypeError {
-                    message: format!("cannot compare scalars of data types {} and {}", left.r#type(), right.r#type()),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot compare scalars of data types {} and {}",
+                    left.r#type(),
+                    right.r#type()
+                ))
                 .into());
             }
         };
@@ -2179,7 +2157,7 @@ impl Select for Scalar {
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let condition = condition.concretize()?;
         let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let selected = if condition { on_true } else { on_false };
         selected.convert_element_type(target)
     }
@@ -2193,10 +2171,10 @@ impl Concretizable<bool> for Scalar {
         }
         Ok(match self {
             Scalar::Token => {
-                return Err(TypeError { message: "cannot convert a token scalar to a Boolean".to_string() }.into());
+                return Err(TypeError::Invalid("cannot convert a token scalar to a Boolean".to_string()).into());
             }
             Scalar::Zero => {
-                return Err(TypeError { message: "cannot convert a zero-space scalar to a Boolean".to_string() }.into());
+                return Err(TypeError::Invalid("cannot convert a zero-space scalar to a Boolean".to_string()).into());
             }
             Scalar::Bool(value) => *value,
             Scalar::I8(value) => *value != 0,
@@ -2274,9 +2252,9 @@ impl ConvertElementType for Scalar {
                         return Self::encode_low_precision_float(data_type, value as f64);
                     }
                     other => {
-                        return Err(TypeError {
-                            message: format!("cannot convert scalar to unsupported data type {other}"),
-                        }
+                        return Err(TypeError::Invalid(format!(
+                            "cannot convert scalar to unsupported data type {other}"
+                        ))
                         .into());
                     }
                 }
@@ -2288,12 +2266,10 @@ impl ConvertElementType for Scalar {
             return Ok(*self);
         }
         if source.is_token() || target.is_token() {
-            return Err(
-                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
-            );
+            return Err(TypeError::Invalid("cannot convert values to or from the token data type".to_string()).into());
         }
         if source.is_zero() || target.is_zero() {
-            return Err(TypeError { message: "cannot convert values to or from the zero data type".to_string() }.into());
+            return Err(TypeError::Invalid("cannot convert values to or from the zero data type".to_string()).into());
         }
         let converted = if let Some((data_type, bits)) = self.low_precision_float_parts() {
             convert_real!(Self::decode_low_precision_float(data_type, bits))
@@ -2325,9 +2301,10 @@ impl ConvertElementType for Scalar {
                     _ => convert_real!(value.re),
                 },
                 other => {
-                    return Err(TypeError {
-                        message: format!("cannot convert scalar of data type {} to {target}", other.r#type()),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "cannot convert scalar of data type {} to {target}",
+                        other.r#type()
+                    ))
                     .into());
                 }
             }
@@ -2496,7 +2473,7 @@ mod tests {
         let interface = body.interface();
         assert_eq!(
             WhileOperation::new().infer_output_types(&[DataType::F64], &[interface.clone(), interface]),
-            Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
+            Err(TypeError::Invalid("'while' condition output type must be bool, but got f64".to_string())),
         );
     }
 
@@ -2609,11 +2586,11 @@ mod tests {
         assert!(Scalar::from_low_precision_float_bits(DataType::F4E2M1FN, 0x10).is_err());
         assert_eq!(
             Scalar::from_low_precision_float_bits(DataType::F6E2M3FN, 0x40),
-            Err(TypeError { message: "raw f6e2m3fn value 0x40 does not fit in 6 bits".to_string() }.into()),
+            Err(TypeError::Invalid("raw f6e2m3fn value 0x40 does not fit in 6 bits".to_string()).into()),
         );
         assert_eq!(
             Scalar::from_low_precision_float_bits(DataType::F6E3M2FN, 0x40),
-            Err(TypeError { message: "raw f6e3m2fn value 0x40 does not fit in 6 bits".to_string() }.into()),
+            Err(TypeError::Invalid("raw f6e3m2fn value 0x40 does not fit in 6 bits".to_string()).into()),
         );
         assert!(Scalar::from_low_precision_float_bits(DataType::F32, 0).is_err());
         assert_eq!(Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x20));
@@ -2773,21 +2750,21 @@ mod tests {
         // Fallible integer division reports exceptional inputs instead of panicking.
         assert_eq!(
             Div::div(&Scalar::from(1i32), &Scalar::from(0i32)),
-            Err(ProgramError::Type(TypeError {
-                message: "cannot divide an integer scalar of data type i32 by zero".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "cannot divide an integer scalar of data type i32 by zero".to_string()
+            ))),
         );
         assert_eq!(
             Div::div(&Scalar::from(i32::MIN), &Scalar::from(-1i32)),
-            Err(ProgramError::Type(TypeError {
-                message: "cannot divide the minimum integer scalar of data type i32 by -1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "cannot divide the minimum integer scalar of data type i32 by -1".to_string()
+            ))),
         );
 
         // Non-numeric scalars remain outside the arithmetic operation family.
         assert_eq!(
             Add::add(&Scalar::from(true), &Scalar::from(true)),
-            Err(ProgramError::Type(TypeError { message: "'add' does not support input data type bool".to_string() })),
+            Err(ProgramError::Type(TypeError::Invalid("'add' does not support input data type bool".to_string()))),
         );
     }
 
@@ -2990,10 +2967,9 @@ mod tests {
         assert_eq!(left.compare(&right, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
         assert_eq!(
             left.compare(&right, ComparisonDirection::LessThan),
-            Err(TypeError {
-                message: "cannot apply an ordered comparison to unordered complex scalars of data type c128"
-                    .to_string(),
-            }
+            Err(TypeError::Invalid(
+                "cannot apply an ordered comparison to unordered complex scalars of data type c128".to_string()
+            )
             .into()),
         );
     }
@@ -3028,11 +3004,11 @@ mod tests {
         assert_eq!(Scalar::from(2.5f32).promote_element_type(DataType::F64), Ok(Scalar::from(2.5f64)));
         assert_eq!(
             Scalar::from(2.5f64).promote_element_type(DataType::I32),
-            Err(TypeError { message: "cannot promote type `f64` to type `i32`".to_string() }.into()),
+            Err(TypeError::Invalid("cannot promote type `f64` to type `i32`".to_string()).into()),
         );
         assert_eq!(
             Scalar::from(Complex::new(1.5f32, -2.0f32)).promote_element_type(DataType::F64),
-            Err(TypeError { message: "cannot promote type `c64` to type `f64`".to_string() }.into()),
+            Err(TypeError::Invalid("cannot promote type `c64` to type `f64`".to_string()).into()),
         );
     }
 

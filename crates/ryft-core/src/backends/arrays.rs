@@ -231,23 +231,19 @@ impl Array {
     pub fn new(r#type: ArrayType, values: Vec<Scalar>) -> Result<Self, ProgramError> {
         let element_count = Self::materialized_element_count(&r#type)?;
         if values.len() != element_count {
-            return Err(TypeError {
-                message: format!(
-                    "array type {type} requires {element_count} elements but got {count}",
-                    count = values.len(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "array type {type} requires {element_count} elements but got {count}",
+                count = values.len(),
+            ))
             .into());
         }
         let data_type = r#type.data_type();
         for value in &values {
             let value_type = value.r#type().into_owned();
             if value_type != data_type {
-                return Err(TypeError {
-                    message: format!(
-                        "array of element data type {data_type} cannot store an element of data type {value_type}"
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "array of element data type {data_type} cannot store an element of data type {value_type}"
+                ))
                 .into());
             }
         }
@@ -334,8 +330,8 @@ impl Array {
     /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
     /// therefore cannot be materialized into a concrete payload.
     pub fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
-        r#type.element_count().map_err(|error| TypeError { message: error.to_string() })?.ok_or_else(|| {
-            TypeError { message: format!("cannot materialize a value of dynamically sized type {}", r#type) }.into()
+        r#type.element_count().map_err(|error| TypeError::Invalid(error.to_string()))?.ok_or_else(|| {
+            TypeError::Invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
         })
     }
 
@@ -360,7 +356,7 @@ impl Array {
         function: impl Fn(&Scalar, &Scalar) -> Result<Scalar, ProgramError>,
     ) -> Result<Self, ProgramError> {
         let output_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let output_len = Self::element_count(&output_type);
         let left = self.broadcast_values(output_len);
         let right = rhs.broadcast_values(output_len);
@@ -516,15 +512,15 @@ impl<O: Operation<ArrayType>> crate::operations::constants::Iota<Array> for Eage
             .dimensions()
             .iter()
             .map(|dimension| {
-                dimension.value().ok_or_else(|| TypeError {
-                    message: format!("cannot materialize an iota of dynamically sized type {type}"),
+                dimension.value().ok_or_else(|| {
+                    TypeError::Invalid(format!("cannot materialize an iota of dynamically sized type {type}"))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         if dimension >= sizes.len() {
-            return Err(TypeError {
-                message: format!("iota dimension {dimension} is out of bounds for array type {type}"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "iota dimension {dimension} is out of bounds for array type {type}"
+            ))
             .into());
         }
         // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
@@ -762,27 +758,25 @@ impl Sort for Array {
             });
         }
         if key_count > operands.len() {
-            return Err(TypeError {
-                message: format!("'sort' key_count {key_count} exceeds operand count {}", operands.len()),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'sort' key_count {key_count} exceeds operand count {}",
+                operands.len()
+            ))
             .into());
         }
         let shape = key.r#type.static_shape().unwrap();
         if axis >= shape.rank() {
-            return Err(TypeError {
-                message: format!("'sort' axis {axis} is out of bounds for rank {}", shape.rank()),
-            }
-            .into());
+            return Err(
+                TypeError::Invalid(format!("'sort' axis {axis} is out of bounds for rank {}", shape.rank())).into()
+            );
         }
         for operand in operands {
             if operand.r#type.shape() != key.r#type.shape() {
-                return Err(TypeError {
-                    message: format!(
-                        "'sort' operands must agree on shape but got {} and {}",
-                        key.r#type.shape(),
-                        operand.r#type.shape(),
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'sort' operands must agree on shape but got {} and {}",
+                    key.r#type.shape(),
+                    operand.r#type.shape(),
+                ))
                 .into());
             }
         }
@@ -793,9 +787,10 @@ impl Sort for Array {
                     .iter()
                     .map(|value| {
                         value.total_order_rank().ok_or_else(|| {
-                            ProgramError::from(TypeError {
-                                message: format!("'sort' does not support key data type {}", key.r#type.data_type()),
-                            })
+                            ProgramError::from(TypeError::Invalid(format!(
+                                "'sort' does not support key data type {}",
+                                key.r#type.data_type()
+                            )))
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -820,10 +815,9 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
     let shape = value.r#type.static_shape().unwrap();
     let dimensions = shape.dimensions().to_vec();
     if axis >= dimensions.len() {
-        return Err(TypeError {
-            message: format!("'sort' axis {axis} is out of bounds for rank {}", dimensions.len()),
-        }
-        .into());
+        return Err(
+            TypeError::Invalid(format!("'sort' axis {axis} is out of bounds for rank {}", dimensions.len())).into()
+        );
     }
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let axis_size = dimensions[axis];
@@ -984,9 +978,9 @@ impl RngBitGenerator for Array {
         output_type: &ArrayType,
     ) -> Result<(Self, Self), ProgramError> {
         let Some(output_shape) = output_type.static_shape() else {
-            return Err(TypeError {
-                message: "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
-            }
+            return Err(TypeError::Invalid(
+                "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
+            )
             .into());
         };
         let count = output_shape.dimensions().iter().product::<usize>();
@@ -998,20 +992,18 @@ impl RngBitGenerator for Array {
             _ => Scalar::U8(word as u8),
         };
         if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
-            return Err(TypeError {
-                message: format!("'rng_bit_generator' does not support output data type {data_type}"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'rng_bit_generator' does not support output data type {data_type}"
+            ))
             .into());
         }
         let (state_values, values) = match algorithm {
             RandomAlgorithm::ThreeFry => {
                 let [Scalar::U64(key), Scalar::U64(counter)] = self.values() else {
-                    return Err(TypeError {
-                        message: format!(
-                            "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[2] state but got {}",
-                            self.r#type,
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[2] state but got {}",
+                        self.r#type,
+                    ))
                     .into());
                 };
                 if data_type == DataType::U64 {
@@ -1030,12 +1022,10 @@ impl RngBitGenerator for Array {
             }
             RandomAlgorithm::Philox => {
                 let [Scalar::U64(key), Scalar::U64(counter_low), Scalar::U64(counter_high)] = self.values() else {
-                    return Err(TypeError {
-                        message: format!(
-                            "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[3] state but got {}",
-                            self.r#type,
-                        ),
-                    }
+                    return Err(TypeError::Invalid(format!(
+                        "'rng_bit_generator' with the {algorithm} algorithm needs a ui64[3] state but got {}",
+                        self.r#type,
+                    ))
                     .into());
                 };
                 let counter = u128::from(*counter_low) | (u128::from(*counter_high) << 64);
@@ -1130,21 +1120,19 @@ impl crate::operations::complex::Complex for Array {
         // Mirrors the `ComplexOperation` type-inference contract: the two part arrays must have identical types, and
         // the element data type maps to the complex data type with the parts' precision.
         if self.r#type != imaginary.r#type {
-            return Err(TypeError {
-                message: format!(
-                    "'complex' requires identical part types but got {} and {}",
-                    self.r#type, imaginary.r#type,
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'complex' requires identical part types but got {} and {}",
+                self.r#type, imaginary.r#type,
+            ))
             .into());
         }
         let data_type = match self.r#type.data_type() {
             DataType::F32 => DataType::C64,
             DataType::F64 => DataType::C128,
             other => {
-                return Err(TypeError {
-                    message: format!("cannot construct a complex value from parts of data type {other}"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "cannot construct a complex value from parts of data type {other}"
+                ))
                 .into());
             }
         };
@@ -1368,10 +1356,9 @@ impl Broadcast for Array {
         }
         let input_shape = self.r#type.static_shape().unwrap();
         let Some(target_shape) = r#type.static_shape() else {
-            return Err(TypeError {
-                message: format!("cannot materialize a value of dynamically sized type {}", r#type),
-            }
-            .into());
+            return Err(
+                TypeError::Invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
+            );
         };
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
@@ -1424,19 +1411,19 @@ impl DynamicBroadcast for Array {
                     Scalar::U64(value) => usize::try_from(*value),
                     _ => unreachable!("dynamic broadcast output dimension types are validated before interpretation"),
                 };
-                value.map_err(|_| TypeError {
-                    message: format!("dynamic broadcast output dimension {index} has invalid value {dimension}"),
+                value.map_err(|_| {
+                    TypeError::Invalid(format!(
+                        "dynamic broadcast output dimension {index} has invalid value {dimension}"
+                    ))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
         if !output_type.shape().is_refined_by(&shape) {
-            return Err(TypeError {
-                message: format!(
-                    "dynamic broadcast runtime shape {shape} does not refine declared output shape {}",
-                    output_type.shape(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "dynamic broadcast runtime shape {shape} does not refine declared output shape {}",
+                output_type.shape(),
+            ))
             .into());
         }
         self.broadcast(output_type.with_shape(shape), output_axes)
@@ -1545,19 +1532,19 @@ impl Pad for Array {
             let mut output_flat = 0usize;
             for axis in 0..rank {
                 let input_coordinate = i128::try_from(input_index[axis])
-                    .map_err(|_| TypeError { message: format!("'pad' input index is too large on axis {axis}") })?;
+                    .map_err(|_| TypeError::Invalid(format!("'pad' input index is too large on axis {axis}")))?;
                 let stride = i128::try_from(interior_padding[axis])
                     .ok()
                     .and_then(|padding| padding.checked_add(1))
-                    .ok_or_else(|| TypeError { message: format!("'pad' stride is too large on axis {axis}") })?;
+                    .ok_or_else(|| TypeError::Invalid(format!("'pad' stride is too large on axis {axis}")))?;
                 let output_index =
                     i128::from(edge_padding_low[axis])
-                        .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| TypeError {
-                            message: format!("'pad' output index overflows on axis {axis}"),
+                        .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
+                            TypeError::Invalid(format!("'pad' output index overflows on axis {axis}"))
                         })?)
-                        .ok_or_else(|| TypeError { message: format!("'pad' output index overflows on axis {axis}") })?;
+                        .ok_or_else(|| TypeError::Invalid(format!("'pad' output index overflows on axis {axis}")))?;
                 let output_extent = i128::try_from(output_shape[axis])
-                    .map_err(|_| TypeError { message: format!("'pad' output extent is too large on axis {axis}") })?;
+                    .map_err(|_| TypeError::Invalid(format!("'pad' output extent is too large on axis {axis}")))?;
                 if output_index < 0 || output_index >= output_extent {
                     written += 1;
                     for position in (0..rank).rev() {
@@ -1570,13 +1557,13 @@ impl Pad for Array {
                     continue 'elements;
                 }
                 let output_index = usize::try_from(output_index)
-                    .map_err(|_| TypeError { message: format!("'pad' output index is too large on axis {axis}") })?;
+                    .map_err(|_| TypeError::Invalid(format!("'pad' output index is too large on axis {axis}")))?;
                 output_flat =
                     output_flat
-                        .checked_add(output_index.checked_mul(output_strides[axis]).ok_or_else(|| TypeError {
-                            message: format!("'pad' output index overflows on axis {axis}"),
+                        .checked_add(output_index.checked_mul(output_strides[axis]).ok_or_else(|| {
+                            TypeError::Invalid(format!("'pad' output index overflows on axis {axis}"))
                         })?)
-                        .ok_or_else(|| TypeError { message: format!("'pad' output index overflows on axis {axis}") })?;
+                        .ok_or_else(|| TypeError::Invalid(format!("'pad' output index overflows on axis {axis}")))?;
             }
             values[output_flat] = self.values[written];
             written += 1;
@@ -1600,7 +1587,7 @@ impl Concatenate for Array {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(
-                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
+                TypeError::Invalid("'concatenate' expects at least one operand but got none".to_string()).into()
             );
         };
         if inputs.len() == 1 {
@@ -1873,7 +1860,7 @@ impl Compare for Array {
         // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
         // output type is the Boolean-typed counterpart of the broadcast type.
         let broadcast_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let target = broadcast_type.data_type();
         let output_len = Self::element_count(&broadcast_type);
         let left = self.broadcast_values(output_len);
@@ -1901,10 +1888,10 @@ impl Select for Array {
                 &condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
                 &on_true.r#type,
             )
-            .map_err(|error| TypeError { message: error.to_string() })?,
+            .map_err(|error| TypeError::Invalid(error.to_string()))?,
             &on_false.r#type,
         )
-        .map_err(|error| TypeError { message: error.to_string() })?;
+        .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let output_len = Self::element_count(&output_type);
         let condition = condition.broadcast_values(output_len);
         let on_true = on_true.broadcast_values(output_len);
@@ -1984,9 +1971,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
 impl ConvertElementType for Array {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         if self.r#type.data_type().is_token() || data_type.is_token() {
-            return Err(
-                TypeError { message: "cannot convert values to or from the token data type".to_string() }.into()
-            );
+            return Err(TypeError::Invalid("cannot convert values to or from the token data type".to_string()).into());
         }
         let values = self
             .values
@@ -2062,20 +2047,20 @@ mod tests {
         // Element data types must match the declared element data type.
         assert!(matches!(
             Array::new(array_type(DataType::F64, &[2]), vec![Scalar::F64(1.0), Scalar::F32(2.0)]),
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "array of element data type f64 cannot store an element of data type f32",
         ));
         // The payload length must match the static element count.
         assert!(matches!(
             Array::new(array_type(DataType::F64, &[3]), vec![Scalar::F64(1.0)]),
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "array type f64[3] requires 3 elements but got 1",
         ));
         // Dynamically shaped types cannot describe a materialized payload.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert!(matches!(
             Array::new(dynamic_type, vec![Scalar::F64(1.0)]),
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "cannot materialize a value of dynamically sized type f64[*]",
         ));
         // A well-formed payload constructs successfully and round-trips through the accessors.
@@ -2179,15 +2164,15 @@ mod tests {
         let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
         assert!(matches!(
             context.zero(&dynamic_type),
-            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message == expected_message,
         ));
         assert!(matches!(
             context.one(&dynamic_type),
-            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message == expected_message,
         ));
         assert!(matches!(
             context.fill(&dynamic_type, Scalar::from(42.0)),
-            Err(ProgramError::Type(TypeError { message })) if message == expected_message,
+            Err(ProgramError::Type(TypeError::Invalid(message))) if message == expected_message,
         ));
     }
 
@@ -2321,7 +2306,7 @@ mod tests {
         // Conversions to or from the token data type are rejected.
         assert!(matches!(
             vector.convert_element_type(DataType::Token),
-            Err(ProgramError::Type(TypeError { message }))
+            Err(ProgramError::Type(TypeError::Invalid(message)))
                 if message == "cannot convert values to or from the token data type",
         ));
     }

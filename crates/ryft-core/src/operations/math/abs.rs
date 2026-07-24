@@ -39,9 +39,7 @@ define_elementwise_operation!(
         } else if (input_type.is_signed() && input_type != DataType::I1) || input_type.is_floating_point() {
             input_type
         } else {
-            return Err(TypeError {
-                message: format!("cannot compute the absolute value of a value of data type {input_type}"),
-            });
+            return Err(TypeError::Invalid(format!("cannot compute the absolute value of a value of data type {input_type}")));
         };
         Ok(vec![output_type])
     },

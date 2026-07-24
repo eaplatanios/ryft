@@ -309,7 +309,7 @@ impl Operation<ArrayType> for GatherOperation {
         match input_types[0].gather(&input_types[1], self) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::Invalid(error.to_string())),
         }
     }
 
@@ -433,9 +433,9 @@ fn resolve_mesh(
         (None, None) => Ok(None),
         (Some(left), Some(right)) => {
             if left.mesh() != right.mesh() {
-                return Err(TypeError {
-                    message: format!("'{GATHER_OPERATION_NAME}' operand and indices shardings must use the same mesh"),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' operand and indices shardings must use the same mesh"
+                )));
             }
             Ok(Some(left.mesh().clone()))
         }
@@ -454,15 +454,15 @@ pub(crate) fn validate_sorted_unique_in_range(
 ) -> Result<(), TypeError> {
     for window in axes.windows(2) {
         if window[0] >= window[1] {
-            return Err(TypeError {
-                message: format!("'{operation_name}' {field} must be sorted and unique but got {axes:?}"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {field} must be sorted and unique but got {axes:?}"
+            )));
         }
     }
     if let Some(&axis) = axes.iter().find(|&&axis| axis >= bound) {
-        return Err(TypeError {
-            message: format!("'{operation_name}' {field} entry {axis} is out of range for bound {bound}"),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' {field} entry {axis} is out of range for bound {bound}"
+        )));
     }
     Ok(())
 }
@@ -478,12 +478,12 @@ pub(crate) fn validate_unique_in_range(
     let mut seen = BTreeSet::new();
     for &axis in axes {
         if axis >= bound {
-            return Err(TypeError {
-                message: format!("'{operation_name}' {field} entry {axis} is out of range for bound {bound}"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' {field} entry {axis} is out of range for bound {bound}"
+            )));
         }
         if !seen.insert(axis) {
-            return Err(TypeError { message: format!("'{operation_name}' {field} must be unique but got {axes:?}") });
+            return Err(TypeError::Invalid(format!("'{operation_name}' {field} must be unique but got {axes:?}")));
         }
     }
     Ok(())
@@ -737,34 +737,30 @@ impl Gather for ArrayType {
         let indices_rank = indices.rank();
 
         if indices_rank == 0 {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
+            ))
             .into());
         }
         if !indices.data_type().is_integer() {
-            return Err(TypeError {
-                message: format!("'{GATHER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"
+            ))
             .into());
         }
         if operand.memory() != indices.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' operand and indices must share one memory space but reside in {} and {}",
-                    operand.memory(),
-                    indices.memory(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' operand and indices must share one memory space but reside in {} and {}",
+                operand.memory(),
+                indices.memory(),
+            ))
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
         let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
-            return Err(TypeError {
-                message: format!("'{GATHER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' indices index vector dimension must have a static extent"
+            ))
             .into());
         };
 
@@ -790,36 +786,30 @@ impl Gather for ArrayType {
         )?;
 
         if dimensions.start_index_map().len() != index_vector_extent {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' start_index_map has length {} but the index vector extent is \
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' start_index_map has length {} but the index vector extent is \
                      {index_vector_extent}",
-                    dimensions.start_index_map().len(),
-                ),
-            }
+                dimensions.start_index_map().len(),
+            ))
             .into());
         }
         validate_unique_in_range(GATHER_OPERATION_NAME, "start_index_map", dimensions.start_index_map(), operand_rank)?;
 
         if dimensions.start_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' operand and start-indices batching dimensions must align 1:1, but got {} \
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' operand and start-indices batching dimensions must align 1:1, but got {} \
                      and {}",
-                    dimensions.operand_batching_dimensions().len(),
-                    dimensions.start_indices_batching_dimensions().len(),
-                ),
-            }
+                dimensions.operand_batching_dimensions().len(),
+                dimensions.start_indices_batching_dimensions().len(),
+            ))
             .into());
         }
         for &dimension in dimensions.start_indices_batching_dimensions() {
             if dimension >= indices_rank || dimension == index_vector_dimension {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' start_indices_batching_dimensions entry {dimension} is out of range \
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' start_indices_batching_dimensions entry {dimension} is out of range \
                          or names the index vector dimension"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -828,65 +818,53 @@ impl Gather for ArrayType {
         let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
         let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
         if collapsed.intersection(&operand_batching).next().is_some() {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' collapsed_slice_dimensions and operand_batching_dimensions must be \
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' collapsed_slice_dimensions and operand_batching_dimensions must be \
                      disjoint"
-                ),
-            }
+            ))
             .into());
         }
 
         // Slice sizes: one per operand axis; size 1 on collapsed axes; size at most 1 on batching axes; within the
         // operand extent when that extent is static.
         if slice_sizes.len() != operand_rank {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' slice_sizes has length {} but the operand has rank {operand_rank}",
-                    slice_sizes.len(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' slice_sizes has length {} but the operand has rank {operand_rank}",
+                slice_sizes.len(),
+            ))
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
             if let Size::Static(extent) = operand.dimension(axis)
                 && size > extent
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent {extent}"
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent {extent}"
+                ))
                 .into());
             }
             if collapsed.contains(&axis) && size != 1 {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' collapsed slice dimension {axis} must have slice size 1 but has {size}"
-                    ),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' collapsed slice dimension {axis} must have slice size 1 but has {size}"
+                ))
                 .into());
             }
             if operand_batching.contains(&axis) && size > 1 {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' operand batching dimension {axis} must have slice size at most 1 but \
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' operand batching dimension {axis} must have slice size at most 1 but \
                          has {size}"
-                    ),
-                }
+                ))
                 .into());
             }
         }
 
         let offset_count = operand_rank - collapsed.len() - operand_batching.len();
         if dimensions.offset_dimensions().len() != offset_count {
-            return Err(TypeError {
-                message: format!(
-                    "'{GATHER_OPERATION_NAME}' offset_dimensions has length {} but the operand has {offset_count} \
+            return Err(TypeError::Invalid(format!(
+                "'{GATHER_OPERATION_NAME}' offset_dimensions has length {} but the operand has {offset_count} \
                      non-collapsed, non-batching axes",
-                    dimensions.offset_dimensions().len(),
-                ),
-            }
+                dimensions.offset_dimensions().len(),
+            ))
             .into());
         }
 
@@ -895,12 +873,10 @@ impl Gather for ArrayType {
             dimensions.operand_batching_dimensions().iter().zip(dimensions.start_indices_batching_dimensions())
         {
             if operand.dimension(operand_axis) != indices.dimension(indices_axis) {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
                          {operand_axis} and indices axis {indices_axis} differ"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -938,19 +914,17 @@ impl Gather for ArrayType {
         let indices_sharding = indices.sharding();
         let sharding = if let Some(requested) = operation.output_sharding() {
             if requested.rank() != output_rank {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' output sharding rank ({}) does not match the output rank \
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' output sharding rank ({}) does not match the output rank \
                          ({output_rank})",
-                        requested.rank(),
-                    ),
-                }
+                    requested.rank(),
+                ))
                 .into());
             }
             if references_auto_axis(requested) {
-                return Err(TypeError {
-                    message: format!("'{GATHER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
+                ))
                 .into());
             }
             Some(requested.clone())
@@ -967,13 +941,11 @@ impl Gather for ArrayType {
             if let Some(sharding) = operand_sharding {
                 for &axis in &replicated_operand_axes {
                     if dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis]) {
-                        return Err(TypeError {
-                            message: format!(
-                                "'{GATHER_OPERATION_NAME}' operand axis {axis} is indexed by the start indices and must \
+                        return Err(TypeError::Invalid(format!(
+                            "'{GATHER_OPERATION_NAME}' operand axis {axis} is indexed by the start indices and must \
                                  be replicated over explicit mesh axes; request an explicit output sharding to resolve \
                                  placement"
-                            ),
-                        }
+                        ))
                         .into());
                     }
                 }
@@ -981,12 +953,10 @@ impl Gather for ArrayType {
             if let Some(sharding) = indices_sharding
                 && dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension])
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'{GATHER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
+                return Err(TypeError::Invalid(format!(
+                    "'{GATHER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
                          mesh axes"
-                    ),
-                }
+                ))
                 .into());
             }
 
@@ -1022,8 +992,8 @@ impl Gather for ArrayType {
                 ),
                 None => (Vec::new(), Vec::new(), Vec::new()),
             };
-            let map_sharding_error = |error| TypeError {
-                message: format!("'{GATHER_OPERATION_NAME}' output sharding construction failed: {error}"),
+            let map_sharding_error = |error| {
+                TypeError::Invalid(format!("'{GATHER_OPERATION_NAME}' output sharding construction failed: {error}"))
             };
             let sharding = Sharding::new(mesh, placement)
                 .map_err(&map_sharding_error)?
@@ -1040,7 +1010,7 @@ impl Gather for ArrayType {
         ArrayType::new(operand.data_type(), Shape::new(output_dimensions))
             .with_memory(operand.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::Invalid(error.to_string()).into())
     }
 }
 
@@ -1234,29 +1204,29 @@ mod tests {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0, 1]), vec![1, 2]);
         assert_eq!(
             operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
-            Err(TypeError {
-                message: "'gather' start_index_map has length 2 but the index vector extent is 1".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'gather' start_index_map has length 2 but the index vector extent is 1".to_string()
+            )),
         );
 
         // A collapsed axis must have slice size 1.
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![2, 2]);
         assert_eq!(
             operation.infer_output_types(&[operand.clone(), indices.clone()], &[]),
-            Err(TypeError {
-                message: "'gather' collapsed slice dimension 0 must have slice size 1 but has 2".to_string(),
-            }),
+            Err(TypeError::Invalid(
+                "'gather' collapsed slice dimension 0 must have slice size 1 but has 2".to_string()
+            )),
         );
 
         // offset_dimensions count must equal the non-collapsed, non-batching operand axes (here 1).
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1, 2], vec![0], vec![0]), vec![1, 2]);
         assert_eq!(
             operation.infer_output_types(&[operand, indices], &[]),
-            Err(TypeError {
-                message: "'gather' offset_dimensions has length 2 but the operand has 1 non-collapsed, non-batching \
+            Err(TypeError::Invalid(
+                "'gather' offset_dimensions has length 2 but the operand has 1 non-collapsed, non-batching \
                           axes"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
     }
 

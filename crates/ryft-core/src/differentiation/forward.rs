@@ -59,14 +59,12 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
                 if tangent.r#type().as_ref() != &tangent_type {
-                    return Err(TypeError {
-                        message: format!(
-                            "tangent type {} does not match type {} required by primal type {}",
-                            tangent.r#type(),
-                            tangent_type,
-                            primal.r#type(),
-                        ),
-                    });
+                    return Err(TypeError::Invalid(format!(
+                        "tangent type {} does not match type {} required by primal type {}",
+                        tangent.r#type(),
+                        tangent_type,
+                        primal.r#type(),
+                    )));
                 }
                 if tangent_type.is_zero_space() { MaybeZero::Zero(tangent_type) } else { MaybeZero::Value(tangent) }
             }
@@ -1584,7 +1582,7 @@ mod tests {
 
         assert!(matches!(
             DifferentiationDual::new(Scalar::Token, Scalar::Token),
-            Err(TypeError { message })
+            Err(TypeError::Invalid(message))
                 if message == "tangent type token does not match type zero required by primal type token",
         ));
     }
@@ -1873,7 +1871,7 @@ mod tests {
         assert!(matches!(
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
                 .jvp(|token| Ok(token), Scalar::Token, Scalar::Token),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid(message))))
                 if message == "tangent type token does not match type zero required by primal type token",
         ));
 

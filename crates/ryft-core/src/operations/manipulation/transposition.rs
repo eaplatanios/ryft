@@ -58,26 +58,24 @@ impl Permutation {
     /// Validates that this [`Permutation`] is a bijection over the axes of an input with the provided rank.
     fn validate(&self, rank: usize) -> Result<(), TypeError> {
         if self.len() != rank {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' permutation has length {} but input has rank {}",
-                    TRANSPOSE_OPERATION_NAME,
-                    self.len(),
-                    rank,
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{}' permutation has length {} but input has rank {}",
+                TRANSPOSE_OPERATION_NAME,
+                self.len(),
+                rank,
+            )));
         }
         let mut seen = vec![false; rank];
         for axis in self.iter() {
             if *axis >= rank {
-                return Err(TypeError {
-                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation axis {axis} is out of bounds"),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{TRANSPOSE_OPERATION_NAME}' permutation axis {axis} is out of bounds"
+                )));
             }
             if seen[*axis] {
-                return Err(TypeError {
-                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation contains duplicate axis {axis}"),
-                });
+                return Err(TypeError::Invalid(format!(
+                    "'{TRANSPOSE_OPERATION_NAME}' permutation contains duplicate axis {axis}"
+                )));
             }
             seen[*axis] = true;
         }
@@ -188,7 +186,7 @@ impl Operation<ArrayType> for TransposeOperation {
         match input_types[0].transpose(&self.permutation) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::Invalid(error.to_string())),
         }
     }
 
@@ -336,22 +334,20 @@ pub trait Transpose: Sized {
         let source = source.into();
         let destination = destination.into();
         if source.len() != destination.len() {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' move source has length {} but destination has length {}",
-                    TRANSPOSE_OPERATION_NAME,
-                    source.len(),
-                    destination.len(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "'{}' move source has length {} but destination has length {}",
+                TRANSPOSE_OPERATION_NAME,
+                source.len(),
+                destination.len(),
+            ))
             .into());
         }
         let source = source
             .normalize(rank)
-            .map_err(|error| TypeError { message: format!("'{TRANSPOSE_OPERATION_NAME}' move source {error}") })?;
+            .map_err(|error| TypeError::Invalid(format!("'{TRANSPOSE_OPERATION_NAME}' move source {error}")))?;
         let destination = destination
             .normalize(rank)
-            .map_err(|error| TypeError { message: format!("'{TRANSPOSE_OPERATION_NAME}' move destination {error}") })?;
+            .map_err(|error| TypeError::Invalid(format!("'{TRANSPOSE_OPERATION_NAME}' move destination {error}")))?;
         let mut permutation = (0..rank).filter(|axis| !source.contains(axis)).collect::<Vec<_>>();
         let mut moves = destination.into_iter().zip(source).collect::<Vec<_>>();
         moves.sort_by_key(|(destination, _)| *destination);
@@ -371,12 +367,12 @@ pub trait Transpose: Sized {
     {
         let rank = self.r#type().rank();
         let i = i.into();
-        let i = i.normalize(rank).map_err(|_| TypeError {
-            message: format!("'{TRANSPOSE_OPERATION_NAME}' swap axis {i} is out of bounds for rank {rank}"),
+        let i = i.normalize(rank).map_err(|_| {
+            TypeError::Invalid(format!("'{TRANSPOSE_OPERATION_NAME}' swap axis {i} is out of bounds for rank {rank}"))
         })?;
         let j = j.into();
-        let j = j.normalize(rank).map_err(|_| TypeError {
-            message: format!("'{TRANSPOSE_OPERATION_NAME}' swap axis {j} is out of bounds for rank {rank}"),
+        let j = j.normalize(rank).map_err(|_| {
+            TypeError::Invalid(format!("'{TRANSPOSE_OPERATION_NAME}' swap axis {j} is out of bounds for rank {rank}"))
         })?;
         let mut permutation = (0..rank).collect::<Vec<_>>();
         permutation.swap(i, j);
@@ -400,7 +396,7 @@ impl Transpose for Sharding {
             .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
             .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
             .and_then(|sharding| sharding.with_varying_manual_axes(self.varying_manual_axes().clone()))
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::Invalid(error.to_string()).into())
     }
 }
 
@@ -426,7 +422,7 @@ impl Transpose for ArrayType {
         ArrayType::new(input.data_type(), Shape::new(permuted))
             .with_memory(input.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::Invalid(error.to_string()).into())
     }
 }
 
@@ -493,11 +489,11 @@ mod tests {
         // Invalid wrappers report the same precise validation errors as the type-level transpose contract.
         assert_eq!(
             Permutation::from(vec![2, 0]).inverse(),
-            Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
+            Err(TypeError::Invalid("'transpose' permutation axis 2 is out of bounds".to_string())),
         );
         assert_eq!(
             Permutation::from(vec![0, 0]).inverse(),
-            Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
+            Err(TypeError::Invalid("'transpose' permutation contains duplicate axis 0".to_string())),
         );
 
         // Inverting twice recovers the original permutation, and applying the inverse after the permutation restores
@@ -571,17 +567,17 @@ mod tests {
         // Invalid permutations and interpreter arity report precise errors.
         assert_eq!(
             TransposeOperation::new(vec![0, 2]).infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
+            Err(TypeError::Invalid("'transpose' permutation axis 2 is out of bounds".to_string())),
         );
         assert_eq!(
             TransposeOperation::new(vec![0, 0]).infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
+            Err(TypeError::Invalid("'transpose' permutation contains duplicate axis 0".to_string())),
         );
         assert_eq!(
             input.transpose([0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation has length 1 but input has rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation has length 1 but input has rank 2".to_string()
+            ))),
         );
         assert_eq!(placed_input_type.transpose([0, 1]), Ok(placed_input_type.clone()));
         assert_eq!(
@@ -896,21 +892,19 @@ mod tests {
         let sharding = input_type.sharding().unwrap();
         assert_eq!(
             sharding.transpose([1, 1, 0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation contains duplicate axis 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation contains duplicate axis 1".to_string()
+            ))),
         );
         assert_eq!(
             sharding.transpose([0, 1]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation has length 2 but input has rank 3".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation has length 2 but input has rank 3".to_string()
+            ))),
         );
         assert_eq!(
             sharding.transpose([0, 1, 3]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation axis 3 is out of bounds".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid("'transpose' permutation axis 3 is out of bounds".to_string()))),
         );
 
         // An input without a sharding yields an output without one.
@@ -1004,21 +998,19 @@ mod tests {
         let matrix = || Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
             matrix().transpose(vec![1]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation has length 1 but input has rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation has length 1 but input has rank 2".to_string()
+            ))),
         );
         assert_eq!(
             matrix().transpose(vec![0, 2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation axis 2 is out of bounds".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid("'transpose' permutation axis 2 is out of bounds".to_string()))),
         );
         assert_eq!(
             matrix().transpose(vec![0, 0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' permutation contains duplicate axis 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' permutation contains duplicate axis 0".to_string()
+            ))),
         );
 
         // `move_axis` shifts intervening dimensions while preserving their relative order.
@@ -1049,13 +1041,13 @@ mod tests {
         // permutation is validated by the type-level transpose.
         assert_eq!(
             matrix.move_axis(2, 0),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move source axis 2 is out of bounds for rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move source axis 2 is out of bounds for rank 2".to_string()
+            ))),
         );
         assert_eq!(
             matrix.move_axis(0, 2),
-            Err(TypeError { message: "'transpose' move destination axis 2 is out of bounds for rank 2".to_string() }
+            Err(TypeError::Invalid("'transpose' move destination axis 2 is out of bounds for rank 2".to_string())
                 .into()),
         );
 
@@ -1081,33 +1073,33 @@ mod tests {
         assert_eq!(rank_four_type.move_axis([] as [isize; 0], [] as [isize; 0]), Ok(rank_four_type.clone()),);
         assert_eq!(
             rank_four_type.move_axis([0, 1], [2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move source has length 2 but destination has length 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move source has length 2 but destination has length 1".to_string()
+            ))),
         );
         assert_eq!(
             rank_four_type.move_axis([0, -4], [1, 2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move source axes contain duplicate axis 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move source axes contain duplicate axis 0".to_string()
+            ))),
         );
         assert_eq!(
             rank_four_type.move_axis([0, 1], [0, -4]),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move destination axes contain duplicate axis 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move destination axes contain duplicate axis 0".to_string()
+            ))),
         );
         assert_eq!(
             rank_four_type.move_axis(-5, 0),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move source axis -5 is out of bounds for rank 4".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move source axis -5 is out of bounds for rank 4".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::scalar(DataType::F64).move_axis(0, 0),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' move source axis 0 is out of bounds for rank 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' move source axis 0 is out of bounds for rank 0".to_string()
+            ))),
         );
 
         // `swap_axes` exchanges exactly two dimensions and validates both indices.
@@ -1143,9 +1135,9 @@ mod tests {
         // An out-of-bounds axis is a clean error rather than an out-of-bounds panic.
         assert_eq!(
             matrix.swap_axes(2, 0),
-            Err(ProgramError::Type(TypeError {
-                message: "'transpose' swap axis 2 is out of bounds for rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "'transpose' swap axis 2 is out of bounds for rank 2".to_string()
+            ))),
         );
     }
 }

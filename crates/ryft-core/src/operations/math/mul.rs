@@ -36,29 +36,25 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     // consumed when the reduced set is computed below).
     let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
         (false, false) => {
-            return Err(TypeError {
-                message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"
+            )));
         }
         (false, true) => {
             if left_unreduced != right_reduced {
-                return Err(TypeError {
-                    message: format!(
-                        "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
+                return Err(TypeError::Invalid(format!(
+                    "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
                              the first is unreduced over",
-                    ),
-                });
+                )));
             }
             left_unreduced.clone()
         }
         (true, false) => {
             if right_unreduced != left_reduced {
-                return Err(TypeError {
-                    message: format!(
-                        "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
+                return Err(TypeError::Invalid(format!(
+                    "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
                              the second is unreduced over",
-                    ),
-                });
+                )));
             }
             right_unreduced.clone()
         }
@@ -75,9 +71,7 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
         left_reduced.clone()
     } else {
-        return Err(TypeError {
-            message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
-        });
+        return Err(TypeError::Invalid(format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes")));
     };
     output_reduced.retain(|axis| !output_unreduced.contains(axis));
 
@@ -91,10 +85,10 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     let rebuilt = sharding
         .clone()
         .with_unreduced_axes(output_unreduced)
-        .map_err(|error| TypeError { message: error.to_string() })?
+        .map_err(|error| TypeError::Invalid(error.to_string()))?
         .with_reduced_axes(output_reduced)
-        .map_err(|error| TypeError { message: error.to_string() })?;
-    Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
+        .map_err(|error| TypeError::Invalid(error.to_string()))?;
+    Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError::Invalid(error.to_string()))?])
 }
 
 define_elementwise_operation!(

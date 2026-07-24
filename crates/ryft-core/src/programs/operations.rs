@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
             operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() })
+            Err(TypeError::Invalid("expected 1 input but got 0".to_string()))
         );
         assert_eq!(
             operation

@@ -76,9 +76,10 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
 ) -> Result<&RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 2 {
-        return Err(TypeError {
-            message: format!("custom_jvp expects 2 attached regions but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::Invalid(format!(
+            "custom_jvp expects 2 attached regions but got {}",
+            region_interfaces.len()
+        )));
     }
     let primal_interface = &region_interfaces[0];
     let jvp_interface = &region_interfaces[1];
@@ -331,9 +332,10 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
 ) -> Result<&RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 3 {
-        return Err(TypeError {
-            message: format!("custom_vjp expects 3 attached regions but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::Invalid(format!(
+            "custom_vjp expects 3 attached regions but got {}",
+            region_interfaces.len()
+        )));
     }
     let primal_interface = &region_interfaces[0];
     let forward_interface = &region_interfaces[1];
@@ -343,13 +345,11 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     check_types!(@same, "custom_vjp forward input", [input_types, forward_interface.input_types()]);
     let forward_output_types = forward_interface.output_types();
     if forward_output_types.len() < output_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
-                output_types.len(),
-                forward_output_types.len(),
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+            output_types.len(),
+            forward_output_types.len(),
+        )));
     }
     check_types!(@same, "custom_vjp forward output", [
         output_types,
@@ -594,13 +594,11 @@ impl<T: Type> CustomVjpTangentOperation<T> {
     /// types (one per primal output).
     fn split_backward_inputs(&self, backward_interface: &RegionInterface<T>) -> Result<(Vec<T>, Vec<T>), TypeError> {
         if self.residual_count > backward_interface.input_types().len() {
-            return Err(TypeError {
-                message: format!(
-                    "custom_vjp residual count {} exceeds backward region input count {}",
-                    self.residual_count,
-                    backward_interface.input_types().len(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "custom_vjp residual count {} exceeds backward region input count {}",
+                self.residual_count,
+                backward_interface.input_types().len(),
+            )));
         }
         let mut residual_types = backward_interface.input_types().to_vec();
         let cotangent_types = residual_types.split_off(self.residual_count);
@@ -630,9 +628,11 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
-            return Err(TypeError {
-                message: format!("{} expects 1 attached region but got {}", self.name(), region_interfaces.len(),),
-            });
+            return Err(TypeError::Invalid(format!(
+                "{} expects 1 attached region but got {}",
+                self.name(),
+                region_interfaces.len(),
+            )));
         }
         let backward_interface = &region_interfaces[0];
         let (residual_types, cotangent_types) = self.split_backward_inputs(backward_interface)?;
@@ -679,11 +679,11 @@ impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation<C::Type>
         _driver: &D,
         _inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        Err(TypeError {
-            message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
+        Err(TypeError::Invalid(
+            "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                 value_and_gradient, or jacobian_reverse) instead"
                 .to_string(),
-        }
+        )
         .into())
     }
 }
@@ -775,11 +775,11 @@ where
     O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
 {
     if operation.transposed {
-        return Err(TypeError {
-            message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
+        return Err(TypeError::Invalid(
+            "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
                 supported"
                 .to_string(),
-        }
+        )
         .into());
     }
 
@@ -984,7 +984,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError { message: "custom_jvp requires at least one input".to_string() }.into());
+            return Err(TypeError::Invalid("custom_jvp requires at least one input".to_string()).into());
         };
         let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let input_tangent_types =
@@ -1116,7 +1116,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError { message: "custom_vjp requires at least one input".to_string() }.into());
+            return Err(TypeError::Invalid("custom_vjp requires at least one input".to_string()).into());
         };
         let (output_types, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let (forward_output_types, forward) = D::trace(|xs| (self.forward)(xs), input_types.clone())?;
@@ -1403,7 +1403,7 @@ mod tests {
             assert!(matches!(
                 CustomVjpTangentOperation::new(2, transposed, Vec::new(), Vec::new())
                     .infer_output_types(&[], std::slice::from_ref(&backward_interface)),
-                Err(TypeError { message })
+                Err(TypeError::Invalid(message))
                     if message == "custom_vjp residual count 2 exceeds backward region input count 1",
             ));
         }
@@ -1591,7 +1591,7 @@ mod tests {
                         &crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver,
                                         &[Array::scalar(1.0)],
                     ),
-                    Err(ProgramError::Type(TypeError { message }))
+                    Err(ProgramError::Type(TypeError::Invalid(message)))
                         if message.starts_with("custom_vjp does not support forward-mode differentiation"),
                 ));
     }

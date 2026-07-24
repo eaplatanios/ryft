@@ -89,16 +89,14 @@ impl<T: Broadcastable + ElementType> Operation<T> for CompareOperation {
         if !matches!(self.direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
             && input_types.iter().any(|input_type| input_type.is_complex())
         {
-            return Err(TypeError {
-                message: format!(
-                    "cannot apply an ordered comparison to unordered complex operands of types {} and {}",
-                    input_types[0], input_types[1],
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "cannot apply an ordered comparison to unordered complex operands of types {} and {}",
+                input_types[0], input_types[1],
+            )));
         }
 
         let broadcasted = T::broadcasted(input_types)
-            .map_err(|_| TypeError { message: "comparison input types are not broadcast-compatible".to_string() })?;
+            .map_err(|_| TypeError::Invalid("comparison input types are not broadcast-compatible".to_string()))?;
         Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
     }
 

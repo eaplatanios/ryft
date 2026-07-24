@@ -324,19 +324,17 @@ fn ensure_call_input_types(
     input_types: &[ArrayType],
 ) -> Result<(), TypeError> {
     if expected_types.len() != input_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "'{operation_name}' expected {} input(s) but got {}",
-                expected_types.len(),
-                input_types.len(),
-            ),
-        });
+        return Err(TypeError::Invalid(format!(
+            "'{operation_name}' expected {} input(s) but got {}",
+            expected_types.len(),
+            input_types.len(),
+        )));
     }
     for (index, (expected, actual)) in expected_types.iter().zip(input_types).enumerate() {
         if expected != actual {
-            return Err(TypeError {
-                message: format!("'{operation_name}' input #{index} expected {expected} but got {actual}"),
-            });
+            return Err(TypeError::Invalid(format!(
+                "'{operation_name}' input #{index} expected {expected} but got {actual}"
+            )));
         }
     }
     Ok(())
@@ -354,9 +352,10 @@ impl Operation<ArrayType> for JitCallOperation {
         region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if region_interfaces.len() != 1 {
-            return Err(TypeError {
-                message: format!("jit_call expects 1 attached callee region but got {}", region_interfaces.len()),
-            });
+            return Err(TypeError::Invalid(format!(
+                "jit_call expects 1 attached callee region but got {}",
+                region_interfaces.len()
+            )));
         }
         let callee_interface = &region_interfaces[0];
         ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;

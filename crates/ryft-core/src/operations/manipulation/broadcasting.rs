@@ -83,7 +83,7 @@ impl Operation<ArrayType> for BroadcastOperation {
         match input_types[0].broadcast(self.output_type.clone(), self.output_axes.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::Invalid(error.to_string())),
         }
     }
 
@@ -309,36 +309,30 @@ impl Operation<ArrayType> for DynamicBroadcastOperation {
             )
             .map_err(|error| match error {
                 ProgramError::Type(error) => error,
-                error => TypeError { message: error.to_string() },
+                error => TypeError::Invalid(error.to_string()),
             })?;
 
         let dimensions_type = &input_types[1];
         if dimensions_type.rank() != 1 {
-            return Err(TypeError {
-                message: format!(
-                    "dynamic broadcast output dimensions must have rank 1 but have rank {}",
-                    dimensions_type.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "dynamic broadcast output dimensions must have rank 1 but have rank {}",
+                dimensions_type.rank(),
+            )));
         }
 
         if !dimensions_type.data_type().is_integer() {
-            return Err(TypeError {
-                message: format!(
-                    "dynamic broadcast output dimensions must have integer elements but have data type {}",
-                    dimensions_type.data_type(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "dynamic broadcast output dimensions must have integer elements but have data type {}",
+                dimensions_type.data_type(),
+            )));
         }
 
         if dimensions_type.dimension(0) != Size::Static(self.output_type.rank()) {
-            return Err(TypeError {
-                message: format!(
-                    "dynamic broadcast output dimensions has length {} but output has rank {}",
-                    dimensions_type.dimension(0),
-                    self.output_type.rank(),
-                ),
-            });
+            return Err(TypeError::Invalid(format!(
+                "dynamic broadcast output dimensions has length {} but output has rank {}",
+                dimensions_type.dimension(0),
+                self.output_type.rank(),
+            )));
         }
 
         Ok(vec![self.output_type.clone()])
@@ -616,7 +610,7 @@ pub trait Broadcast: Sized {
             .sharding()
             .map(|sharding| sharding.with_broadcasted_dimensions(output_dimensions.len(), output_axes.as_slice()))
             .transpose()
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let output_shape = Shape::new(output_dimensions);
         let output_type = if output_shape == *input_type.shape() {
             input_type
@@ -625,7 +619,7 @@ pub trait Broadcast: Sized {
                 .with_shape(output_shape)
                 .with_layout(None)
                 .with_sharding(sharding)
-                .map_err(|error| TypeError { message: error.to_string() })?
+                .map_err(|error| TypeError::Invalid(error.to_string()))?
         };
         self.broadcast(output_type, output_axes.as_slice())
     }
@@ -675,7 +669,7 @@ pub trait Broadcast: Sized {
             .sharding()
             .map(|sharding| sharding.with_broadcasted_dimensions(shape.rank(), output_axes.as_slice()))
             .transpose()
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::Invalid(error.to_string()))?;
         let output_type = if shape == *input_type.shape() {
             input_type
         } else {
@@ -683,7 +677,7 @@ pub trait Broadcast: Sized {
                 .with_shape(shape)
                 .with_layout(None)
                 .with_sharding(sharding)
-                .map_err(|error| TypeError { message: error.to_string() })?
+                .map_err(|error| TypeError::Invalid(error.to_string()))?
         };
         self.broadcast(output_type, output_axes.as_slice())
     }
@@ -692,54 +686,46 @@ pub trait Broadcast: Sized {
 impl Broadcast for ArrayType {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != output_type.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "broadcasting input data type {} does not match output data type {}",
-                    self.data_type(),
-                    output_type.data_type(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "broadcasting input data type {} does not match output data type {}",
+                self.data_type(),
+                output_type.data_type(),
+            ))
             .into());
         }
 
         if self.memory() != output_type.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "broadcasting input memory {} does not match output memory {}",
-                    self.memory(),
-                    output_type.memory(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "broadcasting input memory {} does not match output memory {}",
+                self.memory(),
+                output_type.memory(),
+            ))
             .into());
         }
 
         let input_rank = self.rank();
         let output_rank = output_type.rank();
         if output_axes.len() != input_rank {
-            return Err(TypeError {
-                message: format!(
-                    "broadcasting output axes has length {} but input has rank {input_rank}",
-                    output_axes.len(),
-                ),
-            }
+            return Err(TypeError::Invalid(format!(
+                "broadcasting output axes has length {} but input has rank {input_rank}",
+                output_axes.len(),
+            ))
             .into());
         }
 
         let mut seen = vec![false; output_rank];
         for (input_axis, &output_axis) in output_axes.iter().enumerate() {
             if output_axis >= output_rank {
-                return Err(TypeError {
-                    message: format!(
-                        "broadcasting `output_axes[{input_axis}] = {output_axis}` is out of bounds for output rank \
+                return Err(TypeError::Invalid(format!(
+                    "broadcasting `output_axes[{input_axis}] = {output_axis}` is out of bounds for output rank \
                         {output_rank}",
-                    ),
-                }
+                ))
                 .into());
             }
             if seen[output_axis] {
-                return Err(TypeError {
-                    message: format!("broadcasting output axes map two input axes to output axis {output_axis}"),
-                }
+                return Err(TypeError::Invalid(format!(
+                    "broadcasting output axes map two input axes to output axis {output_axis}"
+                ))
                 .into());
             }
             seen[output_axis] = true;
@@ -753,31 +739,25 @@ impl Broadcast for ArrayType {
                 // into a dynamic output dimension is unsupported because the replication count is unknown.
                 (Size::Static(1), Size::Static(_)) => {}
                 (Size::Static(1), Size::Dynamic(_)) => {
-                    return Err(TypeError {
-                        message: format!(
-                            "broadcasting cannot expand input axis {input_axis} of size 1 into dynamic output size \
+                    return Err(TypeError::Invalid(format!(
+                        "broadcasting cannot expand input axis {input_axis} of size 1 into dynamic output size \
                             {output_dimension}",
-                        ),
-                    }
+                    ))
                     .into());
                 }
                 (Size::Static(input_size), Size::Static(output_size)) => {
-                    return Err(TypeError {
-                        message: format!(
-                            "broadcasting input axis {input_axis} has size {input_size}, which is neither {output_size} \
+                    return Err(TypeError::Invalid(format!(
+                        "broadcasting input axis {input_axis} has size {input_size}, which is neither {output_size} \
                             nor 1",
-                        ),
-                    }
+                    ))
                     .into());
                 }
                 // All remaining combinations pair a dynamic size with a mismatched size on the other side.
                 (input_dimension, output_dimension) => {
-                    return Err(TypeError {
-                        message: format!(
-                            "broadcasting input axis {input_axis} has size {input_dimension} but the output has size \
+                    return Err(TypeError::Invalid(format!(
+                        "broadcasting input axis {input_axis} has size {input_dimension} but the output has size \
                             {output_dimension}; a dynamic dimension only broadcasts to an identical dynamic dimension",
-                        ),
-                    }
+                    ))
                     .into());
                 }
             }
@@ -788,12 +768,10 @@ impl Broadcast for ArrayType {
         for (output_axis, mapped) in seen.iter().enumerate() {
             let output_dimension = output_type.dimension(output_axis);
             if !mapped && matches!(output_dimension, Size::Dynamic(_)) {
-                return Err(TypeError {
-                    message: format!(
-                        "broadcasting cannot replicate the input into unmapped dynamic output axis {output_axis} \
+                return Err(TypeError::Invalid(format!(
+                    "broadcasting cannot replicate the input into unmapped dynamic output axis {output_axis} \
                         of size {output_dimension}",
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -1320,17 +1298,17 @@ mod tests {
         let negative_dimensions = Array::from_f64s(dimensions_type.clone(), vec![-1.0, 3.0, 2.0]);
         assert_eq!(
             input.dynamic_broadcast(&negative_dimensions, output_type.clone(), &[2, 1]),
-            Err(ProgramError::Type(TypeError {
-                message: "dynamic broadcast output dimension 0 has invalid value -1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "dynamic broadcast output dimension 0 has invalid value -1".to_string()
+            ))),
         );
         let out_of_bounds_dimensions = Array::from_f64s(dimensions_type.clone(), vec![2.0, 3.0, 5.0]);
         assert_eq!(
             input.dynamic_broadcast(&out_of_bounds_dimensions, output_type, &[2, 1]),
-            Err(ProgramError::Type(TypeError {
-                message: "dynamic broadcast runtime shape [2, 3, 5] does not refine declared output shape [*, 3, <4]"
-                    .to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "dynamic broadcast runtime shape [2, 3, 5] does not refine declared output shape [*, 3, <4]"
+                    .to_string()
+            ))),
         );
 
         // The value tangent follows the same runtime broadcast while the integer dimensions carry a structural zero.
@@ -1535,22 +1513,22 @@ mod tests {
         assert_eq!(input_type.broadcast(output_type.clone(), &[1]), Ok(output_type.clone()));
         assert_eq!(
             input_type.broadcast(output_type.clone().with_memory(Memory::Host { pinned: true }), &[1]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input memory Device does not match output memory Host[Pinned]".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting input memory Device does not match output memory Host[Pinned]".to_string()
+            ))),
         );
         assert_eq!(
             input_type.broadcast(output_type.clone(), &[2]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting `output_axes[0] = 2` is out of bounds for output rank 2".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(3)]))
                 .broadcast(output_type, &[1, 1]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting output axes map two input axes to output axis 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting output axes map two input axes to output axis 1".to_string()
+            ))),
         );
 
         // A dynamic input dimension maps only to the identical dynamic dimension, while replicated output axes must
@@ -1563,43 +1541,41 @@ mod tests {
         let unbounded = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
             unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         assert_eq!(
             unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])).broadcast(unbounded.clone(), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(unbounded, &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
+            Err(ProgramError::Type(TypeError::Invalid(
+                "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).broadcast(
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
                 &[1],
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *"
-                    .to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid("broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *"
+                    .to_string()))),
         );
     }
 
@@ -1656,9 +1632,10 @@ mod tests {
         // Oversized target shapes fail through checked element-count arithmetic instead of panicking or wrapping.
         assert_eq!(
             Array::scalar(1.0).broadcast_to(Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)])),
-            Err(ProgramError::Type(TypeError {
-                message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX),
-            })),
+            Err(ProgramError::Type(TypeError::Invalid(format!(
+                "shape [{}, 2] element count does not fit in usize",
+                usize::MAX
+            )))),
         );
     }
 }
