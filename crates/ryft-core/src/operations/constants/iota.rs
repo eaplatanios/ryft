@@ -178,13 +178,13 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
     #[test]
     fn test_iota() {
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
 
         // Axis zero varies between rows, while an axis outside the rank is rejected.

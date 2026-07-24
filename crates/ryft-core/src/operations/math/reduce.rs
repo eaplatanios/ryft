@@ -747,12 +747,12 @@ mod tests {
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
     fn array_type(dimensions: &[usize], data_type: DataType) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
+        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
     }
 
     #[test]
@@ -806,15 +806,15 @@ mod tests {
         // dynamic, and the remaining dynamic dimensions are preserved in order.
         let input = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Size::Dynamic(None), Size::Static(3), Size::Dynamic(Some(4))]),
+            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
         );
         assert_eq!(
             reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4))]))),
         );
         assert_eq!(
             reduce_abstract(&input, &[0, 2], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         );
     }
 
@@ -1092,7 +1092,7 @@ mod tests {
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;
 
-        let input_shape = Shape::new(vec![Size::Static(4)]);
+        let input_shape = Shape::new(vec![Dimension::Static(4)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
         let cotangent_type = ArrayType::scalar(DataType::F64);
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -1138,7 +1138,7 @@ mod tests {
         use crate::programs::types::TypeError;
         use crate::tracing::TracingContext;
 
-        let input_shape = Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]);
+        let input_shape = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
@@ -1166,8 +1166,10 @@ mod tests {
         use crate::programs::atoms::MaybeZero;
         use crate::tracing::TracingContext;
 
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]));
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
+        );
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
             let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));

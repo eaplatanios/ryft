@@ -159,7 +159,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -218,7 +218,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let vector_type = || ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let vector_type = || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let unreduced = |axis: &str| {
             vector_type()
                 .with_sharding(
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn test_mul_transposition() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         check_operation_transposition!(
             @exact,
             operation = MulOperation,

@@ -1158,13 +1158,16 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::{RegionDriver, RegionRef};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().map(|dimension| Size::Static(*dimension)).collect()))
+        ArrayType::new(
+            DataType::F64,
+            Shape::new(dimensions.iter().map(|dimension| Dimension::Static(*dimension)).collect()),
+        )
     }
 
     /// Builds `f(x) = sin(x)` over one input of the provided type.

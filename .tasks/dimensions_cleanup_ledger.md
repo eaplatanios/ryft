@@ -72,11 +72,11 @@ ledger disagrees with Git.
 
 ## S4: structured type errors
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/s4-type-error`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `775a96c976c9f7f0957394eca41a71a5e846ed5d`
+- Integration commit: `8be8783b11a55c7239e1af4162449a7481f9fb31`
+- Remainder reconciliation commit: `b25a257f85bf93af5ea73642624e5a6910d285ba`
 - Immutable archive unchanged: yes
 - Landed: replaces the single-field `TypeError` struct with named `Invalid { message: String }` and typed `Custom`
   variants; routes invalid-error construction through `TypeError::invalid(...)`; adds typed custom recovery; migrates
@@ -96,7 +96,7 @@ ledger disagrees with Git.
 - Residual search: `rg -n 'TypeError::Invalid\(' --glob '*.rs' crates` and
   `rg -n 'TypeError::Invalid\s*\{\s*message\s*:' --glob '*.rs' crates` are empty; the remaining
   `TypeError::Invalid { message }` matches are intentional destructuring patterns
-- Next action: push this increment and stage its no-commit merge on `u/eaplatanios/dynamic-shapes` for owner review
+- Next action: none
 
 ## B0: repair the custom-derivatives module move
 
@@ -132,3 +132,26 @@ ledger disagrees with Git.
 - Residual search: no old module path or filename remains; the five `data_types` matches are ordinary local
   variable/parameter names and are intentionally retained
 - Next action: none
+
+## S5a: rename dimensions and move shape types
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/s5a-dimension-rename`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: renames the public `Size` type to `Dimension`; moves `Dimension`, `Shape`, and `StaticShape` from
+  `types::arrays` to the new canonical `types::dimensions` module; updates all in-repo consumers directly without a
+  compatibility alias or re-export; and moves the 14 representation tests with their owning types
+- Deferred: identity-bearing dimensions, authoritative bounds, refinements, and every other semantic representation
+  change remain assigned to P1; S5a preserves `Dynamic(Option<usize>)` exactly
+- Verification: formatting and diff checks passed; core, XLA, and facade checks passed; all 913 core library tests
+  passed; all 14 focused dimension tests passed; core doctests passed 43 tests with 13 ignored; XLA library tests
+  passed 395 tests with 1 ignored; macro verification passed all 53 macro unit tests and all 17 operation integration
+  tests, while the parameter compile-fail snapshot retained the independently reproduced S4 baseline mismatch caused
+  by rustc listing `Axes`
+- Residual search: the only `Size` matches under `ryft-core`, `ryft-xla`, and `ryft` are the unrelated
+  `ryft_mlir::Size` import aliased as `MlirSize` and its five uses; no old public `Size` declaration, variant use, test
+  name, or stale `types::arrays` path for `Dimension`, `Shape`, or `StaticShape` remains
+- Next action: push the source increment and stage its no-commit integration merge for owner review

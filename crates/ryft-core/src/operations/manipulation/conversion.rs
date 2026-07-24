@@ -244,7 +244,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::types::Typed;
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Dimension, Layout, Shape, StridedLayout};
 
     use super::*;
 
@@ -295,7 +295,7 @@ mod tests {
                 outputs = [(
                     @mapped(axis = 0),
                     Array::from_f64s(
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
                         vec![1.0, 2.0],
                     )
                 )],
@@ -348,10 +348,11 @@ mod tests {
         // type: byte-level layout metadata is removed when widening away from `F8E8M0FNU` and restored when returning
         // to a layout-bearing `F32` differential space.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
-        let laid_out_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)])).with_layout(layout.clone());
+        let laid_out_f32 =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
         let laid_out_f8 =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(1)])).with_layout(layout.clone());
-        let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]));
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
+        let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
         let (_, tangent) = jvp(
             |value| value.convert_element_type(DataType::F8E8M0FNU),

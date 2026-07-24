@@ -177,17 +177,17 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::TypeError;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
     #[test]
     fn test_fill() {
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let context = EagerContext::<Array, FillOperation<ArrayType, Scalar>>::new();
 
         // Dynamically sized outputs cannot be materialized by the eager array backend.
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
         assert_eq!(
             context.fill(&dynamic_type, Scalar::from(3.5)),
             Err(ProgramError::Type(TypeError::invalid(

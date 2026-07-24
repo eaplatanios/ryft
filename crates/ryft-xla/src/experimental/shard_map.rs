@@ -18,7 +18,7 @@ use ryft_core::programs::types::Typed;
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::{DomainTracingContext, Tracer};
-use ryft_core::types::{ArrayType, Shape, Size};
+use ryft_core::types::{ArrayType, Dimension, Shape};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::ShardMapOperation;
@@ -1438,7 +1438,7 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
             Ok::<ArrayType, ShardMapTraceError>(
                 ArrayType::new(
                     global_input_type.data_type(),
-                    Shape::new(local_shape.into_iter().map(Size::Static).collect()),
+                    Shape::new(local_shape.into_iter().map(Dimension::Static).collect()),
                 )
                 .with_layout(global_input_type.layout().cloned())
                 .with_sharding(sharding_with_varying_manual_axes(&local_sharding, local_varying_axes)?)?,
@@ -1567,7 +1567,7 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             Ok::<ArrayType, ShardMapTraceError>(
                 ArrayType::new(
                     local_output_type.data_type(),
-                    Shape::new(global_shape.into_iter().map(Size::Static).collect()),
+                    Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
                 )
                 .with_layout(local_output_type.layout().cloned())
                 .with_sharding(sharding_with_varying_manual_axes(output_sharding, surviving_varying_axes)?)?,
@@ -1590,7 +1590,7 @@ fn static_dimensions(
         .shape()
         .dimensions()
         .iter()
-        .position(|size| !matches!(size, Size::Static(_)))
+        .position(|size| !matches!(size, Dimension::Static(_)))
         .expect("array types without static shapes should have at least one dynamic dimension");
     Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind, value_index, dimension })
 }
@@ -2029,7 +2029,7 @@ mod tests {
     }
 
     fn static_sharded_array_type(data_type: DataType, global_shape: &[usize], sharding: Sharding) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(Size::Static).collect()))
+        ArrayType::new(data_type, Shape::new(global_shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)
             .unwrap()
     }
@@ -2114,7 +2114,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_function_rejects_mesh_without_manual_axes() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let mesh = crate::tests::logical_mesh_2x2();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,
@@ -2370,7 +2370,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(test_sharding_with_varying(
                 &mesh,
                 vec![ShardingDimension::replicated()],
@@ -2382,7 +2382,7 @@ mod tests {
         let global_input_types = derive_global_input_types(&shard_map, &vec![global_input_type]).unwrap();
         let local_input_types = derive_local_input_types(&shard_map, &global_input_types).unwrap();
 
-        assert_eq!(local_input_types[0].shape(), &Shape::new(vec![Size::Static(4)]));
+        assert_eq!(local_input_types[0].shape(), &Shape::new(vec![Dimension::Static(4)]));
         assert_eq!(
             local_input_types[0]
                 .sharding()
@@ -2405,7 +2405,7 @@ mod tests {
             .unwrap();
         let shard_map =
             ShardMap::new(mesh.clone(), vec![input_sharding], Vec::new(), vec!["x".into(), "y".into()], true).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -2451,7 +2451,7 @@ mod tests {
         let global_input_types = derive_global_input_types(
             &shard_map,
             &vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
                     .with_sharding(input_sharding)
                     .unwrap(),
             ],
@@ -2486,7 +2486,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(test_sharding_with_varying(
                 &mesh,
                 vec![ShardingDimension::replicated()],
@@ -2497,7 +2497,7 @@ mod tests {
             .unwrap();
         let global_output_types = derive_global_output_types(&shard_map, &vec![local_output_type]).unwrap();
 
-        assert_eq!(global_output_types[0].shape(), &Shape::new(vec![Size::Static(8)]));
+        assert_eq!(global_output_types[0].shape(), &Shape::new(vec![Dimension::Static(8)]));
         assert_eq!(
             global_output_types[0]
                 .sharding()
@@ -2521,7 +2521,7 @@ mod tests {
         let shard_map =
             ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding.clone()], vec!["x".into(), "y".into()], true)
                 .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let global_output_types = derive_global_output_types(&shard_map, &vec![local_output_type]).unwrap();
 
         assert_eq!(
@@ -2548,7 +2548,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -2582,7 +2582,7 @@ mod tests {
             .unwrap();
         let shard_map =
             ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding], vec!["x".into(), "y".into()], true).unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         assert_eq!(
             derive_global_output_types(&shard_map, &vec![local_output_type]),
@@ -2607,7 +2607,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(test_sharding_with_varying(
                 &mesh,
                 vec![ShardingDimension::replicated()],
@@ -2637,7 +2637,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(test_sharding_with_varying(
                 &mesh,
                 vec![ShardingDimension::replicated()],
@@ -2666,7 +2666,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_derives_types_and_renders_mlir() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
@@ -2677,10 +2677,10 @@ mod tests {
             input_sharding.clone(),
         )
         .unwrap();
-        let expected_global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let expected_global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(input_sharding.clone())
             .unwrap();
-        let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))
+        let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -2712,7 +2712,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_hides_auto_axes_in_type_level_shardings() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(16)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)]));
         let mesh = test_logical_mesh_data_model();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
         let projected_sharding = input_sharding.without_auto_axes();
@@ -2724,10 +2724,10 @@ mod tests {
             input_sharding,
         )
         .unwrap();
-        let expected_global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(16)]))
+        let expected_global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)]))
             .with_sharding(projected_sharding.clone())
             .unwrap();
-        let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])])
                     .unwrap()
@@ -2786,7 +2786,7 @@ mod tests {
                     nested + x
                 }
             },
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
             mesh,
             outer_sharding.clone(),
             outer_sharding,
@@ -2816,7 +2816,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_rejects_dynamic_input_types() {
-        let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,
@@ -2834,7 +2834,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_infers_single_input_closure_argument_type() {
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
@@ -2880,7 +2880,7 @@ mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type,
@@ -2975,8 +2975,8 @@ mod tests {
         )
         .unwrap();
         let global_input_types = (
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)])),
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(4)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
         );
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
             |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
@@ -3089,7 +3089,7 @@ mod tests {
     fn test_trace_reshard_renders_mlir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -3102,7 +3102,7 @@ mod tests {
         )
         .unwrap();
 
-        let expected_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let expected_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(sharding.clone())
             .unwrap();
         assert_eq!(traced.global_input_types(), &global_input_type);
@@ -3361,7 +3361,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // `psum` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to a
         // `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
@@ -3476,7 +3476,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // The custom call executes per shard inside the manual region: its declared output type is the local
         // shard type, and the lowered `stablehlo.custom_call` appears inside the `sdy.manual_computation` body.
@@ -3576,7 +3576,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -3629,7 +3629,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // A named `batch` level inside the shard_map body binds `"b"`, while `psum` names the *mesh* axis `"x"`: the
         // batching rule forwards the collective through the batch level to the seeded base trace (which binds `"x"`),
@@ -3697,7 +3697,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // The `psum` sits inside a `condition` branch inside the shard_map body, so it lowers through the nested
         // control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
@@ -3788,7 +3788,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // Two manual regions in one module each emit a channeled `all_reduce`: the module-scoped channel allocator
         // hands out distinct handles (1 and 2), which XLA requires across a module.
@@ -3868,7 +3868,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
 
         // `axis_index("x")` gives each device its own coordinate along the manual mesh axis `"x"`, added to the local
         // shard. The single-axis mesh has unit stride and full-size axis, so the coordinate is just `partition_id`.
@@ -3977,7 +3977,7 @@ mod tests {
         ])
         .unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(4)]));
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -4033,7 +4033,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // The shard_map body binds only the manual mesh axis `"x"`, so a collective naming `"y"` fails fast at
         // staging time with an unbound-axis error instead of tracing as a silent identity.
@@ -4083,7 +4083,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `all_gather` over the manual mesh axis `"x"` extends the local shard from `f32[2]` to the full `f32[4]`
         // concatenation on every device. Its output still varies along the manual axis for VMA purposes (a replicated
@@ -4193,7 +4193,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // `psum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and scatters
         // the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`. The
@@ -4308,7 +4308,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `ppermute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two local
         // shards without changing their shapes. The staged collective lowers to a channeled
@@ -4417,7 +4417,7 @@ mod tests {
         .unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // `all_to_all` over the manual mesh axis `"x"` with split and concat both at axis 0 keeps the local `f32[4]`
         // shape: each device splits its shard into two chunks, keeps its own chunk, and receives the peer's matching
@@ -4521,7 +4521,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `sum(all_gather(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the tiled
         // `all_gather` is a `psum_scatter` over the same axis and dimension, which lowers to a channeled
@@ -4594,7 +4594,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         // `sum(ppermute(x))` is linear, so its gradient transposes the shard_map body: the adjoint of the rotation
         // [(0, 1), (1, 0)] is the permutation with every pair inverted, [(1, 0), (0, 1)], which lowers to a channeled

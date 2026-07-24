@@ -1,9 +1,11 @@
 pub mod arrays;
 pub mod data;
+pub mod dimensions;
 pub mod layouts;
 pub mod memories;
 
-pub use arrays::{ArrayType, Shape, Size, StaticShape};
+pub use arrays::ArrayType;
 pub use data::{DataType, DataTypeError};
+pub use dimensions::{Dimension, Shape, StaticShape};
 pub use layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 pub use memories::Memory;

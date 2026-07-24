@@ -15,7 +15,7 @@ use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
-use crate::types::{ArrayType, DataType, Size};
+use crate::types::{ArrayType, DataType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
@@ -111,20 +111,20 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
             )));
         }
         let dimensions = self.leaf_type.shape().dimensions();
-        if dimensions.iter().any(|size| matches!(size, Size::Dynamic(_))) {
+        if dimensions.iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
             return Err(TypeError::invalid(format!(
                 "coordinate basis requires a fully static leaf type but got {}",
                 self.leaf_type
             )));
         }
-        let coordinate_count = if dimensions.contains(&Size::Static(0)) {
+        let coordinate_count = if dimensions.contains(&Dimension::Static(0)) {
             0
         } else {
             dimensions.iter().try_fold(1usize, |count, size| match size {
-                Size::Static(size) => count.checked_mul(*size).ok_or_else(|| {
+                Dimension::Static(size) => count.checked_mul(*size).ok_or_else(|| {
                     TypeError::invalid(format!("coordinate count overflows usize for leaf type {}", self.leaf_type))
                 }),
-                Size::Dynamic(_) => unreachable!("dynamic dimensions were rejected above"),
+                Dimension::Dynamic(_) => unreachable!("dynamic dimensions were rejected above"),
             })?
         };
         let coordinate_end = self.coordinate_offset.checked_add(coordinate_count).ok_or_else(|| {
@@ -136,7 +136,7 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
                 self.coordinate_offset, self.basis_size,
             )));
         }
-        Ok(vec![self.leaf_type.with_inserted_dimension(0, Size::Static(self.basis_size))?])
+        Ok(vec![self.leaf_type.with_inserted_dimension(0, Dimension::Static(self.basis_size))?])
     }
 
     #[inline]
@@ -268,20 +268,20 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
-    use crate::types::{ArrayType, Shape, Size};
+    use crate::types::{ArrayType, Dimension, Shape};
 
     use super::*;
 
     #[test]
     fn test_coordinate_basis_operation_infers_packed_type() {
-        let leaf_type = ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = CoordinateBasisOperation::new(leaf_type.clone(), 4, 10);
         check_operation_type_inference!(
             operation = operation,
             cases = [{
                 type = ArrayType,
                 input_types = [],
-                output_types = [leaf_type.with_inserted_dimension(0, Size::Static(10)).unwrap()],
+                output_types = [leaf_type.with_inserted_dimension(0, Dimension::Static(10)).unwrap()],
             }],
         );
     }
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_coordinate_basis_operation_renders_semantic_attributes() {
         let operation = CoordinateBasisOperation::new(
-            ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             4,
             10,
         );
@@ -303,8 +303,8 @@ mod tests {
             (F6E2M3FN, Scalar::F6E2M3FN(0), Scalar::F6E2M3FN(0x08)),
             (F6E3M2FN, Scalar::F6E3M2FN(0), Scalar::F6E3M2FN(0x0c)),
         ] {
-            let leaf_type = ArrayType::new(data_type, Shape::new(vec![Size::Static(2)]));
-            let basis_type = leaf_type.with_inserted_dimension(0, Size::Static(4)).unwrap();
+            let leaf_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(2)]));
+            let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
             let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
             let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
 
@@ -357,7 +357,7 @@ mod tests {
             ),
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
         assert_eq!(
             CoordinateBasisOperation::new(dynamic_type, 0, 1)
                 .infer_output_types(&[], &[])
@@ -366,13 +366,14 @@ mod tests {
             "coordinate basis requires a fully static leaf type but got f32[*]",
         );
 
-        let leaf_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
+        let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
         assert_eq!(
             CoordinateBasisOperation::new(leaf_type, 2, 4).infer_output_types(&[], &[]).unwrap_err().to_string(),
             "coordinate range [2, 5) exceeds basis size 4",
         );
 
-        let overflowing_type = ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]));
+        let overflowing_type =
+            ArrayType::new(F32, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]));
         assert_eq!(
             CoordinateBasisOperation::new(overflowing_type, 0, usize::MAX)
                 .infer_output_types(&[], &[])
@@ -381,25 +382,29 @@ mod tests {
             format!("coordinate count overflows usize for leaf type f32[{}, 2]", usize::MAX),
         );
 
-        let zero_coordinate_type =
-            ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2), Size::Static(0)]));
+        let zero_coordinate_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
+        );
         assert_eq!(
             CoordinateBasisOperation::new(zero_coordinate_type.clone(), usize::MAX, usize::MAX)
                 .infer_output_types(&[], &[])
                 .unwrap(),
-            vec![zero_coordinate_type.with_inserted_dimension(0, Size::Static(usize::MAX)).unwrap()],
+            vec![zero_coordinate_type.with_inserted_dimension(0, Dimension::Static(usize::MAX)).unwrap()],
         );
     }
 
     #[test]
     fn test_coordinate_basis_operation_interprets_zero_sized_leaf_without_stride_overflow() {
-        let leaf_type =
-            ArrayType::new(F32, Shape::new(vec![Size::Static(0), Size::Static(usize::MAX), Size::Static(2)]));
+        let leaf_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Static(0), Dimension::Static(usize::MAX), Dimension::Static(2)]),
+        );
         let operation = CoordinateBasisOperation::new(leaf_type.clone(), 0, 0);
         let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[]).unwrap(),
-            vec![Array::from_f64s(leaf_type.with_inserted_dimension(0, Size::Static(0)).unwrap(), Vec::new(),)],
+            vec![Array::from_f64s(leaf_type.with_inserted_dimension(0, Dimension::Static(0)).unwrap(), Vec::new(),)],
         );
     }
 }

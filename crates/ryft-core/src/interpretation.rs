@@ -440,7 +440,7 @@ mod tests {
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -555,7 +555,7 @@ mod tests {
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
         let mut builder = ProgramBuilder::<Array, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
@@ -568,7 +568,7 @@ mod tests {
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
         let mut builder = ProgramBuilder::<Array, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])));
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
@@ -581,7 +581,7 @@ mod tests {
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
         let mut builder = ProgramBuilder::<Array, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(3))])));
+        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(3))])));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);

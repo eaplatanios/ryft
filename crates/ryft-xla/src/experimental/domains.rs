@@ -39,7 +39,7 @@ use ryft_core::sharding::{
 };
 use ryft_core::tracing::DomainTracer;
 use ryft_core::types::{
-    ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout,
+    ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout, Tile, TileDimension, TiledLayout,
 };
 
 use super::lowering::XlaExecutableSignature;
@@ -1339,8 +1339,8 @@ impl From<&ArrayType> for PersistentArrayTypeV1 {
                 .dimensions()
                 .iter()
                 .map(|size| match size {
-                    Size::Static(size) => PersistentSizeV1::Static(*size as u64),
-                    Size::Dynamic(bound) => PersistentSizeV1::Dynamic(bound.map(|bound| bound as u64)),
+                    Dimension::Static(size) => PersistentSizeV1::Static(*size as u64),
+                    Dimension::Dynamic(bound) => PersistentSizeV1::Dynamic(bound.map(|bound| bound as u64)),
                 })
                 .collect(),
             layout: value.layout().map(PersistentLayoutV1::from),
@@ -1362,8 +1362,8 @@ impl TryFrom<PersistentArrayTypeV1> for ArrayType {
                 .shape
                 .into_iter()
                 .map(|size| match size {
-                    PersistentSizeV1::Static(size) => checked_usize(size).map(Size::Static),
-                    PersistentSizeV1::Dynamic(bound) => bound.map(checked_usize).transpose().map(Size::Dynamic),
+                    PersistentSizeV1::Static(size) => checked_usize(size).map(Dimension::Static),
+                    PersistentSizeV1::Dynamic(bound) => bound.map(checked_usize).transpose().map(Dimension::Dynamic),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
@@ -2744,7 +2744,7 @@ mod tests {
     use ryft_core::operations::math::{AddOperation, Atan2Operation, DivOperation, MulOperation, NegOperation};
     use ryft_core::programs::regions::CalleeRegionDriver;
     use ryft_core::sharding::ShardingDimension;
-    use ryft_core::types::{Size, StaticShape};
+    use ryft_core::types::{Dimension, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{values_from_bytes, values_to_bytes};
@@ -2763,7 +2763,7 @@ mod tests {
     }
 
     fn replicated_vector_type(mesh: &DeviceMesh, size: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap()
     }
@@ -2785,14 +2785,14 @@ mod tests {
     }
 
     fn f64_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f64]) -> Array<'c> {
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())]))
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f64>(values).as_slice()).unwrap()
     }
 
     fn boolean_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[bool]) -> Array<'c> {
-        let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(values.len())]))
+        let r#type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(values.len())]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let values = values.iter().copied().map(u8::from).collect::<Vec<_>>();
@@ -2924,7 +2924,7 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 2);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
 
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
         assert_eq!(array.shape(), StaticShape::new(vec![3, 2]));
@@ -2944,7 +2944,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
-        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = domain.constant(&array_type, ConstantKind::Zero).unwrap();
 
@@ -2958,8 +2958,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
         let domain = XlaDomain::with_mesh(&client, mesh);
 
         let array = domain.constant(&array_type, ConstantKind::One).unwrap();
@@ -3012,7 +3013,7 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let engine = XlaDomain::with_mesh(&client, mesh.clone());
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = XlaOptions::new(mesh.clone());
@@ -3069,7 +3070,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]))
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let staged = stage_function(&domain, |input| input, input_type.clone(), XlaOptions::new(mesh.clone())).unwrap();
@@ -3115,11 +3116,12 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]))
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let zero_type =
-            ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)])).with_sharding(sharding).unwrap();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
+            .with_sharding(sharding)
+            .unwrap();
         let options = XlaOptions { donation_flags: Some(vec![false, true]), ..XlaOptions::new(mesh.clone()) };
         let staged =
             stage_function(&domain, |(value, zero)| (zero, value), (value_type.clone(), zero_type.clone()), options)
@@ -3165,11 +3167,12 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let dynamic_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Dynamic(Some(3))]))
+        let dynamic_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let runtime_zero_type =
-            ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)])).with_sharding(sharding).unwrap();
+        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
+            .with_sharding(sharding)
+            .unwrap();
         let zero = Array::from_host_buffer(&client, runtime_zero_type, mesh, []).unwrap();
 
         let carriers = materialize_zero_space_carriers(&client, &[dynamic_zero_type], vec![zero]).unwrap();
@@ -3198,7 +3201,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let staged = stage_function(&domain, |x| x.sin().unwrap(), input_type, XlaOptions::new(mesh)).unwrap();
@@ -3228,7 +3231,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let capture = Array::from_host_buffer(
@@ -3319,7 +3322,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let directory = tempdir().unwrap();
@@ -3470,7 +3473,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let domain = XlaDomain::new(&client);
 
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let outputs = domain.bind(FillOperation::new(r#type, Scalar::from(2.5f64)), Vec::new(), &[]).unwrap();
 
         assert_eq!(outputs.len(), 1);
@@ -3479,7 +3482,7 @@ mod tests {
 
         // A complex fill value lowers as two real part splats composed through `stablehlo.complex`, and a `c64`
         // buffer's bytes are the interleaved `f32` real and imaginary parts of its elements.
-        let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]));
+        let r#type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
         let value = Scalar::from(num_complex::Complex::new(1.5f32, -2.0f32));
         let outputs = domain.bind(FillOperation::new(r#type, value), Vec::new(), &[]).unwrap();
 
@@ -3634,7 +3637,7 @@ mod tests {
         // A vector sharded over a 2-device mesh executes eagerly through per-operation SPMD compilation: each device
         // adds its own 2-element shard.
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let input = Array::from_host_buffer(
@@ -3755,7 +3758,9 @@ mod tests {
         let scan = ScanOperation::<XlaConstant>::new(1, 4);
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        let xs_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
         let xs = Array::from_host_buffer(
             &client,
             xs_type,
@@ -3828,8 +3833,8 @@ mod tests {
         // Manual shard-map body `local -> local + local` over `f32[4]` sharded across the 2-device mesh: each device
         // doubles its own 2-element shard inside the manual region.
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
-        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let body_program = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(local_type.clone());
@@ -3855,7 +3860,7 @@ mod tests {
         let (operation, body_region) = ShardMapOperation::from_body(body);
         let operation = XlaOperation::ShardMap(Box::new(operation));
 
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let input = Array::from_host_buffer(
@@ -3916,7 +3921,7 @@ mod tests {
 
         // The effectful `print` rides the compiled per-operation program as a token-threaded `@ryft.print` custom
         // call: eagerly binding it fires the host callback once and passes the payload through unchanged.
-        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let input =
@@ -4008,8 +4013,9 @@ mod tests {
 
     #[test]
     fn test_persistent_array_type_round_trips_zero_space_metadata() {
-        let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(2), Size::Dynamic(Some(4))]))
-            .with_memory(Memory::Host { pinned: true });
+        let array_type =
+            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(Some(4))]))
+                .with_memory(Memory::Host { pinned: true });
 
         let restored = ArrayType::try_from(PersistentArrayTypeV1::from(&array_type)).unwrap();
 

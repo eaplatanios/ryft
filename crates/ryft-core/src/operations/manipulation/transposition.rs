@@ -465,7 +465,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Layout, Memory, Size, StridedLayout};
+    use crate::types::{DataType, Dimension, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(operation.permutation().as_slice(), &[1, 0]);
 
         // Type inference permutes the input shape, including dynamic dimension sizes.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let placed_input_type = input_type
             .clone()
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
@@ -533,11 +533,11 @@ mod tests {
                 {
                     input_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4))]),
+                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4))]),
                     )],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Dynamic(Some(4)), Size::Dynamic(None)]),
+                        Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Dynamic(None)]),
                     )],
                 },
                 {
@@ -549,7 +549,7 @@ mod tests {
                     error = "expected 1 input but got 0",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                    input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))],
                     error = "'transpose' permutation has length 2 but input has rank 1",
                 },
             ],
@@ -693,7 +693,7 @@ mod tests {
         // stages the physical permutation [3, 1, 0, 2] without demanding a concrete batch size from the input type.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let symbolic_input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), Size::Dynamic(None), 3.into(), 4.into()]));
+            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), Dimension::Dynamic(None), 3.into(), 4.into()]));
         let symbolic_input = context.input(symbolic_input_type.clone());
         let symbolic_input = ArrayBatch::new(symbolic_input_type, symbolic_input, BatchAxis::new(1)).unwrap();
         let symbolic_output = TransposeOperation::new([2, 0, 1])
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(symbolic_output.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             symbolic_output.r#type().as_ref(),
-            &ArrayType::new(DataType::F64, Shape::new(vec![4.into(), Size::Dynamic(None), 2.into(), 3.into()]),),
+            &ArrayType::new(DataType::F64, Shape::new(vec![4.into(), Dimension::Dynamic(None), 2.into(), 3.into()]),),
         );
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert_eq!(
@@ -858,33 +858,37 @@ mod tests {
         .unwrap()
         .with_varying_manual_axes(["v"])
         .unwrap();
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]))
-                .with_sharding(input_sharding)
-                .unwrap();
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        )
+        .with_sharding(input_sharding)
+        .unwrap();
 
         // Permutation [2, 0, 1] makes output dimension i carry input dimension permutation[i].
         let operation = TransposeOperation::new(vec![2, 0, 1]);
-        let expected =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)]))
-                .with_sharding(
-                    Sharding::new(
-                        mesh,
-                        vec![
-                            ShardingDimension::replicated(),
-                            ShardingDimension::sharded(["x"]),
-                            ShardingDimension::unconstrained(),
-                        ],
-                    )
-                    .unwrap()
-                    .with_reduced_axes(["r"])
-                    .unwrap()
-                    .with_unreduced_axes(["u"])
-                    .unwrap()
-                    .with_varying_manual_axes(["v"])
-                    .unwrap(),
-                )
-                .unwrap();
+        let expected = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]),
+        )
+        .with_sharding(
+            Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::replicated(),
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::unconstrained(),
+                ],
+            )
+            .unwrap()
+            .with_reduced_axes(["r"])
+            .unwrap()
+            .with_unreduced_axes(["u"])
+            .unwrap()
+            .with_varying_manual_axes(["v"])
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![expected]));
 
         // Direct sharding transposition validates the complete permutation even when duplicate axes refer to
@@ -908,8 +912,10 @@ mod tests {
         );
 
         // An input without a sharding yields an output without one.
-        let unsharded =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let unsharded = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        );
         assert_eq!(operation.infer_output_types(std::slice::from_ref(&unsharded), &[]).unwrap()[0].sharding(), None);
 
         // Transpose is independent of element representation, including non-differentiable, complex, structural-zero,
@@ -937,7 +943,7 @@ mod tests {
         let output = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose(vec![1, 0]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))
         );
         assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -965,13 +971,18 @@ mod tests {
         }
 
         // Rank-3 permutation moving the last axis to the front.
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
         let output = Array::from_f64s(input_type, values).transpose(vec![2, 0, 1]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2), Size::Static(3)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)])
+            ),
         );
         assert_eq!(
             output.to_f64s(),
@@ -985,11 +996,11 @@ mod tests {
         let output = Array::scalar(42.0).transpose(vec![]).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output.to_f64s(), vec![42.0]);
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]));
         let output = Array::from_f64s(input_type, Vec::new()).transpose(vec![1, 0]).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(0)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(0)]))
         );
         assert_eq!(output.to_f64s(), Vec::<f64>::new());
 
@@ -1019,19 +1030,24 @@ mod tests {
         let output = matrix.move_axis(0, 1).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))
         );
         assert_eq!(output.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
         // On a rank-3 array, moving axis 0 to the last position shifts the other axes left to preserve their relative
         // order, so [2, 3, 4] becomes [3, 4, 2] (the permutation [1, 2, 0]).
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
         let output = Array::from_f64s(input_type, values).move_axis(0, 2).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(3), Dimension::Static(4), Dimension::Static(2)])
+            ),
         );
 
         // `from == to` leaves the array unchanged.
@@ -1070,7 +1086,7 @@ mod tests {
             &Shape::new(vec![4.into(), 3.into(), 2.into(), 5.into()]),
         );
         assert_eq!(rank_four_type.move_axis(-1, 3), Ok(rank_four_type.clone()));
-        assert_eq!(rank_four_type.move_axis([], []), Ok(rank_four_type.clone()),);
+        assert_eq!(rank_four_type.move_axis(Axes::default(), Axes::default()), Ok(rank_four_type.clone()),);
         assert_eq!(
             rank_four_type.move_axis([0, 1], [2]),
             Err(ProgramError::Type(TypeError::invalid(
@@ -1108,7 +1124,7 @@ mod tests {
         let swapped = matrix.swap_axes(0, 1).unwrap();
         assert_eq!(
             swapped.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))
         );
         assert_eq!(swapped.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -1117,13 +1133,18 @@ mod tests {
 
         // Swapping the outer two axes of a rank-3 array leaves the untouched trailing axis in place, so [2, 3, 4]
         // becomes [3, 2, 4] (the permutation [1, 0, 2]).
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
         let output = Array::from_f64s(input_type, values).swap_axes(0, 1).unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)])
+            ),
         );
 
         // `i == j` leaves the array unchanged.

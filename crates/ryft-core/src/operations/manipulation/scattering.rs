@@ -24,7 +24,7 @@ use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Size};
+use crate::types::{ArrayType, Dimension};
 
 // TODO(eaplatanios): Review this.
 
@@ -739,14 +739,14 @@ where
 /// # use ryft_core::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
+/// # use ryft_core::types::{ArrayType, DataType, Shape, Dimension};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Add two row updates into rows 0 and 2 of a 3x2 zero matrix. Each query is a scalar row index, so the indices
 /// // have shape [2, 1] and each update window is a full row (update window axis 1).
 /// let operand = Array::matrix(3, 2, vec![0.0; 6]);
 /// let indices = Array::from_f64s(
-///     ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)])),
+///     ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)])),
 ///     vec![0.0, 2.0],
 /// );
 /// let updates = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
@@ -804,7 +804,7 @@ impl Scatter for ArrayType {
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
-        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
+        let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
                 "'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"
             ))
@@ -897,7 +897,7 @@ impl Scatter for ArrayType {
             .filter(|axis| !inserted.contains(axis) && !operand_batching.contains(axis))
             .collect();
         for (&operand_axis, &update_axis) in operand_window_axes.iter().zip(dimensions.update_window_dimensions()) {
-            if let (Size::Static(update_extent), Size::Static(operand_extent)) =
+            if let (Dimension::Static(update_extent), Dimension::Static(operand_extent)) =
                 (updates.dimension(update_axis), operand.dimension(operand_axis))
                 && update_extent > operand_extent
             {
@@ -1032,16 +1032,16 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Layout, Memory, Shape, Size, StridedLayout};
+    use crate::types::{DataType, Dimension, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 
     fn indices_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
     }
 
     fn float_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
     }
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -1050,7 +1050,7 @@ mod tests {
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
-        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
+        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
         exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
     }
 

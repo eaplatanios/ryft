@@ -23,7 +23,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 /// Represents axis-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -501,7 +501,7 @@ impl<C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + Fr
             // mapped on this level's batch axis (position 0). The mapped physical `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
             let size = context.axis_size();
-            let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]));
+            let r#type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]));
             let operation = IotaOperation::new(r#type.clone(), 0);
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
@@ -529,7 +529,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::programs::types::Typed;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -634,7 +634,7 @@ mod tests {
             BatchAxisSpecification::named("i"),
         )
         .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)])));
         assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0]);
     }
 
@@ -665,7 +665,7 @@ mod tests {
                 BatchAxisSpecification::named("o"),
             )
             .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])));
         assert_eq!(output.to_f64s(), vec![0.0, 1.0]);
     }
 

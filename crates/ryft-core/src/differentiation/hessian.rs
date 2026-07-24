@@ -735,7 +735,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::types::DataType;
     use crate::types::DataType::{F32, F64};
-    use crate::types::{ArrayType, Shape, Size};
+    use crate::types::{ArrayType, Dimension, Shape};
 
     use super::*;
 
@@ -792,7 +792,7 @@ mod tests {
         assert_abs_diff_eq!(block.value().values()[0], -2.0f64.sin(), epsilon = 1e-6);
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
-        let r#type = ArrayType::new(F64, Shape::new(vec![Size::Static(0)]));
+        let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
         let zero_sized_hessian =
             hessian(|input| Ok(input.clone() * input), Array::from_f64s(r#type, Vec::new())).unwrap();
         let block = zero_sized_hessian.iter_blocks().next().unwrap();

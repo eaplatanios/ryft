@@ -706,7 +706,7 @@ mod tests {
     use ryft_core::programs::types::Typed;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::TracingContext;
-    use ryft_core::types::{ArrayType, DataType, Shape, Size};
+    use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::{
         JitCallOperation, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder, transpose_primal_jit_call,
@@ -742,13 +742,13 @@ mod tests {
     }
 
     fn vector_type() -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
     }
 
     #[test]
     fn test_jit_call_zero_transpose_uses_cotangent_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -782,8 +782,8 @@ mod tests {
 
     #[test]
     fn test_jit_call_mixed_output_transpose_materializes_zero_space_values() {
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]));
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
         let source = {
             let mut builder = XlaProgramBuilder::new();
             let value = builder.add_input(value_type.clone());

@@ -9,7 +9,9 @@ use ryft_core::compilation::{
     CompilationDomain, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction, stage_function,
 };
 use ryft_core::operations::math::Sin;
-use ryft_core::{ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size};
+use ryft_core::{
+    ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+};
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};
 use serde_json::{Value, json};
@@ -151,7 +153,7 @@ fn mesh(client: &Client<'_>) -> Result<DeviceMesh, Box<dyn std::error::Error>> {
 }
 
 fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::error::Error>> {
-    Ok(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]))
+    Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?)
 }
 

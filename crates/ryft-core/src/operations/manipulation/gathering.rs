@@ -25,7 +25,7 @@ use crate::programs::values::Value;
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Shape, Size};
+use crate::types::{ArrayType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -187,7 +187,7 @@ pub struct GatherOperation {
     /// Dimension numbers mapping the index operand and sliced windows onto the operand and output axes.
     dimensions: GatherDimensionNumbers,
 
-    /// Size of the sliced window along each operand axis (length equals the operand rank).
+    /// Dimension of the sliced window along each operand axis (length equals the operand rank).
     slice_sizes: Vec<usize>,
 
     /// Out-of-bounds index handling.
@@ -708,8 +708,8 @@ where
 /// let operand = Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 /// let indices = Array::from_f64s(
 ///     ArrayType::new(DataType::I32, ryft_core::types::Shape::new(vec![
-///         ryft_core::types::Size::Static(2),
-///         ryft_core::types::Size::Static(1),
+///         ryft_core::types::Dimension::Static(2),
+///         ryft_core::types::Dimension::Static(1),
 ///     ])),
 ///     vec![0.0, 2.0],
 /// );
@@ -757,7 +757,7 @@ impl Gather for ArrayType {
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
-        let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
+        let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
                 "'{GATHER_OPERATION_NAME}' indices index vector dimension must have a static extent"
             ))
@@ -835,7 +835,7 @@ impl Gather for ArrayType {
             .into());
         }
         for (axis, &size) in slice_sizes.iter().enumerate() {
-            if let Size::Static(extent) = operand.dimension(axis)
+            if let Dimension::Static(extent) = operand.dimension(axis)
                 && size > extent
             {
                 return Err(TypeError::invalid(format!(
@@ -886,18 +886,18 @@ impl Gather for ArrayType {
         let operand_offset_axes: Vec<usize> = (0..operand_rank)
             .filter(|axis| !collapsed.contains(axis) && !operand_batching.contains(axis))
             .collect();
-        let batch_query_sizes: Vec<Size> = (0..indices_rank)
+        let batch_query_sizes: Vec<Dimension> = (0..indices_rank)
             .filter(|axis| *axis != index_vector_dimension)
             .map(|axis| indices.dimension(axis))
             .collect();
         let offset_position: BTreeSet<usize> = dimensions.offset_dimensions().iter().copied().collect();
         let mut offset_iterator = operand_offset_axes.iter();
         let mut batch_iterator = batch_query_sizes.iter();
-        let output_dimensions: Vec<Size> = (0..output_rank)
+        let output_dimensions: Vec<Dimension> = (0..output_rank)
             .map(|position| {
                 if offset_position.contains(&position) {
                     let &operand_axis = offset_iterator.next().expect("offset axis count was validated");
-                    Size::Static(slice_sizes[operand_axis])
+                    Dimension::Static(slice_sizes[operand_axis])
                 } else {
                     *batch_iterator.next().expect("batch axis count was validated")
                 }
@@ -1047,11 +1047,11 @@ mod tests {
     use super::*;
 
     fn indices_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+        ArrayType::new(DataType::I32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
     }
 
     fn float_type(dimensions: Vec<usize>) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+        ArrayType::new(DataType::F32, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
     }
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -1060,7 +1060,7 @@ mod tests {
         V: crate::programs::Value<Type = ArrayType>,
         V::DispatchDomain: crate::contexts::Context<Constant = Array>,
     {
-        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
+        let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
         exemplar.dispatch_domain().lift(Array::from_f64s(r#type, values)).unwrap()
     }
 

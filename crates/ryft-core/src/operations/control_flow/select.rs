@@ -268,7 +268,7 @@ impl_differentiable_operation! {
 /// # use ryft_core::programs::ProgramError;
 /// # use ryft_core::backends::scalars::Scalar;
 /// # use ryft_core::backends::arrays::Array;
-/// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
+/// # use ryft_core::types::{ArrayType, DataType, Shape, Dimension};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Scalar values use a Boolean scalar condition.
@@ -276,7 +276,7 @@ impl_differentiable_operation! {
 /// assert_eq!(Scalar::select(&Scalar::from(false), &Scalar::from(2.0), &Scalar::from(3.0))?, Scalar::from(3.0));
 ///
 /// // Array values pair with a Boolean-typed condition array of the same shape.
-/// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
+/// let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
 /// let condition = Array::from_f64s(condition_type, vec![1.0, 0.0, 1.0]);
 /// let on_true = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let on_false = Array::vector(vec![4.0, 5.0, 6.0]);
@@ -322,7 +322,7 @@ mod tests {
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::programs::ProgramError;
     use crate::programs::types::Typed;
-    use crate::types::{Shape, Size};
+    use crate::types::{Dimension, Shape};
 
     use super::*;
 
@@ -359,10 +359,10 @@ mod tests {
         );
 
         // Check ternary shape broadcasting and branch promotion in the array type universe.
-        let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
-        let branch_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let scalar_branch = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]));
-        let scalar_condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(1)]));
+        let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
+        let branch_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let scalar_branch = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let scalar_condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(1)]));
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -389,7 +389,7 @@ mod tests {
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])),
+                        ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])),
                         branch_type.clone(),
                         branch_type.clone(),
                     ],
@@ -399,7 +399,7 @@ mod tests {
                     input_types = [
                         condition_type.clone(),
                         branch_type.clone(),
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])),
                     ],
                     output_types = [branch_type.clone()],
                 },

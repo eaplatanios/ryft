@@ -1,7 +1,7 @@
 use crate::experimental::domains::XlaDomain;
 use crate::{Array, FromPjrt};
 
-use ryft_core::{ArrayType, Shape, Size};
+use ryft_core::{ArrayType, Dimension, Shape};
 
 use super::*;
 
@@ -50,7 +50,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
                 DevicePutTarget::device(Device::from_pjrt(device)?).resolve(shape.len())?
             }
         };
-        let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Size::Static).collect()))
+        let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Dimension::Static).collect()))
             .with_sharding(sharding)?;
         Array::from_host_buffer(client, r#type, mesh, bytes.as_slice())
     }

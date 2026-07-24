@@ -45,7 +45,7 @@ mod tests {
     use super::*;
     use crate::Array;
     use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size,
+        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
 
     /// Bulk-balanced operations bring the counter back to its starting baseline within the noise
@@ -79,7 +79,7 @@ mod tests {
     /// deltas dominate the noise from other parallel tests creating arrays.
     #[test]
     fn test_live_array_count_tracks_array_construction_and_drop() {
-        let shape = Shape::new(vec![Size::Static(2)]);
+        let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
