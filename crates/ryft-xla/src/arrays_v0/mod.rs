@@ -13,7 +13,7 @@ use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInp
 use ryft_core::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
 use ryft_core::types::StaticShape;
-use ryft_core::types::data_types::DataType;
+use ryft_core::types::data::DataType;
 
 pub mod array;
 pub mod compiled_reshard;

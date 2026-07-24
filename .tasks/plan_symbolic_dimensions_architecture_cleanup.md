@@ -675,6 +675,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | ------ | ------------------------------------------------------------------------- | ------------------------- |
 | `S0`   | This plan, delivery ledger, and narrow `AGENTS.md` restore exception        | Line by line              |
 | `B0`   | Repair the incomplete custom-derivatives module move                       | Line by line              |
+| `B1`   | Rename the public array/data type modules                                  | Pattern and residual      |
 | `S1`   | `RegionRef` arena-reroot helper and call-site cleanup                       | Line by line              |
 | `S3`   | Elementwise-macro restructure                                              | Line by line              |
 | `S4`   | Structured `TypeError` core, then mechanical `Invalid(String)` call sites   | Core plus sampled sites  |
@@ -694,9 +695,11 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 
 Each increment depends on the one above it. `B0` reconstructs the physical custom-derivatives move from the last
 compiling pre-move implementation, updates every direct module path, and excludes the symbolic-dimension semantics
-accidentally mixed into the original move commit. `S3` covers `macros.rs` and `differentiation/elementwise.rs`; `S5a`
-renames `Size` to `Dimension` and moves `Shape` and `StaticShape` into `types::dimensions` without changing
-representation or behavior.
+accidentally mixed into the original move commit. `B1` is a pure module/file rename from `types::array_types` and
+`types::data_types` to `types::arrays` and `types::data`: update every in-repo reference directly, add no compatibility
+re-exports, and preserve all public items and behavior. `S3` covers `macros.rs` and
+`differentiation/elementwise.rs`; `S5a` renames `Size` to `Dimension` and moves `Shape` and `StaticShape` into
+`types::dimensions` without changing representation or behavior.
 
 `B0`, `S1`, and `S3` are refactors unrelated to dimensions that are present only because they were in flight
 concurrently. They must land first: they are bounded, they reduce the archived remainder, and they provide low-risk
@@ -1357,3 +1360,27 @@ the 187 later symbolic-dimension insertions that made the move depend on APIs ab
 - `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored.
 
 The residual search found no `tracing_v2::operations` reference in Rust source under `crates/`.
+
+### Execution: B1 type-module renames
+
+- [x] Move `types/array_types.rs` to `types/arrays.rs` and change the public module path to `types::arrays`.
+- [x] Move `types/data_types.rs` to `types/data.rs` and change the public module path to `types::data`.
+- [x] Update all in-repo Rust paths and documentation links directly, without compatibility modules or re-exports.
+- [x] Run formatting, affected crate checks, library tests, and doctests.
+- [ ] Record an empty residual search for the old module paths and stage the no-commit integration merge for review.
+
+The rename exposed an existing root-facade collision: both `backends` and `types` now contain a public `arrays` module
+and both are glob-re-exported by `ryft-core`. The root facade explicitly selects `backends::arrays`, preserving its
+existing meaning, while the renamed type module remains available at the unambiguous `types::arrays` path.
+
+Verification completed without warnings or failures:
+
+- `cargo fmt --all -- --check`;
+- `cargo check -p ryft-core`;
+- `cargo check -p ryft-xla`;
+- `cargo test -p ryft-core --lib` passed all 911 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; and
+- `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored.
+
+The exact old module-path and filename search is empty. The five remaining `data_types` matches are intentionally
+retained local variable/parameter names describing collections of data types.

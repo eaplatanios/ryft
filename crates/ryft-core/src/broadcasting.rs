@@ -79,7 +79,7 @@ pub enum BroadcastingError {
 ///
 /// ```rust
 /// # use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
-/// # use ryft_core::types::data_types::DataType::{Boolean, F32, F64};
+/// # use ryft_core::types::data::DataType::{Boolean, F32, F64};
 /// # use ryft_core::types::{ArrayType, Shape};
 /// let x = Shape::new(vec![4.into(), 3.into()]);
 /// let y = Shape::new(vec![3.into()]);
@@ -509,7 +509,7 @@ mod tests {
 
     use crate::parameters::{Parameter, ParameterError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
-    use crate::types::data_types::DataType::*;
+    use crate::types::data::DataType::*;
     use crate::types::{Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
