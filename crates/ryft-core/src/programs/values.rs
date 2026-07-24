@@ -9,7 +9,7 @@ use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::regions::RegionId;
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, Typed};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -106,7 +106,7 @@ impl<C: Context> Concretizable<bool> for Tracer<C> {
     }
 }
 
-impl Concretizable<bool> for CaptureReference<ArrayType> {
+impl<T: Type> Concretizable<bool> for CaptureReference<T> {
     #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
         // A captured constant is a reference into a side table, not the concrete predicate value itself. Control-flow
