@@ -135,11 +135,11 @@ ledger disagrees with Git.
 
 ## S5a: rename dimensions and move shape types
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/s5a-dimension-rename`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `3676d051cc1ae8a43bc19de09310386bb0d90455`
+- Integration commit: `0367c1464f9c1dcbaaab9d14622adcab779b0b93`
+- Remainder reconciliation commit: `3445c89ced98069ad8728082102a3fa10cbf131f`
 - Immutable archive unchanged: yes
 - Landed: renames the public `Size` type to `Dimension`; moves `Dimension`, `Shape`, and `StaticShape` from
   `types::arrays` to the new canonical `types::dimensions` module; updates all in-repo consumers directly without a
@@ -151,7 +151,26 @@ ledger disagrees with Git.
   passed 395 tests with 1 ignored; macro verification passed all 53 macro unit tests and all 17 operation integration
   tests, while the parameter compile-fail snapshot retained the independently reproduced S4 baseline mismatch caused
   by rustc listing `Axes`
-- Residual search: the only `Size` matches under `ryft-core`, `ryft-xla`, and `ryft` are the unrelated
-  `ryft_mlir::Size` import aliased as `MlirSize` and its five uses; no old public `Size` declaration, variant use, test
-  name, or stale `types::arrays` path for `Dimension`, `Shape`, or `StaticShape` remains
-- Next action: push the source increment and stage its no-commit integration merge for owner review
+- Residual search: the S5a handoff reported only the unrelated `ryft_mlir::Size` import aliased as `MlirSize`, but the
+  broad rename had incorrectly removed three legitimate `ryft_mlir::Size` uses from the StableHLO example; S5b
+  corrects that omission; no old public core `Size` declaration, variant use, test name, or stale `types::arrays` path
+  for `Dimension`, `Shape`, or `StaticShape` remains
+- Next action: correct the unrelated MLIR `Size` use discovered by the remainder reconciliation
+
+## S5b: restore the MLIR size in the StableHLO example
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/s5b-mlir-size-example`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: restores the three low-level StableHLO tensor-shape expressions to `ryft_mlir::Size`, leaving the
+  `ryft_core::types::Dimension` rename unchanged
+- Deferred: P0 and all dimension semantics remain unchanged
+- Verification: the integration baseline's
+  `cargo check -p ryft --example stable_hlo_matmul` failed with six unresolved `Dimension` uses; after the correction,
+  the same command passes; `cargo fmt -p ryft -- --check` and `git diff --check` pass
+- Residual search: exact `Size` matches are the three restored example expressions plus the XLA lowering import
+  aliased as `MlirSize`; all four are intentional `ryft_mlir::Size` uses
+- Next action: push the corrective increment and stage its no-commit integration merge for owner review
