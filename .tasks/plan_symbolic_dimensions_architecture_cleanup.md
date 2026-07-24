@@ -1370,10 +1370,12 @@ The residual search found no `tracing_v2::operations` reference in Rust source u
 - [x] Record an empty residual search for the old module paths and stage the no-commit integration merge for review.
 
 The rename exposed an existing root-facade collision: both `backends` and `types` now contain a public `arrays` module
-and both are glob-re-exported by `ryft-core`. The root facade explicitly selects `backends::arrays`, preserving its
-existing meaning, while the renamed type module remains available at the unambiguous `types::arrays` path.
+and both are glob-re-exported by `ryft-core`. The B1 source branch explicitly selected `backends::arrays`, preserving
+its existing root-facade meaning while exposing the type module at `types::arrays`; that disambiguation was omitted
+during owner integration review. The landed tree therefore retains an `ambiguous_glob_reexports` warning. S1 does not
+silently reverse that review outcome; the root-facade decision remains open for explicit owner direction or `P9`.
 
-Verification completed without failures; both compiler checks emitted no code warnings:
+The B1 source branch completed verification without failures or code warnings:
 
 - `cargo fmt --all -- --check`;
 - `cargo check -p ryft-core`;
@@ -1384,3 +1386,28 @@ Verification completed without failures; both compiler checks emitted no code wa
 
 The exact old module-path and filename search is empty. The five remaining `data_types` matches are intentionally
 retained local variable/parameter names describing collections of data types.
+
+### Execution: S1 region arena rerooting
+
+- [x] Add `RegionRef::reroot` as the canonical way to select another root from an existing borrowed arena.
+- [x] Replace every in-repo reconstruction from `existing_ref.regions()` while retaining initial arena-entry
+      `RegionRef::new` calls.
+- [x] Cover successful rerooting, arena preservation, rooted interfaces, and invalid identifiers in one focused test.
+- [x] Run formatting, the focused test, the complete core library suite, and core doctests.
+- [ ] Push the verified increment and stage its no-commit integration merge for review.
+
+`RegionRef::reroot` is public because `RegionRef` itself is a public borrowed arena view and downstream transformation
+or backend implementations need the same metadata-preserving traversal seam as in-crate consumers. Keeping it
+`pub(crate)` would leave downstream code reconstructing views through `RegionRef::new(existing.regions(), id)`, which
+is precisely the duplicate arena-plumbing idiom S1 removes.
+
+Verification completed:
+
+- `cargo fmt --all -- --check`;
+- the focused `test_region_ref_reroot` test passed;
+- `cargo test -p ryft-core --lib` passed all 912 tests; and
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored.
+
+The compiler emitted the `arrays` ambiguous-glob warning already present on the reviewed B1 integration tree; S1
+introduces no warning. The residual `RegionRef::new` calls are the two intentional initial arena-entry APIs in
+`Program` and `ProgramBuilder`, the entry-region constructor, and the direct invalid-constructor test.

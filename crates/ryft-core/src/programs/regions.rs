@@ -182,7 +182,7 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
     }
 
     /// Returns a view rooted at `id` in the same source region arena.
-    pub(crate) fn reroot(self, id: RegionId) -> Result<Self, ProgramError> {
+    pub fn reroot(self, id: RegionId) -> Result<Self, ProgramError> {
         Self::new(self.regions, id)
     }
 
