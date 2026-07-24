@@ -274,7 +274,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         let mut imported = region.region().clone();
         for instruction in &mut imported.instructions {
             for attached in &mut instruction.regions {
-                let nested = region.reroot(*attached).unwrap();
+                let nested = region.with_id(*attached).unwrap();
                 *attached = self.import_region_with_remapping(nested, remapping);
             }
         }

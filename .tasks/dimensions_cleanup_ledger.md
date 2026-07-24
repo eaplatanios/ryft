@@ -37,7 +37,7 @@ ledger disagrees with Git.
 - Residual search: branch, PR, `S6`, phase-ordering, and restore-policy searches passed before handoff
 - Next action: none
 
-## S1: region arena rerooting
+## S1: region arena ID selection
 
 - Status: ready for review
 - Branch: `u/eaplatanios/increment/s1-region-reroot`
@@ -46,11 +46,11 @@ ledger disagrees with Git.
 - Integration commit: pending owner review
 - Remainder reconciliation commit: pending integration
 - Immutable archive unchanged: yes
-- Landed: pending; introduce public `RegionRef::reroot` and replace reconstruction from an existing `RegionRef`'s
+- Landed: pending; introduce public `RegionRef::with_id` and replace reconstruction from an existing `RegionRef`'s
   arena
 - Deferred: identity-signature retention remains in `P1`; `S1` provides the metadata-preserving seam without
   introducing identity machinery
-- Verification: formatting passed; the focused reroot test passed; all 912 core library tests passed; core doctests
+- Verification: formatting passed; the focused `with_id` test passed; all 912 core library tests passed; core doctests
   passed 43 tests with 13 ignored; the compiler emitted only the `arrays` ambiguous-glob warning already present on
   the B1 integration baseline
 - Residual search: the production change leaves only initial arena-entry `RegionRef::new` calls and its direct

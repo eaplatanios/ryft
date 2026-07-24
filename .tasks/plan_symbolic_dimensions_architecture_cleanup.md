@@ -676,7 +676,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `S0`   | This plan, delivery ledger, and narrow `AGENTS.md` restore exception        | Line by line              |
 | `B0`   | Repair the incomplete custom-derivatives module move                       | Line by line              |
 | `B1`   | Rename the public array/data type modules                                  | Pattern and residual      |
-| `S1`   | `RegionRef` arena-reroot helper and call-site cleanup                       | Line by line              |
+| `S1`   | `RegionRef::with_id` helper and call-site cleanup                           | Line by line              |
 | `S3`   | Elementwise-macro restructure                                              | Line by line              |
 | `S4`   | Structured `TypeError` core, then mechanical `Invalid(String)` call sites   | Core plus sampled sites  |
 | `S5a`  | Pure `Size` to `Dimension` rename and `Shape` module move, semantics intact | Pattern, residual, sample |
@@ -706,7 +706,7 @@ concurrently. They must land first: they are bounded, they reduce the archived r
 rehearsals of the workflow.
 
 `S1` is not a global rename of `Program::region_ref` or `ProgramBuilder::region_ref`. It introduces
-`RegionRef::reroot` as the one way to select another root from an existing borrowed arena and replaces only
+`RegionRef::with_id` as the one way to select another root from an existing borrowed arena and replaces only
 `RegionRef::new(existing_ref.regions(), id)` reconstruction sites. Initial arena entry through `Program` and
 `ProgramBuilder` remains named `region_ref`.
 
@@ -1387,16 +1387,17 @@ The B1 source branch completed verification without failures or code warnings:
 The exact old module-path and filename search is empty. The five remaining `data_types` matches are intentionally
 retained local variable/parameter names describing collections of data types.
 
-### Execution: S1 region arena rerooting
+### Execution: S1 region arena ID selection
 
-- [x] Add `RegionRef::reroot` as the canonical way to select another root from an existing borrowed arena.
+- [x] Add `RegionRef::with_id` as the canonical way to select another root from an existing borrowed arena.
 - [x] Replace every in-repo reconstruction from `existing_ref.regions()` while retaining initial arena-entry
       `RegionRef::new` calls.
-- [x] Cover successful rerooting, arena preservation, rooted interfaces, and invalid identifiers in one focused test.
+- [x] Cover successful ID replacement, arena preservation, rooted interfaces, and invalid identifiers in one focused
+      test.
 - [x] Run formatting, the focused test, the complete core library suite, and core doctests.
 - [ ] Push the verified increment and stage its no-commit integration merge for review.
 
-`RegionRef::reroot` is public because `RegionRef` itself is a public borrowed arena view and downstream transformation
+`RegionRef::with_id` is public because `RegionRef` itself is a public borrowed arena view and downstream transformation
 or backend implementations need the same metadata-preserving traversal seam as in-crate consumers. Keeping it
 `pub(crate)` would leave downstream code reconstructing views through `RegionRef::new(existing.regions(), id)`, which
 is precisely the duplicate arena-plumbing idiom S1 removes.
@@ -1404,7 +1405,7 @@ is precisely the duplicate arena-plumbing idiom S1 removes.
 Verification completed:
 
 - `cargo fmt --all -- --check`;
-- the focused `test_region_ref_reroot` test passed;
+- the focused `test_region_ref_with_id` test passed;
 - `cargo test -p ryft-core --lib` passed all 912 tests; and
 - `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored.
 
