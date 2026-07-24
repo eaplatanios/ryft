@@ -23,7 +23,7 @@ use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -459,8 +459,8 @@ fn is_effective_identity(
         && edge_padding_high.iter().all(|padding| *padding == 0)
         && input_type.shape().dimensions().iter().zip(interior_padding).all(|(dimension, padding)| {
             *padding == 0
-                || matches!(dimension, Size::Static(0 | 1))
-                || matches!(dimension, Size::Dynamic(Some(upper_bound)) if *upper_bound <= 2)
+                || matches!(dimension, Dimension::Static(0 | 1))
+                || matches!(dimension, Dimension::Dynamic(Some(upper_bound)) if *upper_bound <= 2)
         })
 }
 
@@ -511,7 +511,7 @@ fn padded_extent(
     Ok(dilated_size)
 }
 
-/// Computes one concrete padded extent and validates that it is representable by [`Size::Static`].
+/// Computes one concrete padded extent and validates that it is representable by [`Dimension::Static`].
 fn static_padded_extent(
     input_size: usize,
     edge_padding_low: i64,
@@ -576,14 +576,14 @@ impl Pad for ArrayType {
         for axis in 0..rank {
             let dimension = self.dimension(axis);
             let output_dimension = match dimension {
-                Size::Static(size) => Size::Static(static_padded_extent(
+                Dimension::Static(size) => Dimension::Static(static_padded_extent(
                     size,
                     edge_padding_low[axis],
                     edge_padding_high[axis],
                     interior_padding[axis],
                     axis,
                 )?),
-                Size::Dynamic(upper_bound) => {
+                Dimension::Dynamic(upper_bound) => {
                     let output_upper_bound = match upper_bound {
                         None => None,
                         Some(upper_bound) => {
@@ -607,7 +607,7 @@ impl Pad for ArrayType {
                             }
                         }
                     };
-                    Size::Dynamic(output_upper_bound)
+                    Dimension::Dynamic(output_upper_bound)
                 }
             };
             output_dimensions.push(output_dimension);
@@ -616,8 +616,8 @@ impl Pad for ArrayType {
             edge_padding_low[axis] > 0
                 || edge_padding_high[axis] > 0
                 || (interior_padding[axis] > 0
-                    && !matches!(dimension, Size::Static(0 | 1))
-                    && !matches!(dimension, Size::Dynamic(Some(upper_bound)) if *upper_bound <= 2))
+                    && !matches!(dimension, Dimension::Static(0 | 1))
+                    && !matches!(dimension, Dimension::Dynamic(Some(upper_bound)) if *upper_bound <= 2))
         });
         let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
         if padding_positions_may_exist {
@@ -727,9 +727,9 @@ mod tests {
         // Type inference validates the padding geometry and returns the padded type, and the type-level (abstract)
         // capability backs it without consuming the borrowed input type. With d = 3, low = 1, high = 2, and
         // interior = 1, the output dimension is 1 + (3 - 1) * 2 + 1 + 2 = 8.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let padding_value_type = ArrayType::scalar(DataType::F64);
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(8)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(8)]));
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -751,21 +751,21 @@ mod tests {
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])),
                         padding_value_type.clone(),
                     ],
-                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]))],
+                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]))],
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4))])),
                         padding_value_type.clone(),
                     ],
-                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(9))]))],
+                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(9))]))],
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX)])),
                         padding_value_type.clone(),
                     ],
                     error = "'pad' output size overflows usize on axis 0",
@@ -795,25 +795,25 @@ mod tests {
         // non-negative extent, but rejecting the abstract operation would make the transpose of positive padding
         // impossible to stage. For an input extent below 9, cropping 1 and 2 yields an output extent below 6.
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(9))])).pad(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(9))])).pad(
                 &padding_value_type,
                 &[-1],
                 &[-2],
                 &[0]
             ),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(6))]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(6))]))),
         );
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])).pad(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])).pad(
                 &padding_value_type,
                 &[-1],
                 &[-2],
                 &[0]
             ),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]))),
         );
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2))])).pad(
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(2))])).pad(
                 &padding_value_type,
                 &[-5],
                 &[0],
@@ -835,10 +835,10 @@ mod tests {
 
         // Empty input axes hold only the edge padding (the `d == 0` case skips interior padding entirely) and
         // rank-0 inputs pass through unchanged.
-        let empty_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
+        let empty_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]));
         assert_eq!(
             empty_type.pad(&padding_value_type, &[1], &[2], &[1]),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         );
         let empty = Array::from_f64s(empty_type, vec![]).pad(&Array::scalar(7.0), &[1], &[2], &[1]).unwrap();
         assert_eq!(empty.to_f64s(), vec![7.0, 7.0, 7.0]);
@@ -1094,7 +1094,7 @@ mod tests {
 
         // Positive edge padding over a bounded-dynamic operand must produce a fully stageable dynamic pullback: the
         // inverse signed pad crops the cotangent and the full-extent slice applies the interior stride.
-        let dynamic_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4))]));
+        let dynamic_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4))]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let dynamic_input = builder.add_input(dynamic_input_type);
         let dynamic_padding = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1131,7 +1131,7 @@ mod tests {
         // inverse pad nevertheless introduces zeros for cropped input positions and must derive that internal zero's
         // dependencies from the operand cotangent rather than from the unused primal padding scalar.
         let crop_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let crop_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+        let crop_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(crop_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         let crop_padding_type =
@@ -1183,7 +1183,10 @@ mod tests {
         // row and columns gain asymmetric edge padding.
         let input = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
         let output = input.pad(&Array::scalar(0.0), &[0, 1], &[1, 0], &[1, 0]).unwrap();
-        assert_eq!(*output.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
+        assert_eq!(
+            *output.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
+        );
         assert_eq!(output.to_f64s(), vec![0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0],);
 
         // Signed edge padding crops the dilated operand. Cropping can be asymmetric, can combine with interior
@@ -1210,7 +1213,7 @@ mod tests {
 
         // Interior padding is an effective identity on singleton axes. The eager and abstract fast paths preserve
         // the complete type and avoid overflowing `interior + 1` for a value that can never be used as a stride.
-        let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]))
+        let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![7])));
         let singleton = Array::from_f64s(singleton_type.clone(), vec![3.0]);
         let identity = singleton.pad(&Array::scalar(0.0), &[0], &[0], &[usize::MAX]).unwrap();
@@ -1240,7 +1243,7 @@ mod tests {
             .unwrap()
             .with_unreduced_axes(["m"])
             .unwrap();
-        let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let pad_value = ArrayType::scalar(DataType::F32)
@@ -1249,8 +1252,8 @@ mod tests {
 
         // Padding preserves a common memory placement and rejects a padding scalar that would require an implicit
         // transfer.
-        let host_input =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_memory(Memory::Host { pinned: true });
+        let host_input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_memory(Memory::Host { pinned: true });
         let host_padding = ArrayType::scalar(DataType::F32).with_memory(Memory::Host { pinned: true });
         assert_eq!(host_input.pad(&host_padding, &[0], &[1], &[0]).unwrap().memory(), Memory::Host { pinned: true },);
         assert_eq!(
@@ -1280,7 +1283,7 @@ mod tests {
             .with_sharding(Sharding::replicated(sharding.mesh().clone(), 0).with_reduced_axes(["m"]).unwrap())
             .unwrap();
         assert!(input.pad(&reduced_padding, &[0], &[4], &[0]).is_err());
-        let varying_input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let varying_input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(
                 Sharding::new(sharding.mesh().clone(), vec![ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -1296,7 +1299,7 @@ mod tests {
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let ordinary_input_sharding =
             Sharding::new(sharding.mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let ordinary_input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let ordinary_input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(ordinary_input_sharding.clone())
             .unwrap();
         let other_mesh_padding =
@@ -1317,16 +1320,17 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]))
-                .with_sharding(physical_sharding)
-                .unwrap();
+            let input_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                    .with_sharding(physical_sharding)
+                    .unwrap();
             let input = ArrayBatch::new(
                 input_type.clone(),
                 Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]),
                 BatchAxis::new(0),
             )
             .unwrap();
-            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
                         .unwrap()
@@ -1365,13 +1369,14 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0), Size::Static(2)]))
-                .with_sharding(physical_sharding.clone())
-                .unwrap();
+            let input_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]))
+                    .with_sharding(physical_sharding.clone())
+                    .unwrap();
             let input =
                 ArrayBatch::new(input_type.clone(), Array::from_f64s(input_type, Vec::new()), BatchAxis::new(0))
                     .unwrap();
-            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]))
+            let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
                         .unwrap()
@@ -1393,7 +1398,7 @@ mod tests {
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), physical_sharding.dimensions(),);
-            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(3)]);
+            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(0), Dimension::Static(3)]);
             assert!(outputs[0].value().values().is_empty());
         }
     }

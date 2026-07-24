@@ -40,7 +40,7 @@ use ryft_core::programs::regions::{RegionId, RegionRef};
 use ryft_core::programs::types::Typed;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::types::{ArrayType, DataType, Memory, Shape, Size};
+use ryft_core::types::{ArrayType, DataType, Dimension, Memory, Shape};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -1358,8 +1358,8 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
             .dimensions()
             .iter()
             .map(|size| match size {
-                Size::Static(value) => Ok(Some(*value)),
-                Size::Dynamic(_) => stable_hlo_dynamic_dimension_bound(size),
+                Dimension::Static(value) => Ok(Some(*value)),
+                Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(size),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let reshape = block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
@@ -1459,7 +1459,7 @@ fn lower_reshape_shape<'b, 'c: 'b, 't: 'c>(
     let shape_type = context
         .tensor_type(context.signless_integer_type(32), &[MlirSize::Static(expressions.len())], None, location)
         .map_err(|_| LoweringError::InvalidTensorType {
-            array_type: ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(expressions.len())])),
+            array_type: ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(expressions.len())])),
         })?;
     if expressions.is_empty() {
         let elements = context
@@ -1606,8 +1606,8 @@ fn broadcast_changes_explicit_sharding(input_type: &ArrayType, output_type: &Arr
     // Even when the ranked placement labels are unchanged, expanding a unit dimension that is partitioned over an
     // explicit mesh axis changes which partitions own the replicated values and must remain visible to Shardy.
     let expands_explicit_dimension = output_axes.iter().copied().enumerate().any(|(input_axis, output_axis)| {
-        input_type.dimension(input_axis as isize) == Size::Static(1)
-            && output_type.dimension(output_axis as isize) != Size::Static(1)
+        input_type.dimension(input_axis as isize) == Dimension::Static(1)
+            && output_type.dimension(output_axis as isize) != Dimension::Static(1)
             && (uses_explicit_axis(&projected_input_sharding.dimensions()[output_axis], &projected_input_sharding)
                 || uses_explicit_axis(&output_sharding.dimensions()[output_axis], output_sharding))
     });
@@ -1670,19 +1670,19 @@ fn lower_dynamic_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            Size::Static(size) | Size::Dynamic(Some(size)) => Ok(Size::Static(*size)),
-            Size::Dynamic(None) => Err(LoweringError::UnsupportedOp {
+            Dimension::Static(size) | Dimension::Dynamic(Some(size)) => Ok(Dimension::Static(*size)),
+            Dimension::Dynamic(None) => Err(LoweringError::UnsupportedOp {
                 op: "dynamic broadcast with an unbounded output dimension".to_string(),
             }),
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (input_axis, output_axis) in operation.output_axes().iter().copied().enumerate() {
-        let Size::Static(input_size) = input_types[0].dimension(input_axis as isize) else {
+        let Dimension::Static(input_size) = input_types[0].dimension(input_axis as isize) else {
             return Err(LoweringError::UnsupportedOp {
                 op: "dynamic broadcast with a runtime-dependent mapped input dimension".to_string(),
             });
         };
-        let Size::Static(output_bound) = upper_bound_dimensions[output_axis] else {
+        let Dimension::Static(output_bound) = upper_bound_dimensions[output_axis] else {
             unreachable!("upper-bound dimensions are static by construction")
         };
         if input_size != 1 && input_size != output_bound {
@@ -1709,7 +1709,7 @@ fn lower_dynamic_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     let mut refined_type = upper_bound_type;
     for (axis, dimension) in output_type.shape().dimensions().iter().copied().enumerate() {
-        if !matches!(dimension, Size::Dynamic(_)) {
+        if !matches!(dimension, Dimension::Dynamic(_)) {
             continue;
         }
         let size = block.append_operation(stable_hlo::slice(input_values[1], &[axis], &[axis + 1], &[1], location)?)?;
@@ -1792,7 +1792,7 @@ fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     let index_type = context
         .tensor_type(context.signless_integer_type(64), &[MlirSize::Static(rank)], None, location)
         .map_err(|_| LoweringError::InvalidTensorType {
-            array_type: ArrayType::new(DataType::I64, Shape::new(vec![Size::Static(rank)])),
+            array_type: ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(rank)])),
         })?;
     let lower_index_vector =
         |field: &'static str, values: &[usize], block: &mut B| -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
@@ -3052,15 +3052,15 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             .to_vec();
         let element_type = ArrayType::new(
             accumulation_type,
-            Shape::new(element_dimensions.iter().map(|&size| Size::Static(size)).collect()),
+            Shape::new(element_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
         );
         let expanded_type = ArrayType::new(
             accumulation_type,
             Shape::new(
                 scale_dimensions
                     .iter()
-                    .map(|&size| Size::Static(size))
-                    .chain(std::iter::once(Size::Static(operation.block_size())))
+                    .map(|&size| Dimension::Static(size))
+                    .chain(std::iter::once(Dimension::Static(operation.block_size())))
                     .collect(),
             ),
         );
@@ -3068,7 +3068,7 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         let scale_tensor_type = lower_tensor_type(
             &ArrayType::new(
                 accumulation_type,
-                Shape::new(scale_dimensions.iter().map(|&size| Size::Static(size)).collect()),
+                Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
             ),
             context,
             location,
@@ -3149,7 +3149,7 @@ fn attention_static_dimensions(input_type: &ArrayType) -> Result<[usize; 4], Low
 
 /// Returns the static [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
 fn attention_array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect()))
+    ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Dimension::Static(size)).collect()))
 }
 
 /// The cuDNN fMHA proto-JSON dot-dimension-number block of the two forward attention matrix products under the
@@ -5861,8 +5861,8 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
         .dimensions()
         .iter()
         .map(|size| match size {
-            Size::Static(value) => Ok(*value),
-            Size::Dynamic(_) => Err(LoweringError::InvalidTensorType { array_type: array_type.clone() }),
+            Dimension::Static(value) => Ok(*value),
+            Dimension::Dynamic(_) => Err(LoweringError::InvalidTensorType { array_type: array_type.clone() }),
         })
         .collect()
 }
@@ -6376,7 +6376,7 @@ where
         dimensions.extend(static_dimensions(slice_type)?);
         Ok(ArrayType::new(
             slice_type.data_type(),
-            ryft_core::types::Shape::new(dimensions.into_iter().map(Size::Static).collect()),
+            ryft_core::types::Shape::new(dimensions.into_iter().map(Dimension::Static).collect()),
         ))
     };
 
@@ -8534,8 +8534,8 @@ where
         .dimensions()
         .iter()
         .map(|dimension_size| match dimension_size {
-            Size::Static(dimension_size) => Ok(*dimension_size),
-            Size::Dynamic(_) => Err(ProgramError::InvalidArgument {
+            Dimension::Static(dimension_size) => Ok(*dimension_size),
+            Dimension::Dynamic(_) => Err(ProgramError::InvalidArgument {
                 message: format!(
                     "coordinate basis requires a fully static leaf type but got {}",
                     operation.leaf_type(),
@@ -9275,8 +9275,8 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
         .dimensions()
         .iter()
         .map(|size| match size {
-            Size::Static(value) => MlirSize::Static(*value),
-            Size::Dynamic(_) => MlirSize::Dynamic,
+            Dimension::Static(value) => MlirSize::Static(*value),
+            Dimension::Dynamic(_) => MlirSize::Dynamic,
         })
         .collect::<Vec<_>>();
     let bounds = array_type
@@ -9297,10 +9297,10 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
 }
 
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
-fn stable_hlo_dynamic_dimension_bound(size: &Size) -> Result<Option<usize>, LoweringError> {
+fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Result<Option<usize>, LoweringError> {
     match size {
-        Size::Static(_) | Size::Dynamic(None) => Ok(None),
-        Size::Dynamic(Some(exclusive_bound)) => {
+        Dimension::Static(_) | Dimension::Dynamic(None) => Ok(None),
+        Dimension::Dynamic(Some(exclusive_bound)) => {
             exclusive_bound.checked_sub(1).map(Some).ok_or(LoweringError::InvalidDynamicDimensionBound)
         }
     }
@@ -9598,7 +9598,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::types::{Shape, Size};
+    use ryft_core::types::{Dimension, Shape};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use ryft_core::tracing::Trace;
@@ -9610,11 +9610,11 @@ mod tests {
     }
 
     fn test_vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]))
     }
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
     }
 
     fn xla_identity_branch(input_type: ArrayType) -> FlatXlaProgram {
@@ -9640,11 +9640,13 @@ mod tests {
     fn xla_elementwise_normalization_program() -> FlatXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(1)])));
-        let right =
-            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)])));
+        let left = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)])));
+        let right = builder
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])));
         let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let boolean_vector = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)])));
+        let boolean_vector =
+            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
         let divide = builder.add_instruction(DivOperation, Vec::new(), vec![left, right]).unwrap()[0];
         let atan2 = builder.add_instruction(Atan2Operation, Vec::new(), vec![right, left]).unwrap()[0];
         let compare = builder
@@ -9764,7 +9766,7 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Size::Static(6)])).with_dimensions([1, 0]),
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 Vec::new(),
                 vec![input],
             )
@@ -9791,7 +9793,7 @@ mod tests {
 
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
-        let shape = Shape::new(vec![Size::Dynamic(None), Size::Static(3)]);
+        let shape = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
         let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
@@ -9815,8 +9817,9 @@ mod tests {
 
     #[test]
     fn test_plain_fixed_dynamic_permuted_reshape_lowers_to_transpose() {
-        let input_shape = Shape::new(vec![Size::Dynamic(None), Size::Static(3), Size::Dynamic(Some(5))]);
-        let output_shape = Shape::new(vec![Size::Dynamic(Some(5)), Size::Dynamic(None), Size::Static(3)]);
+        let input_shape = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(5))]);
+        let output_shape =
+            Shape::new(vec![Dimension::Dynamic(Some(5)), Dimension::Dynamic(None), Dimension::Static(3)]);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let output = builder
@@ -9843,7 +9846,8 @@ mod tests {
 
     #[test]
     fn test_plain_symbolic_reshape_lowers_runtime_shape_from_original_input_dimensions() {
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Dynamic(None)]));
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(None)]));
         let normalized_input_dimension = |dimension, factor| ReshapeDimensionExpression::ExactDivision {
             numerator: Box::new(ReshapeDimensionExpression::Product(vec![
                 ReshapeDimensionExpression::InputDimension(dimension),
@@ -9900,8 +9904,8 @@ mod tests {
     #[test]
     fn test_plain_symbolic_reshape_refines_inferred_mixed_output_dimensions() {
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
-        let input =
-            builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Static(6)])));
+        let input = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(6)])));
         let output = builder
             .add_instruction(
                 ReshapeOperation::from_dimension_expressions(vec![
@@ -9943,8 +9947,10 @@ mod tests {
     #[test]
     fn test_plain_symbolic_reshape_preserves_exclusive_dynamic_bounds() {
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
-        let input =
-            builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(Some(6)), Size::Static(4)])));
+        let input = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(Some(6)), Dimension::Static(4)]),
+        ));
         let output = builder
             .add_instruction(
                 ReshapeOperation::from_dimension_expressions(vec![
@@ -10022,9 +10028,9 @@ mod tests {
     fn test_pad_lowering_casts_inferred_type_to_requested_dynamic_bound() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(Some(5))]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
-        let requested_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(Some(12))]));
+        let requested_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(12))]));
         let input_tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
         let padding_value_tensor_type = lower_tensor_type(&padding_value_type, &context, location).unwrap();
         let mut block = context.block(&[(input_tensor_type, location), (padding_value_tensor_type, location)]);
@@ -10067,11 +10073,11 @@ mod tests {
 
     #[test]
     fn test_stable_hlo_dynamic_dimension_bound_converts_exclusive_bounds() {
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Size::Static(4)), Ok(None));
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Size::Dynamic(None)), Ok(None));
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Size::Dynamic(Some(6))), Ok(Some(5)));
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Static(4)), Ok(None));
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(None)), Ok(None));
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(Some(6))), Ok(Some(5)));
         assert_eq!(
-            stable_hlo_dynamic_dimension_bound(&Size::Dynamic(Some(0))),
+            stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(Some(0))),
             Err(LoweringError::InvalidDynamicDimensionBound),
         );
     }
@@ -10083,7 +10089,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
         let error = lower_reshape_to_mlir(
-            &ReshapeOperation::new(Shape::new(vec![Size::Static(4)])),
+            &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
             &[],
             &[test_vector_type(4)],
             &mut block,
@@ -10102,7 +10108,7 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Size::Static(6)])).with_dimensions([1, 0]),
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
                 Vec::new(),
                 vec![input],
             )
@@ -10136,7 +10142,7 @@ mod tests {
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Size::Static(2), Size::Static(2)]))
+                ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
                     .with_output_sharding(output_sharding),
                 Vec::new(),
                 vec![input],
@@ -10166,10 +10172,10 @@ mod tests {
     #[test]
     fn test_plain_dynamic_broadcast_lowers_to_bounded_runtime_shape() {
         let input_type = test_matrix_type(1, 3);
-        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Size::Static(3)]));
+        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let output_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3), Size::Dynamic(Some(4))]),
+            Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
         );
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
         let input = builder.add_input(input_type);
@@ -10221,10 +10227,10 @@ mod tests {
         use crate::tests::{values_from_bytes, values_to_bytes};
 
         let input_type = test_matrix_type(1, 3);
-        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Size::Static(3)]));
+        let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let output_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3), Size::Dynamic(Some(4))]),
+            Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
         );
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
         let input = builder.add_input(input_type);
@@ -10605,7 +10611,7 @@ mod tests {
     fn test_elementwise_lowering_normalizes_zero_sized_operands() {
         let mut builder = XlaProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)])));
+        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
         let output = builder.add_instruction(DivOperation, Vec::new(), vec![scalar, empty]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -11169,7 +11175,7 @@ mod tests {
         axes: Vec<usize>,
         dimensions: Vec<usize>,
     ) -> Result<String, LoweringError> {
-        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Size::Static).collect()));
+        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
@@ -11423,8 +11429,10 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_zero_sized_coordinate_basis() {
-        let leaf_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(0), Size::Static(3)]));
+        let leaf_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(0), Dimension::Static(3)]),
+        );
         let mut builder = XlaProgramBuilder::new();
         let output = builder
             .add_instruction(
@@ -11480,12 +11488,12 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_gather() {
         use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation};
-        use ryft_core::types::{Shape, Size};
+        use ryft_core::types::{Dimension, Shape};
 
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
         // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let mut builder = XlaProgramBuilder::new();
         let operand = builder.add_input(operand_type);
@@ -11513,12 +11521,12 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
         use ryft_core::operations::manipulation::{GatherDimensionNumbers, GatherOperation, GatherScatterMode};
-        use ryft_core::types::{Shape, Size};
+        use ryft_core::types::{Dimension, Shape};
 
         // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
         // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
             .with_mode(GatherScatterMode::Clip);
         let mut builder = XlaProgramBuilder::new();
@@ -11543,13 +11551,13 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_scatter() {
         use ryft_core::operations::manipulation::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
-        use ryft_core::types::{Shape, Size};
+        use ryft_core::types::{Dimension, Shape};
 
         // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
         // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
-        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
         let mut builder = XlaProgramBuilder::new();
@@ -11665,7 +11673,7 @@ mod tests {
         // predicate shape equals the state shape here, so no broadcast is needed for the mask.
         use ryft_core::operations::compare::CompareOperation;
         use ryft_core::operations::constants::{OneLikeOperation, ZeroLikeOperation};
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
@@ -11854,7 +11862,7 @@ mod tests {
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
         // each print's dataflow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
         // call results).
-        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let doubled = builder.add_instruction(AddOperation, Vec::new(), vec![input, input]).unwrap()[0];
@@ -11894,7 +11902,7 @@ mod tests {
         // `stablehlo.custom_call` whose `backend_config` dictionary carries the typed encodings (string, `i1`
         // Boolean, signless `i64`, and `f64`); a pure attribute-free call lowers with an empty dictionary and
         // no `has_side_effect` marker.
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let left = builder.add_input(array_type.clone());
         let right = builder.add_input(array_type.clone());
@@ -11935,8 +11943,8 @@ mod tests {
 
         // A two-operand descending sort lowers to a stable `stablehlo.sort` whose synthesized comparator compares
         // the key pair with `GT` and `TOTALORDER` semantics, and whose index passenger rides along unexamined.
-        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
-        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
+        let key_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let index_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = XlaProgramBuilder::new();
         let keys = builder.add_input(key_type.clone());
         let indices = builder.add_input(index_type.clone());
@@ -11978,9 +11986,9 @@ mod tests {
         // that key's data type (`TOTALORDER` for the `f32` primary key, including its equality comparison so NaN
         // ties fall through deterministically, and `SIGNED` for the `i32` secondary key), while the passenger rides
         // along unexamined.
-        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
-        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
-        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let primary_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let secondary_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
+        let passenger_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = XlaProgramBuilder::new();
         let primary = builder.add_input(primary_type.clone());
         let secondary = builder.add_input(secondary_type.clone());
@@ -12025,8 +12033,9 @@ mod tests {
 
         // An accumulation-typed dot lowers to a `stablehlo.dot_general` whose result type is the accumulation type
         // (XLA's `preferred_element_type` contract), with the operands kept at their narrow element type.
-        let operand_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let operand_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let lhs = builder.add_input(operand_type.clone());
         let rhs = builder.add_input(operand_type.clone());
@@ -12059,9 +12068,11 @@ mod tests {
     {
         use ryft_core::operations::math::ScaledDotOperation;
 
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(16)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(1)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
@@ -12136,13 +12147,19 @@ mod tests {
     -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
         use ryft_core::operations::math::ScaledDotOperation;
 
-        let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(16)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(1)]));
+        let element_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(16)]),
+        );
+        let scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(1)]),
+        );
         let global_scale_type = ArrayType::scalar(DataType::F32);
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let output_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+        );
         let mut builder = XlaProgramBuilder::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
@@ -12220,9 +12237,11 @@ mod tests {
         // scaled dot inside a shared callee still lowers to the `__op$block_scaled_dot` custom call on CUDA.
         use ryft_core::operations::math::ScaledDotOperation;
 
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(16)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(1)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut callee_builder = XlaProgramBuilder::new();
         let callee_inputs = vec![
             callee_builder.add_input(element_type.clone()),
@@ -12284,7 +12303,12 @@ mod tests {
     ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
         let operand_type = ArrayType::new(
             data_type,
-            Shape::new(vec![Size::Static(1), Size::Static(4), Size::Static(2), Size::Static(head_dimension)]),
+            Shape::new(vec![
+                Dimension::Static(1),
+                Dimension::Static(4),
+                Dimension::Static(2),
+                Dimension::Static(head_dimension),
+            ]),
         );
         let mut builder = XlaProgramBuilder::new();
         let inputs = vec![
@@ -12439,22 +12463,37 @@ mod tests {
     ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
         let query_type = ArrayType::new(
             data_type,
-            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(query_heads), Size::Static(8)]),
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(query_heads),
+                Dimension::Static(8),
+            ]),
         );
         let key_value_type = ArrayType::new(
             data_type,
-            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(key_value_heads), Size::Static(8)]),
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(key_value_heads),
+                Dimension::Static(8),
+            ]),
         );
         let mut builder = XlaProgramBuilder::new();
         let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
         if bias {
             input_types.push(ArrayType::new(
                 data_type,
-                Shape::new(vec![Size::Static(1), Size::Static(query_heads), Size::Static(4), Size::Static(4)]),
+                Shape::new(vec![
+                    Dimension::Static(1),
+                    Dimension::Static(query_heads),
+                    Dimension::Static(4),
+                    Dimension::Static(4),
+                ]),
             ));
         }
         if sequence_lengths {
-            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)]));
+            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
             input_types.push(lengths_type.clone());
             input_types.push(lengths_type);
         }
@@ -12484,27 +12523,42 @@ mod tests {
     ) -> (XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, Vec<ArrayType>, Vec<ArrayType>) {
         let query_type = ArrayType::new(
             data_type,
-            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(query_heads), Size::Static(8)]),
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(query_heads),
+                Dimension::Static(8),
+            ]),
         );
         let key_value_type = ArrayType::new(
             data_type,
-            Shape::new(vec![Size::Static(2), Size::Static(4), Size::Static(key_value_heads), Size::Static(8)]),
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(key_value_heads),
+                Dimension::Static(8),
+            ]),
         );
         let activation_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Size::Static(2), Size::Static(query_heads), Size::Static(4)]),
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(query_heads), Dimension::Static(4)]),
         );
         let mut builder = XlaProgramBuilder::new();
         let mut input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type];
         if bias {
             input_types.push(ArrayType::new(
                 data_type,
-                Shape::new(vec![Size::Static(1), Size::Static(query_heads), Size::Static(4), Size::Static(4)]),
+                Shape::new(vec![
+                    Dimension::Static(1),
+                    Dimension::Static(query_heads),
+                    Dimension::Static(4),
+                    Dimension::Static(4),
+                ]),
             ));
         }
         input_types.extend([query_type.clone(), activation_type, query_type]);
         if sequence_lengths {
-            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)]));
+            let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
             input_types.push(lengths_type.clone());
             input_types.push(lengths_type);
         }
@@ -12857,8 +12911,8 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_rng_bit_generator() {
         use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 
-        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)]));
-        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(4)]));
+        let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4)]));
         let mut builder = XlaProgramBuilder::new();
         let state = builder.add_input(state_type.clone());
         let outputs = builder
@@ -12910,7 +12964,7 @@ mod tests {
             .unwrap();
         let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
-        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let init = builder.add_input(scalar_f64.clone());
@@ -13080,7 +13134,7 @@ mod tests {
         .unwrap();
         let engine = XlaDomain::new(&client);
 
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
@@ -13147,7 +13201,7 @@ mod tests {
             .unwrap();
         let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
-        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let init = builder.add_input(scalar_f64.clone());
@@ -13247,7 +13301,7 @@ mod tests {
         // the condition is evaluated once per iteration (seeded before the loop, recomputed in the body) rather than
         // twice. Items [3, 1, 2] terminate after 3, 1, and 2 iterations and all land at 0; a masking bug (or a
         // rejoining finished item) would leave nonzero or negative entries.
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
@@ -13544,7 +13598,8 @@ mod tests {
         );
 
         // Dynamic operands lower directly too; StableHLO carries the exact runtime sum on the concatenated axis.
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
@@ -13569,8 +13624,9 @@ mod tests {
 
         // Transposing a concatenate with dynamic non-concatenated dimensions lowers its full-extent slices through
         // `stablehlo.real_dynamic_slice`.
-        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Dynamic(None)]));
-        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Dynamic(None)]));
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]));
+        let right_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(None)]));
         let mut builder = XlaProgramBuilder::new();
         let left = builder.add_input(left_type);
         let right = builder.add_input(right_type);
@@ -13716,7 +13772,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_preserves_dynamic_pad_bound() {
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(Some(5))]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
@@ -14033,7 +14089,7 @@ mod tests {
 
     #[test]
     fn test_zero_space_type_and_constant_lower_to_a_false_i1_carrier() {
-        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let output_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let output = builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new()).unwrap()[0];
         let program = builder
@@ -14049,7 +14105,7 @@ mod tests {
 
     #[test]
     fn test_zero_space_one_like_lowers_to_the_unique_zero_value() {
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(OneLikeOperation, Vec::new(), vec![input]).unwrap()[0];
@@ -14066,9 +14122,9 @@ mod tests {
 
     #[test]
     fn test_xla_executable_signature_erases_only_static_zero_space_leaves() {
-        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
-        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Dynamic(Some(3))]));
-        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]));
+        let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
         let signature = XlaExecutableSignature::new(
             &[static_zero.clone(), boolean.clone(), dynamic_zero.clone()],
             &[dynamic_zero, static_zero],
@@ -14082,7 +14138,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -14107,7 +14163,7 @@ mod tests {
     fn test_to_mlir_module_for_program_preserves_effects_that_produce_an_erased_output() {
         use ryft_core::operations::debugging::PrintOperation;
 
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let output = builder.add_instruction(PrintOperation::new("zero"), Vec::new(), vec![input]).unwrap()[0];
@@ -14122,7 +14178,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Dynamic(Some(3))]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();

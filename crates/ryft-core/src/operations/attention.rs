@@ -23,7 +23,7 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::DomainTracer;
 use crate::tracing_v2::custom_derivatives::{CustomVjp, custom_vjp};
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -685,7 +685,7 @@ fn validated_dropout(operation_name: &str, dropout: Option<(f64, u64)>) -> Resul
 
 /// Returns the static [`Shape`] with the provided dimensions.
 fn static_shape(dimensions: &[usize]) -> Shape {
-    Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect())
+    Shape::new(dimensions.iter().map(|&size| Dimension::Static(size)).collect())
 }
 
 /// Returns the `[batch, q_seq, heads, head_dim]` attention output type at the operand data type.
@@ -973,8 +973,8 @@ where
                 dimensions = materialized_dimensions;
                 materialized_bias_batch = true;
             }
-            let merged_dimensions = std::iter::once(Size::Static(dimensions[0] * dimensions[1]))
-                .chain(dimensions[2..].iter().map(|&size| Size::Static(size)))
+            let merged_dimensions = std::iter::once(Dimension::Static(dimensions[0] * dimensions[1]))
+                .chain(dimensions[2..].iter().map(|&size| Dimension::Static(size)))
                 .collect();
             let merged_value = value.reshape(Shape::new(merged_dimensions))?;
             Ok(ArrayBatch::replicated(merged_value))
@@ -992,7 +992,7 @@ where
             let split_dimensions = [axis_size, output_dimensions[0] / axis_size]
                 .into_iter()
                 .chain(output_dimensions[1..].iter().copied())
-                .map(Size::Static)
+                .map(Dimension::Static)
                 .collect();
             let mut split_value = output.value().reshape(Shape::new(split_dimensions))?;
             if materialized_bias_batch && bias_cotangent_index == Some(index) {
@@ -2190,7 +2190,7 @@ mod tests {
 
     /// Returns the static [`ArrayType`] with the provided data type and dimensions used throughout these tests.
     fn attention_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Size::Static(size)).collect()))
+        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|&size| Dimension::Static(size)).collect()))
     }
 
     /// Plain-Rust host reference for `BTNH` scaled dot-product attention with `f64` accumulation, covering grouped
@@ -2667,7 +2667,7 @@ mod tests {
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
                         key_value.clone(),
                         key_value.clone(),
                     ],
@@ -2677,7 +2677,7 @@ mod tests {
                     input_types = [
                         query.clone(),
                         attention_type(DataType::F32, &[2, 5, 2, 3]),
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
                     ],
                     error = "'dot_product_attention' value must have rank 4 but got rank 1",
                 },
@@ -2802,7 +2802,7 @@ mod tests {
                     input_types = [
                         ArrayType::new(
                             DataType::F32,
-                            Shape::new(vec![Size::Static(2), Size::Dynamic(None), Size::Static(2), Size::Static(3)]),
+                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
                         ),
                         key_value.clone(),
                         key_value.clone(),
@@ -3072,7 +3072,13 @@ mod tests {
 
         let stacked_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(2), Size::Static(1), Size::Static(2)]),
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(1),
+                Dimension::Static(2),
+                Dimension::Static(1),
+                Dimension::Static(2),
+            ]),
         );
         let stack = |first: &[f64], second: &[f64]| {
             let values = first.iter().chain(second.iter()).copied().collect::<Vec<_>>();

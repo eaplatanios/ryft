@@ -23,7 +23,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, Shape, Size};
+use crate::types::{ArrayType, Dimension, Shape};
 
 /// Canonical operation name for [`ConcatenateOperation`].
 pub const CONCATENATE_OPERATION_NAME: &str = "concatenate";
@@ -151,7 +151,7 @@ impl_differentiable_operation! {
                     for (index, input) in inputs.iter().enumerate() {
                         let input_type = input.r#type();
                         let dimension = input_type.dimension(axis);
-                        let Size::Static(input_axis_size) = dimension else {
+                        let Dimension::Static(input_axis_size) = dimension else {
                             return Err(TypeError::invalid(format!(
                                     "'{CONCATENATE_OPERATION_NAME}' transpose requires a static size along the \
                                     concatenated axis {axis} but operand {index} has size {dimension}",
@@ -347,8 +347,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-/// Validates `inputs` and returns their combined dimension [`Size`] along `axis`.
-fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Result<Size, TypeError> {
+/// Validates `inputs` and returns their combined dimension [`Dimension`] along `axis`.
+fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Result<Dimension, TypeError> {
     let first = inputs[0];
     let rank = first.rank();
     let mut concatenated_static = 0usize;
@@ -399,7 +399,7 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
         }
 
         match operand.dimension(axis) {
-            Size::Static(size) => {
+            Dimension::Static(size) => {
                 concatenated_static = concatenated_static.checked_add(size).ok_or_else(|| {
                     TypeError::invalid(format!(
                         "'{CONCATENATE_OPERATION_NAME}' output size overflows usize on axis {axis}",
@@ -407,7 +407,7 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
                 })?;
                 maximum_concatenated_size = maximum_concatenated_size.and_then(|maximum| maximum.checked_add(size));
             }
-            Size::Dynamic(upper_bound) => {
+            Dimension::Dynamic(upper_bound) => {
                 concatenated_dynamic = true;
                 maximum_concatenated_size = match (maximum_concatenated_size, upper_bound) {
                     (Some(maximum), Some(upper_bound)) => maximum.checked_add(upper_bound.saturating_sub(1)),
@@ -420,9 +420,9 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
     if concatenated_dynamic {
         // Bounds are exclusive. Sum each operand's maximum possible size, then add one to make the result exclusive.
         // If that final addition overflows, retain an unbounded dynamic result.
-        Ok(Size::Dynamic(maximum_concatenated_size.and_then(|maximum| maximum.checked_add(1))))
+        Ok(Dimension::Dynamic(maximum_concatenated_size.and_then(|maximum| maximum.checked_add(1))))
     } else {
-        Ok(Size::Static(concatenated_static))
+        Ok(Dimension::Static(concatenated_static))
     }
 }
 
@@ -545,13 +545,16 @@ mod tests {
 
         // Type inference sums the concatenated axis, preserves matching non-concatenated axes, and reports exact
         // validation errors. Dynamic concatenated dimensions propagate their tight exclusive upper bound.
-        let first_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        let second_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(2)]));
-        let dynamic_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
-        let bounded_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(2)]));
-        let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
-        let dynamic_non_axis = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(None)]));
+        let first_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
+        let second_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]));
+        let dynamic_stack =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]));
+        let bounded_stack =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Static(2)]));
+        let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
+        let dynamic_non_axis =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(None)]));
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -563,21 +566,21 @@ mod tests {
                     input_types = [dynamic_stack, fixed_slice.clone()],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Dynamic(None), Size::Static(2)]),
+                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]),
                     )],
                 },
                 {
                     input_types = [bounded_stack, fixed_slice],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Dynamic(Some(5)), Size::Static(2)]),
+                        Shape::new(vec![Dimension::Dynamic(Some(5)), Dimension::Static(2)]),
                     )],
                 },
                 {
                     input_types = [dynamic_non_axis.clone(), dynamic_non_axis.clone()],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Static(2), Size::Dynamic(None)]),
+                        Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]),
                     )],
                 },
                 {
@@ -592,7 +595,7 @@ mod tests {
                 {
                     input_types = [
                         first_type.clone(),
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
                     ],
                     error = "'concatenate' operands must share one data type but operand 1 has data type f32 and \
                         operand 0 has data type f64",
@@ -600,7 +603,7 @@ mod tests {
                 {
                     input_types = [
                         first_type.clone(),
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(5)])),
                     ],
                     error = "'concatenate' operands must agree on every axis other than 0 but operand 1 has size 5 \
                         on axis 1 and operand 0 has size 2",
@@ -608,7 +611,7 @@ mod tests {
                 {
                     input_types = [
                         dynamic_non_axis,
-                        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(Some(3))])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(Some(3))])),
                     ],
                     error = "'concatenate' operands must agree on every axis other than 0 but operand 1 has size <3 \
                         on axis 1 and operand 0 has size *",
@@ -812,11 +815,11 @@ mod tests {
                     inputs = [
                         (@linear(type = ArrayType::new(
                             DataType::F64,
-                            Shape::new(vec![Size::Static(2), Size::Dynamic(None)]),
+                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]),
                         ))),
                         (@linear(type = ArrayType::new(
                             DataType::F64,
-                            Shape::new(vec![Size::Static(3), Size::Dynamic(None)]),
+                            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(None)]),
                         ))),
                     ],
                     output_cotangents = [Array::matrix(
@@ -877,13 +880,14 @@ mod tests {
                 .unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 2);
         let row = |sharding: Option<Sharding>| {
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]))
                 .with_sharding(sharding)
                 .unwrap()
         };
 
         // Identical spatial placement is preserved, while an absent placement is neutral in either operand order.
-        let expected = row(Some(spatial.clone())).with_shape(Shape::new(vec![Size::Static(8), Size::Static(2)]));
+        let expected =
+            row(Some(spatial.clone())).with_shape(Shape::new(vec![Dimension::Static(8), Dimension::Static(2)]));
         assert_eq!(
             operation.infer_output_types(&[row(Some(spatial.clone())), row(Some(spatial.clone()))], &[]),
             Ok(vec![expected.clone()]),
@@ -1019,15 +1023,17 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]))
-                .with_sharding(physical_sharding.clone())
-                .unwrap();
-            let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]))
+            let physical_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                    .with_sharding(physical_sharding.clone())
+                    .unwrap();
+            let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
-            let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-                .with_sharding(physical_sharding)
-                .unwrap();
+            let expected_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+                    .with_sharding(physical_sharding)
+                    .unwrap();
             check_operation_batching!(
                 @exact,
                 context = EagerContext::<Array, ArrayOperation<Array>>::new(),
@@ -1055,9 +1061,9 @@ mod tests {
     #[test]
     fn test_array_type_concatenate() {
         // The type-level capability accepts negative axes and preserves a sole input exactly.
-        let left = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
-        let right = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let expected = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]));
+        let left = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let right = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let expected = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
         assert_eq!(ArrayType::concatenate([&left, &right], -1), Ok(expected));
 
         let placed = left
@@ -1066,7 +1072,7 @@ mod tests {
         assert_eq!(ArrayType::concatenate([&placed], 2), Ok(placed.clone()));
 
         // Multiple inputs preserve their common memory space but clear physical layout metadata.
-        let host_row = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))
+        let host_row = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])))
             .with_memory(Memory::Host { pinned: true });
         let host_output = ArrayType::concatenate([&host_row, &host_row], 0).unwrap();
@@ -1074,7 +1080,10 @@ mod tests {
         assert_eq!(host_output.layout(), None);
         assert_eq!(
             ArrayType::concatenate(
-                [&host_row, &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]))],
+                [
+                    &host_row,
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]))
+                ],
                 0,
             ),
             Err(ProgramError::Type(TypeError::invalid(
@@ -1088,8 +1097,8 @@ mod tests {
         assert_eq!(
             ArrayType::concatenate(
                 [
-                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)])),
-                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
                 ],
                 -3,
             ),
@@ -1100,8 +1109,8 @@ mod tests {
         assert_eq!(
             ArrayType::concatenate(
                 [
-                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(usize::MAX)])),
-                    &ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX)])),
+                    &ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])),
                 ],
                 0,
             ),

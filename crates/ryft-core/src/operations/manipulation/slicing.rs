@@ -27,7 +27,7 @@ use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Memory, Shape, Size};
+use crate::types::{ArrayType, Dimension, Memory, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -233,17 +233,17 @@ impl Operation<ArrayType> for SliceOperation {
                             )));
                         }
                         output_dimensions.push(match input_type.dimension(axis) {
-                            Size::Static(size) => Size::Static(size.div_ceil(stride)),
-                            Size::Dynamic(None) => Size::Dynamic(None),
-                            Size::Dynamic(Some(0)) => Size::Dynamic(Some(0)),
-                            Size::Dynamic(Some(upper_bound)) => {
-                                Size::Dynamic((upper_bound - 1).div_ceil(stride).checked_add(1))
+                            Dimension::Static(size) => Dimension::Static(size.div_ceil(stride)),
+                            Dimension::Dynamic(None) => Dimension::Dynamic(None),
+                            Dimension::Dynamic(Some(0)) => Dimension::Dynamic(Some(0)),
+                            Dimension::Dynamic(Some(upper_bound)) => {
+                                Dimension::Dynamic((upper_bound - 1).div_ceil(stride).checked_add(1))
                             }
                         });
                         continue;
                     }
                     let dimension = input_type.dimension(axis);
-                    let Size::Static(size) = dimension else {
+                    let Dimension::Static(size) = dimension else {
                         return Err(TypeError::invalid(format!(
                             "'slice' does not support dynamic input axis {axis} with size {dimension}; slice \
                                  bounds cannot be validated against an unknown extent",
@@ -264,7 +264,7 @@ impl Operation<ArrayType> for SliceOperation {
                             "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
                         )));
                     }
-                    output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
+                    output_dimensions.push(Dimension::Static((limit - start).div_ceil(stride)));
                 }
                 let sharding = resized_output_sharding(input_type, &output_dimensions, SLICE_OPERATION_NAME)?;
                 ArrayType::new(input_type.data_type(), Shape::new(output_dimensions))
@@ -537,19 +537,19 @@ pub trait Slice: Sized {
 /// The check is gated to explicit axes, leaving `Manual`/`Auto` shardings to `shard_map` / the compiler.
 pub(crate) fn resized_output_sharding(
     operand: &ArrayType,
-    output_sizes: &[Size],
+    output_sizes: &[Dimension],
     op: &'static str,
 ) -> Result<Option<Sharding>, TypeError> {
     let Some(sharding) = operand.sharding() else {
         return Ok(None);
     };
     for (axis, (input_size, output_size)) in operand.shape().dimensions().iter().zip(output_sizes).enumerate() {
-        let (ShardingDimension::Sharded(axis_names), Size::Static(output_size)) =
+        let (ShardingDimension::Sharded(axis_names), Dimension::Static(output_size)) =
             (&sharding.dimensions()[axis], output_size)
         else {
             continue;
         };
-        if input_size == &Size::Static(*output_size) {
+        if input_size == &Dimension::Static(*output_size) {
             continue;
         }
         // `product()` over an empty iterator is 1, so dimensions sharded only over Manual/Auto axes skip the check.
@@ -642,7 +642,7 @@ impl Slice for ArrayType {
             start_indices.iter().zip(limit_indices.iter()).zip(strides.iter()).enumerate()
         {
             let dimension = self.dimension(axis);
-            let Size::Static(size) = dimension else {
+            let Dimension::Static(size) = dimension else {
                 return Err(TypeError::invalid(format!(
                     "'slice' does not support dynamic input axis {axis} with size {dimension}; slice bounds \
                         cannot be validated against an unknown extent",
@@ -667,7 +667,7 @@ impl Slice for ArrayType {
                 ))
                 .into());
             }
-            output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
+            output_dimensions.push(Dimension::Static((limit - start).div_ceil(stride)));
         }
         if output_dimensions.as_slice() == self.shape().dimensions() {
             return Ok(self.clone());
@@ -965,7 +965,7 @@ impl UpdateSlice for ArrayType {
         }
         for (axis, &start) in start_indices.iter().enumerate() {
             let update_dimension = update.dimension(axis);
-            let Size::Static(update_size) = update_dimension else {
+            let Dimension::Static(update_size) = update_dimension else {
                 return Err(TypeError::invalid(format!(
                     "'update_slice' does not support dynamic update axis {axis} with size {update_dimension}; \
                         update shapes must be static",
@@ -973,7 +973,7 @@ impl UpdateSlice for ArrayType {
                 .into());
             };
             let input_dimension = self.dimension(axis);
-            let Size::Static(input_size) = input_dimension else {
+            let Dimension::Static(input_size) = input_dimension else {
                 return Err(TypeError::invalid(format!(
                     "'update_slice' cannot prove that the update fits along dynamic input axis {axis} with \
                         size {input_dimension}",
@@ -1018,7 +1018,7 @@ where
 /// run time. Refer to the documentation of [`DynamicSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation {
-    /// Size of the extracted slice along each input axis.
+    /// Dimension of the extracted slice along each input axis.
     sizes: Vec<usize>,
 }
 
@@ -1189,7 +1189,7 @@ where
 /// extracted block always lies in bounds: the effective start index along axis `d` is
 /// `clamp(0, start_indices[d], input_dimension[d] - sizes[d])`. The output shape is exactly `sizes` and is therefore
 /// fully static even though the slice origin is not. Each static input axis must satisfy
-/// `sizes[d] <= input_dimension[d]`. A [`Size::Dynamic`] input axis is accepted: the clamp keeps the read in bounds
+/// `sizes[d] <= input_dimension[d]`. A [`Dimension::Dynamic`] input axis is accepted: the clamp keeps the read in bounds
 /// against any runtime extent satisfying the operation's `sizes[d] <= input_dimension[d]` precondition, and the output
 /// dimension is still the static `sizes[d]`. A finite dynamic upper bound is rejected when it proves that no admissible
 /// runtime extent could satisfy that precondition. This is what lets a dynamically-sized stack (such as the residual
@@ -1227,7 +1227,7 @@ pub trait DynamicSlice: Sized {
     ///
     ///   - `start_indices`: Scalar integer start index values, one per input axis, clamped to keep the extracted
     ///     block in bounds.
-    ///   - `sizes`: Size of the extracted slice along each input axis.
+    ///   - `sizes`: Dimension of the extracted slice along each input axis.
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError>;
 }
 
@@ -1254,13 +1254,13 @@ impl DynamicSlice for ArrayType {
             // `[0, input_dimension - size]`, so the read always stays in bounds and the output shape is the static
             // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
             match self.dimension(axis) {
-                Size::Static(input_size) if size > input_size => {
+                Dimension::Static(input_size) if size > input_size => {
                     return Err(TypeError::invalid(format!(
                         "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
                     ))
                     .into());
                 }
-                Size::Dynamic(Some(upper_bound)) if size >= upper_bound => {
+                Dimension::Dynamic(Some(upper_bound)) if size >= upper_bound => {
                     return Err(TypeError::invalid(format!(
                         "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
                              {upper_bound}",
@@ -1270,7 +1270,7 @@ impl DynamicSlice for ArrayType {
                 _ => {}
             }
         }
-        let output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
+        let output_dimensions: Vec<Dimension> = sizes.iter().map(|size| Dimension::Static(*size)).collect();
         if output_dimensions.as_slice() == self.shape().dimensions() {
             return Ok(self.clone());
         }
@@ -1542,7 +1542,7 @@ impl DynamicUpdateSlice for ArrayType {
         validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
         for axis in 0..rank {
             let update_dimension = update.dimension(axis);
-            let Size::Static(update_size) = update_dimension else {
+            let Dimension::Static(update_size) = update_dimension else {
                 return Err(TypeError::invalid(format!(
                     "'dynamic_update_slice' does not support dynamic update axis {axis} with size \
                         {update_dimension}; update shapes must be static",
@@ -1550,7 +1550,7 @@ impl DynamicUpdateSlice for ArrayType {
                 .into());
             };
             let input_dimension = self.dimension(axis);
-            let Size::Static(input_size) = input_dimension else {
+            let Dimension::Static(input_size) = input_dimension else {
                 return Err(TypeError::invalid(format!(
                     "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis {axis} \
                         with size {input_dimension}",
@@ -1604,7 +1604,7 @@ pub struct LinearDynamicSliceOperation<F> {
     /// Captured scalar integer start index factors, one per input axis.
     start_indices: Vec<F>,
 
-    /// Size of the extracted slice along each input axis.
+    /// Dimension of the extracted slice along each input axis.
     sizes: Vec<usize>,
 }
 
@@ -2046,7 +2046,7 @@ where
             .value()
             .clone()
             .slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
-    item_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
+    item_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Dimension::Static(dimension)).collect()))
 }
 
 /// Returns a copy of `sharding` with the placement of array dimension `index` replaced by `dimension`, preserving the
@@ -2094,7 +2094,7 @@ where
             }
             Some(accumulator) => {
                 let mut expanded_dimensions = Vec::with_capacity(output_item_type.rank() + 1);
-                expanded_dimensions.push(Size::Static(1));
+                expanded_dimensions.push(Dimension::Static(1));
                 expanded_dimensions.extend(output_item_type.shape().dimensions().iter().cloned());
                 let expanded = output_item.reshape(Shape::new(expanded_dimensions))?;
                 let mut write_indices = vec![0; output_item_type.rank() + 1];
@@ -2230,7 +2230,8 @@ mod tests {
     /// Returns a batch-varying scalar integer index batch carrying one start index per batch item, mapped at axis `0`.
     fn batch_varying_indices(values: Vec<f64>) -> ArrayBatch<Array> {
         let length = values.len();
-        let value = Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(length)])), values);
+        let value =
+            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])), values);
         ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
     }
 
@@ -2246,8 +2247,8 @@ mod tests {
 
         // Type inference validates the slice bounds and returns the sliced type, and the type-level (abstract)
         // capability backs it without consuming the borrowed input type.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -2262,7 +2263,7 @@ mod tests {
                 {
                     input_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Size::Dynamic(None), Size::Static(3)]),
+                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]),
                     )],
                     error = "'slice' does not support dynamic input axis 0 with size *; slice bounds cannot be \
                         validated against an unknown extent",
@@ -2290,10 +2291,10 @@ mod tests {
         let strided = SliceOperation::new(vec![1], vec![6]).with_strides(vec![2]).unwrap();
         assert_eq!(strided.strides(), &[2]);
         assert_eq!(format!("{strided}"), "slice [start_indices=[1], limit_indices=[6], strides=[2]]");
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(6)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
         assert_eq!(
             strided.infer_output_types(std::slice::from_ref(&vector_type), &[]),
-            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))]),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))]),
         );
 
         // Strided interpretation keeps the elements at `start + i * stride`.
@@ -2307,12 +2308,12 @@ mod tests {
         let single = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[1], &[4], &[5]).unwrap();
         assert_eq!(single.to_f64s(), vec![1.0]);
         let strided_empty = Array::vector(vec![0.0, 1.0, 2.0, 3.0]).slice(&[2], &[2], &[2]).unwrap();
-        assert_eq!(*strided_empty.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)])));
+        assert_eq!(*strided_empty.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
         assert_eq!(strided_empty.to_f64s(), Vec::<f64>::new());
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
+            operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))], &[]),
             Err(TypeError::invalid("'slice' start_indices has length 2 but input has rank 1".to_string())),
         );
         assert_eq!(
@@ -2477,8 +2478,8 @@ mod tests {
 
         // Type inference validates that the update fits and returns the input type, and the type-level (abstract)
         // capability backs it without consuming the borrowed input type.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -2493,7 +2494,7 @@ mod tests {
                 {
                     input_types = [
                         input_type.clone(),
-                        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
                     ],
                     error = "'update_slice' input data type f64 does not match update data type f32",
                 },
@@ -2523,7 +2524,7 @@ mod tests {
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
             operation.infer_output_types(
-                &[input_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),],
+                &[input_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),],
                 &[],
             ),
             Err(TypeError::invalid("'update_slice' update has rank 1 but input has rank 2".to_string())),
@@ -2536,7 +2537,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)])),
                 ],
                 &[],
             ),
@@ -2555,7 +2556,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(3)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Static(3)])),
                     update_type.clone(),
                 ],
                 &[],
@@ -2715,9 +2716,9 @@ mod tests {
         assert_eq!(operation.sizes(), &[1, 2]);
 
         // Type inference validates the sizes and index operand types and returns the statically shaped output.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -2776,7 +2777,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2788,7 +2789,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(2)), Size::Static(3)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2799,7 +2800,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(1)), Size::Static(3)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(1)), Dimension::Static(3)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2813,7 +2814,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])),
                     index_type.clone(),
                 ],
                 &[],
@@ -2914,8 +2915,8 @@ mod tests {
         assert_eq!(format!("{operation}"), "dynamic_update_slice");
 
         // Type inference validates the update and index operand types and returns the input type.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let index_type = ArrayType::scalar(DataType::I32);
         check_operation_type_inference!(
             operation = operation,
@@ -2969,7 +2970,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2983,7 +2984,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2995,7 +2996,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -3011,7 +3012,7 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -3024,7 +3025,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)])),
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)])),
                     update_type.clone(),
                     index_type.clone(),
                     index_type.clone(),
@@ -3139,21 +3140,29 @@ mod tests {
     #[test]
     fn test_array_slicing() {
         // Rank-3 slice exercises the row-major odometer across non-contiguous blocks.
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+        );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
         let output = Array::from_f64s(input_type.clone(), values.clone())
             .slice(&[0, 1, 2], &[2, 3, 4], &[1, 1, 1])
             .unwrap();
         assert_eq!(
             *output.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)])
+            ),
         );
         assert_eq!(output.to_f64s(), vec![6.0, 7.0, 10.0, 11.0, 18.0, 19.0, 22.0, 23.0]);
 
         // The matching update-slice writes the block back into place.
         let update = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+            ),
             vec![-6.0, -7.0, -10.0, -11.0, -18.0, -19.0, -22.0, -23.0],
         );
         let updated = Array::from_f64s(input_type, values).update_slice(&update, &[0, 1, 2]).unwrap();
@@ -3168,14 +3177,20 @@ mod tests {
         // Strided slicing walks the row-major odometer with per-axis steps: rows with stride 2 and columns with
         // stride 3 keep elements at indices (0, 0), (0, 3), (1, 0), and (1, 3) of a 2x3x4 input's last two axes.
         let strided = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
+            ),
             (0..24).map(|value| value as f64).collect(),
         )
         .slice(&[0, 0, 0], &[2, 3, 4], &[2, 2, 3])
         .unwrap();
         assert_eq!(
             *strided.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2), Size::Static(2)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(2)])
+            ),
         );
         assert_eq!(strided.to_f64s(), vec![0.0, 3.0, 8.0, 11.0]);
 
@@ -3203,10 +3218,10 @@ mod tests {
 
         // Every slicing operation preserves the operand's memory placement, and operations with update or dynamic
         // index operands reject combinations that would require an implicit transfer.
-        let host_operand =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_memory(Memory::Host { pinned: true });
-        let host_update =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])).with_memory(Memory::Host { pinned: true });
+        let host_operand = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_memory(Memory::Host { pinned: true });
+        let host_update = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+            .with_memory(Memory::Host { pinned: true });
         let host_index = ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true });
         let laid_out_host_operand = host_operand.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out_host_operand.slice(&[0], &[4], &[1]), Ok(laid_out_host_operand.clone()));
@@ -3225,7 +3240,7 @@ mod tests {
             Memory::Host { pinned: true },
         );
         assert_eq!(
-            host_operand.update_slice(&ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])), &[0]),
+            host_operand.update_slice(&ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])), &[0]),
             Err(ProgramError::Type(TypeError::invalid(
                 "'update_slice' input and update must share one memory space but reside in Host[Pinned] and \
                           Device"
@@ -3253,7 +3268,7 @@ mod tests {
                     .unwrap()
                     .with_unreduced_axes(["m"])
                     .unwrap();
-            let input = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
                 .with_sharding(sharding.clone())
                 .unwrap();
             let start = ArrayType::scalar(DataType::I32);
@@ -3276,15 +3291,16 @@ mod tests {
                     .unwrap();
             let replicated =
                 Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::replicated()]).unwrap();
-            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
                 .with_sharding(sharded.clone())
                 .unwrap();
-            let matching = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            let matching = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
                 .with_sharding(sharded.clone())
                 .unwrap();
-            let conflicting = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-                .with_sharding(replicated)
-                .unwrap();
+            let conflicting =
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
+                    .with_sharding(replicated)
+                    .unwrap();
             let start = ArrayType::scalar(DataType::I32);
 
             // Static and dynamic updates keep matching operand placement and reject explicit placement conflicts.
@@ -3304,10 +3320,10 @@ mod tests {
             ])
             .unwrap();
             let dimensions = || vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
-            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            let operand = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
                 .with_sharding(Sharding::new(mesh.clone(), dimensions()).unwrap())
                 .unwrap();
-            let update = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+            let update = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
                 .with_sharding(Sharding::new(mesh, dimensions()).unwrap().with_varying_manual_axes(["m"]).unwrap())
                 .unwrap();
 
@@ -3321,7 +3337,7 @@ mod tests {
     fn test_dynamic_slice_differentiation() {
         // Slice a [1, 2] block at start (1, 1) of a [2, 3] operand: the operand is linear and the scalar start indices
         // are the known operands. The sliced output and its cotangent have shape [1, 2].
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]);
         let sizes = vec![1, 2];
 
@@ -3359,8 +3375,8 @@ mod tests {
     fn test_dynamic_update_slice_differentiation() {
         // Update a [1, 2] block at start (0, 1) of a [2, 3] input: the input and update are linear and the scalar
         // start indices are the known operands. The output and its cotangent have shape [2, 3].
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let cotangent = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         check_operation_transposition!(
@@ -3428,7 +3444,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         // The full input is [2 (batch), 4]: the batch axis is replicated and the data axis is sharded over `x`.
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
                     .unwrap(),
@@ -3457,10 +3473,11 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)]))
-                .with_sharding(physical_sharding.clone())
-                .unwrap();
-            let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            let input_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
+                    .with_sharding(physical_sharding.clone())
+                    .unwrap();
+            let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
                 .with_sharding(Sharding::replicated(mesh, 1))
                 .unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
@@ -3508,7 +3525,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(2)]);
+        assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(2)]);
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
 
         // A batched operand pairs item `i` of the operand with item `i` of the indices; item 1's start index 3 is
@@ -3565,7 +3582,7 @@ mod tests {
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(4)]);
+        assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(4)]);
         assert_eq!(outputs[0].value().to_f64s(), vec![9.0, 9.0, 2.0, 3.0, 0.0, 1.0, 8.0, 8.0]);
 
         // A batched input with a replicated update writes the same block at each batch item's own offset.
@@ -3598,7 +3615,7 @@ mod tests {
                 let context = x.context().clone();
                 let starts = context
                     .lift(Array::from_f64s(
-                        ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                        ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])),
                         vec![1.0, 2.0],
                     ))
                     .unwrap();

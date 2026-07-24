@@ -2589,7 +2589,7 @@ macro_rules! check_operation_type_inference {
         );
         let input_type = $crate::types::ArrayType::new(
             input_data_type,
-            $crate::types::Shape::new(vec![$crate::types::Size::Static(2), $crate::types::Size::Static(3)]),
+            $crate::types::Shape::new(vec![$crate::types::Dimension::Static(2), $crate::types::Dimension::Static(3)]),
         )
         .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
         .with_memory($crate::types::Memory::Host { pinned: true });
@@ -2642,7 +2642,7 @@ macro_rules! check_operation_type_inference {
         );
         let left_type = $crate::types::ArrayType::new(
             left_data_type,
-            $crate::types::Shape::new(vec![$crate::types::Size::Static(2), $crate::types::Size::Static(3)]),
+            $crate::types::Shape::new(vec![$crate::types::Dimension::Static(2), $crate::types::Dimension::Static(3)]),
         )
         .with_layout($crate::types::Layout::Strided($crate::types::StridedLayout::new(vec![3, 1])))
         .with_memory($crate::types::Memory::Host { pinned: true });
@@ -3014,7 +3014,7 @@ macro_rules! check_operation_partial_evaluation {
 ///   - `context = $context`: Optional parent [`Context`](crate::Context) for the extended batching form.
 ///   - `driver = $driver`: Optional [`BatchingDriver`](crate::BatchingDriver) for the extended batching form.
 ///   - `operation = $operation`: [`Operation`](crate::Operation) expression evaluated once per macro invocation.
-///   - `axis_size = $axis_size`: Size of the mapped batching axis. It remains explicit because no mapped input exists
+///   - `axis_size = $axis_size`: Dimension of the mapped batching axis. It remains explicit because no mapped input exists
 ///     from which to infer it in an all-replicated case.
 ///   - `axis_sharding = $axis_sharding`: Optional [`ShardingDimension`](crate::ShardingDimension) assigned to the
 ///     mapped axis by the extended form. It appears immediately after `axis_size` because both arguments describe the
@@ -3860,7 +3860,7 @@ mod tests {
     use crate::programs::types::{Type, TypeError};
     use crate::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingError};
     use crate::tracing::{Tracer, TracingContext};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     const TEST_UNARY_OPERATION_NAME: &str = "test_unary";
     const TEST_BINARY_OPERATION_NAME: &str = "test_binary";
@@ -4892,7 +4892,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
-        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, std::slice::from_ref(&matrix_type), &[]),
             Ok(vec![matrix_type]),
@@ -4963,7 +4963,7 @@ mod tests {
             Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[scalar_type, vector_type.clone()], &[]),
             Ok(vec![vector_type]),
@@ -5022,8 +5022,8 @@ mod tests {
             Operation::<DataType>::infer_output_types(&magnitude, &[DataType::C64], &[]),
             Ok(vec![DataType::F32]),
         );
-        let complex_vector = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]));
-        let real_vector = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let complex_vector = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2)]));
+        let real_vector = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&magnitude, std::slice::from_ref(&complex_vector), &[],),
             Ok(vec![real_vector.clone()]),
@@ -5043,7 +5043,7 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), scalar.clone()], &[]),
             Ok(vec![scalar.clone()]),
         );
-        let vector = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let expected = Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), vector.clone()], &[]),

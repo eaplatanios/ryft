@@ -1048,7 +1048,7 @@ mod tests {
     use ryft_core::programs::{Program, ProgramBuilder};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{DomainTracingContext, TracingContext};
-    use ryft_core::types::{ArrayType, DataType, Shape, Size};
+    use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
 
     use crate::experimental::domains::XlaDomain;
     use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn test_shard_map_jvp_uses_tangent_boundary_descriptors() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let boundary_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(4)]));
+        let boundary_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(4)]));
         let ambient_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let ambient_input_type = boundary_type.clone().with_sharding(ambient_sharding).unwrap();
         let ambient_tangent_type = ambient_input_type.tangent();
@@ -1160,7 +1160,10 @@ mod tests {
         assert_eq!(primal_body.input_types(), vec![boundary_type]);
         assert_eq!(tangent_body.input_types()[0], boundary_tangent_type);
         assert_eq!(&tangent_body.input_types()[1..], &primal_body.output_types()[1..]);
-        assert_eq!(tangent_body.output_types(), vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))]);
+        assert_eq!(
+            tangent_body.output_types(),
+            vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))]
+        );
     }
 
     #[test]
@@ -1170,7 +1173,7 @@ mod tests {
             .unwrap()
             .with_unreduced_axes(["x"])
             .unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
         let cotangent_type = tangent_type.cotangent();
@@ -1213,7 +1216,7 @@ mod tests {
             .unwrap()
             .with_unreduced_axes(["x"])
             .unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
         let cotangent_type = tangent_type.cotangent();
@@ -1238,10 +1241,10 @@ mod tests {
     fn test_shard_map_mixed_output_transpose_materializes_zero_space_values() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 1);
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)]))
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let source = {

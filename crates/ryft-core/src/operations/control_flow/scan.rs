@@ -37,7 +37,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this.
 
@@ -243,7 +243,7 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), T
 /// types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
 pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-    dimensions.push(Size::Static(length));
+    dimensions.push(Dimension::Static(length));
     dimensions.extend(slice_type.shape().dimensions().iter().cloned());
     ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory())
 }
@@ -403,7 +403,7 @@ impl ScanTypeSemantics for ArrayType {
 
     fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
         let capture_type = capture.r#type();
-        if capture_type.rank() == 0 || capture_type.dimension(0) != Size::Static(length) {
+        if capture_type.rank() == 0 || capture_type.dimension(0) != Dimension::Static(length) {
             return Err(TypeError::invalid(format!(
                 "scan capture {index} must have leading dimension {length} but has type {capture_type}",
                 capture_type = capture_type.as_ref(),
@@ -691,7 +691,7 @@ where
     limit_indices[0] = iteration + 1;
     let unit_strides = vec![1; dimensions.len()];
     let iteration_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
-    iteration_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
+    iteration_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Dimension::Static(dimension)).collect()))
 }
 
 /// Writes `value` as slice `iteration` of `accumulator` along its leading axis, prepending a unit axis to `value`
@@ -702,7 +702,7 @@ where
 {
     let value_type = value.r#type().into_owned();
     let mut dimensions = Vec::with_capacity(value_type.rank() + 1);
-    dimensions.push(Size::Static(1));
+    dimensions.push(Dimension::Static(1));
     dimensions.extend(value_type.shape().dimensions().iter().cloned());
     let expanded = value.reshape(Shape::new(dimensions))?;
     let mut start_indices = vec![0; value_type.rank() + 1];
@@ -1441,7 +1441,7 @@ where
             for (output_type, output_axis) in
                 output_types.into_iter().zip(output_axes.into_iter()).skip(self.carry_count())
             {
-                let stacked_type = output_type.with_inserted_dimension(0, Size::Static(0))?;
+                let stacked_type = output_type.with_inserted_dimension(0, Dimension::Static(0))?;
                 let stacked_axis = match output_axis.axis() {
                     Some(axis) => BatchAxis::new(axis.value() + 1),
                     None => BatchAxis::replicated(),
@@ -1523,12 +1523,12 @@ where
                     // Unlike the scan operation's unbatched signature helper, this physical accumulator must retain
                     // the iteration value's mapped-dimension placement. The newly inserted scan dimension itself is
                     // replicated.
-                    accumulator: allocate_zero(&iteration_type.with_inserted_dimension(0, Size::Static(length))?)?,
+                    accumulator: allocate_zero(&iteration_type.with_inserted_dimension(0, Dimension::Static(length))?)?,
                     batch_axis,
                 }),
             };
             let mut expanded_dimensions = Vec::with_capacity(iteration_type.rank() + 1);
-            expanded_dimensions.push(Size::Static(1));
+            expanded_dimensions.push(Dimension::Static(1));
             expanded_dimensions.extend(iteration_type.shape().dimensions().iter().cloned());
             let expanded = iteration_y.into_value().reshape(Shape::new(expanded_dimensions))?;
             let mut start_indices = vec![0; iteration_type.rank() + 1];
@@ -1609,7 +1609,7 @@ where
         .iter()
         .enumerate()
         .filter(|(axis, _)| *axis != stack_axis)
-        .map(|(_, &dimension)| Size::Static(dimension))
+        .map(|(_, &dimension)| Dimension::Static(dimension))
         .collect::<Vec<_>>();
     let iteration_value = iteration_value.reshape(Shape::new(iteration_dimensions))?;
     let iteration_type = iteration_value.r#type().into_owned();
@@ -2253,12 +2253,12 @@ mod tests {
 
     #[test]
     fn test_scan_stacked_type_preserves_memory() {
-        let slice_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])).with_memory(Memory::Host { pinned: true });
+        let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+            .with_memory(Memory::Host { pinned: true });
 
         assert_eq!(
             stacked_scan_type(&slice_type, 2),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                 .with_memory(Memory::Host { pinned: true }),
         );
     }
@@ -2266,7 +2266,7 @@ mod tests {
     #[test]
     fn test_scan() {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let operation = TestScanOperation::new(1, 3);
         let body = product_body();
         let interfaces = vec![region_interface(&body)];
@@ -2373,7 +2373,7 @@ mod tests {
             )),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
         let dynamic_carry = builder.add_input(dynamic_type.clone());
         let dynamic_body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![dynamic_carry], vec![Placeholder], vec![Placeholder])
@@ -2421,7 +2421,7 @@ mod tests {
 
         // A zero-length scan returns the initial carries and empty stacked outputs.
         let empty = TestScanOperation::new(1, 0);
-        let empty_stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
+        let empty_stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]));
         let outputs = context
             .bind(
                 ArrayOperation::Scan(empty),
@@ -2690,7 +2690,7 @@ mod tests {
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let operation = TestScanOperation::new(1, 3);
         let interfaces = vec![region_interface(&product_body())];
 
@@ -2717,7 +2717,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(
-                &[scalar_f64, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))],
+                &[scalar_f64, ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))],
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid(
@@ -2737,7 +2737,7 @@ mod tests {
         use crate::tracing::TracingContext;
 
         let scalar = || ArrayType::scalar(DataType::F64);
-        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         // Body `[acc, k, x] -> [acc + (print(k) * k) * x, k, acc + (print(k) * k) * x]`: the print sits inside the
         // otherwise-known `k * k` chain.
@@ -2808,7 +2808,7 @@ mod tests {
         use crate::tracing::TracingContext;
 
         let scalar = || ArrayType::scalar(DataType::F64);
-        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         let mut body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = body_builder.add_input(scalar());
@@ -2865,7 +2865,7 @@ mod tests {
         use crate::tracing::TracingContext;
 
         let scalar = || ArrayType::scalar(DataType::F64);
-        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`, as in the loop-invariant test below.
         let body = || {
@@ -2954,7 +2954,7 @@ mod tests {
     #[test]
     fn test_scan_partial_evaluation_splits_time_varying_known_work() {
         let scalar = || ArrayType::scalar(DataType::F64);
-        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         // Body `[c, x] -> [c + x * x, x * x]` over an unknown accumulator `c` and known stacked `xs`.
         let body = {
@@ -3020,7 +3020,7 @@ mod tests {
     #[test]
     fn test_scan_partial_evaluation_folds_loop_invariant_known_carry() {
         let scalar = || ArrayType::scalar(DataType::F64);
-        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
 
         // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`.
         let body = || {
@@ -3147,7 +3147,7 @@ mod tests {
 
     /// Builds the `f64` array type with the provided static dimensions.
     fn f64_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
+        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
     }
 
     /// Builds a cumulative-product [`ScanOperation`] whose nested depth matches `lengths`, returning the
@@ -3218,7 +3218,7 @@ mod tests {
     #[test]
     fn test_scan_jvp_stages_one_fused_scan_with_no_residual_stacks() {
         use crate::tracing::DomainTracer;
-        use crate::types::{Shape, Size};
+        use crate::types::{Dimension, Shape};
 
         let (scan, scan_body) = product_scan();
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
@@ -3234,7 +3234,7 @@ mod tests {
                 let ys = outputs.remove(1);
                 Ok((outputs.remove(0), ys))
             },
-            (ArrayType::scalar(DataType::F64), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))),
+            (ArrayType::scalar(DataType::F64), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         )
         .unwrap();
         let program = program.to_flat_program();
@@ -3379,7 +3379,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 48.0, 72.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(3)]);
+        assert_eq!(outputs[1].r#type().shape().dimensions(), &[Dimension::Static(3), Dimension::Static(3)]);
         assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 4.0, 6.0, 6.0, 12.0, 18.0, 24.0, 48.0, 72.0]);
     }
 
@@ -3399,7 +3399,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 210.0]);
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(2)]);
+        assert_eq!(outputs[1].r#type().shape().dimensions(), &[Dimension::Static(3), Dimension::Static(2)]);
         assert_eq!(outputs[1].value().to_f64s(), vec![2.0, 5.0, 6.0, 30.0, 24.0, 210.0]);
 
         // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
@@ -3491,7 +3491,7 @@ mod tests {
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
             assert_eq!(outputs[0].value().to_f64s(), vec![24.0, 48.0]);
             assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(3), Size::Static(2)]);
+            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Dimension::Static(3), Dimension::Static(2)]);
             assert_eq!(
                 outputs[1].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
@@ -3581,18 +3581,18 @@ mod tests {
 
             assert_eq!(outputs.len(), 3);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2)]);
+            assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2)]);
             assert_eq!(outputs[0].r#type().sharding().unwrap().dimensions(), carry_sharding.dimensions());
             assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0]);
             assert_eq!(outputs[1].batch_axis(), BatchAxis::new(1));
-            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
+            assert_eq!(outputs[1].r#type().shape().dimensions(), &[Dimension::Static(0), Dimension::Static(2)]);
             assert_eq!(
                 outputs[1].r#type().sharding().unwrap().dimensions(),
                 &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
             );
             assert!(outputs[1].value().values().is_empty());
             assert_eq!(outputs[2].batch_axis(), BatchAxis::replicated());
-            assert_eq!(outputs[2].r#type().shape().dimensions(), &[Size::Static(0)]);
+            assert_eq!(outputs[2].r#type().shape().dimensions(), &[Dimension::Static(0)]);
             assert_eq!(outputs[2].r#type().sharding().unwrap().dimensions(), &[ShardingDimension::replicated()],);
             assert!(outputs[2].value().values().is_empty());
         }
@@ -3650,14 +3650,14 @@ mod tests {
             let output_types = program.output_types();
 
             assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
-            assert_eq!(output_types[0].shape().dimensions(), &[Size::Static(2)]);
+            assert_eq!(output_types[0].shape().dimensions(), &[Dimension::Static(2)]);
             assert_eq!(output_types[0].sharding().unwrap().dimensions(), carry_sharding.dimensions());
             // The staged batched scan's stacked outputs carry the scan's *declared* output types, whose optional
             // sharding metadata is left unspecified for sharding propagation to resolve (the `scan_output_types`
             // contract); only the batch axes and shapes are pinned structurally.
-            assert_eq!(output_types[1].shape().dimensions(), &[Size::Static(0), Size::Static(2)]);
+            assert_eq!(output_types[1].shape().dimensions(), &[Dimension::Static(0), Dimension::Static(2)]);
             assert_eq!(output_types[1].sharding(), None);
-            assert_eq!(output_types[2].shape().dimensions(), &[Size::Static(0)]);
+            assert_eq!(output_types[2].shape().dimensions(), &[Dimension::Static(0)]);
             assert_eq!(output_types[2].sharding(), None);
         }
     }

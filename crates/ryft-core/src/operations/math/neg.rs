@@ -62,7 +62,7 @@ mod tests {
     };
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, Shape, Size};
+    use crate::types::{ArrayType, Dimension, Shape};
 
     use super::*;
 
@@ -132,7 +132,7 @@ mod tests {
 
         // Negation is linear, so partial-sum and reduced markers pass through unchanged.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -147,7 +147,7 @@ mod tests {
                 output_types = [unreduced],
             }],
         );
-        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()

@@ -8,7 +8,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, Shardin
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use ryft_core::types::{ArrayType, DataType, Shape, Size};
+use ryft_core::types::{ArrayType, DataType, Dimension, Shape};
 
 use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaProgram};
@@ -83,7 +83,7 @@ fn scalar_type() -> ArrayType {
 ///
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
 }
 
 /// Returns a rank-2 benchmark array type.
@@ -93,7 +93,7 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `rows`: Matrix row count.
 ///   - `cols`: Matrix column count.
 fn matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
+    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
 }
 
 /// Summarizes one traced XLA program; attached nested regions (including shard-map bodies) are covered by the

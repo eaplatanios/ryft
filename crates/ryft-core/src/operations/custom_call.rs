@@ -328,13 +328,13 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::ShardingDimension;
     use crate::tracing::{DomainTracer, Trace};
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 
     /// Returns the `f32[2]` array type used throughout these tests.
     fn vector_type() -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
     }
 
     #[test]

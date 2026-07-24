@@ -18,7 +18,7 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::ShardingDimension;
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -267,7 +267,7 @@ where
                     return input.move_axis(0);
                 }
                 let unbatched_type = input.unbatched_type();
-                let mut physical_type = unbatched_type.with_inserted_dimension(0, Size::Static(axis_size))?;
+                let mut physical_type = unbatched_type.with_inserted_dimension(0, Dimension::Static(axis_size))?;
                 if let Some(sharding) = unbatched_type.sharding() {
                     physical_type.sharding = Some(
                         sharding
@@ -430,11 +430,11 @@ pub(crate) fn top_k_via_squeezed_view<V: Typed<Type = ArrayType> + TopK + Reshap
 ) -> Result<Option<(V, V)>, ProgramError> {
     let value_type = value.r#type();
     let dimensions = value_type.shape().dimensions();
-    if axis + 1 != dimensions.len() || !dimensions.iter().all(|size| matches!(size, Size::Static(_))) {
+    if axis + 1 != dimensions.len() || !dimensions.iter().all(|size| matches!(size, Dimension::Static(_))) {
         return Ok(None);
     }
-    let squeezed_count = dimensions[..axis].iter().take_while(|size| matches!(size, Size::Static(1))).count();
-    if squeezed_count == 0 || matches!(dimensions[axis], Size::Static(size) if k > size) {
+    let squeezed_count = dimensions[..axis].iter().take_while(|size| matches!(size, Dimension::Static(1))).count();
+    if squeezed_count == 0 || matches!(dimensions[axis], Dimension::Static(size) if k > size) {
         return Ok(None);
     }
     if let Some(sharding) = value_type.sharding() {
@@ -446,7 +446,7 @@ pub(crate) fn top_k_via_squeezed_view<V: Typed<Type = ArrayType> + TopK + Reshap
     let squeezed = value.reshape(Shape::new(dimensions[squeezed_count..].to_vec()))?;
     let (values, indices) = squeezed.top_k(k, axis - squeezed_count)?;
     let mut output_dimensions = dimensions.to_vec();
-    output_dimensions[axis] = Size::Static(k);
+    output_dimensions[axis] = Dimension::Static(k);
     let output_shape = Shape::new(output_dimensions);
     Ok(Some((values.reshape(output_shape.clone())?, indices.reshape(output_shape)?)))
 }
@@ -535,8 +535,8 @@ where
         .dimensions()
         .iter()
         .map(|size| match size {
-            Size::Static(size) => Ok(*size),
-            Size::Dynamic(_) => Err(ProgramError::UnsupportedOperation {
+            Dimension::Static(size) => Ok(*size),
+            Dimension::Dynamic(_) => Err(ProgramError::UnsupportedOperation {
                 message: "ranking operations do not support dynamic dimensions".to_string(),
             }),
         })
@@ -571,7 +571,7 @@ pub(crate) fn extremal_index_from_index_passenger<V: Clone + Sort + Slice + Resh
     let output_dimensions = dimensions
         .iter()
         .enumerate()
-        .filter_map(|(dimension, &size)| (dimension != axis).then_some(Size::Static(size)))
+        .filter_map(|(dimension, &size)| (dimension != axis).then_some(Dimension::Static(size)))
         .collect::<Vec<_>>();
     leading.reshape(Shape::new(output_dimensions))
 }
@@ -597,7 +597,7 @@ mod tests {
 
     /// Returns the static `f64` vector type of the provided length used throughout these tests.
     fn vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(length)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(length)]))
     }
 
     #[test]
@@ -666,9 +666,9 @@ mod tests {
     #[test]
     fn test_sort_type_inference() {
         let operation = SortOperation::new(0, SortDirection::Ascending);
-        let complex = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(4)]));
+        let complex = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]));
         // Sort operands only need to agree on shape; passenger element types pass through unchanged.
-        let passenger = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
+        let passenger = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -703,8 +703,8 @@ mod tests {
         // count, every key data type must be sortable (a complex second key is rejected), and passengers still pass
         // through unchanged.
         let multi_key = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap();
-        let complex = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(4)]));
-        let passenger = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(4)]));
+        let complex = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]));
+        let passenger = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(4)]));
         check_operation_type_inference!(
             operation = multi_key,
             cases = [
@@ -897,7 +897,7 @@ mod tests {
                 },
                 {
                     inputs = [(@unknown(
-                        type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),
+                        type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
                         replay = Array::vector(vec![3.0, 1.0, 2.0])
                     ))],
                     outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
@@ -924,7 +924,7 @@ mod tests {
                 {
                     inputs = [
                         (@unknown(
-                            type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),
+                            type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
                             replay = Array::vector(vec![2.0, 1.0, 2.0])
                         )),
                         (@known, Array::vector(vec![5.0, 9.0, 4.0])),
@@ -944,7 +944,7 @@ mod tests {
         check_operation_transposition!(
             @rejected,
             operation = SortOperation::new(0, SortDirection::Ascending),
-            input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))],
+            input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))],
         );
     }
 
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(
             indices,
             Array::new(
-                ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(3)])),
+                ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])),
                 vec![Scalar::I32(0), Scalar::I32(2), Scalar::I32(5)],
             )
             .unwrap(),
@@ -972,13 +972,13 @@ mod tests {
     fn test_top_k_with_leading_unit_dimensions() {
         /// Returns the static `f64` array of the provided dimensions holding `values`.
         fn f64_array(dimensions: Vec<usize>, values: Vec<f64>) -> Array {
-            let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+            let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
             Array::new(ArrayType::new(DataType::F64, shape), values.into_iter().map(Scalar::F64).collect()).unwrap()
         }
 
         /// Returns the static `i32` array of the provided dimensions holding `indices`.
         fn i32_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
-            let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+            let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
             Array::new(ArrayType::new(DataType::I32, shape), indices.into_iter().map(Scalar::I32).collect()).unwrap()
         }
 
@@ -1020,7 +1020,7 @@ mod tests {
     fn test_argmax_and_argmin() {
         /// Returns the expected `i32` index array of the provided static dimensions.
         fn index_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
-            let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+            let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
             Array::new(ArrayType::new(DataType::I32, shape), indices.into_iter().map(Scalar::I32).collect()).unwrap()
         }
 
@@ -1072,7 +1072,7 @@ mod tests {
         // Staging `top_k` along the trailing axis of a batch-size-1 operand squeezes the leading size-1 dimension
         // away before the composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that XLA's
         // top-k rewriter rejects) and both outputs reshape back to the original rank afterward.
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)]));
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.top_k(2, 1)?.0),
             input_type,

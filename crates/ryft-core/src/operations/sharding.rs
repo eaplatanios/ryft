@@ -505,7 +505,7 @@ mod tests {
     use crate::differentiation::{LinearizationTracer, vjp};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::Trace;
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 
@@ -519,7 +519,7 @@ mod tests {
     }
 
     fn vector_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(size)]))
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
             ReshardOperation::new(target).infer_output_types(
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(2)]),)],
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(2)]),)],
                 &[]
             ),
             Err(TypeError::invalid("reshard target sharding rank (1) does not match the input rank (2)".to_string())),
@@ -614,11 +614,11 @@ mod tests {
     }
 
     fn vector_f64_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
     }
 
     fn matrix_type(rows: usize, columns: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(columns)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
     }
 
     #[test]
@@ -658,7 +658,7 @@ mod tests {
     fn test_reshard_transposition_restores_an_unsharded_input_cotangent() {
         let mesh = mesh();
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(8)]));
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(8)]));
         let input = Array::from_f64s(input_type.clone(), vec![1.0; 8]);
         let (output, pullback) = vjp(
             {

@@ -11,7 +11,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
 /// Differential values need not use the primal representation. A compact primal storage format may require a wider
@@ -349,7 +349,7 @@ where
             ))
             .into());
         }
-        let expected_type = value_type.with_inserted_dimension(0, Size::Static(packed_direction_count))?;
+        let expected_type = value_type.with_inserted_dimension(0, Dimension::Static(packed_direction_count))?;
         let mut outputs = context.bind(
             CoordinateBasisOperation::new(value_type.clone(), coordinate_offset, packed_direction_count),
             Vec::new(),
@@ -535,7 +535,7 @@ fn validate_array_derivative_block_type(
             })?;
         for size in coordinate_shape.dimensions() {
             let index = if is_prefix { prefix_index } else { expected_type.rank() };
-            expected_type = expected_type.with_inserted_dimension(index, Size::Static(*size))?;
+            expected_type = expected_type.with_inserted_dimension(index, Dimension::Static(*size))?;
             if is_prefix {
                 prefix_index += 1;
             }
@@ -587,7 +587,7 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
             "Jacobian or Hessian materialization requires a fully static array shape but got {expected_value_type}",
         ))
     })?;
-    let coordinate_shape = Shape::new(coordinate_shape.iter().copied().map(Size::Static).collect());
+    let coordinate_shape = Shape::new(coordinate_shape.iter().copied().map(Dimension::Static).collect());
     let coordinate_count = coordinate_shape.element_count()?.unwrap();
     let coordinate_limit = coordinate_offset
         .checked_add(coordinate_count)
@@ -609,7 +609,7 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
             .dimensions()
             .iter()
             .copied()
-            .chain(item_shape.dimensions().iter().copied().map(Size::Static))
+            .chain(item_shape.dimensions().iter().copied().map(Dimension::Static))
             .collect(),
     );
     sliced.reshape(reshaped_shape)
@@ -626,7 +626,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::DataType::*;
-    use crate::types::{ArrayType, Layout, Memory, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, Dimension, Layout, Memory, Shape, StridedLayout};
 
     use super::*;
 
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_array_type_tangent() {
-        let boolean = ArrayType::new(Boolean, Shape::new(vec![Size::Static(4)]))
+        let boolean = ArrayType::new(Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![1])));
         assert_eq!(boolean.tangent(), boolean.clone().with_data_type(Zero).with_layout(None));
 
@@ -682,7 +682,7 @@ mod tests {
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let primal = ArrayType::new(F8E8M0FNU, Shape::new(vec![Size::Static(4)]))
+        let primal = ArrayType::new(F8E8M0FNU, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap()
             .with_layout(Layout::Strided(StridedLayout::new(vec![1])))
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(primal.tangent(), tangent);
 
         // An unchanged element representation retains its explicit physical layout.
-        let laid_out = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]))
+        let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out.tangent(), laid_out);
     }
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn test_array_type_cotangent() {
         // A non-differentiable element type maps to a zero cotangent space with the same structural metadata.
-        let boolean = ArrayType::new(Boolean, Shape::new(vec![Size::Static(4)]))
+        let boolean = ArrayType::new(Boolean, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![1])));
         assert_eq!(boolean.cotangent(), boolean.clone().with_data_type(Zero).with_layout(None));
 
@@ -712,7 +712,7 @@ mod tests {
         );
 
         // Without a sharding, the cotangent type is the type itself.
-        let plain = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]));
+        let plain = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]));
         assert_eq!(plain.cotangent(), plain.clone());
 
         // With a sharding, the unreduced and reduced axes are swapped.
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(e8m0.cotangent(), e8m0_cotangent);
 
         // An unchanged element representation retains its explicit physical layout.
-        let laid_out = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]))
+        let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out.cotangent(), laid_out);
     }
@@ -765,7 +765,7 @@ mod tests {
             .unwrap()
             .with_varying_manual_axes(["manual"])
             .unwrap();
-        let primal = ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
+        let primal = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]))
             .with_sharding(sharding.clone())
             .unwrap();
 
@@ -821,7 +821,7 @@ mod tests {
         );
         assert_eq!(
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
-                &ArrayType::new(F32, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+                &ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
                 transform,
                 role,
                 &path,
@@ -833,7 +833,7 @@ mod tests {
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
                 &ArrayType::new(
                     F32,
-                    Shape::new(vec![Size::Static(usize::MAX), Size::Static(usize::MAX), Size::Static(0)]),
+                    Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(usize::MAX), Dimension::Static(0)]),
                 ),
                 transform,
                 role,
@@ -843,7 +843,7 @@ mod tests {
             0,
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
         assert_eq!(
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
                 &dynamic_type,
@@ -860,7 +860,8 @@ mod tests {
             },
         );
 
-        let overflowing_type = ArrayType::new(F32, Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]));
+        let overflowing_type =
+            ArrayType::new(F32, Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]));
         assert_eq!(
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
                 &overflowing_type,
@@ -902,7 +903,7 @@ mod tests {
         let error = <ArrayType as DenseDifferentiableType<
             EagerContext<Array, ArrayOperation<Array>>,
         >>::validate_hessian_block_type(
-            &ArrayType::new(F32, Shape::new(vec![Size::Static(2)])),
+            &ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])),
             &ArrayType::scalar(F32),
             &ArrayType::scalar(F32),
             &ArrayType::scalar(F32),
@@ -914,7 +915,7 @@ mod tests {
         // values, so a packed replay output that stays in the narrow `f8e8m0fnu` storage type is rejected by both
         // extractors, whose expected per-item type is the widened `f32` differential representation.
         let narrow_type = ArrayType::scalar(F8E8M0FNU);
-        let physical_type = ArrayType::new(F8E8M0FNU, Shape::new(vec![Size::Static(1)]));
+        let physical_type = ArrayType::new(F8E8M0FNU, Shape::new(vec![Dimension::Static(1)]));
         let packed =
             ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, vec![2.0]), BatchAxis::new(0))
                 .unwrap();
@@ -947,9 +948,9 @@ mod tests {
             "batched derivative output has per-item type f8e8m0fnu[] but expected f32[]",
         );
 
-        let output_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2)]));
-        let input_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
-        let wrong_block_type = ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let output_type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)]));
+        let input_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
+        let wrong_block_type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             <ArrayType as DenseDifferentiableType<
                 EagerContext<Array, ArrayOperation<Array>>,

@@ -26,7 +26,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
+use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -299,7 +299,7 @@ fn dot_abstract(
     let lhs_result = lhs_result_axes(dimensions, lhs_rank);
     let rhs_result = rhs_result_axes(dimensions, rhs_rank);
 
-    let output_dimensions: Vec<Size> = lhs_batching
+    let output_dimensions: Vec<Dimension> = lhs_batching
         .iter()
         .map(|axis| lhs.dimension(*axis))
         .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis)))
@@ -1124,10 +1124,10 @@ impl Operation<ArrayType> for ScaledDotOperation {
         }
         let mut output_dimensions = Vec::with_capacity(rank);
         if rank == 3 {
-            output_dimensions.push(Size::Static(lhs[0]));
+            output_dimensions.push(Dimension::Static(lhs[0]));
         }
-        output_dimensions.push(Size::Static(lhs[rank - 2]));
-        output_dimensions.push(Size::Static(rhs[rank - 2]));
+        output_dimensions.push(Dimension::Static(lhs[rank - 2]));
+        output_dimensions.push(Dimension::Static(rhs[rank - 2]));
         Ok(vec![ArrayType::new(self.accumulation_type, Shape::new(output_dimensions))])
     }
 }
@@ -1556,13 +1556,13 @@ where
         Shape::new(
             scale_dimensions
                 .iter()
-                .map(|&size| Size::Static(size))
-                .chain(std::iter::once(Size::Static(block_size)))
+                .map(|&size| Dimension::Static(size))
+                .chain(std::iter::once(Dimension::Static(block_size)))
                 .collect(),
         ),
     );
     let scale_axes = (0..scale_dimensions.len()).collect::<Vec<_>>();
-    let element_sizes = element_dimensions.iter().map(|&size| Size::Static(size)).collect::<Vec<_>>();
+    let element_sizes = element_dimensions.iter().map(|&size| Dimension::Static(size)).collect::<Vec<_>>();
     let expanded_scales = scales
         .convert_element_type(accumulation_type)?
         .broadcast(expanded_type, scale_axes.as_slice())?
@@ -1692,12 +1692,14 @@ where
         let block_shape = Shape::new(
             scale_dimensions
                 .iter()
-                .map(|&size| Size::Static(size))
-                .chain(std::iter::once(Size::Static(block_size)))
+                .map(|&size| Dimension::Static(size))
+                .chain(std::iter::once(Dimension::Static(block_size)))
                 .collect(),
         );
-        let scale_value_type =
-            ArrayType::new(compute_type, Shape::new(scale_dimensions.iter().map(|&size| Size::Static(size)).collect()));
+        let scale_value_type = ArrayType::new(
+            compute_type,
+            Shape::new(scale_dimensions.iter().map(|&size| Dimension::Static(size)).collect()),
+        );
         let domain = self.dispatch_domain();
         let fill = |value: f64| -> Result<V, ProgramError> {
             let scalar = if compute_type == DataType::F32 { Scalar::from(value as f32) } else { Scalar::from(value) };
@@ -1966,7 +1968,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -1981,7 +1983,7 @@ mod tests {
     }
 
     fn plain_array(sizes: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(sizes.iter().map(|size| Size::Static(*size)).collect()))
+        ArrayType::new(DataType::F32, Shape::new(sizes.iter().map(|size| Dimension::Static(*size)).collect()))
     }
 
     fn sharded_array(mesh: &LogicalMesh, sizes: &[usize], dimensions: Vec<ShardingDimension>) -> ArrayType {
@@ -1994,9 +1996,10 @@ mod tests {
         // per-block scales along the trailing contracting dimension of BOTH operands (`lhs [m, k]`, `rhs [n, k]`).
         // Every element, scale, product, and partial sum below is exactly representable, so the `f32` result is
         // exact.
-        let lhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let rhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let lhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let rhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let lhs = Array::from_f64s(lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
         let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
         let rhs = Array::from_f64s(rhs_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
@@ -2004,13 +2007,15 @@ mod tests {
         let product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 2, DataType::F32).unwrap();
         assert_eq!(
             product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
 
         // MXFP8-flavored case: `f8e4m3fn` elements with power-of-two `f8e8m0fnu` scales.
-        let f8_lhs_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let mx_scale_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let f8_lhs_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let mx_scale_type =
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let f8_lhs = Array::from_f64s(f8_lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
         let f8_lhs_scales = Array::from_f64s(mx_scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
         let f8_rhs = Array::from_f64s(f8_lhs_type, vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
@@ -2029,7 +2034,7 @@ mod tests {
                 &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
                 &[],
             ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))]),
         );
 
         // Contract violations report clear errors through type inference.
@@ -2049,7 +2054,7 @@ mod tests {
                 &[
                     lhs_type.clone(),
                     scale_type.clone(),
-                    ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(4)])),
+                    ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(4)])),
                     scale_type.clone(),
                 ],
                 &[],
@@ -2063,7 +2068,10 @@ mod tests {
         let inputs = vec![
             builder.add_input(lhs_type),
             builder.add_input(scale_type.clone()),
-            builder.add_input(ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]))),
+            builder.add_input(ArrayType::new(
+                DataType::F4E2M1FN,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
+            )),
             builder.add_input(scale_type),
         ];
         let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
@@ -2098,10 +2106,14 @@ mod tests {
     fn test_scaled_dot_rank_3() {
         // The rank-3 form carries one leading batch dimension shared by all four operands. Stacking the rank-2
         // fixture from `test_scaled_dot` twice must reproduce its exact result per batch item.
-        let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(4)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let element_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(4)]),
+        );
+        let scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+        );
         let item_lhs = vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5];
         let item_lhs_scales = vec![0.5, 2.0, 1.0, 0.5];
         let item_rhs = vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0];
@@ -2114,7 +2126,10 @@ mod tests {
         let product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 2, DataType::F32).unwrap();
         assert_eq!(
             product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
+            &ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)])
+            ),
         );
         assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0, 6.75, 11.25, 10.375, 7.0]);
 
@@ -2127,11 +2142,11 @@ mod tests {
             ),
             Ok(vec![ArrayType::new(
                 DataType::F32,
-                Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]),
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
             )]),
         );
         let rank_2_element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
         assert_eq!(
             operation.infer_output_types(
                 &[element_type.clone(), scale_type.clone(), rank_2_element_type, scale_type.clone()],
@@ -2143,8 +2158,10 @@ mod tests {
                     .to_string()
             )),
         );
-        let mismatched_batch_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)]));
+        let mismatched_batch_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
+        );
         assert_eq!(
             operation.infer_output_types(&[element_type, scale_type.clone(), mismatched_batch_type, scale_type], &[],),
             Err(TypeError::invalid("'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string())),
@@ -2155,8 +2172,10 @@ mod tests {
     fn test_scaled_dot_global_scale() {
         // The optional fifth operand is a scalar at the accumulation type that is multiplied into the result, so
         // the `test_scaled_dot` fixture with a global scale of 2 exactly doubles.
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let lhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
         let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
         let rhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
@@ -2180,7 +2199,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))]),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))]),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2189,7 +2208,7 @@ mod tests {
                     scale_type.clone(),
                     element_type.clone(),
                     scale_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
                 ],
                 &[],
             ),
@@ -2225,8 +2244,10 @@ mod tests {
 
         // Two batch items built from the `test_scaled_dot` NVFP4 fixture: item 0 is the fixture itself and item 1
         // swaps its operand sides, so the per-item expectations come from unbatched `scaled_dot` calls.
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let item_lhs = [1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5];
         let item_lhs_scales = [0.5, 2.0, 1.0, 0.5];
         let item_rhs = [1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0];
@@ -2241,10 +2262,14 @@ mod tests {
             .unwrap();
         let expected: Vec<f64> = expected_item_0.to_f64s().into_iter().chain(expected_item_1.to_f64s()).collect();
 
-        let stacked_element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(4)]));
-        let stacked_scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let stacked_element_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(4)]),
+        );
+        let stacked_scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+        );
         let stack = |element_values: bool, first: &[f64], second: &[f64]| {
             let values = first.iter().chain(second.iter()).copied().collect::<Vec<_>>();
             let r#type = if element_values { stacked_element_type.clone() } else { stacked_scale_type.clone() };
@@ -2314,7 +2339,7 @@ mod tests {
         // A mapped global scale is multiplied into the result per batch item instead of riding the lifted
         // operation's scalar operand.
         let mapped_global_scales =
-            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])), vec![2.0, 0.5]);
+            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])), vec![2.0, 0.5]);
         let outputs = operation
             .batch(
                 &context,
@@ -2339,18 +2364,22 @@ mod tests {
 
         // The rank-3 form has no rank-4 analogue: batching an already-batched operation is rejected.
         let stacked_rank_3 = |values: &[f64], r#type: &ArrayType| {
-            let dimensions: Vec<Size> =
-                std::iter::once(Size::Static(2)).chain(r#type.shape().dimensions().iter().copied()).collect();
+            let dimensions: Vec<Dimension> =
+                std::iter::once(Dimension::Static(2)).chain(r#type.shape().dimensions().iter().copied()).collect();
             let value = Array::from_f64s(
                 ArrayType::new(r#type.data_type(), Shape::new(dimensions)),
                 values.iter().chain(values.iter()).copied().collect(),
             );
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
         };
-        let rank_3_element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(1), Size::Static(2), Size::Static(4)]));
-        let rank_3_scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(1), Size::Static(2), Size::Static(2)]));
+        let rank_3_element_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(4)]),
+        );
+        let rank_3_scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(2)]),
+        );
         let error = operation
             .batch(
                 &context,
@@ -2376,8 +2405,10 @@ mod tests {
         // is the sum of two `scaled_dot`s reusing the primal scales, and the (nonzero) scale tangents supplied
         // below are ignored by design (straight-through with respect to the elements). Every value is exactly
         // representable in its storage format, so the `f32` results are exact.
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(4)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = vec![
             builder.add_input(element_type.clone()),
@@ -2437,7 +2468,7 @@ mod tests {
         let lhs_values = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
         let rhs_values = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
         let identity_cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
             vec![1.0, 0.0, 0.0, 1.0],
         );
         check_operation_transposition!(
@@ -2494,7 +2525,7 @@ mod tests {
         // NVFP4 recipe: `f4e2m1fn` elements with `f8e4m3fn` scales, `scale = max_abs(block) / 6.0`. Every block
         // below is a scaled copy of `f4e2m1fn` grid points whose scale is exactly representable in `f8e4m3fn`, so
         // quantization is exact; the all-zero block exercises the clamp to the smallest normal scale, `2^-6`.
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)]));
         let input = Array::from_f64s(
             input_type.clone(),
             vec![
@@ -2505,11 +2536,11 @@ mod tests {
         let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(
             elements.r#type().as_ref(),
-            &ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(8)])),
+            &ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)])),
         );
         assert_eq!(
             scales.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(scales.to_f64s(), vec![1.0, 0.25, 2.0, 0.015625]);
         assert_eq!(
@@ -2536,7 +2567,7 @@ mod tests {
             Err(error) if error.to_string().contains("'block_quantize' does not support scale data type f16"),
         ));
         let integer_input =
-            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(8)])), vec![1.0; 8]);
+            Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(8)])), vec![1.0; 8]);
         assert!(matches!(
             integer_input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
             Err(error) if error.to_string().contains("'block_quantize' expects an f32 or f64 input but got i32"),
@@ -2554,7 +2585,7 @@ mod tests {
         // `scale = 2^(floor(log2(max_abs)) - 8)`. The block maxima below sit exactly on powers of two (exercising
         // the boundary nudge in the `log2` composition) and every quotient is exactly representable in `f8e4m3fn`,
         // so quantization is exact; the all-zero block clamps its scale to `2^-127`.
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)]));
         let input = Array::from_f64s(
             input_type.clone(),
             vec![
@@ -2565,11 +2596,11 @@ mod tests {
         let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(
             elements.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(8)])),
+            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)])),
         );
         assert_eq!(
             scales.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(scales.to_f64s(), vec![(-6.0f64).exp2(), (-8.0f64).exp2(), (-5.0f64).exp2(), (-127.0f64).exp2()],);
         assert_eq!(
@@ -2589,13 +2620,13 @@ mod tests {
         // three mantissa bits, so each dequantized element is within about 6% of its input (plus the OCP MX
         // saturation of a block maximum landing past the finite range) and the contraction of eight such products
         // stays within a proportional tolerance of the full-precision dot.
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(8)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(8)]));
         let input = Array::from_f64s(input_type.clone(), vec![1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]);
         let (elements, scales) = input.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(elements.r#type().shape(), input_type.shape());
         assert_eq!(
             scales.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(1), Size::Static(2)])),
+            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
         );
         let product = elements.scaled_dot(&scales, &elements, &scales, 4, DataType::F32).unwrap();
         let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
@@ -2604,14 +2635,14 @@ mod tests {
         assert_abs_diff_eq!(actual_value, expected_value, epsilon = 0.05 * expected_value);
 
         // Rank-1 inputs quantize per block along their only dimension.
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let vector = Array::from_f64s(vector_type.clone(), vec![1.1, -2.3, 0.7, 3.9, 0.013, -0.27, 5.4, 8.9]);
         let (vector_elements, vector_scales) =
             vector.block_quantize(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).unwrap();
         assert_eq!(vector_elements.r#type().shape(), vector_type.shape());
         assert_eq!(
             vector_scales.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Size::Static(2)])),
+            &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2)])),
         );
         assert_eq!(vector_elements.to_f64s(), elements.to_f64s());
         assert_eq!(vector_scales.to_f64s(), scales.to_f64s());
@@ -2627,16 +2658,16 @@ mod tests {
         let builder = context.builder().clone();
         let input_atom = builder
             .borrow_mut()
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(8)])));
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)])));
         let input = context.tracer(input_atom, None);
         let (elements, scales) = input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
         assert_eq!(
             elements.r#type().as_ref(),
-            &ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(8)])),
+            &ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(8)])),
         );
         assert_eq!(
             scales.r#type().as_ref(),
-            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            &ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
     }
 
@@ -2646,10 +2677,10 @@ mod tests {
         // non-promotable ones, combining with a requested output sharding, and differentiation.
         let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
         assert_eq!(operation.accumulation_type(), Some(DataType::F32));
-        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let rhs = lhs.clone();
-        let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Size::Static(2), Size::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -2691,7 +2722,7 @@ mod tests {
         let product = lhs_values.dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32);
         assert_eq!(
             product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)]))
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
         );
         assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
 
@@ -2762,7 +2793,7 @@ mod tests {
                     (@linear(type = rhs.clone())),
                 ],
                 output_cotangents = [Array::from_f64s(
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
                     vec![1.0, 0.0, 0.0, 1.0],
                 )],
                 input_cotangents = [Array::from_f64s(rhs, vec![0.5, 1.5, 1.0, 2.0])],
@@ -2780,8 +2811,10 @@ mod tests {
             )
             .unwrap()
             .0;
-        let batched_lhs_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]));
+        let batched_lhs_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+        );
         let batched_lhs = Array::from_f64s(batched_lhs_type.clone(), vec![0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0]);
         let batched_rhs = Array::from_f64s(batched_lhs_type, vec![1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0]);
         let outputs = lifted.interpret(vec![batched_lhs, batched_rhs]).unwrap();
@@ -2800,24 +2833,26 @@ mod tests {
         // batching dimension is preserved and the equal bounded dynamic contracting dimensions are dropped.
         let lhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Dynamic(Some(4))]),
+            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2), Dimension::Dynamic(Some(4))]),
         );
         let rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Size::Dynamic(None), Size::Dynamic(Some(4)), Size::Static(3)]),
+            Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4)), Dimension::Static(3)]),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Ok(vec![ArrayType::new(
                 DataType::F64,
-                Shape::new(vec![Size::Dynamic(None), Size::Static(2), Size::Static(3)]),
+                Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
             )]),
         );
 
         // Static-vs-dynamic and unequal dynamic dimension pairs keep erroring under the strict size equality used
         // for batching and contracting dimensions.
-        let static_rhs =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(4), Size::Static(3)]));
+        let static_rhs = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(4), Dimension::Static(3)]),
+        );
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), static_rhs], &[]),
             Err(TypeError::invalid(
@@ -2826,7 +2861,7 @@ mod tests {
         );
         let mismatched_batch_rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Size::Dynamic(Some(8)), Size::Dynamic(Some(4)), Size::Static(3)]),
+            Shape::new(vec![Dimension::Dynamic(Some(8)), Dimension::Dynamic(Some(4)), Dimension::Static(3)]),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs, mismatched_batch_rhs], &[]),
@@ -3267,11 +3302,13 @@ mod tests {
             .unwrap()
             .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
             .unwrap();
-            let lhs_type =
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)]))
-                    .with_sharding(lhs_sharding)
-                    .unwrap();
-            let rhs_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]))
+            let lhs_type = ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+            )
+            .with_sharding(lhs_sharding)
+            .unwrap();
+            let rhs_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]))
                 .with_sharding(Sharding::replicated(mesh, 2))
                 .unwrap();
             let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -3319,7 +3356,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),);
         // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
         for (actual, expected) in output.to_f64s().iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
@@ -3385,7 +3422,7 @@ mod tests {
                     inputs = [
                         (@linear(type = ArrayType::new(
                             DataType::F64,
-                            Shape::new(vec![Size::Static(2), Size::Static(3)]),
+                            Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]),
                         ))),
                         (@known, right),
                     ],

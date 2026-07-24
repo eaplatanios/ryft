@@ -94,7 +94,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::TracingContext;
-use crate::types::{ArrayType, Shape, Size};
+use crate::types::{ArrayType, Dimension, Shape};
 
 /// Represents batching-related errors.
 ///
@@ -465,7 +465,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     ///   - `axis`: Possibly-negative position of the inserted batch axis in the output, normalized against the
     ///     physical output rank (e.g., `-1` denotes the final output axis).
-    ///   - `axis_size`: Size of the inserted batch axis.
+    ///   - `axis_size`: Dimension of the inserted batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the inserted batch axis when the value carries
     ///     sharding metadata.
     pub fn broadcast<A: Into<Axis>>(
@@ -491,7 +491,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let position = axis
             .normalize(output_rank)
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type.clone()), axis })?;
-        let mut physical_type = per_item_type.with_inserted_dimension(position, Size::Static(axis_size))?;
+        let mut physical_type = per_item_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
         if let Some(sharding) = per_item_type.sharding() {
             physical_type.sharding = Some(
                 sharding
@@ -547,7 +547,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     ///   - `axis`: Possibly-negative position the batch axis should occupy in the output, normalized against the
     ///     physical output rank (e.g., `-1` denotes the final output axis).
-    ///   - `axis_size`: Size of the batch axis.
+    ///   - `axis_size`: Dimension of the batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated value must be broadcast.
     #[inline]
     pub fn match_axis<A: Into<Axis>>(
@@ -577,7 +577,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// # Parameters
     ///
     ///   - `batch_axis`: Requested mapped axis, or a replicated declaration if the output must remain replicated.
-    ///   - `axis_size`: Size of the batch axis.
+    ///   - `axis_size`: Dimension of the batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to the batch axis if a replicated output must be broadcast.
     #[inline]
     pub fn align_axis(
@@ -943,7 +943,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseO
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
                 let mut physical_type =
-                    target_type.with_inserted_dimension(batch_axis_position, Size::Static(axis_size))?;
+                    target_type.with_inserted_dimension(batch_axis_position, Dimension::Static(axis_size))?;
                 if let Some(sharding) = target_type.sharding() {
                     physical_type.sharding = Some(
                         sharding
@@ -1070,7 +1070,7 @@ pub struct BatchingContext<C> {
     /// [`Context`] that this [`BatchingContext`] is nested into.
     parent: C,
 
-    /// Size of the new batch axis.
+    /// Dimension of the new batch axis.
     axis_size: usize,
 
     /// Optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
@@ -1087,7 +1087,7 @@ impl<C> BatchingContext<C> {
     /// # Parameters
     ///
     ///   - `parent`: [`Context`] into which batched operations are lifted.
-    ///   - `axis_size`: Size of the transform-owned mapped dimension.
+    ///   - `axis_size`: Dimension of the transform-owned mapped dimension.
     #[inline]
     pub fn new(parent: C, axis_size: usize) -> Self {
         Self { parent, axis_size, axis_name: None, axis_sharding: ShardingDimension::Replicated }
@@ -1336,7 +1336,7 @@ impl<
     ///
     /// # Parameters
     ///
-    ///   - `axis_size`: Size of the new batch axis.
+    ///   - `axis_size`: Dimension of the new batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to every newly materialized batch axis.
     ///   - `input_batch_axes`: [`BatchAxis`] for each input (i.e., argument) of this [`Program`].
     ///   - `output_axes_policy`: [`ProgramBatchingOutputAxesPolicy`] for packaging the batched program outputs.
@@ -1375,7 +1375,7 @@ impl<
                                 BatchingError::BatchAxisOutOfBounds { r#type: Box::new(unbatched_type.clone()), axis }
                             })?;
                             let mut batched_type =
-                                unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?;
+                                unbatched_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
                             if let Some(sharding) = unbatched_type.sharding() {
                                 batched_type.sharding =
                                     Some(sharding.with_inserted_dimension(position, axis_sharding.clone()).map_err(
@@ -1466,7 +1466,7 @@ impl<
     ///
     /// # Parameters
     ///
-    ///   - `axis_size`: Size of the new batch axis.
+    ///   - `axis_size`: Dimension of the new batch axis.
     ///   - `axis_sharding`: Sharding placement assigned to every newly materialized batch axis.
     ///   - `input_batch_axes`: [`BatchAxis`] for each program input.
     ///   - `output_axes_policy`: Policy controlling how the transformed program packages its output batch axes.
@@ -1710,7 +1710,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{DomainTracingContext, Trace};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -1773,14 +1773,17 @@ mod tests {
         assert_eq!(batched.value(), &matrix);
         assert_eq!(*batched.r#type(), matrix_type);
         assert_eq!(batched.batch_size(), Ok(Some(2)));
-        assert_eq!(batched.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(batched.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         assert_eq!(batched.to_string(), "batch[f64[2, 3], axis=0]([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])");
         assert_eq!(batched.into_value(), matrix);
 
         // A different mapped axis reads the batch size and per-item type from that axis instead.
         let batched_axis_one = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(1)).unwrap();
         assert_eq!(batched_axis_one.batch_size(), Ok(Some(3)));
-        assert_eq!(batched_axis_one.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
+        assert_eq!(
+            batched_axis_one.unbatched_type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),
+        );
 
         // Negative axes follow Python/JAX indexing and are normalized once at construction.
         // `-1` denotes the final physical axis and the stored metadata is the canonical nonnegative position.
@@ -1850,10 +1853,10 @@ mod tests {
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(0));
         assert_eq!(
             *broadcasted.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
         );
         assert_eq!(broadcasted.value(), &Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
-        assert_eq!(broadcasted.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
+        assert_eq!(broadcasted.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),);
 
         // Broadcasting to a trailing batch axis keeps the per-item dimensions before it in place.
         // The input's own axis stays at position 0 and the size-2 batch axis is inserted at position 1.
@@ -1861,12 +1864,12 @@ mod tests {
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *broadcasted.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
         );
         assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
 
         // Broadcasting rejects an already-batched value.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let batched = ArrayBatch::new(vector_type, Array::vector(vec![1.0, 2.0]), Some(0)).unwrap();
         assert!(matches!(
             batched.broadcast(0, 2, ShardingDimension::Replicated),
@@ -1887,9 +1890,12 @@ mod tests {
         // new mapped axis, while the per-item type ([3]) and the batch size (2) are preserved.
         let moved = batched.move_axis(1).unwrap();
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
-        assert_eq!(*moved.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
+        assert_eq!(
+            *moved.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
+        );
         assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
-        assert_eq!(moved.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(moved.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         assert_eq!(moved.batch_size(), Ok(Some(2)));
 
         // A replicated value has no mapped axis, so moving to any axis is a no-op.
@@ -1902,7 +1908,7 @@ mod tests {
         // `match_axis` on a batched value moves its mapped axis to the target (like `move_axis`). [2, 3] mapped at 0
         // becomes [3, 2] mapped at 1, and the `axis_size` argument is unused for an already-batched value.
         let batched = ArrayBatch::new(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             Some(0),
         )
@@ -1911,7 +1917,7 @@ mod tests {
         assert_eq!(matched.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *matched.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
         );
         assert_eq!(matched.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
 
@@ -1925,7 +1931,7 @@ mod tests {
     #[test]
     fn test_array_batch_align_axis() {
         let batched = ArrayBatch::new(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             Some(0),
         )
@@ -1940,7 +1946,7 @@ mod tests {
         assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *aligned.r#type(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
         );
         assert_eq!(aligned.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
 
@@ -1970,7 +1976,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap(),
@@ -1998,9 +2004,10 @@ mod tests {
 
         // A replicated mapped dimension is explicitly normalized to the concrete sharded placement contributed
         // by another mapped input.
-        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_sharding(Sharding::replicated(mesh.clone(), 2))
-            .unwrap();
+        let replicated_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+                .with_sharding(Sharding::replicated(mesh.clone(), 2))
+                .unwrap();
         let other = {
             let value = replicated_type;
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -2017,7 +2024,7 @@ mod tests {
 
         // Two distinct concrete placements remain ambiguous and are rejected.
         let differently_sharded_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()])
                         .unwrap(),
@@ -2041,7 +2048,7 @@ mod tests {
             let mut sharding_dimensions = vec![ShardingDimension::replicated(); 3];
             sharding_dimensions[batch_axis] = ShardingDimension::sharded(["x"]);
             let physical_type =
-                ArrayType::new(DataType::F64, Shape::new(dimensions.into_iter().map(Size::Static).collect()))
+                ArrayType::new(DataType::F64, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
                     .with_sharding(Sharding::new(mesh.clone(), sharding_dimensions).unwrap())
                     .unwrap();
             let batch = ArrayBatch::new(
@@ -2082,8 +2089,8 @@ mod tests {
         // The blanket `BatchableOperation` for elementwise operations lifts `interpret` over the mapped batch axis.
         // It realigns every mapped operand onto the common axis, broadcasts replicated operands across the batch,
         // and reports each output on that common axis.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let make_batch = |r#type: &ArrayType, values: Vec<f64>, axis: Option<isize>| {
             ArrayBatch::new(r#type.clone(), Array::from_f64s(r#type.clone(), values), axis).unwrap()
         };
@@ -2107,7 +2114,8 @@ mod tests {
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
         // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
-        let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let transposed_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
         let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right_axis_one]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -2116,9 +2124,11 @@ mod tests {
         // Physical mapped-axis positions are canonicalized independently of operand rank. The rank-3 left operand
         // maps its trailing axis while the rank-1 right operand maps its only axis; their logical per-item shapes are
         // `[3, 4]` and scalar, respectively. The output is restored to the first mapped input's trailing axis.
-        let left_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)]));
-        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let left_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(3), Dimension::Static(4), Dimension::Static(2)]),
+        );
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let left = make_batch(&left_type, (1..=24).map(f64::from).collect(), Some(2));
         let right = make_batch(&right_type, vec![10.0, 20.0], Some(0));
         let outputs = AddOperation.batch(&context, &EmptyRegionDriver, &[left, right]).unwrap();
@@ -2160,7 +2170,7 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes(varying_manual_axes)
                     .unwrap();
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                     .with_sharding(sharding)
                     .unwrap()
             };
@@ -2193,7 +2203,7 @@ mod tests {
         // `interpret_with_batch_axes` interprets the operation on the unpacked input values and repackages each
         // output as an `ArrayBatch` carrying the requested output batch axis. Here two batched length-3 inputs are
         // added elementwise, yielding a single batched sum mapped on axis 0.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
 
@@ -2225,7 +2235,7 @@ mod tests {
             } else {
                 Sharding::replicated(mesh.clone(), 1)
             };
-            let logical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))
+            let logical_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
                 .with_sharding(logical_sharding)
                 .unwrap();
             let (_, program) =
@@ -2246,9 +2256,10 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let expected_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))
-                .with_sharding(expected_sharding)
-                .unwrap();
+            let expected_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]))
+                    .with_sharding(expected_sharding)
+                    .unwrap();
 
             assert_eq!(batched.input_types(), &[expected_type.clone()]);
             assert_eq!(batched.output_types(), &[expected_type]);
@@ -2259,7 +2270,7 @@ mod tests {
     #[test]
     fn test_program_batched_transforms_input_and_output_axes() {
         // Trace a per-item squaring function into a flat program over per-item (logical) vector types.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
             vec![vector_type.clone()],
@@ -2366,7 +2377,7 @@ mod tests {
         // Under an active trace, the free `batch` recovers the staging context from its tracer input instead, so
         // `batch` composes inside traced code without threading a context. The traced function squares each row of
         // its `[2, 3]` input by batching a per-item squaring closure over axis 0.
-        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
                 let mapped =
@@ -2448,10 +2459,10 @@ mod tests {
     #[test]
     fn test_batch_normalizes_mapped_input_sharding_before_tracing() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
         let sharded = Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]);
@@ -2624,10 +2635,10 @@ mod tests {
 
     #[test]
     fn test_batch_rejects_dynamic_batch_axis() {
-        // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched since `batch`
+        // A mapped input whose batch dimension is `Dimension::Dynamic` cannot be batched since `batch`
         // has no way of determining the batch size.
         let dynamic_input = Array::with_unchecked_type(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])),
             vec![Scalar::F64(1.0), Scalar::F64(2.0), Scalar::F64(3.0)],
         );
         let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(
@@ -2651,7 +2662,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
         );
         // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
         // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
@@ -2693,7 +2704,7 @@ mod tests {
 
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)])),
         );
         let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
         for (actual, expected) in output.to_f64s().iter().zip(expected.iter()) {
@@ -2732,7 +2743,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
         );
         assert_eq!(output.to_f64s(), vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
     }
@@ -2745,7 +2756,7 @@ mod tests {
         // implicit broadcasting.
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let input_tracer = parent.tracer(input_atom, None);
         let output = Batch::batch(

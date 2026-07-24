@@ -19,7 +19,7 @@ use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::TypeError;
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Size};
+use crate::types::{ArrayType, DataType, Dimension};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
 /// implicitly broadcasting elementwise result and _unaligned_ back to an operand type. The two methods form an adjoint
@@ -143,7 +143,7 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
             let target_dimension = target.dimension(target_axis);
             let value_dimension = value_type.dimension(output_axis);
             if target_dimension != value_dimension {
-                if target_dimension != Size::Static(1) {
+                if target_dimension != Dimension::Static(1) {
                     return Err(TypeError::invalid(format!(
                         "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
                         output_axis, value_dimension, target_axis, target_dimension,
@@ -429,7 +429,7 @@ mod tests {
     use crate::programs::atoms::MaybeZero;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
 
@@ -447,18 +447,18 @@ mod tests {
     #[test]
     fn test_array_elementwise_derivative_alignment() {
         let scalar = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(scalar.align_tangent(&target), Ok(Array::from_f64s(target, vec![2.0, 2.0, 2.0, 2.0, 2.0, 2.0])),);
 
         let cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
-        let target = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]));
+        let target = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         assert_eq!(cotangent.unalign_cotangent(&target), Ok(Array::from_f64s(target, vec![5.0, 7.0, 9.0])),);
 
         let value = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         assert!(matches!(
             value.align_tangent(&target),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
@@ -469,26 +469,29 @@ mod tests {
     #[test]
     fn test_broadcast_derivative_alignment() {
         let cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 0]),
             Ok(Array::from_f64s(target, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0])),
         );
 
         let cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
+            ),
             (1..=24).map(|value| value as f64).collect(),
         );
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         assert_eq!(
             cotangent.unalign_cotangent_along(&target, &[1, 2]),
             Ok(Array::from_f64s(target, vec![126.0, 174.0]))
         );
 
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         assert!(matches!(
             cotangent.unalign_cotangent_along(&target, &[3]),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
@@ -734,10 +737,10 @@ mod tests {
     #[test]
     fn test_binary_elementwise_vjp_restores_each_input_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();

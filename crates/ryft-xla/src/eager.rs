@@ -233,7 +233,7 @@ mod tests {
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
-    use ryft_core::types::{ArrayType, Shape, Size, StaticShape};
+    use ryft_core::types::{ArrayType, Dimension, Shape, StaticShape};
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::tests::{
@@ -259,7 +259,7 @@ mod tests {
     }
 
     fn replicated_type(mesh: &DeviceMesh, data_type: DataType, dimensions: &[usize]) -> ArrayType {
-        let shape = Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect());
+        let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
         ArrayType::new(data_type, shape)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
             .unwrap()
@@ -504,7 +504,7 @@ mod tests {
         )
         .unwrap();
         let reference_integer = CpuArray::new(
-            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(integer_values.len())])),
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(integer_values.len())])),
             integer_values.iter().copied().map(Scalar::I32).collect(),
         )
         .unwrap();
@@ -714,7 +714,7 @@ mod tests {
         let secondary = f32_vector(&client, &mesh, &secondary_values);
         let passenger = f32_vector(&client, &mesh, &passenger_values);
         let reference_primary = CpuArray::new(
-            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(primary_values.len())])),
+            ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(primary_values.len())])),
             primary_values.iter().copied().map(Scalar::I32).collect(),
         )
         .unwrap();
@@ -783,13 +783,13 @@ mod tests {
         )
         .unwrap();
         let reference_state = CpuArray::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])),
             state_values.iter().copied().map(Scalar::U64).collect(),
         )
         .unwrap();
 
         // An odd `u32` element count exercises the padded counter pair and the truncated word layout.
-        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
+        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(5)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
@@ -813,7 +813,7 @@ mod tests {
         assert_eq!(device_state_words, vec![42u64, 10u64]);
         assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(10)]);
 
-        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
@@ -866,13 +866,13 @@ mod tests {
         )
         .unwrap();
         let reference_state = CpuArray::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)])),
             state_values.iter().copied().map(Scalar::U64).collect(),
         )
         .unwrap();
 
         // An odd `u32` element count exercises the padded counter quad and the truncated word layout.
-        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(5)]));
+        let u32_output_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(5)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(device_state_words, vec![42u64, 9u64, 9u64]);
         assert_eq!(reference_new_state.values(), &[Scalar::U64(42), Scalar::U64(9), Scalar::U64(9)]);
 
-        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let u64_output_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
@@ -950,12 +950,12 @@ mod tests {
         )
         .unwrap();
         let reference_state = CpuArray::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)])),
             state_values.iter().copied().map(Scalar::U64).collect(),
         )
         .unwrap();
 
-        let shape = Shape::new(vec![Size::Static(8)]);
+        let shape = Shape::new(vec![Dimension::Static(8)]);
         let (_, device_uniform) = state.uniform(shape.clone(), DataType::F32).unwrap();
         let (_, reference_uniform) = reference_state.uniform(shape.clone(), DataType::F32).unwrap();
         let device_bits = read_f32s(&device_uniform).into_iter().map(f32::to_bits).collect::<Vec<_>>();
@@ -1015,7 +1015,8 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
 
-        let operand_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let operand_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let lhs_values = [0.5f64, 1.0, 1.5, 2.0];
         let rhs_values = [1.0f64, 0.5, 0.5, 1.0];
         let reference_lhs = CpuArray::from_f64s(operand_type.clone(), lhs_values.to_vec());
@@ -1055,8 +1056,10 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
 
-        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Size::Static(2), Size::Static(16)]));
-        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let element_type =
+            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         const F4_CANDIDATES: [f64; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
         let element_values =
             |seed: usize| (0..32).map(|index| F4_CANDIDATES[(index * 5 + seed) % 8]).collect::<Vec<_>>();
@@ -1117,7 +1120,7 @@ mod tests {
         let dimensions = [1usize, 4, 2, 3];
         let operand_type = ArrayType::new(
             DataType::F32,
-            Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect()),
+            Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect()),
         );
         let device_type = replicated_type(&mesh, DataType::F32, &dimensions);
         let query_values: Vec<f64> = (0..24).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
@@ -1177,7 +1180,7 @@ mod tests {
             Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
         };
         let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect());
+            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
             CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
         };
         let scale = 0.5;
@@ -1249,11 +1252,11 @@ mod tests {
             Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
         };
         let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect());
+            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
             CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
         };
         let reference_lengths = |values: &[i32]| {
-            let shape = Shape::new(vec![Size::Static(values.len())]);
+            let shape = Shape::new(vec![Dimension::Static(values.len())]);
             CpuArray::from_f64s(
                 ArrayType::new(DataType::I32, shape),
                 values.iter().map(|&value| f64::from(value)).collect(),
@@ -1346,11 +1349,11 @@ mod tests {
             Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
         };
         let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect());
+            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
             CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
         };
         let reference_lengths = |values: &[i32]| {
-            let shape = Shape::new(vec![Size::Static(values.len())]);
+            let shape = Shape::new(vec![Dimension::Static(values.len())]);
             CpuArray::from_f64s(
                 ArrayType::new(DataType::I32, shape),
                 values.iter().map(|&value| f64::from(value)).collect(),
@@ -1487,7 +1490,7 @@ mod tests {
             Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
         };
         let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Size::Static(dimension)).collect());
+            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
             CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
         };
         let scale = 0.5;
@@ -1576,10 +1579,10 @@ mod tests {
         assert_eq!(round_tripped.shape(), StaticShape::new(vec![2, 3]));
         assert_eq!(read_f32s(&round_tripped), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        let reshaped = matrix.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap();
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.shape(), StaticShape::new(vec![3, 2]));
         assert_eq!(read_f32s(&reshaped), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let flattened = reshaped.reshape(Shape::new(vec![Size::Static(6)])).unwrap();
+        let flattened = reshaped.reshape(Shape::new(vec![Dimension::Static(6)])).unwrap();
         assert_eq!(flattened.shape(), StaticShape::new(vec![6]));
         assert_eq!(read_f32s(&flattened), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
@@ -1783,7 +1786,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(4)]))
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let values = [
@@ -1796,8 +1799,9 @@ mod tests {
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap();
 
         let output: Array<'_> = batch(|input| input.abs(), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
-        let expected_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        let expected_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
         assert_eq!(output.r#type().as_ref(), &expected_type);
         for (actual, expected) in read_f64_coordinates(&output).into_iter().zip([5.0, 13.0, 17.0, 25.0]) {
             assert!((actual - expected).abs() < 1e-5, "expected {expected} but got {actual}");
@@ -2078,7 +2082,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
@@ -2102,7 +2108,9 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let jacobian = jacobian_reverse(|x| Mul::mul(&x, &x), x).unwrap();

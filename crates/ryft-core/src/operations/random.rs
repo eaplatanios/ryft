@@ -18,7 +18,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -46,7 +46,7 @@ impl RandomAlgorithm {
             Self::ThreeFry => 2,
             Self::Philox => 3,
         };
-        ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(size)]))
     }
 }
 
@@ -364,7 +364,7 @@ where
     V::DispatchDomain: Fill<Scalar, V>,
 {
     fn split_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
-        let keys_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(count)]));
+        let keys_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(count)]));
         let (state, keys) = self.rng_bit_generator(RandomAlgorithm::ThreeFry, &keys_type)?;
         let fresh_states = (0..count)
             .map(|index| {
@@ -593,7 +593,7 @@ mod tests {
 
     /// Returns the `u32[count]` bits output type used throughout these tests.
     fn bits_type(count: usize) -> ArrayType {
-        ArrayType::new(DataType::U32, Shape::new(vec![Size::Static(count)]))
+        ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(count)]))
     }
 
     #[test]
@@ -755,18 +755,18 @@ mod tests {
             operation = operation,
             cases = [
                 {
-                    input_types = [ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]))],
+                    input_types = [ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]))],
                     error = "'rng_bit_generator' with the three_fry algorithm needs a u64[2] state but got u64[3]",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]))],
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))],
                     error = "'rng_bit_generator' with the three_fry algorithm needs a u64[2] state but got f32[2]",
                 },
             ],
         );
 
         // Floating-point bits outputs are rejected; every unsigned-integer width is accepted.
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         check_operation_type_inference!(
             operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type),
             cases = [{
@@ -775,7 +775,7 @@ mod tests {
             }],
         );
         for data_type in [DataType::U8, DataType::U16, DataType::U64] {
-            let output_type = ArrayType::new(data_type, Shape::new(vec![Size::Static(4)]));
+            let output_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(4)]));
             check_operation_type_inference!(
                 operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type.clone()),
                 cases = [{
@@ -834,7 +834,7 @@ mod tests {
         // Two distinct ThreeFry states stacked at batch axis 1 (`u64[2, b]` holding `[[k0, k1], [c0, c1]]`) exercise
         // the realignment to batch axis 0 before the scan consumes one state row per iteration.
         let states = Array::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
             vec![Scalar::U64(42), Scalar::U64(3), Scalar::U64(7), Scalar::U64(11)],
         )
         .unwrap();
@@ -860,7 +860,7 @@ mod tests {
     fn test_rng_bit_generator_batching_philox() {
         // Two distinct Philox `u64[3]` states stacked at batch axis 0 (`u64[2, 3]`).
         let states = Array::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
             vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(9), Scalar::U64(3), Scalar::U64(11), Scalar::U64(0)],
         )
         .unwrap();
@@ -934,7 +934,7 @@ mod tests {
 
         // The batched program computes each batch item's unbatched result exactly.
         let states = Array::new(
-            ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             vec![Scalar::U64(42), Scalar::U64(7), Scalar::U64(3), Scalar::U64(11), Scalar::U64(5), Scalar::U64(0)],
         )
         .unwrap();
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(bits.values(), expected_words.into_iter().map(Scalar::U32).collect::<Vec<_>>());
 
         // Three `u64` words also run two cipher invocations (two words per invocation, truncated).
-        let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)]));
+        let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
         let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_bits_type).unwrap();
         let (expected_words, expected_counter) = philox_u64_words(42, counter, 3);
         assert_eq!(expected_counter, counter + 2);
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn test_uniform() {
-        let shape = Shape::new(vec![Size::Static(4096)]);
+        let shape = Shape::new(vec![Dimension::Static(4096)]);
         let parent = state(42, 7);
         let (_, samples) = parent.uniform(shape.clone(), DataType::F32).unwrap();
         assert_eq!(samples.r#type().into_owned(), ArrayType::new(DataType::F32, shape.clone()));
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_normal() {
-        let shape = Shape::new(vec![Size::Static(4096)]);
+        let shape = Shape::new(vec![Dimension::Static(4096)]);
         let (_, samples) = state(42, 7).normal(shape.clone(), DataType::F64).unwrap();
         assert_eq!(samples.r#type().into_owned(), ArrayType::new(DataType::F64, shape));
         let values = samples.to_f64s();

@@ -100,7 +100,7 @@ mod tests {
 
     use crate::programs::regions::RegionInterface;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Dimension, Layout, Shape, StridedLayout};
 
     use super::*;
 
@@ -135,7 +135,7 @@ mod tests {
         }
 
         let operation = TestElementwiseArrayOperation { input_count: 1 };
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[input_type.clone()], &[]),
             Ok(vec![input_type])
@@ -161,8 +161,8 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])),
                 ],
                 &[],
             ),
@@ -174,13 +174,16 @@ mod tests {
             &operation,
             &[
                 ArrayType::scalar(DataType::F32),
-                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
-                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)])),
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(3)])),
             ],
             &[],
         )
         .unwrap();
-        assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))],);
+        assert_eq!(
+            output,
+            vec![ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))],
+        );
 
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -188,7 +191,7 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let first = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let first = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -196,7 +199,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let second = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let second = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -204,7 +207,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let third = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]))
+        let third = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -221,7 +224,8 @@ mod tests {
         // Dynamic dimensions flow through elementwise congruence when they match exactly, while static-vs-dynamic
         // mismatches are rejected.
         let operation = TestElementwiseArrayOperation { input_count: 2 };
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()], &[]),
             Ok(vec![dynamic_type.clone()]),
@@ -229,7 +233,10 @@ mod tests {
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(
                 &operation,
-                &[dynamic_type, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]))],
+                &[
+                    dynamic_type,
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                ],
                 &[],
             ),
             Err(TypeError::invalid("'elementwise_test' input types are not broadcast-compatible".to_string())),

@@ -1142,7 +1142,7 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::DomainTracingContext;
     use crate::tracing::Trace;
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 
@@ -1187,7 +1187,7 @@ mod tests {
     /// Builds a single-input branch that scales a vector input by `factor`.
     fn vector_scale_branch(size: usize, factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)])));
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)])));
         let factor = builder.add_constant(Array::scalar(factor));
         let output = builder.add_instruction(MulOperation, Vec::new(), vec![input, factor]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -1196,16 +1196,18 @@ mod tests {
     /// Builds a vector-input branch that returns a replicated constant vector.
     fn constant_vector_branch(values: Vec<f64>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(values.len())])));
+        builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(values.len())])));
         let output = builder.add_constant(Array::vector(values));
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Batches a vector-valued condition whose branches scale their input by two and three.
     fn batch_vector_condition(batch_size: usize, item_size: usize, input_values: Vec<f64>) -> ArrayBatch<Array> {
-        let physical_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size), Size::Static(item_size)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let physical_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(batch_size), Dimension::Static(item_size)]),
+        );
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
         let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
         let predicate = ArrayBatch::new(
             predicate_type.clone(),
@@ -1290,14 +1292,14 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(
-                &[ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])), operand_type.clone()],
+                &[ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), operand_type.clone()],
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid("condition predicate type must be a scalar boolean, but got bool[2]".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
-                &[predicate_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                &[predicate_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))],
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid(
@@ -1560,9 +1562,10 @@ mod tests {
                     .unwrap()
                     .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
-            let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-                .with_sharding(physical_sharding)
-                .unwrap();
+            let physical_type =
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+                    .with_sharding(physical_sharding)
+                    .unwrap();
             let operand = ArrayBatch::new(
                 physical_type.clone(),
                 Array::from_f64s(physical_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -1601,7 +1604,7 @@ mod tests {
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
         let operand_atom = builder.borrow_mut().add_input(operand_type);
         let predicate_tracer = parent.tracer(predicate_atom, None);
@@ -1655,8 +1658,9 @@ mod tests {
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
-        let operand_atom =
-            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let operand_atom = builder
+            .borrow_mut()
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let predicate_tracer = parent.tracer(predicate_atom, None);
         let operand_tracer = parent.tracer(operand_atom, None);
         let output = batch(
@@ -1729,7 +1733,7 @@ mod tests {
     fn test_condition_batching_aligns_replicated_and_mapped_branch_outputs() {
         let batch_size = 2;
         let item_size = 3;
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(batch_size)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
         let predicate = ArrayBatch::new(
             predicate_type.clone(),
             Array::from_f64s(predicate_type, vec![1.0, 0.0]),

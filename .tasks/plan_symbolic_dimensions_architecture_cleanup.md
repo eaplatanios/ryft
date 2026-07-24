@@ -1471,3 +1471,35 @@ Verification completed:
 The residual search contains no old `TypeError` struct construction, tuple-variant construction, or direct named-field
 construction. The remaining `TypeError::Invalid { message }` matches are intentional destructuring patterns;
 similarly named test fixtures and `DataTypeError` are unrelated.
+
+### Execution: S5a dimension rename and module move
+
+- [x] Rename the public `Size` descriptor to `Dimension` without changing its representation or semantics.
+- [x] Move `Dimension`, `Shape`, `StaticShape`, and their 14 tests from `types::arrays` to
+      `types::dimensions`.
+- [x] Update every in-repo Rust use directly, without a compatibility alias or re-export.
+- [x] Run formatting, diff checks, affected crate checks, focused and full library tests, doctests, and macro
+      integration tests.
+- [x] Classify every residual `Size` and old module-path match before staging the no-commit integration merge.
+
+The semantic boundary remained intact: `Dimension` still has exactly the pre-S5a
+`Static(usize) | Dynamic(Option<usize>)` representation. Identity-bearing dynamic dimensions, authoritative bounds,
+and refinements remain wholly assigned to P1. Moving the shape types required only using their public
+`dimensions()` accessor from `ArrayType`; one empty-axis test now passes `Axes::default()` because the module split
+removed enough surrounding type context that rustc could no longer infer the element type of `[]`.
+
+Verification completed:
+
+- `cargo fmt -p ryft-core -p ryft-xla -p ryft -- --check` and `git diff --check` passed;
+- `cargo check -p ryft-core`, `cargo check -p ryft-xla`, and `cargo check -p ryft` passed;
+- the 14 focused `types::dimensions::tests` passed;
+- `cargo test -p ryft-core --lib` passed all 913 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored;
+- `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored; and
+- `cargo test -p ryft-macros -p ryft-macros-tests` passed all 53 macro unit tests and all 17 operation integration
+  tests. The parameter compile-fail snapshot retains the independently reproduced S4 integration-baseline mismatch
+  caused by rustc listing `Axes`.
+
+The only remaining `Size` references under `ryft-core`, `ryft-xla`, and `ryft` are the unrelated
+`ryft_mlir::Size as MlirSize` import and its five uses. No old public `Size` declaration, `Size` variant use, old test
+name, or stale `types::arrays` path for the moved types remains.

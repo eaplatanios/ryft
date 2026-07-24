@@ -1986,7 +1986,7 @@ mod tests {
     use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::types::{ArrayType, DataType, Memory, Shape, Size};
+    use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
 
     /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.
     trait TestPolicy: RematerializationPolicy<ArrayType, ArrayOperation<Array>> + Clone + Debug {}
@@ -2071,7 +2071,7 @@ mod tests {
     }
 
     fn vector_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
     }
 
     #[test]
@@ -2134,7 +2134,7 @@ mod tests {
                 .unwrap()
         };
         let stacked = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),
             rows.iter().flatten().copied().collect(),
         );
         let scan_body = |carry: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
@@ -2753,7 +2753,7 @@ mod tests {
         // the memory-saving structure survives `vmap`: the staged program holds exactly one rematerialize call whose
         // batched forward program still stores only the body output and the region input plus the policy-saved
         // residuals — each now carrying the batch axis.
-        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, matrix_type: &ArrayType) {
             let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body)
                 .with_policy(policy.clone());
@@ -2780,7 +2780,7 @@ mod tests {
             for output_type in &forward_output_types {
                 assert_eq!(
                     output_type.shape().dimensions().first().copied(),
-                    Some(Size::Static(2)),
+                    Some(Dimension::Static(2)),
                     "batched forward outputs should carry the batch axis for policy {policy:?}",
                 );
             }
@@ -2891,7 +2891,7 @@ mod tests {
             let v = u.dot(&u, &DotDimensionNumbers::inner_product());
             Ok(v.clone() * v.sin()?)
         }
-        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize, matrix_type: &ArrayType) {
             let function =
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy.clone());
@@ -3240,7 +3240,7 @@ mod tests {
         // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(tagged_dot_sine_body)
             .with_policy(SaveAndOffloadOnlyTheseNames::new([] as [&str; 0], ["u"], PINNED_HOST));
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
@@ -3259,7 +3259,7 @@ mod tests {
         let forward_output_types = forward.output_types();
         assert_eq!(forward_output_types.len(), 3);
         let saved_type = &forward_output_types[2];
-        assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Size::Static(2)));
+        assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Dimension::Static(2)));
         assert_eq!(saved_type.memory(), PINNED_HOST);
 
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
@@ -3350,8 +3350,9 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let stacked_rows_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let stacked_rows_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(scalar_type);
         let rows = builder.add_input(stacked_rows_type);
@@ -3686,7 +3687,7 @@ mod tests {
                 if message == "storage operation 'effectful' must be pure but declares effects",
         ));
 
-        let restored_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1)]));
+        let restored_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
         let error = validate_restored_residual_type(&restored_type, &scalar_type).unwrap_err();
         assert!(matches!(
             error,

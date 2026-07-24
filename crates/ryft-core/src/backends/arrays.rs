@@ -87,7 +87,7 @@ use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
-use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
+use crate::types::{ArrayType, DataType, Dimension, Shape, StaticShape};
 
 /// Reusable [`Operation`] enum for ordinary staged array programs.
 ///
@@ -264,7 +264,7 @@ impl Array {
     pub fn vector<S: Into<Scalar>>(values: Vec<S>) -> Self {
         let values: Vec<Scalar> = values.into_iter().map(Into::into).collect();
         let data_type = values.first().map_or(DataType::F64, |value| value.r#type().into_owned());
-        let r#type = ArrayType::new(data_type, Shape::new(vec![Size::Static(values.len())]));
+        let r#type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(values.len())]));
         Self::new(r#type, values).unwrap_or_else(|error| panic!("{error}"))
     }
 
@@ -274,7 +274,7 @@ impl Array {
     pub fn matrix<S: Into<Scalar>>(rows: usize, columns: usize, values: Vec<S>) -> Self {
         let values: Vec<Scalar> = values.into_iter().map(Into::into).collect();
         let data_type = values.first().map_or(DataType::F64, |value| value.r#type().into_owned());
-        let r#type = ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(columns)]));
+        let r#type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]));
         Self::new(r#type, values).unwrap_or_else(|error| panic!("{error}"))
     }
 
@@ -1419,7 +1419,7 @@ impl DynamicBroadcast for Array {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let shape = Shape::new(dimensions.into_iter().map(Size::Static).collect());
+        let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
         if !output_type.shape().is_refined_by(&shape) {
             return Err(TypeError::invalid(format!(
                 "dynamic broadcast runtime shape {} does not refine declared output shape {}",
@@ -2041,7 +2041,7 @@ mod tests {
 
     /// Creates a static [`ArrayType`] with the provided element data type and dimension sizes.
     fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|size| Size::Static(*size)).collect()))
+        ArrayType::new(data_type, Shape::new(dimensions.iter().map(|size| Dimension::Static(*size)).collect()))
     }
 
     #[test]
@@ -2059,7 +2059,7 @@ mod tests {
                 if message == "array type f64[3] requires 3 elements but got 1",
         ));
         // Dynamically shaped types cannot describe a materialized payload.
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
         assert!(matches!(
             Array::new(dynamic_type, vec![Scalar::F64(1.0)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -2162,7 +2162,8 @@ mod tests {
         );
         assert_eq!(context.iota(&array_type(DataType::F64, &[3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
         // Kernels that materialize a payload from a type reject dynamically sized types.
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
         let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
         assert!(matches!(
             context.zero(&dynamic_type),
@@ -2382,10 +2383,10 @@ mod tests {
     #[test]
     fn test_array_reshape() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let reshaped = matrix.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap();
+        let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(matrix.reshape(Shape::new(vec![Size::Static(4)])).is_err());
+        assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
     }
 
     #[test]

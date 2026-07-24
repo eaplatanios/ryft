@@ -232,18 +232,18 @@ mod tests {
     use crate::operations::math::{Dot, DotDimensionNumbers};
     use crate::programs::types::Typed;
     use crate::tracing::Trace;
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, Shape};
 
     use super::*;
 
     const PINNED_HOST: Memory = Memory::Host { pinned: true };
 
     fn vector_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(size)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
     }
 
     fn matrix_type(rows: usize, columns: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(rows), Size::Static(columns)]))
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
     }
 
     #[test]

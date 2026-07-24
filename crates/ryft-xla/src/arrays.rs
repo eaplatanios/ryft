@@ -1129,8 +1129,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, Error as CoreError, Layout, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension, ShardingError, Size, StaticShape, TiledLayout, Typed,
+        ArrayType, DataType, Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
@@ -1159,7 +1159,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_sharding(sharding.clone())
             .unwrap();
         let shard_buffers = client_devices
@@ -1202,7 +1202,7 @@ mod tests {
 
         // Layout metadata stored on the underlying array type is exposed verbatim by `Array::layout`.
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], Vec::new()));
-        let layout_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+        let layout_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_layout(layout.clone())
             .with_sharding(sharding)
             .unwrap();
@@ -1241,7 +1241,7 @@ mod tests {
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
         assert_eq!(array.data_type(), DataType::Zero);
@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(array, array.clone());
         assert_eq!(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap(), Vec::<u8>::new());
 
-        let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(0)]));
+        let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(0)]));
         let zero_sized = Array::from_host_buffer(&client, zero_sized_type, array.mesh(), []).unwrap();
         assert_eq!(zero_sized.shape(), StaticShape::new(vec![0]));
         assert!(zero_sized.addressable_shards().next().unwrap().buffer().is_none());
@@ -1265,7 +1265,7 @@ mod tests {
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![logical_device]).unwrap();
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8, 1u8, 0u8], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
         let error = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap_err();
@@ -1281,7 +1281,7 @@ mod tests {
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![logical_device]).unwrap();
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let buffer = client.buffer(&[0u8; 3], BufferType::Predicate, [3u64], None, device, None).unwrap();
 
         let array = Array::from_addressable_buffers(&client, r#type, mesh, vec![buffer]).unwrap();
@@ -1299,7 +1299,7 @@ mod tests {
         let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![local_device, remote_device]).unwrap();
-        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Size::Static(3)]));
+        let r#type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
 
         let array = Array::from_host_buffer(&client, r#type, mesh, []).unwrap();
 
@@ -1322,7 +1322,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
             .with_sharding(sharding)
             .unwrap();
 
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_array_debug() {
-        let shape = Shape::new(vec![Size::Static(2)]);
+        let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
@@ -1627,20 +1627,20 @@ mod tests {
 
     #[test]
     fn test_array_type_size_in_bytes() {
-        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let scalar_type = ArrayType::scalar(DataType::C128);
-        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Size::Static(4)]));
+        let token_type = ArrayType::new(DataType::Token, Shape::new(vec![Dimension::Static(4)]));
 
         assert_eq!(matrix_type.size_in_bytes(), Ok(24));
         assert_eq!(scalar_type.size_in_bytes(), Ok(16));
         assert_eq!(token_type.size_in_bytes(), Ok(0));
 
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]));
         let error = dynamic_type.size_in_bytes().unwrap_err();
         assert_eq!(error, Error::DynamicShape { shape: dynamic_type.shape().clone() });
         assert_eq!(error.to_string(), "expected static shape but got [*]");
 
-        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Size::Static(usize::MAX)]));
+        let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
         let error = oversized_type.size_in_bytes().unwrap_err();
         let message = format!(
             "dense byte size for array type {oversized_type} exceeds the maximum allowed size of {}",

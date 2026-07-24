@@ -1788,7 +1788,7 @@ mod tests {
     use crate::operations::math::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
     use crate::tracing::DomainTracingContext;
-    use crate::types::{Shape, Size};
+    use crate::types::{Dimension, Shape};
 
     use super::*;
 
@@ -1847,7 +1847,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(
-                &[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))],
+                &[ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))],
                 interfaces.as_slice(),
             ),
             Err(TypeError::invalid(
@@ -1858,7 +1858,7 @@ mod tests {
         // Inference rejects mismatched condition/body state signatures, non-Boolean condition outputs,
         // multi-output conditions, and body outputs that do not match the state signature.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
+        let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
         let zero = builder.add_instruction(ZeroLikeOperation, Vec::new(), vec![state]).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
@@ -2315,7 +2315,7 @@ mod tests {
         // the masked loop: it continues while any per-item predicate is true, and items whose predicate is false
         // keep their carried state. Items [3, 1, 2] count down independently, terminating after 3, 1, and 2
         // iterations.
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
@@ -2356,7 +2356,7 @@ mod tests {
         // through the attached region interfaces' declared effects. A scalar predicate imposes no such restriction
         // (the loop exits for all items at once).
         use crate::operations::debugging::PrintOperation;
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
@@ -2392,8 +2392,8 @@ mod tests {
     fn test_while_rejects_batched_predicate_that_is_not_a_state_shape_prefix() {
         // A `bool[3]` predicate over an `f64[2]` state violates the predicate-prefix rule: item masking would be
         // ill-defined, so type inference over the attached region interfaces fails.
-        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(3)]));
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(state_type.clone());
@@ -3027,7 +3027,7 @@ mod tests {
         // `4 x³ = [13.5, 32]`, with trip count 2 strictly below the bound 4.
         use crate::operations::math::ReductionKind;
 
-        let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
@@ -3195,7 +3195,7 @@ mod tests {
     ) -> Program<Array, TestDomainOperation, Array, Array> {
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size)]));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(batch_size)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let input_tracer = parent.tracer(input_atom, None);
         let output = batch(
@@ -3289,8 +3289,9 @@ mod tests {
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let counter_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let value_atom =
-            builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
+        let value_atom = builder
+            .borrow_mut()
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
         let counter_tracer = parent.tracer(counter_atom, None);
         let value_tracer = parent.tracer(value_atom, None);
         let (counter_output, value_output) = batch(

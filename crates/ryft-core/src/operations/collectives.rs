@@ -34,7 +34,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{ArrayType, DataType, Shape, Size};
+use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
 
@@ -458,7 +458,7 @@ fn shape_changing_collective_output_type(
     input_type: &ArrayType,
     output_dimensions: Vec<usize>,
 ) -> Result<ArrayType, TypeError> {
-    let output_sizes = output_dimensions.into_iter().map(Size::Static).collect::<Vec<_>>();
+    let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
     let sharding = resized_output_sharding(input_type, output_sizes.as_slice(), operation_name)?;
     let mut output_type = ArrayType::new(input_type.data_type(), Shape::new(output_sizes));
     output_type.sharding = sharding;
@@ -931,7 +931,7 @@ where
         let moved = value.move_axis(0, self.concat_axis)?;
         let mut output_dimensions = dimensions[1..].to_vec();
         output_dimensions[self.concat_axis] *= dimensions[0];
-        let gathered = moved.reshape(Shape::new(output_dimensions.into_iter().map(Size::Static).collect()))?;
+        let gathered = moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?;
         Ok(vec![ArrayBatch::replicated(gathered)])
     }
 }
@@ -988,7 +988,7 @@ where
         let mut split_dimensions = dimensions[1..].to_vec();
         split_dimensions[self.scatter_axis] = batch_size;
         split_dimensions.insert(self.scatter_axis + 1, scatter_dimension / batch_size);
-        let split = summed.reshape(Shape::new(split_dimensions.into_iter().map(Size::Static).collect()))?;
+        let split = summed.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
         let scattered = split.move_axis(self.scatter_axis, 0)?;
         let physical_type = scattered.r#type().into_owned();
         Ok(vec![ArrayBatch::new(physical_type, scattered, Some(0))?])
@@ -1112,7 +1112,7 @@ where
         let mut split_dimensions = dimensions.clone();
         split_dimensions[self.split_axis + 1] = batch_size;
         split_dimensions.insert(self.split_axis + 2, split_dimension / batch_size);
-        let split = value.reshape(Shape::new(split_dimensions.into_iter().map(Size::Static).collect()))?;
+        let split = value.reshape(Shape::new(split_dimensions.into_iter().map(Dimension::Static).collect()))?;
         let exchanged = split.swap_axes(0, self.split_axis + 1)?;
         // Move the sender axis to sit immediately before the per-item `concat_axis` and merge it in row-major, which
         // concatenates the received chunks sender-major along `concat_axis`. When `split_axis == concat_axis` the
@@ -1122,7 +1122,7 @@ where
         let mut output_dimensions = dimensions;
         output_dimensions[self.split_axis + 1] /= batch_size;
         output_dimensions[self.concat_axis + 1] *= batch_size;
-        let received = moved.reshape(Shape::new(output_dimensions.into_iter().map(Size::Static).collect()))?;
+        let received = moved.reshape(Shape::new(output_dimensions.into_iter().map(Dimension::Static).collect()))?;
         let physical_type = received.r#type().into_owned();
         Ok(vec![ArrayBatch::new(physical_type, received, Some(0))?])
     }
@@ -1261,7 +1261,7 @@ mod tests {
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
-    use crate::types::{Shape, Size};
+    use crate::types::{Dimension, Shape};
 
     use super::*;
 
@@ -1428,7 +1428,7 @@ mod tests {
         // The inner `psum` targets the *outer* named axis, so each inner batch item must reduce over the
         // outer batch items: column sums of [[1, 2], [3, 4]].
         let x = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
         let output: Array = batch(
@@ -1448,13 +1448,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),);
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])),);
         assert_eq!(output.to_f64s(), vec![4.0, 6.0]);
     }
 
     /// Returns the static `f32` vector type of the provided length used by the shape-changing collective tests.
     fn f32_vector(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]))
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]))
     }
 
     #[test]
@@ -1479,7 +1479,7 @@ mod tests {
                     error = "'all_gather' concat axis 0 is out of bounds for rank 0",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]))],
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]))],
                     error = "'all_gather' does not support dynamically shaped operands",
                 },
             ],
@@ -1546,7 +1546,7 @@ mod tests {
         use crate::macros::check_operation_type_inference;
 
         let matrix = |rows: usize, columns: usize| {
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(columns)]))
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
         };
         check_operation_type_inference!(
             operation = AllToAllOperation::new("x".to_string(), 4, 0, 1),
@@ -1627,7 +1627,7 @@ mod tests {
             BatchAxisSpecification::named("x"),
         )
         .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)])));
+        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])));
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
@@ -1665,7 +1665,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(output.to_f64s(), vec![11.0, 22.0, 33.0, 44.0]);
     }
@@ -1686,7 +1686,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(output.to_f64s(), vec![3.0, 4.0, 1.0, 2.0]);
     }
@@ -1727,7 +1727,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(4)])),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
         );
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
@@ -1741,7 +1741,10 @@ mod tests {
         // item 0 = `[[1, 2], [3, 4]]` and item 1 = `[[5, 6], [7, 8]]`, item 0 receives `[[1, 2, 5, 6]]` and item 1
         // receives `[[3, 4, 7, 8]]` (per-item shape `[1, 4]`).
         let x = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2), Size::Static(2)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+            ),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let output: Array = batch(
@@ -1754,7 +1757,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(1), Size::Static(4)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(1), Dimension::Static(4)])
+            ),
         );
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }

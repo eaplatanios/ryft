@@ -81,9 +81,9 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// For fully static types this is type equality (e.g., [`DataType`](crate::types::DataType) requires equal data
     /// types). Types that can carry unknown components additionally admit every more precise instantiation of those
     /// components. For example, [`ArrayType`](crate::types::ArrayType)s with
-    /// [`Size::Dynamic`](crate::types::Size::Dynamic) dimensions are refined by otherwise-equal
-    /// [`ArrayType`](crate::types::ArrayType)s whose corresponding dimensions are static, per
-    /// [`Size::is_refined_by`](crate::types::Size::is_refined_by).
+    /// [`Dimension::Dynamic`](crate::Dimension::Dynamic) dimensions are refined by otherwise-equal
+    /// [`ArrayType`](crate::ArrayType)s whose corresponding dimensions are static,
+    /// per [`Dimension::is_refined_by`](crate::Dimension::is_refined_by).
     ///
     /// Reading each [`Type`] as the set of values it describes, this relation is equivalent to set inclusion
     /// (i.e., argument ⊆ receiver) and forms a partial ordering (i.e., semantic subtyping where `other` is a subtype of
