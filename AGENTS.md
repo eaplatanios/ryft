@@ -49,7 +49,14 @@ When asked to implement a change or add a new feature, you must always follow th
    throwaway crate outside the workspace that depends only on the crates you changed). More generally, never run
    `git checkout <path>`, `git restore <path>`, or `git reset` on tracked files during a session. Large refactors live
    uncommitted in the working tree for hours, and such commands silently destroy that work. To inspect the committed
-   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead.
+   version of a file, use read-only commands like `git show HEAD:<path>` and `git diff HEAD -- <path>` instead. The
+   sole exception is a clean, dedicated staging worktree used by a reviewed extraction plan after the complete source
+   tree has been committed and pushed to an immutable archive branch. In that worktree only, `git restore
+   --source=<immutable-archive-or-reviewed-integration-ref> -- <explicit-paths>` may restore a documented increment's
+   explicit paths. Verify the staging worktree is clean first; restore a whole path only when the reviewed plan assigns
+   its complete delta to that increment, and use patch mode for paths shared with later work. Never target the worktree
+   root, a directory broader than the increment, a glob, or an unresolved variable. This exception never applies in
+   the owner checkout and does not permit `git checkout <path>`, `git reset`, `git clean`, or `git stash`.
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.
