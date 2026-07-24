@@ -67,9 +67,11 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
 
         let rank = value.r#type().rank();
         if rank > target.rank() {
-            return Err(TypeError {
-                message: format!("cannot align tangent type {} to output type {}", value.r#type(), target),
-            }
+            return Err(TypeError::invalid(format!(
+                "cannot align tangent type {} to output type {}",
+                value.r#type(),
+                target,
+            ))
             .into());
         }
 
@@ -89,8 +91,12 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
     }
 
     fn unalign_cotangent(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
-        let offset = self.r#type().rank().checked_sub(target.rank()).ok_or_else(|| TypeError {
-            message: format!("cannot unalign cotangent type {} to input cotangent type {}", self.r#type(), target),
+        let offset = self.r#type().rank().checked_sub(target.rank()).ok_or_else(|| {
+            TypeError::invalid(format!(
+                "cannot unalign cotangent type {} to input cotangent type {}",
+                self.r#type(),
+                target,
+            ))
         })?;
         let output_axes = (0..target.rank()).map(|axis| axis + offset).collect::<Vec<_>>();
         self.unalign_cotangent_along(target, output_axes.as_slice())
@@ -121,12 +127,10 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         // else means the caller's axis mapping and the operand type disagree.
         let value_type = self.r#type();
         if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
-            return Err(TypeError {
-                message: format!(
-                    "cannot unalign cotangent type {value_type} to input cotangent type {target} using output axes \
-                     {output_axes:?}",
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "cannot unalign cotangent type {} to input cotangent type {} using output axes {:?}",
+                value_type, target, output_axes,
+            ))
             .into());
         }
 
@@ -140,12 +144,10 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
             let value_dimension = value_type.dimension(output_axis);
             if target_dimension != value_dimension {
                 if target_dimension != Size::Static(1) {
-                    return Err(TypeError {
-                        message: format!(
-                            "cannot unalign cotangent axis {output_axis} of size {value_dimension} to input axis \
-                             {target_axis} of size {target_dimension}",
-                        ),
-                    }
+                    return Err(TypeError::invalid(format!(
+                        "cannot unalign cotangent axis {} of size {} to input axis {} of size {}",
+                        output_axis, value_dimension, target_axis, target_dimension,
+                    ))
                     .into());
                 }
             } else {
@@ -204,13 +206,11 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Reshape + Tra
         // As a defensive final check, report a mismatch instead of returning a mistyped cotangent, because a wrong
         // cotangent type would surface much later as a confusing accumulation or interpretation error.
         if contribution.r#type().as_ref() != target {
-            return Err(TypeError {
-                message: format!(
-                    "unaligned cotangent type {} does not match required input cotangent type {}",
-                    contribution.r#type(),
-                    target,
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "unaligned cotangent type {} does not match required input cotangent type {}",
+                contribution.r#type(),
+                target,
+            ))
             .into());
         }
 
@@ -461,7 +461,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         assert!(matches!(
             value.align_tangent(&target),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "cannot align tangent type f64[2, 3] to output type f64[3]",
         ));
     }
@@ -491,7 +491,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
         assert!(matches!(
             cotangent.unalign_cotangent_along(&target, &[3]),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError { message })))
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message
                     == "cannot unalign cotangent type f64[3, 2, 4] to input cotangent type f64[2] using output axes [3]",
         ));

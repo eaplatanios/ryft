@@ -27,7 +27,7 @@ macro_rules! check_count {
             let count = values.len();
             let descriptor = $descriptor;
             let noun = if expected == 1 { descriptor.to_string() } else { format!("{descriptor}s") };
-            return Err($crate::TypeError { message: format!("expected {expected} {noun} but got {count}") });
+            return Err($crate::TypeError::invalid(format!("expected {expected} {noun} but got {count}")));
         }
     }};
 }
@@ -70,14 +70,12 @@ macro_rules! check_types {
         let expected = &$expected[..];
         let actual = &$actual[..];
         if expected != actual {
-            return Err($crate::TypeError {
-                message: format!(
+            return Err($crate::TypeError::invalid(format!(
                     "{} type signature mismatch: expected [{}] but got [{}]",
                     $descriptor,
                     expected.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     actual.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-                ),
-            });
+                )));
         }
     }};
 
@@ -87,7 +85,7 @@ macro_rules! check_types {
         let types = &$types[..];
         if types.iter().any(|r#type| !r#type.unreduced_axes().is_empty()) {
             return Err(
-                $crate::TypeError { message: format!("'{descriptor}' does not support unreduced operands") }.into()
+                $crate::TypeError::invalid(format!("'{descriptor}' does not support unreduced operands")).into()
             );
         }
     }};
@@ -97,12 +95,10 @@ macro_rules! check_types {
         let descriptor = $descriptor;
         let types = &$types[..];
         if types.len() != 2 {
-            return Err($crate::TypeError { message: format!("expected 2 inputs but got {}", types.len()) }.into());
+            return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].unreduced_axes() != types[1].unreduced_axes() {
-            return Err($crate::TypeError {
-                message: format!("'{descriptor}' operands must be unreduced over the same axes"),
-            }
+            return Err($crate::TypeError::invalid(format!("'{descriptor}' operands must be unreduced over the same axes"))
             .into());
         }
     }};
@@ -112,12 +108,10 @@ macro_rules! check_types {
         let descriptor = $descriptor;
         let types = &$types[..];
         if types.len() != 2 {
-            return Err($crate::TypeError { message: format!("expected 2 inputs but got {}", types.len()) }.into());
+            return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].reduced_axes() != types[1].reduced_axes() {
-            return Err($crate::TypeError {
-                message: format!("'{descriptor}' operands must be reduced over the same axes"),
-            }
+            return Err($crate::TypeError::invalid(format!("'{descriptor}' operands must be reduced over the same axes"))
             .into());
         }
     }};
@@ -129,9 +123,7 @@ macro_rules! check_types {
         if let Some(input_type) = types.iter().find(|input_type| {
             !$crate::check_types!(@matches_data_type input_type; $(@$selector)+)
         }) {
-            return Err($crate::TypeError {
-                message: format!("'{descriptor}' does not support input data type {input_type}"),
-            }
+            return Err($crate::TypeError::invalid(format!("'{descriptor}' does not support input data type {input_type}"))
             .into());
         }
     }};
@@ -329,9 +321,11 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!($(@$data_type_check)+, $name, input_types);)*)?
-                let output_types = $crate::define_elementwise_operation!(
+                let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+                    $crate::define_elementwise_operation!(
                     @infer_data_types [$($infer_data_types)?] @unary input_types
-                )?;
+                );
+                let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
@@ -367,9 +361,11 @@ macro_rules! define_elementwise_operation {
                 $crate::check_count!("input", input_types, 1, TypeError);
                 $($($crate::check_types!($(@$data_type_check)+, $name, &[input_types[0].data_type()]);)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                let output_types = $crate::define_elementwise_operation!(
+                let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
+                    $crate::define_elementwise_operation!(
                     @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @unary self, input_types
-                )?;
+                );
+                let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
@@ -433,9 +429,11 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::DataType>, $crate::TypeError> {
                 $crate::check_count!("input", input_types, 2, TypeError);
                 $($($crate::check_types!($(@$data_type_selector)+, $name, input_types);)*)?
-                let output_types = $crate::define_elementwise_operation!(
+                let output_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+                    $crate::define_elementwise_operation!(
                     @infer_data_types [$($infer_data_types)?] @binary input_types, $name
-                )?;
+                );
+                let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
@@ -475,9 +473,11 @@ macro_rules! define_elementwise_operation {
                     &[input_types[0].data_type(), input_types[1].data_type()],
                 );)*)?
                 $($($crate::check_types!(@$array_type_check, $name, input_types);)*)?
-                let output_types = $crate::define_elementwise_operation!(
+                let output_types: Result<Vec<$crate::ArrayType>, $crate::TypeError> =
+                    $crate::define_elementwise_operation!(
                     @infer_array_types [$($infer_array_types)?] [$($infer_data_types)?] @binary self, input_types, $name
-                )?;
+                );
+                let output_types = output_types?;
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
@@ -512,16 +512,14 @@ macro_rules! define_elementwise_operation {
 
     // This internal branch supplies the default type-preserving inference for unary operations.
     (@infer_data_types [] @unary $input_types:expr) => {
-        Ok(vec![$input_types[0]])
+        Ok::<Vec<$crate::DataType>, $crate::TypeError>(vec![$input_types[0]])
     };
 
     // This internal branch supplies the default broadcasting inference for binary data types.
     (@infer_data_types [] @binary $input_types:expr, $name:ident) => {
         $crate::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
             .map(|output| vec![output])
-            .map_err(|_| $crate::TypeError {
-                message: format!("'{}' input types are not broadcast-compatible", $name),
-            })
+            .map_err(|_| $crate::TypeError::invalid(format!("'{}' input types are not broadcast-compatible", $name)))
     };
 
     // This internal branch invokes caller-provided array-type inference instead of structural lifting.
@@ -561,13 +559,15 @@ macro_rules! define_elementwise_operation {
         @infer_default_array_types [$($infer_data_types:expr)?] @$arity:ident
         $operation:expr, $input_types:expr, $input_data_types:expr $(, $name:ident)?
     ) => {{
-        let output_data_types = $crate::define_elementwise_operation!(
+        let output_data_types: Result<Vec<$crate::DataType>, $crate::TypeError> =
+            $crate::define_elementwise_operation!(
             @infer_data_types [$($infer_data_types)?] @$arity $input_data_types $(, $name)?
-        )?;
+        );
+        let output_data_types = output_data_types?;
         $crate::check_count!("output", output_data_types, 1, TypeError);
         let output_type = $crate::ElementwiseOperation::infer_elementwise_broadcast_type($operation, $input_types)?
             .with_data_type(output_data_types[0]);
-        Ok(vec![output_type])
+        Ok::<Vec<$crate::ArrayType>, $crate::TypeError>(vec![output_type])
     }};
 }
 
@@ -2491,9 +2491,9 @@ macro_rules! check_operation_type_inference {
             .collect::<Vec<_>>();
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(&operation, input_types.as_slice(), &[]),
-            Err($crate::programs::types::TypeError {
-                message: format!("'{descriptor}' does not support unreduced operands"),
-            }),
+            Err($crate::programs::types::TypeError::invalid(format!(
+                "'{descriptor}' does not support unreduced operands",
+            ))),
         );
     }};
 
@@ -2526,9 +2526,9 @@ macro_rules! check_operation_type_inference {
             .clone()
             .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
             .unwrap();
-        let expected = Err($crate::programs::types::TypeError {
-            message: format!("'{descriptor}' operands must be reduced over the same axes"),
-        });
+        let expected = Err($crate::programs::types::TypeError::invalid(format!(
+            "'{descriptor}' operands must be reduced over the same axes",
+        )));
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
                 &operation,
@@ -2691,9 +2691,9 @@ macro_rules! check_operation_type_inference {
                 input_types.as_slice(),
                 &[],
             ),
-            Err($crate::programs::types::TypeError {
-                message: ::core::convert::Into::<::std::string::String>::into($message),
-            }),
+            Err($crate::programs::types::TypeError::invalid(
+                ::core::convert::Into::<::std::string::String>::into($message),
+            )),
         );
     }};
 
@@ -2733,9 +2733,9 @@ macro_rules! check_operation_type_inference {
                 input_types.as_slice(),
                 &[],
             ),
-            Err($crate::programs::types::TypeError {
-                message: ::core::convert::Into::<::std::string::String>::into($message),
-            }),
+            Err($crate::programs::types::TypeError::invalid(
+                ::core::convert::Into::<::std::string::String>::into($message),
+            )),
         );
     }};
 }
@@ -3907,9 +3907,7 @@ mod tests {
         Add, add,
         infer_array_types = |input_types: &[ArrayType]| {
             if input_types[0] != input_types[1] {
-                return Err(TypeError {
-                    message: "test strict-add inputs must have identical array types".to_string(),
-                });
+                return Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
             }
             Ok(vec![input_types[0].clone()])
         },
@@ -4305,8 +4303,8 @@ mod tests {
         assert_eq!(check_output(&[0, 1]), Ok(()));
         assert_eq!(check_output(&[0]), Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }));
         assert_eq!(check_operand(&[0], 1), Ok(()));
-        assert_eq!(check_operand(&[], 1), Err(TypeError { message: "expected 1 operand but got 0".to_string() }),);
-        assert_eq!(check_operand(&[0], 2), Err(TypeError { message: "expected 2 operands but got 1".to_string() }),);
+        assert_eq!(check_operand(&[], 1), Err(TypeError::invalid("expected 1 operand but got 0".to_string())),);
+        assert_eq!(check_operand(&[0], 2), Err(TypeError::invalid("expected 2 operands but got 1".to_string())),);
     }
 
     #[test]
@@ -4319,9 +4317,7 @@ mod tests {
         assert_eq!(check(&expected, expected.to_vec()), Ok(()));
         assert_eq!(
             check(&expected, vec![DataType::F32, DataType::I64]),
-            Err(TypeError {
-                message: "test type signature mismatch: expected [f32, f64] but got [f32, i64]".to_string(),
-            }),
+            Err(TypeError::invalid("test type signature mismatch: expected [f32, f64] but got [f32, i64]".to_string())),
         );
     }
 
@@ -4359,38 +4355,38 @@ mod tests {
         for r#type in [DataType::Boolean, DataType::Token, DataType::Zero] {
             assert_eq!(
                 check_numeric(&[DataType::F32, r#type]),
-                Err(TypeError { message: format!("'test' does not support input data type {type}", type = r#type) }),
+                Err(TypeError::invalid(format!("'test' does not support input data type {type}", type = r#type))),
             );
         }
         assert_eq!(check_real(&[DataType::I64, DataType::F32]), Ok(()));
         assert_eq!(
             check_real(&[DataType::C64]),
-            Err(TypeError { message: "'test' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type c64".to_string())),
         );
         assert_eq!(check_float(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
         assert_eq!(
             check_float(&[DataType::I64]),
-            Err(TypeError { message: "'test' does not support input data type i64".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type i64".to_string())),
         );
         assert_eq!(check_numeric_then_real(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_numeric(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(
             check_numeric_then_real(&[DataType::C128]),
-            Err(TypeError { message: "'test' does not support input data type c128".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type c128".to_string())),
         );
         assert_eq!(
             check_numeric_then_real(&[DataType::Boolean]),
-            Err(TypeError { message: "'test' does not support input data type bool".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type bool".to_string())),
         );
         assert_eq!(check_float_then_real(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_float(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(
             check_float_then_real(&[DataType::C64]),
-            Err(TypeError { message: "'test' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type c64".to_string())),
         );
         assert_eq!(
             check_float_then_real(&[DataType::I64]),
-            Err(TypeError { message: "'test' does not support input data type i64".to_string() }),
+            Err(TypeError::invalid("'test' does not support input data type i64".to_string())),
         );
     }
 
@@ -4433,25 +4429,25 @@ mod tests {
         assert_eq!(check_no_unreduced(std::slice::from_ref(&plain)), Ok(()));
         assert_eq!(
             check_no_unreduced(std::slice::from_ref(&unreduced_x)),
-            Err(TypeError { message: "'test' does not support unreduced operands".to_string() }),
+            Err(TypeError::invalid("'test' does not support unreduced operands".to_string())),
         );
         assert_eq!(check_unreduced_axes(&[unreduced_x.clone(), unreduced_x.clone()]), Ok(()));
         assert_eq!(
             check_unreduced_axes(&[unreduced_x, unreduced_y]),
-            Err(TypeError { message: "'test' operands must be unreduced over the same axes".to_string() }),
+            Err(TypeError::invalid("'test' operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             check_unreduced_axes(std::slice::from_ref(&plain)),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+            Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         assert_eq!(check_reduced_axes(&[reduced_x.clone(), reduced_x.clone()]), Ok(()));
         assert_eq!(
             check_reduced_axes(&[reduced_x, reduced_y]),
-            Err(TypeError { message: "'test' operands must be reduced over the same axes".to_string() }),
+            Err(TypeError::invalid("'test' operands must be reduced over the same axes".to_string())),
         );
         assert_eq!(
             check_reduced_axes(std::slice::from_ref(&plain)),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+            Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
     }
 
@@ -4878,11 +4874,11 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean], &[]),
-            Err(TypeError { message: "'test_unary' does not support input data type bool".to_string() }),
+            Err(TypeError::invalid("'test_unary' does not support input data type bool".to_string())),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::I64], &[]),
@@ -4890,7 +4886,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
-            Err(TypeError { message: "'test_unary' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F32)], &[]),
@@ -4903,7 +4899,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::C64)], &[]),
-            Err(TypeError { message: "'test_unary' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
@@ -4911,7 +4907,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_type], &[]),
-            Err(TypeError { message: "'test_unary' does not support unreduced operands".to_string() }),
+            Err(TypeError::invalid("'test_unary' does not support unreduced operands".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar, TestUnaryOperation>>::interpret(
@@ -4952,11 +4948,11 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+            Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::Boolean, DataType::Boolean], &[]),
-            Err(TypeError { message: "'test_binary' does not support input data type bool".to_string() }),
+            Err(TypeError::invalid("'test_binary' does not support input data type bool".to_string())),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::I64, DataType::I64], &[]),
@@ -4964,7 +4960,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
-            Err(TypeError { message: "'test_binary' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
@@ -4978,7 +4974,7 @@ mod tests {
                 &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
                 &[],
             ),
-            Err(TypeError { message: "'test_binary' does not support input data type c64".to_string() }),
+            Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
@@ -4993,7 +4989,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[unreduced_x, unreduced_y], &[]),
-            Err(TypeError { message: "'test_binary' operands must be unreduced over the same axes".to_string() }),
+            Err(TypeError::invalid("'test_binary' operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Scalar, TestBinaryOperation>>::interpret(
@@ -5048,7 +5044,7 @@ mod tests {
             Ok(vec![scalar.clone()]),
         );
         let vector = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]));
-        let expected = Err(TypeError { message: "test strict-add inputs must have identical array types".to_string() });
+        let expected = Err(TypeError::invalid("test strict-add inputs must have identical array types".to_string()));
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&strict_add, &[scalar.clone(), vector.clone()], &[]),
             expected.clone(),

@@ -54,31 +54,25 @@ fn validate_start_index_types(
 ) -> Result<(), ProgramError> {
     for (index, index_type) in index_types.iter().enumerate() {
         if index_type.rank() != 0 || !index_type.data_type().is_integer() {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' start index {index} must be a scalar integer but has type {index_type}",
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'{operation_name}' start index {index} must be a scalar integer but has type {index_type}",
+            ))
             .into());
         }
         if index_type.memory() != operand_memory {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' operand and start indices must share one memory space but start index {index} \
+            return Err(TypeError::invalid(format!(
+                "'{operation_name}' operand and start indices must share one memory space but start index {index} \
                      resides in {} and the operand resides in {operand_memory}",
-                    index_type.memory(),
-                ),
-            }
+                index_type.memory(),
+            ))
             .into());
         }
         if index_type.data_type() != index_types[0].data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'{operation_name}' start indices must share one integer type but index {index} has type \
+            return Err(TypeError::invalid(format!(
+                "'{operation_name}' start indices must share one integer type but index {index} has type \
                     {index_type} and index 0 has type {first}",
-                    first = index_types[0],
-                ),
-            }
+                first = index_types[0],
+            ))
             .into());
         }
     }
@@ -115,20 +109,17 @@ impl SliceOperation {
     /// every stride must be at least `1`.
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, ProgramError> {
         if strides.len() != self.start_indices.len() {
-            return Err(TypeError {
-                message: format!(
-                    "'slice' strides has length {} but start_indices has length {}",
-                    strides.len(),
-                    self.start_indices.len(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'slice' strides has length {} but start_indices has length {}",
+                strides.len(),
+                self.start_indices.len(),
+            ))
             .into());
         }
         if let Some(axis) = strides.iter().position(|stride| *stride == 0) {
-            return Err(TypeError {
-                message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
-            }
-            .into());
+            return Err(
+                TypeError::invalid(format!("'slice' strides must be at least 1 but axis {axis} has stride 0")).into()
+            );
         }
         self.strides = strides;
         Ok(self)
@@ -160,17 +151,15 @@ impl SliceOperation {
     pub(crate) fn with_full_extent_axes(mut self, axes: impl IntoIterator<Item = usize>) -> Result<Self, ProgramError> {
         for axis in axes {
             if axis >= self.start_indices.len() {
-                return Err(TypeError {
-                    message: format!(
-                        "'slice' full-extent axis {axis} is out of bounds for {} slice axes",
-                        self.start_indices.len(),
-                    ),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'slice' full-extent axis {axis} is out of bounds for {} slice axes",
+                    self.start_indices.len(),
+                ))
                 .into());
             }
             if self.start_indices[axis] != 0 {
                 return Err(
-                    TypeError { message: format!("'slice' full-extent axis {axis} must have start index 0") }.into()
+                    TypeError::invalid(format!("'slice' full-extent axis {axis} must have start index 0")).into()
                 );
             }
             self.full_extent_axes.insert(axis);
@@ -190,10 +179,10 @@ impl SliceOperation {
         let mut limit_indices = self.limit_indices.clone();
         for &axis in &self.full_extent_axes {
             let dimension = input_type.dimension(axis);
-            limit_indices[axis] = dimension.value().ok_or_else(|| TypeError {
-                message: format!(
+            limit_indices[axis] = dimension.value().ok_or_else(|| {
+                TypeError::invalid(format!(
                     "'slice' cannot resolve the runtime extent of dynamic input axis {axis} while interpreting a value"
-                ),
+                ))
             })?;
         }
         Ok(limit_indices)
@@ -234,14 +223,14 @@ impl Operation<ArrayType> for SliceOperation {
                 {
                     if self.full_extent_axes.contains(&axis) {
                         if start != 0 {
-                            return Err(TypeError {
-                                message: format!("'slice' full-extent axis {axis} must have start index 0"),
-                            });
+                            return Err(TypeError::invalid(format!(
+                                "'slice' full-extent axis {axis} must have start index 0"
+                            )));
                         }
                         if stride == 0 {
-                            return Err(TypeError {
-                                message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
-                            });
+                            return Err(TypeError::invalid(format!(
+                                "'slice' strides must be at least 1 but axis {axis} has stride 0"
+                            )));
                         }
                         output_dimensions.push(match input_type.dimension(axis) {
                             Size::Static(size) => Size::Static(size.div_ceil(stride)),
@@ -255,31 +244,25 @@ impl Operation<ArrayType> for SliceOperation {
                     }
                     let dimension = input_type.dimension(axis);
                     let Size::Static(size) = dimension else {
-                        return Err(TypeError {
-                            message: format!(
-                                "'slice' does not support dynamic input axis {axis} with size {dimension}; slice \
+                        return Err(TypeError::invalid(format!(
+                            "'slice' does not support dynamic input axis {axis} with size {dimension}; slice \
                                  bounds cannot be validated against an unknown extent",
-                            ),
-                        });
+                        )));
                     };
                     if stride == 0 {
-                        return Err(TypeError {
-                            message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
-                        });
+                        return Err(TypeError::invalid(format!(
+                            "'slice' strides must be at least 1 but axis {axis} has stride 0"
+                        )));
                     }
                     if start > limit {
-                        return Err(TypeError {
-                            message: format!(
-                                "'slice' start index {start} is greater than limit index {limit} at axis {axis}"
-                            ),
-                        });
+                        return Err(TypeError::invalid(format!(
+                            "'slice' start index {start} is greater than limit index {limit} at axis {axis}"
+                        )));
                     }
                     if limit > size {
-                        return Err(TypeError {
-                            message: format!(
-                                "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
-                            ),
-                        });
+                        return Err(TypeError::invalid(format!(
+                            "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
+                        )));
                     }
                     output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
                 }
@@ -287,13 +270,13 @@ impl Operation<ArrayType> for SliceOperation {
                 ArrayType::new(input_type.data_type(), Shape::new(output_dimensions))
                     .with_memory(input_type.memory())
                     .with_sharding(sharding)
-                    .map_err(|error| TypeError { message: error.to_string() }.into())
+                    .map_err(|error| TypeError::invalid(error.to_string()).into())
             }
         };
         match result {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -422,11 +405,9 @@ where
                 {
                     let dimension = input_type.dimension(axis);
                     let Some(input_size) = dimension.value() else {
-                        return Err(TypeError {
-                            message: format!(
-                                "'slice' transpose requires a static input shape but axis {axis} has size {dimension}",
-                            ),
-                        }
+                        return Err(TypeError::invalid(format!(
+                            "'slice' transpose requires a static input shape but axis {axis} has size {dimension}",
+                        ))
                         .into());
                     };
                     let output_size = (limit - start).div_ceil(stride);
@@ -437,11 +418,11 @@ where
                         0 => input_size - start,
                         size => input_size - (start + (size - 1) * stride) - 1,
                     };
-                    edge_padding_low.push(i64::try_from(start).map_err(|_| TypeError {
-                        message: format!("'slice' transpose start index is too large on axis {axis}"),
+                    edge_padding_low.push(i64::try_from(start).map_err(|_| {
+                        TypeError::invalid(format!("'slice' transpose start index is too large on axis {axis}"))
                     })?);
-                    edge_padding_high.push(i64::try_from(high).map_err(|_| TypeError {
-                        message: format!("'slice' transpose high padding is too large on axis {axis}"),
+                    edge_padding_high.push(i64::try_from(high).map_err(|_| {
+                        TypeError::invalid(format!("'slice' transpose high padding is too large on axis {axis}"))
                     })?);
                     interior_padding.push(stride - 1);
                 }
@@ -578,12 +559,10 @@ pub(crate) fn resized_output_sharding(
             .filter_map(|name| sharding.mesh().axis_size(name))
             .product();
         if explicit_axis_product > 1 && output_size % explicit_axis_product != 0 {
-            return Err(TypeError {
-                message: format!(
-                    "'{op}' on a dimension sharded over explicit mesh axes requires the output size ({output_size}) at \
+            return Err(TypeError::invalid(format!(
+                "'{op}' on a dimension sharded over explicit mesh axes requires the output size ({output_size}) at \
                      axis {axis} to be divisible by the mesh-axis product ({explicit_axis_product})"
-                ),
-            });
+            )));
         }
     }
     Ok(Some(sharding.clone()))
@@ -607,14 +586,12 @@ fn update_slice_output_sharding(
         return Ok(Some(operand_sharding.clone()));
     };
     if operand_sharding.mesh() != update_sharding.mesh() {
-        return Err(TypeError { message: format!("'{op}' operand and update must use the same mesh") });
+        return Err(TypeError::invalid(format!("'{op}' operand and update must use the same mesh")));
     }
     if operand_sharding.conflicts_on_explicit_axes_with(update_sharding) {
-        return Err(TypeError {
-            message: format!(
-                "'{op}' operand and update must be sharded identically, but got {operand_sharding} and {update_sharding}"
-            ),
-        });
+        return Err(TypeError::invalid(format!(
+            "'{op}' operand and update must be sharded identically, but got {operand_sharding} and {update_sharding}"
+        )));
     }
     if update_sharding.varying_manual_axes().is_subset(operand_sharding.varying_manual_axes()) {
         return Ok(Some(operand_sharding.clone()));
@@ -628,7 +605,7 @@ fn update_slice_output_sharding(
         .clone()
         .with_varying_manual_axes(varying_manual_axes)
         .map(Some)
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
 impl Slice for ArrayType {
@@ -640,21 +617,24 @@ impl Slice for ArrayType {
     ) -> Result<ArrayType, ProgramError> {
         let rank = self.rank();
         if start_indices.len() != rank {
-            return Err(TypeError {
-                message: format!("'slice' start_indices has length {} but input has rank {rank}", start_indices.len(),),
-            }
+            return Err(TypeError::invalid(format!(
+                "'slice' start_indices has length {} but input has rank {rank}",
+                start_indices.len(),
+            ))
             .into());
         }
         if limit_indices.len() != rank {
-            return Err(TypeError {
-                message: format!("'slice' limit_indices has length {} but input has rank {rank}", limit_indices.len(),),
-            }
+            return Err(TypeError::invalid(format!(
+                "'slice' limit_indices has length {} but input has rank {rank}",
+                limit_indices.len(),
+            ))
             .into());
         }
         if strides.len() != rank {
-            return Err(TypeError {
-                message: format!("'slice' strides has length {} but input has rank {rank}", strides.len()),
-            }
+            return Err(TypeError::invalid(format!(
+                "'slice' strides has length {} but input has rank {rank}",
+                strides.len()
+            ))
             .into());
         }
         let mut output_dimensions = Vec::with_capacity(rank);
@@ -663,30 +643,28 @@ impl Slice for ArrayType {
         {
             let dimension = self.dimension(axis);
             let Size::Static(size) = dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "'slice' does not support dynamic input axis {axis} with size {dimension}; slice bounds \
+                return Err(TypeError::invalid(format!(
+                    "'slice' does not support dynamic input axis {axis} with size {dimension}; slice bounds \
                         cannot be validated against an unknown extent",
-                    ),
-                }
+                ))
                 .into());
             };
             if stride == 0 {
-                return Err(TypeError {
-                    message: format!("'slice' strides must be at least 1 but axis {axis} has stride 0"),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'slice' strides must be at least 1 but axis {axis} has stride 0"
+                ))
                 .into());
             }
             if start > limit {
-                return Err(TypeError {
-                    message: format!("'slice' start index {start} is greater than limit index {limit} at axis {axis}"),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'slice' start index {start} is greater than limit index {limit} at axis {axis}"
+                ))
                 .into());
             }
             if limit > size {
-                return Err(TypeError {
-                    message: format!("'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'slice' limit index {limit} is out of bounds for axis {axis} with size {size}"
+                ))
                 .into());
             }
             output_dimensions.push(Size::Static((limit - start).div_ceil(stride)));
@@ -698,7 +676,7 @@ impl Slice for ArrayType {
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_memory(self.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -764,7 +742,7 @@ impl Operation<ArrayType> for UpdateSliceOperation {
         match input_types[0].update_slice(&input_types[1], self.start_indices.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -955,78 +933,65 @@ pub trait UpdateSlice: Sized {
 impl UpdateSlice for ArrayType {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'update_slice' input data type {} does not match update data type {}",
-                    self.data_type(),
-                    update.data_type(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'update_slice' input data type {} does not match update data type {}",
+                self.data_type(),
+                update.data_type(),
+            ))
             .into());
         }
         if self.memory() != update.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'update_slice' input and update must share one memory space but reside in {} and {}",
-                    self.memory(),
-                    update.memory(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'update_slice' input and update must share one memory space but reside in {} and {}",
+                self.memory(),
+                update.memory(),
+            ))
             .into());
         }
         let rank = self.rank();
         if update.rank() != rank {
-            return Err(TypeError {
-                message: format!("'update_slice' update has rank {} but input has rank {rank}", update.rank()),
-            }
+            return Err(TypeError::invalid(format!(
+                "'update_slice' update has rank {} but input has rank {rank}",
+                update.rank()
+            ))
             .into());
         }
         if start_indices.len() != rank {
-            return Err(TypeError {
-                message: format!(
-                    "'update_slice' start_indices has length {} but input has rank {rank}",
-                    start_indices.len(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'update_slice' start_indices has length {} but input has rank {rank}",
+                start_indices.len(),
+            ))
             .into());
         }
         for (axis, &start) in start_indices.iter().enumerate() {
             let update_dimension = update.dimension(axis);
             let Size::Static(update_size) = update_dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "'update_slice' does not support dynamic update axis {axis} with size {update_dimension}; \
+                return Err(TypeError::invalid(format!(
+                    "'update_slice' does not support dynamic update axis {axis} with size {update_dimension}; \
                         update shapes must be static",
-                    ),
-                }
+                ))
                 .into());
             };
             let input_dimension = self.dimension(axis);
             let Size::Static(input_size) = input_dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "'update_slice' cannot prove that the update fits along dynamic input axis {axis} with \
+                return Err(TypeError::invalid(format!(
+                    "'update_slice' cannot prove that the update fits along dynamic input axis {axis} with \
                         size {input_dimension}",
-                    ),
-                }
+                ))
                 .into());
             };
             if start.checked_add(update_size).is_none_or(|limit| limit > input_size) {
-                return Err(TypeError {
-                    message: format!(
-                        "'update_slice' update axis {axis} with start index {start} and size {update_size} does not \
+                return Err(TypeError::invalid(format!(
+                    "'update_slice' update axis {axis} with start index {start} and size {update_size} does not \
                         fit in input size {input_size}",
-                    ),
-                }
+                ))
                 .into());
             }
         }
         // The output is distributed like the input operand (the update is written in place); the operand's placement
         // and reduction state carry through, with the update's varying-manual axes folded in.
         let sharding = update_slice_output_sharding(self, update, UPDATE_SLICE_OPERATION_NAME)?;
-        self.clone()
-            .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+        self.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -1089,16 +1054,16 @@ impl Operation<ArrayType> for DynamicSliceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.is_empty() {
-            return Err(TypeError {
-                message: "'dynamic_slice' expects an input operand followed by its start index operands but got no \
+            return Err(TypeError::invalid(
+                "'dynamic_slice' expects an input operand followed by its start index operands but got no \
                     inputs"
                     .to_string(),
-            });
+            ));
         }
         match input_types[0].dynamic_slice(&input_types[1..], self.sizes.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -1270,18 +1235,17 @@ impl DynamicSlice for ArrayType {
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<ArrayType, ProgramError> {
         let rank = self.rank();
         if start_indices.len() != rank {
-            return Err(TypeError {
-                message: format!(
-                    "'dynamic_slice' expects one start index per input axis ({rank}) but got {}",
-                    start_indices.len(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_slice' expects one start index per input axis ({rank}) but got {}",
+                start_indices.len(),
+            ))
             .into());
         }
         if sizes.len() != rank {
-            return Err(TypeError {
-                message: format!("'dynamic_slice' sizes has length {} but input has rank {rank}", sizes.len()),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_slice' sizes has length {} but input has rank {rank}",
+                sizes.len()
+            ))
             .into());
         }
         validate_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
@@ -1291,20 +1255,16 @@ impl DynamicSlice for ArrayType {
             // `sizes` regardless of the unknown extent. A static input axis still validates the bound eagerly.
             match self.dimension(axis) {
                 Size::Static(input_size) if size > input_size => {
-                    return Err(TypeError {
-                        message: format!(
-                            "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
-                        ),
-                    }
+                    return Err(TypeError::invalid(format!(
+                        "'dynamic_slice' size {size} is out of bounds for axis {axis} with size {input_size}",
+                    ))
                     .into());
                 }
                 Size::Dynamic(Some(upper_bound)) if size >= upper_bound => {
-                    return Err(TypeError {
-                        message: format!(
-                            "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
+                    return Err(TypeError::invalid(format!(
+                        "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
                              {upper_bound}",
-                        ),
-                    }
+                    ))
                     .into());
                 }
                 _ => {}
@@ -1318,7 +1278,7 @@ impl DynamicSlice for ArrayType {
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_memory(self.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -1369,18 +1329,16 @@ impl Operation<ArrayType> for DynamicUpdateSliceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() < 2 {
-            return Err(TypeError {
-                message: format!(
-                    "'dynamic_update_slice' expects an input operand and an update operand followed by start index \
+            return Err(TypeError::invalid(format!(
+                "'dynamic_update_slice' expects an input operand and an update operand followed by start index \
                     operands but got {} inputs",
-                    input_types.len(),
-                ),
-            });
+                input_types.len(),
+            )));
         }
         match input_types[0].dynamic_update_slice(&input_types[1], &input_types[2..]) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -1551,79 +1509,66 @@ pub trait DynamicUpdateSlice: Sized {
 impl DynamicUpdateSlice for ArrayType {
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<ArrayType, ProgramError> {
         if self.data_type() != update.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'dynamic_update_slice' input data type {} does not match update data type {}",
-                    self.data_type(),
-                    update.data_type(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_update_slice' input data type {} does not match update data type {}",
+                self.data_type(),
+                update.data_type(),
+            ))
             .into());
         }
         if self.memory() != update.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'dynamic_update_slice' input and update must share one memory space but reside in {} and {}",
-                    self.memory(),
-                    update.memory(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_update_slice' input and update must share one memory space but reside in {} and {}",
+                self.memory(),
+                update.memory(),
+            ))
             .into());
         }
         let rank = self.rank();
         if update.rank() != rank {
-            return Err(TypeError {
-                message: format!("'dynamic_update_slice' update has rank {} but input has rank {rank}", update.rank()),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_update_slice' update has rank {} but input has rank {rank}",
+                update.rank()
+            ))
             .into());
         }
         if start_indices.len() != rank {
-            return Err(TypeError {
-                message: format!(
-                    "'dynamic_update_slice' expects one start index per input axis ({rank}) but got {}",
-                    start_indices.len(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'dynamic_update_slice' expects one start index per input axis ({rank}) but got {}",
+                start_indices.len(),
+            ))
             .into());
         }
         validate_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self.memory(), start_indices)?;
         for axis in 0..rank {
             let update_dimension = update.dimension(axis);
             let Size::Static(update_size) = update_dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "'dynamic_update_slice' does not support dynamic update axis {axis} with size \
+                return Err(TypeError::invalid(format!(
+                    "'dynamic_update_slice' does not support dynamic update axis {axis} with size \
                         {update_dimension}; update shapes must be static",
-                    ),
-                }
+                ))
                 .into());
             };
             let input_dimension = self.dimension(axis);
             let Size::Static(input_size) = input_dimension else {
-                return Err(TypeError {
-                    message: format!(
-                        "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis {axis} \
+                return Err(TypeError::invalid(format!(
+                    "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis {axis} \
                         with size {input_dimension}",
-                    ),
-                }
+                ))
                 .into());
             };
             if update_size > input_size {
-                return Err(TypeError {
-                    message: format!(
-                        "'dynamic_update_slice' update axis {axis} has size {update_size} which exceeds input size \
+                return Err(TypeError::invalid(format!(
+                    "'dynamic_update_slice' update axis {axis} has size {update_size} which exceeds input size \
                         {input_size}",
-                    ),
-                }
+                ))
                 .into());
             }
         }
         // The output is distributed like the input operand (the update is written in place); the operand's placement
         // and reduction state carry through, with the update's varying-manual axes folded in.
         let sharding = update_slice_output_sharding(self, update, DYNAMIC_UPDATE_SLICE_OPERATION_NAME)?;
-        self.clone()
-            .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+        self.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -2058,10 +2003,8 @@ fn static_update_sizes(context: &str, update_type: &ArrayType) -> Result<Vec<usi
         .enumerate()
         .map(|(axis, size)| {
             size.value().ok_or_else(|| {
-                TypeError {
-                    message: format!("{context} requires a static update shape but axis {axis} has size {size}"),
-                }
-                .into()
+                TypeError::invalid(format!("{context} requires a static update shape but axis {axis} has size {size}"))
+                    .into()
             })
         })
         .collect()
@@ -2085,12 +2028,10 @@ where
         .iter()
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
-                TypeError {
-                    message: format!(
-                        "'{operation_name}' per-item expansion requires static batched operand types but got \
+                TypeError::invalid(format!(
+                    "'{operation_name}' per-item expansion requires static batched operand types but got \
                          {input_type}",
-                    ),
-                }
+                ))
                 .into()
             })
         })
@@ -2372,43 +2313,43 @@ mod tests {
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
             operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))], &[]),
-            Err(TypeError { message: "'slice' start_indices has length 2 but input has rank 1".to_string() }),
+            Err(TypeError::invalid("'slice' start_indices has length 2 but input has rank 1".to_string())),
         );
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2]).infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError { message: "'slice' limit_indices has length 1 but input has rank 2".to_string() }),
+            Err(TypeError::invalid("'slice' limit_indices has length 1 but input has rank 2".to_string())),
         );
         assert_eq!(
             SliceOperation::new(vec![2, 0], vec![1, 3]).infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError { message: "'slice' start index 2 is greater than limit index 1 at axis 0".to_string() }),
+            Err(TypeError::invalid("'slice' start index 2 is greater than limit index 1 at axis 0".to_string())),
         );
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2, 4]).infer_output_types(std::slice::from_ref(&input_type), &[]),
-            Err(TypeError { message: "'slice' limit index 4 is out of bounds for axis 1 with size 3".to_string() }),
+            Err(TypeError::invalid("'slice' limit index 4 is out of bounds for axis 1 with size 3".to_string())),
         );
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2, 3]).with_strides(vec![2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'slice' strides has length 1 but start_indices has length 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'slice' strides has length 1 but start_indices has length 2".to_string()
+            ))),
         );
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2, 3]).with_strides(vec![1, 0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'slice' strides must be at least 1 but axis 1 has stride 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'slice' strides must be at least 1 but axis 1 has stride 0".to_string()
+            ))),
         );
         assert_eq!(
             input_type.slice(&[0, 0], &[2, 3], &[1]),
-            Err(ProgramError::Type(TypeError {
-                message: "'slice' strides has length 1 but input has rank 2".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'slice' strides has length 1 but input has rank 2".to_string()
+            ))),
         );
         assert_eq!(
             input_type.slice(&[0, 0], &[2, 3], &[1, 0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'slice' strides must be at least 1 but axis 1 has stride 0".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'slice' strides must be at least 1 but axis 1 has stride 0".to_string()
+            ))),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -2562,12 +2503,10 @@ mod tests {
         assert_eq!(
             UpdateSliceOperation::new(vec![0, usize::MAX])
                 .infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
-            Err(TypeError {
-                message: format!(
-                    "'update_slice' update axis 1 with start index {} and size 2 does not fit in input size 3",
-                    usize::MAX,
-                ),
-            }),
+            Err(TypeError::invalid(format!(
+                "'update_slice' update axis 1 with start index {} and size 2 does not fit in input size 3",
+                usize::MAX,
+            ))),
         );
 
         // Interpretation overwrites the selected block of the row-major payload.
@@ -2587,11 +2526,11 @@ mod tests {
                 &[input_type.clone(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])),],
                 &[],
             ),
-            Err(TypeError { message: "'update_slice' update has rank 1 but input has rank 2".to_string() }),
+            Err(TypeError::invalid("'update_slice' update has rank 1 but input has rank 2".to_string())),
         );
         assert_eq!(
             UpdateSliceOperation::new(vec![0]).infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
-            Err(TypeError { message: "'update_slice' start_indices has length 1 but input has rank 2".to_string() }),
+            Err(TypeError::invalid("'update_slice' start_indices has length 1 but input has rank 2".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2601,18 +2540,17 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'update_slice' does not support dynamic update axis 0 with size *; update shapes must be \
+            Err(TypeError::invalid(
+                "'update_slice' does not support dynamic update axis 0 with size *; update shapes must be \
                     static"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         assert_eq!(
             UpdateSliceOperation::new(vec![0, 2]).infer_output_types(&[input_type.clone(), update_type.clone()], &[]),
-            Err(TypeError {
-                message: "'update_slice' update axis 1 with start index 2 and size 2 does not fit in input size 3"
-                    .to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'update_slice' update axis 1 with start index 2 and size 2 does not fit in input size 3".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2622,10 +2560,9 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size <4"
-                    .to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size <4".to_string()
+            )),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -2827,12 +2764,12 @@ mod tests {
         assert_eq!(
             DynamicSliceOperation::new(vec![1])
                 .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
-            Err(TypeError { message: "'dynamic_slice' sizes has length 1 but input has rank 2".to_string() }),
+            Err(TypeError::invalid("'dynamic_slice' sizes has length 1 but input has rank 2".to_string())),
         );
         assert_eq!(
             DynamicSliceOperation::new(vec![1, 4])
                 .infer_output_types(&[input_type.clone(), index_type.clone(), index_type.clone(),], &[]),
-            Err(TypeError { message: "'dynamic_slice' size 4 is out of bounds for axis 1 with size 3".to_string() }),
+            Err(TypeError::invalid("'dynamic_slice' size 4 is out of bounds for axis 1 with size 3".to_string())),
         );
         // A dynamic input axis is accepted: StableHLO clamping keeps the read in bounds against the unknown extent
         // and the output dimension is still the static `sizes[axis]`. The static axis 1 still validates `2 <= 3`.
@@ -2868,9 +2805,9 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_slice' size 1 cannot fit axis 0 with exclusive upper bound 1".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'dynamic_slice' size 1 cannot fit axis 0 with exclusive upper bound 1".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -2881,18 +2818,18 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_slice' start index 0 must be a scalar integer but has type i32[2]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'dynamic_slice' start index 0 must be a scalar integer but has type i32[2]".to_string()
+            )),
         );
         assert_eq!(
             operation
                 .infer_output_types(&[input_type.clone(), index_type.clone(), ArrayType::scalar(DataType::I64)], &[]),
-            Err(TypeError {
-                message: "'dynamic_slice' start indices must share one integer type but index 1 has type i64[] and \
+            Err(TypeError::invalid(
+                "'dynamic_slice' start indices must share one integer type but index 1 has type i64[] and \
                     index 0 has type i32[]"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -3038,9 +2975,9 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_update_slice' input data type f64 does not match update data type f32".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'dynamic_update_slice' input data type f64 does not match update data type f32".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -3052,7 +2989,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError { message: "'dynamic_update_slice' update has rank 1 but input has rank 2".to_string() }),
+            Err(TypeError::invalid("'dynamic_update_slice' update has rank 1 but input has rank 2".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -3064,11 +3001,11 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_update_slice' does not support dynamic update axis 0 with size *; update shapes \
+            Err(TypeError::invalid(
+                "'dynamic_update_slice' does not support dynamic update axis 0 with size *; update shapes \
                     must be static"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -3080,9 +3017,9 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_update_slice' update axis 1 has size 4 which exceeds input size 3".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'dynamic_update_slice' update axis 1 has size 4 which exceeds input size 3".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -3094,20 +3031,20 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis 0 with \
+            Err(TypeError::invalid(
+                "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis 0 with \
                     size *"
-                    .to_string(),
-            }),
+                    .to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[input_type.clone(), update_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone(),],
                 &[],
             ),
-            Err(TypeError {
-                message: "'dynamic_update_slice' start index 0 must be a scalar integer but has type f64[]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'dynamic_update_slice' start index 0 must be a scalar integer but has type f64[]".to_string()
+            )),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -3246,15 +3183,15 @@ mod tests {
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
             input.dynamic_slice(&[index(0.0), Array::vector(vec![1.0, 2.0])], &[1, 2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'dynamic_slice' start index 1 must be a scalar integer but has type f64[2]".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'dynamic_slice' start index 1 must be a scalar integer but has type f64[2]".to_string()
+            ))),
         );
         assert_eq!(
             input.dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]), &[index(0.0)]),
-            Err(ProgramError::Type(TypeError {
-                message: "'dynamic_update_slice' expects one start index per input axis (2) but got 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'dynamic_update_slice' expects one start index per input axis (2) but got 1".to_string()
+            ))),
         );
     }
 
@@ -3289,19 +3226,19 @@ mod tests {
         );
         assert_eq!(
             host_operand.update_slice(&ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])), &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'update_slice' input and update must share one memory space but reside in Host[Pinned] and \
+            Err(ProgramError::Type(TypeError::invalid(
+                "'update_slice' input and update must share one memory space but reside in Host[Pinned] and \
                           Device"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         assert_eq!(
             host_operand.dynamic_slice(&[ArrayType::scalar(DataType::I32)], &[2]),
-            Err(ProgramError::Type(TypeError {
-                message: "'dynamic_slice' operand and start indices must share one memory space but start index 0 \
+            Err(ProgramError::Type(TypeError::invalid(
+                "'dynamic_slice' operand and start indices must share one memory space but start index 0 \
                           resides in Device and the operand resides in Host[Pinned]"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
 
         {

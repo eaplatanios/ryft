@@ -211,13 +211,11 @@ pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {
 fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Result<(), TypeError> {
     for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
         if dimension.value().is_none() {
-            return Err(TypeError {
-                message: format!(
-                    "scan body {role} {index} must have a fully static type but axis {axis} of {type} has size \
+            return Err(TypeError::invalid(format!(
+                "scan body {role} {index} must have a fully static type but axis {axis} of {type} has size \
                      {dimension}",
-                    r#type = r#type,
-                ),
-            });
+                r#type = r#type,
+            )));
         }
     }
     Ok(())
@@ -229,12 +227,12 @@ fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Resul
 /// validation alone.
 pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), TypeError> {
     if unroll == 0 {
-        return Err(TypeError { message: "scan unroll factor must be at least 1".to_string() });
+        return Err(TypeError::invalid("scan unroll factor must be at least 1".to_string()));
     }
     if length % unroll != 0 {
-        return Err(TypeError {
-            message: format!("scan unroll factor {unroll} must evenly divide the scan length {length}"),
-        });
+        return Err(TypeError::invalid(format!(
+            "scan unroll factor {unroll} must evenly divide the scan length {length}"
+        )));
     }
     Ok(())
 }
@@ -273,11 +271,9 @@ pub(crate) fn scan_output_types(
     check_count!("input", input_types, expected_input_types.len(), TypeError);
     for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
         if !expected.is_refined_by(actual) {
-            return Err(TypeError {
-                message: format!(
-                    "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
+            )));
         }
     }
     let mut output_types = body_output_types[..carry_count].to_vec();
@@ -297,22 +293,18 @@ pub(crate) fn scalar_scan_output_types(
     input_types: &[DataType],
 ) -> Result<Vec<DataType>, TypeError> {
     if carry_count != body_input_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
+        return Err(TypeError::invalid(format!(
+            "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
                  than the body input count {}",
-                body_input_types.len(),
-            ),
-        });
+            body_input_types.len(),
+        )));
     }
     if carry_count != body_output_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "scalar scan requires every body output to be loop-carried, but carry count {carry_count} is smaller \
+        return Err(TypeError::invalid(format!(
+            "scalar scan requires every body output to be loop-carried, but carry count {carry_count} is smaller \
                  than the body output count {}",
-                body_output_types.len(),
-            ),
-        });
+            body_output_types.len(),
+        )));
     }
     check_types!(@same, "scan body carry", [body_input_types, body_output_types]);
     check_count!("input", input_types, carry_count, TypeError);
@@ -361,20 +353,16 @@ impl ScanTypeSemantics for ArrayType {
         _length: usize,
     ) -> Result<(), TypeError> {
         if carry_count > body_input_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "scan carry count {carry_count} exceeds the body input count {}",
-                    body_input_types.len(),
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "scan carry count {carry_count} exceeds the body input count {}",
+                body_input_types.len(),
+            )));
         }
         if carry_count > body_output_types.len() {
-            return Err(TypeError {
-                message: format!(
-                    "scan carry count {carry_count} exceeds the body output count {}",
-                    body_output_types.len(),
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "scan carry count {carry_count} exceeds the body output count {}",
+                body_output_types.len(),
+            )));
         }
         check_types!(@same, "scan body carry", [
             &body_input_types[..carry_count],
@@ -416,12 +404,10 @@ impl ScanTypeSemantics for ArrayType {
     fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
         let capture_type = capture.r#type();
         if capture_type.rank() == 0 || capture_type.dimension(0) != Size::Static(length) {
-            return Err(TypeError {
-                message: format!(
-                    "scan capture {index} must have leading dimension {length} but has type {capture_type}",
-                    capture_type = capture_type.as_ref(),
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "scan capture {index} must have leading dimension {length} but has type {capture_type}",
+                capture_type = capture_type.as_ref(),
+            )));
         }
         Ok(())
     }
@@ -461,7 +447,7 @@ impl ScanTypeSemantics for DataType {
         _index: usize,
         _length: usize,
     ) -> Result<(), TypeError> {
-        Err(TypeError { message: "scalar scan captures require a scalar stack representation".to_string() })
+        Err(TypeError::invalid("scalar scan captures require a scalar stack representation".to_string()))
     }
 }
 
@@ -475,9 +461,7 @@ fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     length: usize,
 ) -> Result<&'i RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 1 {
-        return Err(TypeError {
-            message: format!("scan expects 1 attached region but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::invalid(format!("scan expects 1 attached region but got {}", region_interfaces.len())));
     }
     let body_interface = &region_interfaces[0];
     T::validate_scan_body(body_interface.input_types(), body_interface.output_types(), carry_count, length)?;
@@ -694,9 +678,9 @@ where
         .iter()
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
-                TypeError {
-                    message: format!("scan iteration extraction requires a static stacked type but got {stack_type}"),
-                }
+                TypeError::invalid(format!(
+                    "scan iteration extraction requires a static stacked type but got {stack_type}"
+                ))
                 .into()
             })
         })
@@ -2309,30 +2293,30 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[scalar_f64.clone(), stacked_f64.clone()], &[]),
-            Err(TypeError { message: "scan expects 1 attached region but got 0".to_string() }),
+            Err(TypeError::invalid("scan expects 1 attached region but got 0".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_f64), interfaces.as_slice()),
-            Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
+            Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
         assert_eq!(
             operation.infer_output_types(&[scalar_f64.clone(), scalar_f64.clone()], interfaces.as_slice()),
-            Err(TypeError {
-                message: "scan input 1 has type f64[] which is incompatible with the expected type f64[3]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "scan input 1 has type f64[] which is incompatible with the expected type f64[3]".to_string()
+            )),
         );
 
         // The lowering-only unroll factor must be at least 1 and must evenly divide the scan length; valid factors
         // render only when greater than 1 and interpretation ignores them entirely.
         assert_eq!(
             TestScanOperation::new(1, 3).with_unroll(0).map(|_| ()),
-            Err(ProgramError::Type(TypeError { message: "scan unroll factor must be at least 1".to_string() })),
+            Err(ProgramError::Type(TypeError::invalid("scan unroll factor must be at least 1".to_string()))),
         );
         assert_eq!(
             TestScanOperation::new(1, 3).with_unroll(2).map(|_| ()),
-            Err(ProgramError::Type(TypeError {
-                message: "scan unroll factor 2 must evenly divide the scan length 3".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "scan unroll factor 2 must evenly divide the scan length 3".to_string()
+            ))),
         );
         let unrolled = TestScanOperation::new(1, 3).with_unroll(3).unwrap();
         assert_eq!(unrolled.unroll(), 3);
@@ -2353,7 +2337,7 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(3, 3)
                 .infer_output_types(&[scalar_f64.clone(), stacked_f64.clone()], interfaces.as_slice()),
-            Err(TypeError { message: "scan carry count 3 exceeds the body input count 2".to_string() }),
+            Err(TypeError::invalid("scan carry count 3 exceeds the body input count 2".to_string())),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let carry = builder.add_input(scalar_f64.clone());
@@ -2365,7 +2349,7 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(2, 3)
                 .infer_output_types(&[scalar_f64.clone(), scalar_f64.clone()], &[region_interface(&no_output_body)],),
-            Err(TypeError { message: "scan carry count 2 exceeds the body output count 1".to_string() }),
+            Err(TypeError::invalid("scan carry count 2 exceeds the body output count 1".to_string())),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
@@ -2384,9 +2368,9 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(1, 3)
                 .infer_output_types(std::slice::from_ref(&scalar_f64), &[region_interface(&mismatched_body)]),
-            Err(TypeError {
-                message: "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string()
+            )),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
@@ -2397,9 +2381,9 @@ mod tests {
         assert_eq!(
             TestScanOperation::new(1, 3)
                 .infer_output_types(std::slice::from_ref(&dynamic_type), &[region_interface(&dynamic_body)]),
-            Err(TypeError {
-                message: "scan body input 0 must have a fully static type but axis 0 of f64[*] has size *".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "scan body input 0 must have a fully static type but axis 0 of f64[*] has size *".to_string()
+            )),
         );
 
         // Eager binding threads the carry while stacking the per-iteration outputs: a cumulative product over
@@ -2727,18 +2711,18 @@ mod tests {
         assert_eq!(
             operation
                 .infer_output_types(&[ArrayType::scalar(DataType::F32), stacked_f64.clone()], interfaces.as_slice(),),
-            Err(TypeError {
-                message: "scan input 0 has type f32[] which is incompatible with the expected type f64[]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "scan input 0 has type f32[] which is incompatible with the expected type f64[]".to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[scalar_f64, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))],
                 interfaces.as_slice(),
             ),
-            Err(TypeError {
-                message: "scan input 1 has type f64[4] which is incompatible with the expected type f64[3]".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "scan input 1 has type f64[4] which is incompatible with the expected type f64[3]".to_string()
+            )),
         );
     }
 

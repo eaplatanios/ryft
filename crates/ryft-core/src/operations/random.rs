@@ -135,25 +135,21 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
         check_count!("input", input_types, 1, TypeError);
         let state_type = self.algorithm.state_type();
         if input_types[0].data_type() != state_type.data_type() || input_types[0].shape() != state_type.shape() {
-            return Err(TypeError {
-                message: format!(
-                    "'rng_bit_generator' with the {} algorithm needs a {} state but got {}",
-                    self.algorithm, state_type, input_types[0],
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "'rng_bit_generator' with the {} algorithm needs a {} state but got {}",
+                self.algorithm, state_type, input_types[0],
+            )));
         }
         if !matches!(self.output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64,) {
-            return Err(TypeError {
-                message: format!(
-                    "'rng_bit_generator' does not support output data type {}",
-                    self.output_type.data_type(),
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "'rng_bit_generator' does not support output data type {}",
+                self.output_type.data_type(),
+            )));
         }
         if self.output_type.static_shape().is_none() {
-            return Err(TypeError {
-                message: "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
-            });
+            return Err(TypeError::invalid(
+                "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
+            ));
         }
         let has_sharded_dimension = |array_type: &ArrayType| {
             array_type.sharding().is_some_and(|sharding| {
@@ -164,11 +160,11 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
             })
         };
         if has_sharded_dimension(&input_types[0]) || has_sharded_dimension(&self.output_type) {
-            return Err(TypeError {
-                message: "'rng_bit_generator' does not support sharded states or outputs; derive per-shard states \
+            return Err(TypeError::invalid(
+                "'rng_bit_generator' does not support sharded states or outputs; derive per-shard states \
                           inside shard_map instead"
                     .to_string(),
-            });
+            ));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
     }
@@ -399,7 +395,7 @@ where
             }
             data_type => {
                 return Err(
-                    TypeError { message: format!("'uniform' does not support output data type {data_type}") }.into()
+                    TypeError::invalid(format!("'uniform' does not support output data type {data_type}")).into()
                 );
             }
         };
@@ -424,7 +420,7 @@ where
         let data_type = logits_type.data_type();
         if !matches!(data_type, DataType::F32 | DataType::F64) {
             return Err(
-                TypeError { message: format!("'categorical' does not support logits data type {data_type}") }.into()
+                TypeError::invalid(format!("'categorical' does not support logits data type {data_type}")).into()
             );
         }
         let shape = Shape::new(logits_type.shape().dimensions().to_vec());

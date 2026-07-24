@@ -491,16 +491,15 @@ mod tests {
     #[test]
     fn operation_inference_and_interpretation_use_concrete_inputs() {
         let operation = IdentityOperation;
-
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
             operation.infer_output_types(&[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() })
+            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
         assert_eq!(
             operation
                 .interpret(&crate::EagerContext::<Scalar>::new(), &crate::EmptyRegionDriver, &[Scalar::from(3.0)],),
-            Ok(vec![Scalar::from(3.0)])
+            Ok(vec![Scalar::from(3.0)]),
         );
         assert_eq!(
             operation.interpret(&crate::EagerContext::<Scalar>::new(), &crate::EmptyRegionDriver, &[]),

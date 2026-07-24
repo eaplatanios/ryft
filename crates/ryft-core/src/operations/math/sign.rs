@@ -25,7 +25,7 @@ define_elementwise_operation!(
         if input_type.is_signed() || input_type.is_floating_point() || input_type.is_complex() {
             Ok(vec![input_type])
         } else {
-            Err(TypeError { message: format!("cannot compute the sign of a value of data type {input_type}") })
+            Err(TypeError::invalid(format!("cannot compute the sign of a value of data type {input_type}")))
         }
     },
     check_array_types = [@no_unreduced],

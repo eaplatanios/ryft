@@ -1563,9 +1563,7 @@ mod tests {
             _region_interfaces: &[RegionInterface<DataType>],
         ) -> Result<Vec<DataType>, TypeError> {
             if input_types.len() != 1 {
-                return Err(TypeError {
-                    message: format!("test_negate expects 1 input but got {}", input_types.len()),
-                });
+                return Err(TypeError::invalid(format!("test_negate expects 1 input but got {}", input_types.len())));
             }
             Ok(input_types.to_vec())
         }

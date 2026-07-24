@@ -56,15 +56,13 @@ impl PadOperation {
         interior_padding: Vec<usize>,
     ) -> Result<Self, ProgramError> {
         if edge_padding_low.len() != edge_padding_high.len() || edge_padding_low.len() != interior_padding.len() {
-            return Err(TypeError {
-                message: format!(
-                    "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
+            return Err(TypeError::invalid(format!(
+                "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
                     got lengths {}, {}, and {}",
-                    edge_padding_low.len(),
-                    edge_padding_high.len(),
-                    interior_padding.len(),
-                ),
-            }
+                edge_padding_low.len(),
+                edge_padding_high.len(),
+                interior_padding.len(),
+            ))
             .into());
         }
         Ok(Self { edge_padding_low, edge_padding_high, interior_padding })
@@ -115,7 +113,7 @@ impl Operation<ArrayType> for PadOperation {
         ) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -231,11 +229,9 @@ where
                         .iter()
                         .enumerate()
                         .map(|(axis, padding)| {
-                            padding.checked_neg().ok_or_else(|| TypeError {
-                                message: format!(
+                            padding.checked_neg().ok_or_else(|| TypeError::invalid(format!(
                                     "'pad' transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
-                                ),
-                            })
+                                )))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let inverse_edge_padding_high = self
@@ -243,11 +239,11 @@ where
                         .iter()
                         .enumerate()
                         .map(|(axis, padding)| {
-                            padding.checked_neg().ok_or_else(|| TypeError {
-                                message: format!(
+                            padding.checked_neg().ok_or_else(|| {
+                                TypeError::invalid(format!(
                                     "'pad' transpose cannot negate edge_padding_high at axis {axis} with value \
                                      {padding}",
-                                ),
+                                ))
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -269,8 +265,8 @@ where
                         .iter()
                         .enumerate()
                         .map(|(axis, padding)| {
-                            padding.checked_add(1).ok_or_else(|| TypeError {
-                                message: format!("'pad' transpose stride overflows usize on axis {axis}"),
+                            padding.checked_add(1).ok_or_else(|| {
+                                TypeError::invalid(format!("'pad' transpose stride overflows usize on axis {axis}"))
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -477,15 +473,15 @@ fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
                 .with_unreduced_axes(sharding.unreduced_axes().clone())
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                .map_err(|error| TypeError {
-                    message: format!("'pad' dependency scalar sharding construction failed: {error}"),
+                .map_err(|error| {
+                    TypeError::invalid(format!("'pad' dependency scalar sharding construction failed: {error}"))
                 })
         })
         .transpose()?;
     ArrayType::scalar(source.data_type())
         .with_memory(source.memory())
         .with_sharding(sharding)
-        .map_err(|error| TypeError { message: error.to_string() })
+        .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
 /// Computes one concrete padded extent in a wide signed representation.
@@ -498,20 +494,20 @@ fn padded_extent(
 ) -> Result<i128, TypeError> {
     let gap_count = input_size.saturating_sub(1);
     let input_size = i128::try_from(input_size)
-        .map_err(|_| TypeError { message: format!("'pad' input size is too large on axis {axis}") })?;
+        .map_err(|_| TypeError::invalid(format!("'pad' input size is too large on axis {axis}")))?;
     let gap_count = i128::try_from(gap_count)
-        .map_err(|_| TypeError { message: format!("'pad' input size is too large on axis {axis}") })?;
+        .map_err(|_| TypeError::invalid(format!("'pad' input size is too large on axis {axis}")))?;
     let interior_padding = i128::try_from(interior_padding)
-        .map_err(|_| TypeError { message: format!("'pad' interior padding is too large on axis {axis}") })?;
+        .map_err(|_| TypeError::invalid(format!("'pad' interior padding is too large on axis {axis}")))?;
     let dilated_size = input_size
         .checked_add(
             gap_count
                 .checked_mul(interior_padding)
-                .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?,
+                .ok_or_else(|| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))?,
         )
         .and_then(|size| size.checked_add(i128::from(edge_padding_low)))
         .and_then(|size| size.checked_add(i128::from(edge_padding_high)))
-        .ok_or_else(|| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })?;
+        .ok_or_else(|| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))?;
     Ok(dilated_size)
 }
 
@@ -525,10 +521,10 @@ fn static_padded_extent(
 ) -> Result<usize, TypeError> {
     let output_size = padded_extent(input_size, edge_padding_low, edge_padding_high, interior_padding, axis)?;
     if output_size < 0 {
-        return Err(TypeError { message: format!("'pad' output size is negative ({output_size}) on axis {axis}") });
+        return Err(TypeError::invalid(format!("'pad' output size is negative ({output_size}) on axis {axis}")));
     }
     usize::try_from(output_size)
-        .map_err(|_| TypeError { message: format!("'pad' output size overflows usize on axis {axis}") })
+        .map_err(|_| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))
 }
 
 impl Pad for ArrayType {
@@ -540,29 +536,25 @@ impl Pad for ArrayType {
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
         if self.data_type() != padding_value.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'pad' input data type {} does not match padding value data type {}",
-                    self.data_type(),
-                    padding_value.data_type(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'pad' input data type {} does not match padding value data type {}",
+                self.data_type(),
+                padding_value.data_type(),
+            ))
             .into());
         }
         if padding_value.rank() != 0 {
-            return Err(TypeError {
-                message: format!("'pad' padding value must be a scalar but has type {padding_value}"),
-            }
+            return Err(TypeError::invalid(format!(
+                "'pad' padding value must be a scalar but has type {padding_value}"
+            ))
             .into());
         }
         if self.memory() != padding_value.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'pad' input and padding value must share one memory space but reside in {} and {}",
-                    self.memory(),
-                    padding_value.memory(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'pad' input and padding value must share one memory space but reside in {} and {}",
+                self.memory(),
+                padding_value.memory(),
+            ))
             .into());
         }
         let rank = self.rank();
@@ -572,10 +564,9 @@ impl Pad for ArrayType {
             ("interior_padding", interior_padding.len()),
         ] {
             if length != rank {
-                return Err(TypeError {
-                    message: format!("'pad' {name} has length {length} but input has rank {rank}"),
-                }
-                .into());
+                return Err(
+                    TypeError::invalid(format!("'pad' {name} has length {length} but input has rank {rank}")).into()
+                );
             }
         }
         if is_effective_identity(self, edge_padding_low, edge_padding_high, interior_padding) {
@@ -605,12 +596,10 @@ impl Pad for ArrayType {
                                 axis,
                             ) {
                                 Ok(maximum) if maximum < 0 => {
-                                    return Err(TypeError {
-                                        message: format!(
-                                            "'pad' output size is negative ({maximum}) on dynamic axis {axis} even at \
+                                    return Err(TypeError::invalid(format!(
+                                        "'pad' output size is negative ({maximum}) on dynamic axis {axis} even at \
                                          its maximum input extent {maximum_input_size}",
-                                        ),
-                                    }
+                                    ))
                                     .into());
                                 }
                                 Ok(maximum) => usize::try_from(maximum).ok().and_then(|maximum| maximum.checked_add(1)),
@@ -635,12 +624,10 @@ impl Pad for ArrayType {
             if self.unreduced_axes() != padding_value.unreduced_axes()
                 || self.reduced_axes() != padding_value.reduced_axes()
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'pad' input and padding value must have matching reduced and unreduced mesh axes but got \
+                return Err(TypeError::invalid(format!(
+                    "'pad' input and padding value must have matching reduced and unreduced mesh axes but got \
                          input type {self} and padding value type {padding_value}",
-                    ),
-                }
+                ))
                 .into());
             }
             let input_varying_manual_axes = self.sharding().map(|sharding| sharding.varying_manual_axes());
@@ -648,12 +635,10 @@ impl Pad for ArrayType {
             if input_varying_manual_axes.cloned().unwrap_or_default()
                 != padding_varying_manual_axes.cloned().unwrap_or_default()
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'pad' input and padding value must have matching varying manual axes but got input type \
+                return Err(TypeError::invalid(format!(
+                    "'pad' input and padding value must have matching varying manual axes but got input type \
                          {self} and padding value type {padding_value}",
-                    ),
-                }
+                ))
                 .into());
             }
             let has_distributed_dependencies = !self.unreduced_axes().is_empty()
@@ -663,17 +648,16 @@ impl Pad for ArrayType {
                 && self.sharding().map(|sharding| sharding.mesh())
                     != padding_value.sharding().map(|sharding| sharding.mesh())
             {
-                return Err(TypeError {
-                    message: "'pad' input and padding value with distributed dependencies must use the same mesh"
-                        .to_string(),
-                }
+                return Err(TypeError::invalid(
+                    "'pad' input and padding value with distributed dependencies must use the same mesh".to_string(),
+                )
                 .into());
             }
         }
         ArrayType::new(self.data_type(), Shape::new(output_dimensions))
             .with_memory(self.memory())
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -791,21 +775,21 @@ mod tests {
         assert_eq!(input_type.pad(&padding_value_type, &[1], &[2], &[1]), Ok(output_type.clone()));
         assert_eq!(
             input_type.pad(&padding_value_type, &[], &[0], &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' edge_padding_low has length 0 but input has rank 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' edge_padding_low has length 0 but input has rank 1".to_string()
+            ))),
         );
         assert_eq!(
             input_type.pad(&padding_value_type, &[0], &[], &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' edge_padding_high has length 0 but input has rank 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' edge_padding_high has length 0 but input has rank 1".to_string()
+            ))),
         );
         assert_eq!(
             input_type.pad(&padding_value_type, &[0], &[0], &[]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' interior_padding has length 0 but input has rank 1".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' interior_padding has length 0 but input has rank 1".to_string()
+            ))),
         );
         // Negative inverse edges remain valid for dynamic dimensions. Runtime values must satisfy the resulting
         // non-negative extent, but rejecting the abstract operation would make the transpose of positive padding
@@ -835,10 +819,9 @@ mod tests {
                 &[0],
                 &[0]
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1"
-                    .to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1".to_string()
+            ))),
         );
 
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
@@ -865,17 +848,17 @@ mod tests {
         // Invalid construction and inputs report precise operation and interpreter errors.
         assert_eq!(
             PadOperation::new(vec![1], vec![2, 0], vec![1]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
                     but got lengths 1, 2, and 1"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         assert_eq!(
             PadOperation::new(vec![1, 0], vec![2, 0], vec![1, 0])
                 .unwrap()
                 .infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
-            Err(TypeError { message: "'pad' edge_padding_low has length 2 but input has rank 1".to_string() }),
+            Err(TypeError::invalid("'pad' edge_padding_low has length 2 but input has rank 1".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -1222,7 +1205,7 @@ mod tests {
         );
         assert_eq!(
             Array::vector(vec![1.0]).pad(&Array::scalar(0.0), &[-2], &[0], &[0]),
-            Err(ProgramError::Type(TypeError { message: "'pad' output size is negative (-1) on axis 0".to_string() })),
+            Err(ProgramError::Type(TypeError::invalid("'pad' output size is negative (-1) on axis 0".to_string()))),
         );
 
         // Interior padding is an effective identity on singleton axes. The eager and abstract fast paths preserve
@@ -1237,9 +1220,9 @@ mod tests {
         // The kernel validates the padding value shape eagerly.
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).pad(&Array::vector(vec![0.0]), &[0], &[0], &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' padding value must be a scalar but has type f64[1]".to_string(),
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' padding value must be a scalar but has type f64[1]".to_string()
+            ))),
         );
     }
 
@@ -1272,11 +1255,11 @@ mod tests {
         assert_eq!(host_input.pad(&host_padding, &[0], &[1], &[0]).unwrap().memory(), Memory::Host { pinned: true },);
         assert_eq!(
             host_input.pad(&pad_value, &[0], &[1], &[0]),
-            Err(ProgramError::Type(TypeError {
-                message: "'pad' input and padding value must share one memory space but reside in Host[Pinned] and \
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' input and padding value must share one memory space but reside in Host[Pinned] and \
                           Device"
-                    .to_string(),
-            })),
+                    .to_string()
+            ))),
         );
         let laid_out_input = host_input.with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out_input.pad(&host_padding, &[0], &[0], &[0]), Ok(laid_out_input.clone()));

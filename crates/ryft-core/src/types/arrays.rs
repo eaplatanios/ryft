@@ -172,8 +172,8 @@ impl Shape {
         for size in &self.dimensions {
             match size {
                 Size::Static(size) => {
-                    count = count.checked_mul(*size).ok_or_else(|| TypeError {
-                        message: format!("shape {self} element count does not fit in usize"),
+                    count = count.checked_mul(*size).ok_or_else(|| {
+                        TypeError::invalid(format!("shape {self} element count does not fit in usize"))
                     })?;
                 }
                 Size::Dynamic(_) => return Ok(None),
@@ -355,9 +355,9 @@ impl TryFrom<&Shape> for StaticShape {
             match size {
                 Size::Static(size) => dimensions.push(*size),
                 Size::Dynamic(_) => {
-                    return Err(TypeError {
-                        message: format!("shape dimension {dimension} must be static, but got {size}"),
-                    });
+                    return Err(TypeError::invalid(format!(
+                        "shape dimension {dimension} must be static, but got {size}",
+                    )));
                 }
             }
         }
@@ -621,9 +621,11 @@ impl ArrayType {
     /// replicated sharding dimension at the same index and shifting the existing dimension annotations.
     pub fn with_inserted_dimension(&self, index: usize, size: Size) -> Result<Self, TypeError> {
         if index > self.rank() {
-            return Err(TypeError {
-                message: format!("cannot insert dimension at index {index} for rank-{} array type", self.rank()),
-            });
+            return Err(TypeError::invalid(format!(
+                "cannot insert dimension at index {} for rank-{} array type",
+                index,
+                self.rank()
+            )));
         }
         let mut dimensions = self.shape.dimensions.clone();
         dimensions.insert(index, size);
@@ -635,7 +637,7 @@ impl ArrayType {
             .as_ref()
             .map(|sharding| sharding.with_inserted_dimension(index, ShardingDimension::Replicated))
             .transpose()
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
 
         Ok(Self {
             data_type: self.data_type,
@@ -655,9 +657,11 @@ impl ArrayType {
     /// axes is rejected because there is no equivalent rank-independent metadata field for those axes.
     pub fn without_dimension(&self, index: usize) -> Result<(Self, Size), TypeError> {
         if index >= self.rank() {
-            return Err(TypeError {
-                message: format!("cannot remove dimension at index {index} for rank-{} array type", self.rank()),
-            });
+            return Err(TypeError::invalid(format!(
+                "cannot remove dimension at index {} for rank-{} array type",
+                index,
+                self.rank()
+            )));
         }
         let mut dimensions = self.shape.dimensions.clone();
         let dimension = dimensions.remove(index);
@@ -670,7 +674,7 @@ impl ArrayType {
             .as_ref()
             .map(|sharding| sharding.without_dimension(index))
             .transpose()
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
 
         Ok((
             Self {
@@ -901,7 +905,7 @@ mod tests {
         assert_eq!(Shape::new(vec![Size::Static(0), Size::Dynamic(None)]).element_count(), Ok(Some(0)));
         assert_eq!(
             Shape::new(vec![Size::Static(usize::MAX), Size::Static(2)]).element_count(),
-            Err(TypeError { message: format!("shape [{}, 2] element count does not fit in usize", usize::MAX) }),
+            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
         );
     }
 
@@ -999,11 +1003,11 @@ mod tests {
         assert_eq!(StaticShape::try_from(&shape), Ok(static_shape));
         assert_eq!(
             StaticShape::try_from(dynamic_shape),
-            Err(TypeError { message: "shape dimension 1 must be static, but got *".to_string() }),
+            Err(TypeError::invalid("shape dimension 1 must be static, but got *".to_string())),
         );
         assert_eq!(
             StaticShape::try_from(&bounded_dynamic_shape),
-            Err(TypeError { message: "shape dimension 1 must be static, but got <8".to_string() }),
+            Err(TypeError::invalid("shape dimension 1 must be static, but got <8".to_string())),
         );
     }
 
@@ -1199,10 +1203,9 @@ mod tests {
 
         assert_eq!(
             t11.without_dimension(0),
-            Err(TypeError {
-                message: "cannot remove dimension 0 because it is sharded over the non-manual mesh axis 'x'"
-                    .to_string(),
-            })
+            Err(TypeError::invalid(
+                "cannot remove dimension 0 because it is sharded over the non-manual mesh axis 'x'".to_string(),
+            )),
         );
     }
 

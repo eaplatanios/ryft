@@ -190,9 +190,9 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
             context.fill(&dynamic_type, Scalar::from(3.5)),
-            Err(ProgramError::Type(TypeError {
-                message: "cannot materialize a value of dynamically sized type f64[*]".to_string()
-            })),
+            Err(ProgramError::Type(TypeError::invalid(
+                "cannot materialize a value of dynamically sized type f64[*]".to_string(),
+            ))),
         );
 
         // Verify the operation's stored type and value, identity, and rendering.

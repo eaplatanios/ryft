@@ -47,15 +47,17 @@ impl Operation<DataType> for SelectOperation {
     ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 3, TypeError);
         if !input_types[0].is_boolean() {
-            return Err(TypeError {
-                message: format!("'select' condition data type {} is not {}", input_types[0], DataType::Boolean),
-            });
+            return Err(TypeError::invalid(format!(
+                "'select' condition data type {} is not {}",
+                input_types[0],
+                DataType::Boolean
+            )));
         }
 
         // The two branch data types are promoted together (the Boolean condition is a mask, not a value that promotes
         // into the result), so `select` supports mixed-but-promotable branch data types like JAX's `jnp.where`.
-        input_types[1].broadcast(&input_types[2]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("'{SELECT_OPERATION_NAME}' input types are not broadcast-compatible"),
+        input_types[1].broadcast(&input_types[2]).map(|output| vec![output]).map_err(|_| {
+            TypeError::invalid(format!("'{SELECT_OPERATION_NAME}' input types are not broadcast-compatible"))
         })
     }
 
@@ -105,14 +107,12 @@ impl ElementwiseOperation for SelectOperation {
         check_count!("input", input_types, 3, TypeError);
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
         if !condition.data_type().is_boolean() {
-            return Err(TypeError {
-                message: format!(
-                    "'{}' condition data type {} is not {}",
-                    SELECT_OPERATION_NAME,
-                    condition.data_type(),
-                    DataType::Boolean,
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "'{}' condition data type {} is not {}",
+                SELECT_OPERATION_NAME,
+                condition.data_type(),
+                DataType::Boolean,
+            )));
         }
 
         // Broadcast the three operand shapes together and promote the two branch data types, retyping the Boolean

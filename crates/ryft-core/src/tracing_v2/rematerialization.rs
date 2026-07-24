@@ -136,9 +136,10 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<&'i RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 4 {
-        return Err(TypeError {
-            message: format!("rematerialize expects 4 attached regions but got {}", region_interfaces.len()),
-        });
+        return Err(TypeError::invalid(format!(
+            "rematerialize expects 4 attached regions but got {}",
+            region_interfaces.len(),
+        )));
     }
     let primal_interface = &region_interfaces[0];
     let forward_interface = &region_interfaces[1];
@@ -149,13 +150,11 @@ fn validated_rematerialize_interfaces<'i, T: Type>(
     check_types!(@same, "rematerialize forward input", [input_types, forward_interface.input_types()]);
     let forward_output_types = forward_interface.output_types();
     if forward_output_types.len() < output_types.len() {
-        return Err(TypeError {
-            message: format!(
-                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
-                output_types.len(),
-                forward_output_types.len(),
-            ),
-        });
+        return Err(TypeError::invalid(format!(
+            "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+            output_types.len(),
+            forward_output_types.len(),
+        )));
     }
     check_types!(@same, "rematerialize forward output", [
         output_types,
@@ -1774,7 +1773,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_tracers.first() else {
-            return Err(TypeError { message: "rematerialization requires at least one input".to_string() }.into());
+            return Err(TypeError::invalid("rematerialization requires at least one input".to_string()).into());
         };
         let input_types = structured_input_types.parameters().cloned().collect::<Vec<_>>();
 
@@ -3643,7 +3642,7 @@ mod tests {
                 _region_interfaces: &[RegionInterface<ArrayType>],
             ) -> Result<Vec<ArrayType>, TypeError> {
                 if matches!(self, Self::RejectsInput) {
-                    return Err(TypeError { message: "unsupported storage input".to_string() });
+                    return Err(TypeError::invalid("unsupported storage input".to_string()));
                 }
                 check_count!("input", input_types, 1, TypeError);
                 Ok(match self {

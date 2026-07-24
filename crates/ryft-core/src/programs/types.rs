@@ -1,15 +1,49 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::errors::CustomError;
 use crate::parameters::Parameter;
 
-/// Error returned when type inference fails.
-#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
-#[error("{message}")]
-pub struct TypeError {
-    pub message: String,
+/// Represents errors produced while inferring or validating [`Type`]s.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
+pub enum TypeError {
+    /// A generic type contract was invalid.
+    #[error("{message}")]
+    Invalid { message: String },
+
+    /// A type family produced an error with a concrete, recoverable type.
+    #[error("{0}")]
+    Custom(Arc<dyn CustomError>),
+}
+
+impl TypeError {
+    /// Creates a new [`TypeError::Invalid`] error with the provided message.
+    #[inline]
+    pub fn invalid<M: Into<String>>(message: M) -> Self {
+        Self::Invalid { message: message.into() }
+    }
+
+    /// Wraps a type-family-specific error in a [`Custom`](TypeError::Custom) variant. The concrete error can later be
+    /// recovered using [`TypeError::downcast_custom`].
+    #[inline]
+    pub fn custom<T: CustomError>(error: T) -> Self {
+        Self::Custom(Arc::new(error))
+    }
+
+    /// Returns the wrapped custom error downcast to `T` when this is a [`Custom`](TypeError::Custom) variant holding a
+    /// `T`, and [`None`] otherwise.
+    #[inline]
+    pub fn downcast_custom<T: CustomError>(&self) -> Option<&T> {
+        match self {
+            // Deref through the `Arc` to the `dyn CustomError`, upcast to `&dyn std::error::Error`, and then use the
+            // standard error downcast. Going through the `Arc` directly would downcast the `Arc` instead of the error.
+            Self::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
+            _ => None,
+        }
+    }
 }
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
@@ -91,4 +125,42 @@ pub trait Typed {
     /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
     /// [`Cow::into_owned`] to clone on demand.
     fn r#type(&self) -> Cow<'_, Self::Type>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
+    #[error("custom type error {code}")]
+    struct CustomTypeError {
+        code: usize,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
+    #[error("other custom type error")]
+    struct OtherCustomTypeError;
+
+    #[test]
+    fn test_type_error() {
+        let invalid = TypeError::invalid("invalid type");
+        assert_eq!(invalid.to_string(), "invalid type");
+        assert_eq!(invalid.downcast_custom::<CustomTypeError>(), None);
+
+        let custom = TypeError::custom(CustomTypeError { code: 1 });
+        let equal = TypeError::custom(CustomTypeError { code: 1 });
+        assert_eq!(custom, equal);
+        assert_ne!(custom, TypeError::custom(CustomTypeError { code: 2 }));
+        assert_ne!(custom, TypeError::custom(OtherCustomTypeError));
+
+        let cloned = custom.clone();
+        assert_eq!(cloned.downcast_custom::<CustomTypeError>(), Some(&CustomTypeError { code: 1 }));
+        assert_eq!(cloned.downcast_custom::<OtherCustomTypeError>(), None);
+
+        let mut errors = HashSet::new();
+        errors.insert(custom);
+        assert!(errors.contains(&equal));
+    }
 }

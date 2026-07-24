@@ -80,8 +80,8 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
                 for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
                     sharding.varying_manual_axes.clear();
                 }
-                let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| TypeError {
-                    message: format!("'{}' input types are not broadcast-compatible", self.name()),
+                let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| {
+                    TypeError::invalid(format!("'{}' input types are not broadcast-compatible", self.name()))
                 })?;
                 if let Some(sharding) = &mut output.sharding {
                     sharding.varying_manual_axes = original_varying_manual_axes;
@@ -142,7 +142,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
-            Err(TypeError { message: "expected 1 input but got 0".to_string() }),
+            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 2 };
@@ -166,7 +166,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError { message: "'elementwise_test' input types are not broadcast-compatible".to_string() }),
+            Err(TypeError::invalid("'elementwise_test' input types are not broadcast-compatible".to_string())),
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 3 };
@@ -232,7 +232,7 @@ mod tests {
                 &[dynamic_type, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]))],
                 &[],
             ),
-            Err(TypeError { message: "'elementwise_test' input types are not broadcast-compatible".to_string() }),
+            Err(TypeError::invalid("'elementwise_test' input types are not broadcast-compatible".to_string())),
         );
     }
 }

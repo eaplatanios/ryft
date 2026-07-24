@@ -62,7 +62,7 @@ impl<T: ElementType> Operation<T> for ConvertElementTypeOperation {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         if input_types[0].element_type().is_token() || self.data_type.is_token() {
-            return Err(TypeError { message: "cannot convert values to or from the token data type".to_string() });
+            return Err(TypeError::invalid("cannot convert values to or from the token data type".to_string()));
         }
         Ok(vec![input_types[0].with_element_type(self.data_type)])
     }
@@ -215,7 +215,7 @@ pub trait ConvertElementType: Sized {
         self.r#type()
             .element_type()
             .promote_to(data_type)
-            .map_err(|error| TypeError { message: error.to_string() })?;
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         self.convert_element_type(data_type)
     }
 }

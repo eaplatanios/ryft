@@ -322,7 +322,7 @@ impl Operation<ArrayType> for ScatterOperation {
         match input_types[0].scatter(&input_types[1], &input_types[2], self) {
             Ok(output_type) => Ok(vec![output_type]),
             Err(ProgramError::Type(error)) => Err(error),
-            Err(error) => Err(TypeError { message: error.to_string() }),
+            Err(error) => Err(TypeError::invalid(error.to_string())),
         }
     }
 
@@ -477,12 +477,10 @@ where
                     } else {
                         let update_axis = update_window_dimensions[window_position];
                         let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
-                            ProgramError::from(TypeError {
-                                message: format!(
-                                    "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
+                            ProgramError::from(TypeError::invalid(format!(
+                                "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
                                      {update_axis} has a dynamic size",
-                                ),
-                            })
+                            )))
                         })?;
                         slice_sizes.push(extent);
                         window_position += 1;
@@ -548,9 +546,9 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
     if let Some(other) = other
         && other.mesh() != mesh
     {
-        return Err(TypeError {
-            message: format!("'{SCATTER_OPERATION_NAME}' operand, indices, and updates shardings must use one mesh"),
-        });
+        return Err(TypeError::invalid(format!(
+            "'{SCATTER_OPERATION_NAME}' operand, indices, and updates shardings must use one mesh"
+        )));
     }
     Ok(())
 }
@@ -684,12 +682,10 @@ where
             } else {
                 let update_axis = update_window_dimensions[window_position];
                 let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
-                    ProgramError::from(TypeError {
-                        message: format!(
-                            "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
+                    ProgramError::from(TypeError::invalid(format!(
+                        "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
                              {update_axis} has a dynamic size",
-                        ),
-                    })
+                    )))
                 })?;
                 slice_sizes.push(extent);
                 window_position += 1;
@@ -778,46 +774,40 @@ impl Scatter for ArrayType {
         let updates_rank = updates.rank();
 
         if indices_rank == 0 {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
+            ))
             .into());
         }
         if !indices.data_type().is_integer() {
-            return Err(TypeError {
-                message: format!("'{SCATTER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"),
-            }
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"
+            ))
             .into());
         }
         if operand.memory() != indices.memory() || operand.memory() != updates.memory() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' operand, indices, and updates must share one memory space but reside \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' operand, indices, and updates must share one memory space but reside \
                      in {}, {}, and {}",
-                    operand.memory(),
-                    indices.memory(),
-                    updates.memory(),
-                ),
-            }
+                operand.memory(),
+                indices.memory(),
+                updates.memory(),
+            ))
             .into());
         }
         if updates.data_type() != operand.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' updates data type {} does not match operand data type {}",
-                    updates.data_type(),
-                    operand.data_type(),
-                ),
-            }
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' updates data type {} does not match operand data type {}",
+                updates.data_type(),
+                operand.data_type(),
+            ))
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
         let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
-            return Err(TypeError {
-                message: format!("'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
-            }
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"
+            ))
             .into());
         };
 
@@ -840,13 +830,11 @@ impl Scatter for ArrayType {
             operand_rank,
         )?;
         if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' scatter_dimensions_to_operand_dimensions has length {} but the index \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' scatter_dimensions_to_operand_dimensions has length {} but the index \
                      vector extent is {index_vector_extent}",
-                    dimensions.scatter_dimensions_to_operand_dimensions().len(),
-                ),
-            }
+                dimensions.scatter_dimensions_to_operand_dimensions().len(),
+            ))
             .into());
         }
         validate_unique_in_range(
@@ -856,24 +844,20 @@ impl Scatter for ArrayType {
             operand_rank,
         )?;
         if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' operand and scatter-indices batching dimensions must align 1:1, but got \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' operand and scatter-indices batching dimensions must align 1:1, but got \
                      {} and {}",
-                    dimensions.operand_batching_dimensions().len(),
-                    dimensions.scatter_indices_batching_dimensions().len(),
-                ),
-            }
+                dimensions.operand_batching_dimensions().len(),
+                dimensions.scatter_indices_batching_dimensions().len(),
+            ))
             .into());
         }
         for &dimension in dimensions.scatter_indices_batching_dimensions() {
             if dimension >= indices_rank || dimension == index_vector_dimension {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' scatter_indices_batching_dimensions entry {dimension} is out of \
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' scatter_indices_batching_dimensions entry {dimension} is out of \
                          range or names the index vector dimension"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -881,12 +865,10 @@ impl Scatter for ArrayType {
         let inserted: BTreeSet<usize> = dimensions.inserted_window_dimensions().iter().copied().collect();
         let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
         if inserted.intersection(&operand_batching).next().is_some() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' inserted_window_dimensions and operand_batching_dimensions must be \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' inserted_window_dimensions and operand_batching_dimensions must be \
                      disjoint"
-                ),
-            }
+            ))
             .into());
         }
 
@@ -894,21 +876,17 @@ impl Scatter for ArrayType {
         // into window axes and the scatter/batch axes carried from the indices (every indices axis but the index
         // vector).
         if operand_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' operand rank {operand_rank} must equal update_window + inserted_window + \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' operand rank {operand_rank} must equal update_window + inserted_window + \
                      operand_batching dimension counts"
-                ),
-            }
+            ))
             .into());
         }
         if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
-            return Err(TypeError {
-                message: format!(
-                    "'{SCATTER_OPERATION_NAME}' updates rank {updates_rank} must equal (indices rank - 1) + the update \
+            return Err(TypeError::invalid(format!(
+                "'{SCATTER_OPERATION_NAME}' updates rank {updates_rank} must equal (indices rank - 1) + the update \
                      window dimension count"
-                ),
-            }
+            ))
             .into());
         }
 
@@ -923,12 +901,10 @@ impl Scatter for ArrayType {
                 (updates.dimension(update_axis), operand.dimension(operand_axis))
                 && update_extent > operand_extent
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' update window axis {update_axis} extent {update_extent} exceeds \
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' update window axis {update_axis} extent {update_extent} exceeds \
                          the operand window axis {operand_axis} extent {operand_extent}"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -940,12 +916,10 @@ impl Scatter for ArrayType {
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
             if updates.dimension(update_axis) != indices.dimension(indices_axis) {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' updates scatter axis {update_axis} must match indices batch axis \
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' updates scatter axis {update_axis} must match indices batch axis \
                          {indices_axis} in extent"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -957,12 +931,10 @@ impl Scatter for ArrayType {
             .zip(dimensions.scatter_indices_batching_dimensions())
         {
             if operand.dimension(operand_axis) != indices.dimension(indices_axis) {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
                          {operand_axis} and indices axis {indices_axis} differ"
-                    ),
-                }
+                ))
                 .into());
             }
         }
@@ -974,19 +946,17 @@ impl Scatter for ArrayType {
         // requested `output_sharding`, mirroring `dot`/`reduce`.
         let sharding = if let Some(requested) = operation.output_sharding() {
             if requested.rank() != operand.rank() {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' output sharding rank ({}) does not match the operand rank ({})",
-                        requested.rank(),
-                        operand.rank(),
-                    ),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' output sharding rank ({}) does not match the operand rank ({})",
+                    requested.rank(),
+                    operand.rank(),
+                ))
                 .into());
             }
             if references_auto_axis(requested) {
-                return Err(TypeError {
-                    message: format!("'{SCATTER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"),
-                }
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
+                ))
                 .into());
             }
             Some(requested.clone())
@@ -1002,25 +972,21 @@ impl Scatter for ArrayType {
                 .collect();
             for &axis in &replicated_operand_axes {
                 if dimension_has_explicit_axis(&mesh, &operand_sharding.dimensions()[axis]) {
-                    return Err(TypeError {
-                        message: format!(
-                            "'{SCATTER_OPERATION_NAME}' operand axis {axis} is targeted by the start indices and must be \
+                    return Err(TypeError::invalid(format!(
+                        "'{SCATTER_OPERATION_NAME}' operand axis {axis} is targeted by the start indices and must be \
                              replicated over explicit mesh axes; request an explicit output sharding to resolve \
                              placement"
-                        ),
-                    }
+                    ))
                     .into());
                 }
             }
             if let Some(indices_sharding) = indices.sharding()
                 && dimension_has_explicit_axis(&mesh, &indices_sharding.dimensions()[index_vector_dimension])
             {
-                return Err(TypeError {
-                    message: format!(
-                        "'{SCATTER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
+                return Err(TypeError::invalid(format!(
+                    "'{SCATTER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
                          mesh axes"
-                    ),
-                }
+                ))
                 .into());
             }
             // The output is the in-place-updated operand, so it keeps the operand's placement and reduction state.
@@ -1031,7 +997,7 @@ impl Scatter for ArrayType {
         operand
             .clone()
             .with_sharding(sharding)
-            .map_err(|error| TypeError { message: error.to_string() }.into())
+            .map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -1233,9 +1199,9 @@ mod tests {
         let operation = ScatterOperation::new(dimensions(), ScatterReductionKind::Add);
         assert_eq!(
             operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])], &[]),
-            Err(TypeError {
-                message: "'scatter' update_window_dimensions entry 1 is out of range for bound 1".to_string(),
-            }),
+            Err(TypeError::invalid(
+                "'scatter' update_window_dimensions entry 1 is out of range for bound 1".to_string()
+            )),
         );
     }
 

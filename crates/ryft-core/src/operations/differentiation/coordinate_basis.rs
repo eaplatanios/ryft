@@ -98,45 +98,43 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
         check_count!("region", region_interfaces, 0, TypeError);
         let cotangent_data_type = self.leaf_type.data_type().cotangent();
         if cotangent_data_type.is_zero_space() {
-            return Err(TypeError {
-                message: format!("coordinate basis requires a differentiable leaf type but got {}", self.leaf_type,),
-            });
+            return Err(TypeError::invalid(format!(
+                "coordinate basis requires a differentiable leaf type but got {}",
+                self.leaf_type,
+            )));
         }
         if cotangent_data_type != self.leaf_type.data_type() {
-            return Err(TypeError {
-                message: format!(
-                    "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
-                    self.leaf_type,
-                    self.leaf_type.clone().with_data_type(cotangent_data_type),
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
+                self.leaf_type,
+                self.leaf_type.clone().with_data_type(cotangent_data_type),
+            )));
         }
         let dimensions = self.leaf_type.shape().dimensions();
         if dimensions.iter().any(|size| matches!(size, Size::Dynamic(_))) {
-            return Err(TypeError {
-                message: format!("coordinate basis requires a fully static leaf type but got {}", self.leaf_type),
-            });
+            return Err(TypeError::invalid(format!(
+                "coordinate basis requires a fully static leaf type but got {}",
+                self.leaf_type
+            )));
         }
         let coordinate_count = if dimensions.contains(&Size::Static(0)) {
             0
         } else {
             dimensions.iter().try_fold(1usize, |count, size| match size {
-                Size::Static(size) => count.checked_mul(*size).ok_or_else(|| TypeError {
-                    message: format!("coordinate count overflows usize for leaf type {}", self.leaf_type),
+                Size::Static(size) => count.checked_mul(*size).ok_or_else(|| {
+                    TypeError::invalid(format!("coordinate count overflows usize for leaf type {}", self.leaf_type))
                 }),
                 Size::Dynamic(_) => unreachable!("dynamic dimensions were rejected above"),
             })?
         };
-        let coordinate_end = self.coordinate_offset.checked_add(coordinate_count).ok_or_else(|| TypeError {
-            message: format!("coordinate range overflows usize for leaf type {}", self.leaf_type),
+        let coordinate_end = self.coordinate_offset.checked_add(coordinate_count).ok_or_else(|| {
+            TypeError::invalid(format!("coordinate range overflows usize for leaf type {}", self.leaf_type))
         })?;
         if coordinate_end > self.basis_size {
-            return Err(TypeError {
-                message: format!(
-                    "coordinate range [{}, {coordinate_end}) exceeds basis size {}",
-                    self.coordinate_offset, self.basis_size,
-                ),
-            });
+            return Err(TypeError::invalid(format!(
+                "coordinate range [{}, {coordinate_end}) exceeds basis size {}",
+                self.coordinate_offset, self.basis_size,
+            )));
         }
         Ok(vec![self.leaf_type.with_inserted_dimension(0, Size::Static(self.basis_size))?])
     }
@@ -168,8 +166,11 @@ where
         let leaf_dimensions = self
             .leaf_type
             .static_shape()
-            .ok_or_else(|| TypeError {
-                message: format!("coordinate basis requires a fully static leaf type but got {}", self.leaf_type),
+            .ok_or_else(|| {
+                TypeError::invalid(format!(
+                    "coordinate basis requires a fully static leaf type but got {}",
+                    self.leaf_type
+                ))
             })?
             .dimensions()
             .to_vec();
@@ -339,7 +340,7 @@ mod tests {
                 CoordinateBasisOperation::new(leaf_type.clone(), 0, 1)
                     .infer_output_types(&[], &[])
                     .unwrap_err()
-                    .message,
+                    .to_string(),
                 format!("coordinate basis requires a differentiable leaf type but got {leaf_type}"),
             );
         }
@@ -349,7 +350,7 @@ mod tests {
             CoordinateBasisOperation::new(e8m0_type.clone(), 0, 1)
                 .infer_output_types(&[], &[])
                 .unwrap_err()
-                .message,
+                .to_string(),
             format!(
                 "coordinate basis values of type {e8m0_type} cannot represent their own cotangents; use {} instead",
                 e8m0_type.clone().with_data_type(F32),
@@ -358,13 +359,16 @@ mod tests {
 
         let dynamic_type = ArrayType::new(F32, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
-            CoordinateBasisOperation::new(dynamic_type, 0, 1).infer_output_types(&[], &[]).unwrap_err().message,
+            CoordinateBasisOperation::new(dynamic_type, 0, 1)
+                .infer_output_types(&[], &[])
+                .unwrap_err()
+                .to_string(),
             "coordinate basis requires a fully static leaf type but got f32[*]",
         );
 
         let leaf_type = ArrayType::new(F32, Shape::new(vec![Size::Static(3)]));
         assert_eq!(
-            CoordinateBasisOperation::new(leaf_type, 2, 4).infer_output_types(&[], &[]).unwrap_err().message,
+            CoordinateBasisOperation::new(leaf_type, 2, 4).infer_output_types(&[], &[]).unwrap_err().to_string(),
             "coordinate range [2, 5) exceeds basis size 4",
         );
 
@@ -373,7 +377,7 @@ mod tests {
             CoordinateBasisOperation::new(overflowing_type, 0, usize::MAX)
                 .infer_output_types(&[], &[])
                 .unwrap_err()
-                .message,
+                .to_string(),
             format!("coordinate count overflows usize for leaf type f32[{}, 2]", usize::MAX),
         );
 

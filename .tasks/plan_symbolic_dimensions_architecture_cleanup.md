@@ -473,19 +473,28 @@ will be removed.
 
 ### `TypeError` representation
 
-Retain `TypeError` as an enum. `WrongKind` is a real structured projection diagnostic, and `Custom` carries production
-`DimensionError` values through type/program boundaries with typed recovery; neither is test-only.
+Retain `TypeError` as an enum because `Custom` will carry production type-family errors such as `DimensionError`
+through type/program boundaries with typed recovery. Projection failures do not need a separate structured variant:
+the archived implementation only needs their rendered message and does not branch on a more specific error category.
+Render them through `Invalid { message: String }` using one canonical expected/actual diagnostic.
 
-The generic invalid variant does not need a named-field struct variant. Prefer:
+Use the named field for clear destructuring while routing every construction through one canonical helper:
 
 ```rust,ignore
-TypeError::Invalid(String)
+TypeError::invalid(message)
 ```
 
-over `TypeError::Invalid { message: String }` or a redundant `TypeError::invalid(...)` constructor. Apply this as a
-separate mechanical cleanup so it does not obscure semantic dimension changes, and verify exact rendered diagnostics.
-Do not convert `TypeError` back to a single struct with an optional source, which would erase structured wrong-kind
-semantics and encode another implicit union.
+The helper owns message conversion and keeps construction sites independent of the variant's storage syntax;
+`TypeError::Invalid { message }` remains available for the few tests and consumers that inspect the rendered payload.
+Apply this as a separate mechanical cleanup so it does not obscure semantic dimension changes, and verify exact
+rendered diagnostics. Do not convert `TypeError` back to a single struct with an optional source, which would erase
+typed custom errors and encode another implicit union.
+
+Do not add a reverse `TypeError::from_program` conversion. The archived call sites only need it because type and shape
+helpers return the higher-level `ProgramError`; stringifying every non-type program error would erase its structure and
+invert error ownership. During each operation migration, make pure type/shape helpers return `TypeError`,
+`DimensionError`, or another owner-specific error, split helpers that mix program construction with inference, and
+wrap `TypeError` in `ProgramError` only at outward program boundaries.
 
 ## Carries-over/deletes ledger
 
@@ -523,7 +532,8 @@ semantics and encode another implicit union.
 - redundant operation-family variant lists and manual outer `From` boilerplate;
 - `OutputIdentityRole` and its operation-specific implementations, subject to the structural prototype gate;
 - duplicated transform rules whose only purpose is storage-kind projection/lifting;
-- verbose `TypeError::Invalid { message: ... }` construction after the separate tuple-variant migration; and
+- direct `TypeError::Invalid { message: ... }` construction after the canonical `TypeError::invalid(...)` migration;
+  named-field destructuring remains supported; and
 - compatibility shims for the retired homogeneous shape-program API.
 
 One centralized schema implementation may internally collect dynamic variables from `Shape` metadata. What must
@@ -677,8 +687,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `B0`   | Repair the incomplete custom-derivatives module move                       | Line by line              |
 | `B1`   | Rename the public array/data type modules                                  | Pattern and residual      |
 | `S1`   | `RegionRef::with_id` helper and call-site cleanup                           | Line by line              |
-| `S3`   | Elementwise-macro restructure                                              | Line by line              |
-| `S4`   | Structured `TypeError` core, then mechanical `Invalid(String)` call sites   | Core plus sampled sites  |
+| `S4`   | Structured `TypeError` core, then mechanical `invalid(...)` call sites       | Core plus sampled sites  |
 | `S5a`  | Pure `Size` to `Dimension` rename and `Shape` module move, semantics intact | Pattern, residual, sample |
 | `P0`   | Behavioral/evidence freeze and archive implementation disposition          | Evidence review           |
 | `P1`   | Leaf identity, bounds, refinements, structural closure, canonical identity | Line by line              |
@@ -697,13 +706,12 @@ Each increment depends on the one above it. `B0` reconstructs the physical custo
 compiling pre-move implementation, updates every direct module path, and excludes the symbolic-dimension semantics
 accidentally mixed into the original move commit. `B1` is a pure module/file rename from `types::array_types` and
 `types::data_types` to `types::arrays` and `types::data`: update every in-repo reference directly, add no compatibility
-re-exports, and preserve all public items and behavior. `S3` covers `macros.rs` and
-`differentiation/elementwise.rs`; `S5a` renames `Size` to `Dimension` and moves `Shape` and `StaticShape` into
-`types::dimensions` without changing representation or behavior.
+re-exports, and preserve all public items and behavior. `S5a` renames `Size` to `Dimension` and moves `Shape` and
+`StaticShape` into `types::dimensions` without changing representation or behavior.
 
-`B0`, `S1`, and `S3` are refactors unrelated to dimensions that are present only because they were in flight
-concurrently. They must land first: they are bounded, they reduce the archived remainder, and they provide low-risk
-rehearsals of the workflow.
+`B0` and `S1` are refactors unrelated to dimensions that were present only because they were in flight concurrently.
+They land first because they are bounded, reduce the archived remainder, and provide low-risk rehearsals of the
+workflow.
 
 `S1` is not a global rename of `Program::region_ref` or `ProgramBuilder::region_ref`. It introduces
 `RegionRef::with_id` as the one way to select another root from an existing borrowed arena and replaces only
@@ -711,8 +719,13 @@ rehearsals of the workflow.
 `ProgramBuilder` remains named `region_ref`.
 
 `S4` has two review strata in one coherent increment: review the semantic enum core and typed conversions line by line,
-then review the uniform tuple-call-site rewrite by transformation command, empty residual search, and representative
-samples. `WrongKind`, `Custom`, and `DimensionError` are semantic structure, not mechanical noise.
+then review the uniform `TypeError::invalid(...)` call-site rewrite by transformation command, empty constructor
+residual search, and representative samples. `Custom` is semantic structure rather than mechanical noise; a later
+dimension-owned conversion will carry `DimensionError` through it without adding dimension knowledge here. Wrong-kind
+projection failures remain canonical `Invalid { message }` diagnostics because no production consumer needs to
+recover separate expected/actual fields. S4 also owns the explicit `Result<_, TypeError>` annotations at elementwise
+inference macro boundaries: the structured error's additional conversion paths make those annotations necessary to
+avoid inference ambiguity.
 
 `S5a` is strictly mechanical. Its dynamic variant must retain the pre-refactor `Option<usize>` semantics. Introducing
 `DimensionVariable`, authoritative bounds, identity, or refinements belongs to `P1`; mixing those into `S5a` would
@@ -1138,7 +1151,8 @@ Execute these specifications in order: `P0`, `P1`, `P2`, `P3.*`, `P4`, `P5`, `P6
 
 ### Phase 9: module and public API cleanup
 
-- [ ] Confirm the `S4` structured `WrongKind` and typed `Custom`/`DimensionError` recovery behavior remains intact;
+- [ ] Confirm the `S4` typed `Custom`/`DimensionError` recovery behavior and canonical invalid projection diagnostics
+      remain intact;
       do not mix another error-representation migration into the module move.
 - [ ] Split core dimension operations from the eager host representation currently colocated under `backends`.
 - [ ] Move operation semantics to `operations::dimensions`.
@@ -1278,8 +1292,8 @@ The pre-execution review identified four missing design decisions and this revis
 - one mixed-operation dimension-operand schema owns positions, segments, identities, bounds, ordering, validation,
   diagnostics, and consumer views across inference, eager execution, transforms, and lowering.
 
-The revision also retains the structured `TypeError` enum while selecting the smaller `Invalid(String)` tuple variant
-as a separately reviewable mechanical cleanup.
+The revision also retains the structured `TypeError` enum while selecting a named `Invalid { message: String }`
+variant, with all construction routed through `TypeError::invalid(...)`, as a separately reviewable mechanical cleanup.
 
 ### Plan revision: execution staging and review process
 
@@ -1353,7 +1367,7 @@ committed, but the commit neither updated its consumers nor separated later symb
 path, retains the root module documentation, and updates every production import and rustdoc link directly. It removes
 the 187 later symbolic-dimension insertions that made the move depend on APIs absent from integration. Verification:
 
-- `cargo check -p ryft-core` passed;
+- `cargo check -p ryft-core` and `cargo check -p ryft-xla` passed;
 - `cargo check -p ryft-xla` passed;
 - `cargo test -p ryft-core --lib` passed all 911 tests;
 - `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; and
@@ -1412,3 +1426,48 @@ Verification completed:
 The compiler emitted the `arrays` ambiguous-glob warning already present on the reviewed B1 integration tree; S1
 introduces no warning. The residual `RegionRef::new` calls are the two intentional initial arena-entry APIs in
 `Program` and `ProgramBuilder`, the entry-region constructor, and the direct invalid-constructor test.
+
+### Disposition: former S3 elementwise-macro increment
+
+The former standalone S3 was based on a whole-file comparison that conflated three histories:
+
+- the independent elementwise-macro restructure is already ancestral to the integration baseline;
+- the remaining `TypeError::Invalid` rewrites and explicit elementwise inference result types belong to S4; and
+- the remaining `Size` to `Dimension` changes belong to S5a.
+
+There is therefore no valid standalone S3 patch. Restoring the archived `macros.rs` and
+`differentiation/elementwise.rs` wholesale after S4 and S5a would merely duplicate those phases, while restoring them
+beforehand would mix their prerequisites. S3 is removed from the increment catalog, its error-related hunks are
+accepted by S4, and its dimension-related hunks remain deferred to S5a.
+
+### Execution: S4 structured type errors
+
+S4 keeps generic type machinery decoupled from dimensions while establishing the structured error surface needed by
+the later heterogeneous program type:
+
+- `TypeError::Invalid { message: String }` preserves the existing general diagnostics while allowing clear payload
+  destructuring, and `TypeError::invalid(...)` centralizes all construction;
+- `TypeError::Custom` carries typed, equality- and hash-preserving family errors through generic type APIs;
+- heterogeneous projection failures use canonical `TypeError::Invalid` diagnostics because no consumer recovers their
+  expected and actual variants;
+- elementwise inference has explicit result types at its seven ambiguous macro boundaries.
+
+The mechanical portion converted all 759 pre-existing `TypeError` construction and destructuring sites. Exact
+diagnostic behavior is covered by the complete core and XLA suites, while focused tests cover invalid display and
+custom downcasting, clone/equality, and hash behavior. All operation files touched by later dimension phases remain
+shared paths: S4 owns only their error syntax.
+
+Verification completed:
+
+- `cargo fmt --all -- --check` and `git diff --check` passed;
+- `cargo check -p ryft-core` passed;
+- `cargo test -p ryft-core --lib` passed all 913 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored;
+- `cargo test -p ryft-macros -p ryft-macros-tests` passed all 53 macro unit tests and all 17 operation integration
+  tests; one parameter compile-fail snapshot has an independently reproduced integration-baseline mismatch because
+  the compiler's implementor list now includes `Axes`; and
+- `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored.
+
+The residual search contains no old `TypeError` struct construction, tuple-variant construction, or direct named-field
+construction. The remaining `TypeError::Invalid { message }` matches are intentional destructuring patterns;
+similarly named test fixtures and `DataTypeError` are unrelated.

@@ -356,10 +356,8 @@ impl<'c> Context for XlaDomain<'c> {
     /// compiled function's capture table carrying only a type and no data — so there is nothing to materialize
     /// without the surrounding capture table and lifting is always rejected.
     fn lift(&self, constant: XlaConstant) -> Result<Array<'c>, ProgramError> {
-        Err(TypeError {
-            message: format!("xla captured constant {constant} requires a captured program capture table"),
-        }
-        .into())
+        Err(TypeError::invalid(format!("xla captured constant {constant} requires a captured program capture table"))
+            .into())
     }
 
     /// Eagerly executes `operation` on concrete input [`Array`]s, mirroring JAX's op-by-op dispatch: the operation
@@ -385,8 +383,7 @@ impl<'c> Context for XlaDomain<'c> {
             // through to the compiled eager path below, which derives a default execution mesh instead.
             if self.mesh.is_some() {
                 let kind = if name == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
-                let value =
-                    self.constant(&array_type, kind).map_err(|error| TypeError { message: error.to_string() })?;
+                let value = self.constant(&array_type, kind).map_err(|error| TypeError::invalid(error.to_string()))?;
                 return Ok(vec![value]);
             }
         }
@@ -503,13 +500,11 @@ impl<'c> InterpretableOperation<XlaDomain<'c>> for ShardMapOperation<XlaConstant
 fn eager_identity_output_type<O: Operation<ArrayType>>(operation: &O) -> Result<ArrayType, ProgramError> {
     let mut output_types = operation.infer_output_types(&[], &[])?;
     if output_types.len() != 1 {
-        return Err(TypeError {
-            message: format!(
-                "xla identity operation `{}` must produce exactly one output but produced {}",
-                operation.name(),
-                output_types.len(),
-            ),
-        }
+        return Err(TypeError::invalid(format!(
+            "xla identity operation `{}` must produce exactly one output but produced {}",
+            operation.name(),
+            output_types.len(),
+        ))
         .into());
     }
     Ok(output_types.pop().expect("output count checked above"))
@@ -517,19 +512,15 @@ fn eager_identity_output_type<O: Operation<ArrayType>>(operation: &O) -> Result<
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), ProgramError> {
     match array_type.data_type() {
-        DataType::Token | DataType::Zero if identity == ONE_OPERATION_NAME => Err(TypeError {
-            message: format!(
-                "xla domain cannot synthesize {identity} value for element type {}",
-                array_type.data_type()
-            ),
-        }
+        DataType::Token | DataType::Zero if identity == ONE_OPERATION_NAME => Err(TypeError::invalid(format!(
+            "xla domain cannot synthesize {identity} value for element type {}",
+            array_type.data_type()
+        ))
         .into()),
-        DataType::Token => Err(TypeError {
-            message: format!(
-                "xla domain cannot synthesize {identity} value for element type {}",
-                array_type.data_type()
-            ),
-        }
+        DataType::Token => Err(TypeError::invalid(format!(
+            "xla domain cannot synthesize {identity} value for element type {}",
+            array_type.data_type()
+        ))
         .into()),
         _ => Ok(()),
     }
@@ -2992,8 +2983,8 @@ mod tests {
 
         assert!(matches!(
             XlaDomain::token().bind(OneOperation::new(array_type.clone()), Vec::new(), &[]),
-            Err(ProgramError::Type(error))
-                if error.message == "xla domain cannot synthesize one value for element type token"
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "xla domain cannot synthesize one value for element type token"
         ));
     }
 
@@ -3962,7 +3953,8 @@ mod tests {
         let right = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         assert!(matches!(
             domain.bind(AddOperation, Vec::new(), &[left, right]),
-            Err(ProgramError::Type(error)) if error.message == "'add' input types are not broadcast-compatible",
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "'add' input types are not broadcast-compatible",
         ));
     }
 
