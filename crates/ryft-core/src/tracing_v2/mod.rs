@@ -4,17 +4,14 @@ pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
 /// IR benchmarking utilities that emit raw artifacts and normalized summaries for comparison.
 pub mod benchmarking;
-/// Semantic operation traits and built-in operation enums.
-///
-/// Per-op staging stays on small operation-local capability traits rather than on catch-all
-/// `Supports*` bundles.
-pub mod operations;
+/// Higher-order custom-derivative operations (`custom_jvp` / `custom_vjp`).
+pub mod custom_derivatives;
 pub mod rematerialization;
 
 pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
-pub use operations::custom_derivatives::transpose_primal_custom_vjp;
+pub use custom_derivatives::transpose_primal_custom_vjp;
 pub use rematerialization::{
     DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage, NoStorage,
     NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate, RematerializationDecision,

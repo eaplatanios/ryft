@@ -483,7 +483,7 @@ where
                 Some(name) => format!("{}.{name}", instruction.operation().name()),
                 None => format!("{}.{slot}", instruction.operation().name()),
             };
-            nested_regions.push(nested_region(label, summarize_region(RegionRef::new(program.regions(), region)?)?));
+            nested_regions.push(nested_region(label, summarize_region(program.region_ref(region)?)?));
         }
     }
 

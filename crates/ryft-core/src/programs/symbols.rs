@@ -4,11 +4,11 @@ use std::sync::OnceLock;
 
 use crate::programs::types::{Type, TypeError};
 
-/// Coherent symbolic-metadata vocabulary selected by a [`Type`] family. A [`Symbols`] implementation defines the kinds
-/// of binder, expression, substitution, constraint, closed-signature identity, and concrete runtime value that belong
-/// to one symbolic algebra. It is not a container or a runtime symbol table. A type family selects the vocabulary
+/// Coherent symbolic-metadata system selected by a [`Type`] family. A [`Symbols`] implementation defines the kinds of
+/// binder, expression, substitution, constraint, closed-signature identity, and concrete runtime value that belong to
+/// one symbolic algebra. It is not a container or a runtime symbol table. A type family selects the symbol system
 /// through [`Type::Symbols`], after which its types, values, operations, and generic [`Program`](crate::Program)
-/// machinery agree on all six associated types. The pieces participate in a program as follows:
+/// machinery agree on all associated types. The pieces participate in a program as follows:
 ///
 ///   1. Types and operation metadata carry [`Expression`](Self::Expression)s over scoped [`Variable`](Self::Variable)s.
 ///   2. Closing a [`Region`](crate::Region) discovers where those variables come from: formal input types,
@@ -22,11 +22,11 @@ use crate::programs::types::{Type, TypeError};
 ///      identities or names (refer to the [`SignatureKey`](Self::SignatureKey) documentation for more information on
 ///      this kind of _alpha-normalization_).
 ///
-/// Type families without symbolic metadata use the dummy [`NoSymbols`] vocabulary.
+/// Type families without symbolic metadata use the dummy [`NoSymbols`] system.
 ///
 /// # Example
 ///
-/// [`DimensionSymbols`](crate::DimensionSymbols), the vocabulary selected by [`ArrayType`](crate::ArrayType),
+/// [`DimensionSymbols`](crate::DimensionSymbols), the symbol system selected by [`ArrayType`](crate::ArrayType),
 /// instantiates the associated types with the dimension algebra: a [`Variable`](Self::Variable) is a symbolic array
 /// extent such as `batch`, an [`Expression`](Self::Expression) is a dimension polynomial such as `2 * batch` (the kind
 /// of value an array type like `f32[2 * batch]` embeds), a [`Substitution`](Self::Substitution) rewrites one scope's
@@ -57,20 +57,20 @@ use crate::programs::types::{Type, TypeError};
 /// # }
 /// ```
 ///
-/// The remaining two associated types do not usually appear in user code.
-/// A [`Constraint`](Self::Constraint) such as "`batch` is divisible by 4" is declared once on a scope via
-/// [`DimensionScope::with_constraints`](crate::DimensionScope::with_constraints) and retained by region closure,
-/// and a [`SignatureKey`](Self::SignatureKey) identity is computed internally by consistently renaming variables
-/// to canonical placeholders, so that a region declared over `batch` and one declared over `n` (identical except
+/// The constraint and signature-key associated types do not usually appear in user code.
+/// A [`Constraint`](Self::Constraint) such as "`batch` is divisible by 4" is part of the immutable scope returned by
+/// [`DimensionScope::declare_constrained`](crate::DimensionScope::declare_constrained) and retained by region closure.
+/// A [`SignatureKey`](Self::SignatureKey) identity is computed internally by consistently renaming variables to
+/// canonical placeholders, so that a region declared over `batch` and one declared over `n` (identical except
 /// for that name) are recognized as the same instantiation and share one imported copy.
 pub trait Symbols: Sized {
     /// Identity of one scoped symbolic binder. A variable identifies a symbolic unknown. It is neither an expression
     /// nor the concrete value eventually associated with that unknown. Equality should preserve whatever scope or
-    /// binder identity the vocabulary needs for capture avoidance.
+    /// binder identity the symbol system needs for capture avoidance.
     type Variable: Clone + Debug + Display + PartialEq;
 
     /// Symbolic metadata expression composed from variables and constants. Expressions are the objects embedded in
-    /// types, operation metadata, and symbolic source declarations. Depending on the vocabulary, an expression may
+    /// types, operation metadata, and symbolic source declarations. Depending on the symbol system, an expression may
     /// reference no variables, one variable, or several variables.
     type Expression: Clone + Debug + Display + PartialEq;
 
@@ -83,7 +83,7 @@ pub trait Symbols: Sized {
 
     /// Semantic predicate over expressions retained by a closed symbolic signature. Constraints restrict the concrete
     /// assignments admitted by a scope without becoming part of structural expression equality. Dimension examples
-    /// include `rows == columns`, `batch <= 64`, and `elements % 8 == 0`. The concrete vocabulary is responsible for
+    /// include `rows == columns`, `batch <= 64`, and `elements % 8 == 0`. The concrete symbol system is responsible for
     /// proving constraints statically when possible and validating any residual constraints against concrete bindings.
     type Constraint: Clone + Debug + PartialEq;
 
@@ -104,50 +104,14 @@ pub trait Symbols: Sized {
     /// [`Value`](crate::Value). Symbolic refinement accepts it only through a source authorized by a
     /// [`SymbolSignature`].
     type Value: Copy + Clone + Debug + Display + PartialEq;
-
+    
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Vocabulary-owned snapshot of mutable constraint state observed while deriving symbol signatures. Generic
-    /// [`Program`](crate::Program) machinery treats this value as opaque. Mutable vocabularies merge per-region
-    /// snapshots, freeze the referenced owners, and verify that their semantic state did not change between derivation
-    /// and sealing. Vocabularies with immutable constraints use `()`.
-    type ConstraintSnapshot: Clone + Debug + Default;
 
     /// Returns the variables referenced by `expression` in deterministic order.
     fn expression_variables(expression: &Self::Expression) -> Vec<Self::Variable>;
 
     /// Returns the constraints retained by the scopes that own `variables`, with duplicates removed.
     fn variable_constraints(variables: &[Self::Variable]) -> Vec<Self::Constraint>;
-
-    /// Returns the constraints retained by `variables` together with an atomic snapshot of their mutable owners.
-    ///
-    /// A vocabulary with mutable constraint owners must override this method and read each owner's constraints and
-    /// snapshot state atomically.
-    #[inline]
-    fn variable_constraints_with_snapshot(
-        variables: &[Self::Variable],
-    ) -> (Vec<Self::Constraint>, Self::ConstraintSnapshot) {
-        (Self::variable_constraints(variables), Self::ConstraintSnapshot::default())
-    }
-
-    /// Merges per-region constraint snapshots into one arena snapshot.
-    #[inline]
-    fn merge_constraint_snapshots(
-        snapshots: impl IntoIterator<Item = Self::ConstraintSnapshot>,
-    ) -> Self::ConstraintSnapshot {
-        let _ = snapshots;
-        Self::ConstraintSnapshot::default()
-    }
-
-    /// Seals every mutable constraint owner referenced by `snapshot`.
-    #[inline]
-    fn freeze_constraint_snapshot(_snapshot: &Self::ConstraintSnapshot) {}
-
-    /// Returns whether every owner in `snapshot` still has the semantic state observed during derivation.
-    #[inline]
-    fn constraint_snapshot_is_unchanged(_snapshot: &Self::ConstraintSnapshot) -> bool {
-        true
-    }
 
     /// Converts potentially overlapping rebindings into capture-avoiding two-phase substitutions.
     fn stage_rebindings(
@@ -159,6 +123,23 @@ pub trait Symbols: Sized {
         signature: &SymbolSignature<Self>,
         substitution: &Self::Substitution,
     ) -> Result<SymbolSignature<Self>, TypeError>;
+
+    /// Validates that `actual` preserves the structure and satisfies the semantic obligations of `expected`.
+    ///
+    /// The default requires exact alpha-normalized signature identity. Symbol systems whose constraints admit semantic
+    /// entailment may override this hook so a caller carrying stronger facts can satisfy a weaker expected contract
+    /// without changing the structural binder and source identity.
+    fn validate_signature_rebinding(
+        expected: &SymbolSignature<Self>,
+        actual: &SymbolSignature<Self>,
+    ) -> Result<(), TypeError> {
+        if Self::alpha_normalized_key(expected)? != Self::alpha_normalized_key(actual)? {
+            return Err(TypeError::Invalid {
+                message: "symbolic program input rebinding changes the entry symbol signature".to_string(),
+            });
+        }
+        Ok(())
+    }
 
     /// Computes the scope-independent identity of `signature` by consistently renaming its variables to canonical
     /// placeholders. Refer to the documentation of [`SignatureKey`](Self::SignatureKey) for more information on this
@@ -177,7 +158,7 @@ impl Display for NoSymbol {
     }
 }
 
-/// Symbol vocabulary for type families whose types carry no symbolic metadata.
+/// Symbol system for type families whose types carry no symbolic metadata.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NoSymbols;
 
@@ -188,8 +169,6 @@ impl Symbols for NoSymbols {
     type Constraint = NoSymbol;
     type SignatureKey = ();
     type Value = NoSymbol;
-    type ConstraintSnapshot = ();
-
     #[inline]
     fn expression_variables(expression: &Self::Expression) -> Vec<Self::Variable> {
         match *expression {}
@@ -574,7 +553,7 @@ mod tests {
 
     use super::{SymbolSignature, SymbolWitness, Symbols};
 
-    /// Symbol vocabulary that counts alpha-normalization calls for cache-behavior tests.
+    /// Symbol system that counts alpha-normalization calls for cache-behavior tests.
     struct CountingSymbols;
 
     /// Number of calls to [`CountingSymbols::alpha_normalized_key`].
@@ -587,8 +566,6 @@ mod tests {
         type Constraint = usize;
         type SignatureKey = usize;
         type Value = usize;
-        type ConstraintSnapshot = ();
-
         fn expression_variables(expression: &Self::Expression) -> Vec<Self::Variable> {
             vec![*expression]
         }

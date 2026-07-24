@@ -1,3 +1,5 @@
+//! Contains higher-order custom-derivative operations and their transformation rules.
+
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
@@ -17,12 +19,24 @@ use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, OperationSymbols};
 use crate::programs::regions::RegionInterface;
+use crate::programs::symbols::SymbolSubstitution;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Dimension};
+
+/// Applies the symbol instantiation induced by `actual_inputs` to `types` expressed in the same formal scope as
+/// `formal_inputs`.
+fn instantiate_boundary_types<T: Type>(
+    formal_inputs: &[T],
+    actual_inputs: &[T],
+    types: &[T],
+) -> Result<Vec<T>, TypeError> {
+    let rebindings = T::symbol_rebindings(formal_inputs, actual_inputs)?;
+    T::apply_symbol_rebindings(types, &rebindings)
+}
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
@@ -74,7 +88,7 @@ fn validated_custom_jvp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
 ) -> Result<&RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 2 {
-        return Err(TypeError {
+        return Err(TypeError::Invalid {
             message: format!("custom_jvp expects 2 attached regions but got {}", region_interfaces.len()),
         });
     }
@@ -105,6 +119,21 @@ impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
         let primal_interface = validated_custom_jvp_interfaces(region_interfaces)?;
         check_types!(@same, "custom_jvp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
+    }
+
+    fn region_input_types_for_rebinding(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 2 {
+            return Err(TypeError::Invalid {
+                message: format!("custom_jvp expects 2 attached regions but got {}", region_interfaces.len()),
+            });
+        }
+        let mut jvp_input_types = input_types.to_vec();
+        jvp_input_types.extend(input_types.iter().map(DifferentiableType::tangent));
+        Ok(vec![Some(input_types.to_vec()), Some(jvp_input_types)])
     }
 
     #[inline]
@@ -197,7 +226,7 @@ where
     C: Context<Type = ArrayType>,
     <C as Domain>::Value: Broadcast + Transpose,
     MakeOperationFn: FnOnce(
-        Option<usize>,
+        Option<Dimension>,
     ) -> Result<
         (C::Operation, Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>),
         BatchingError,
@@ -223,7 +252,7 @@ where
             None => input.broadcast(0, axis_size, context.axis_sharding().clone()),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (operation, operation_regions) = make_operation(Some(axis_size))?;
+    let (operation, operation_regions) = make_operation(Some(axis_size.clone()))?;
     let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
     let outputs = context.parent().bind(operation, operation_regions, &parent_inputs)?;
     outputs
@@ -329,7 +358,7 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     region_interfaces: &[RegionInterface<T>],
 ) -> Result<&RegionInterface<T>, TypeError> {
     if region_interfaces.len() != 3 {
-        return Err(TypeError {
+        return Err(TypeError::Invalid {
             message: format!("custom_vjp expects 3 attached regions but got {}", region_interfaces.len()),
         });
     }
@@ -341,7 +370,7 @@ fn validated_custom_vjp_interfaces<T: DifferentiableType>(
     check_types!(@same, "custom_vjp forward input", [input_types, forward_interface.input_types()]);
     let forward_output_types = forward_interface.output_types();
     if forward_output_types.len() < output_types.len() {
-        return Err(TypeError {
+        return Err(TypeError::Invalid {
             message: format!(
                 "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
                 output_types.len(),
@@ -382,6 +411,36 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
         let primal_interface = validated_custom_vjp_interfaces(region_interfaces)?;
         check_types!(@same, "custom_vjp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
+    }
+
+    fn region_input_types_for_rebinding(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 3 {
+            return Err(TypeError::Invalid {
+                message: format!("custom_vjp expects 3 attached regions but got {}", region_interfaces.len()),
+            });
+        }
+        let primal_interface = &region_interfaces[0];
+        let forward_interface = &region_interfaces[1];
+        let primal_output_types =
+            instantiate_boundary_types(primal_interface.input_types(), input_types, primal_interface.output_types())?;
+        let forward_output_types =
+            instantiate_boundary_types(forward_interface.input_types(), input_types, forward_interface.output_types())?;
+        if forward_output_types.len() < primal_output_types.len() {
+            return Err(TypeError::Invalid {
+                message: format!(
+                    "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+                    primal_output_types.len(),
+                    forward_output_types.len(),
+                ),
+            });
+        }
+        let mut backward_input_types = forward_output_types[primal_output_types.len()..].to_vec();
+        backward_input_types.extend(primal_output_types.iter().map(DifferentiableType::cotangent));
+        Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec()), Some(backward_input_types)])
     }
 
     #[inline]
@@ -592,7 +651,7 @@ impl<T: Type> CustomVjpTangentOperation<T> {
     /// types (one per primal output).
     fn split_backward_inputs(&self, backward_interface: &RegionInterface<T>) -> Result<(Vec<T>, Vec<T>), TypeError> {
         if self.residual_count > backward_interface.input_types().len() {
-            return Err(TypeError {
+            return Err(TypeError::Invalid {
                 message: format!(
                     "custom_vjp residual count {} exceeds backward region input count {}",
                     self.residual_count,
@@ -628,7 +687,7 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
-            return Err(TypeError {
+            return Err(TypeError::Invalid {
                 message: format!("{} expects 1 attached region but got {}", self.name(), region_interfaces.len(),),
             });
         }
@@ -657,6 +716,75 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
         }
     }
 
+    fn region_input_types_for_rebinding(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError::Invalid {
+                message: format!("{} expects 1 attached region but got {}", self.name(), region_interfaces.len()),
+            });
+        }
+        let backward_interface = &region_interfaces[0];
+        let (_, cotangent_types) = self.split_backward_inputs(backward_interface)?;
+        let backward_input_types = if self.transposed {
+            check_count!(
+                "custom_vjp backward input type",
+                input_types,
+                cotangent_types.len() + self.residual_count,
+                TypeError,
+            );
+            input_types[cotangent_types.len()..]
+                .iter()
+                .chain(&input_types[..cotangent_types.len()])
+                .cloned()
+                .collect()
+        } else {
+            check_count!(
+                "custom_vjp tangent input type",
+                input_types,
+                self.input_tangent_types.len() + self.residual_count,
+                TypeError,
+            );
+            input_types[self.input_tangent_types.len()..]
+                .iter()
+                .chain(&self.output_tangent_types)
+                .cloned()
+                .collect()
+        };
+        Ok(vec![Some(backward_input_types)])
+    }
+
+    fn symbols(&self) -> OperationSymbols<T::Symbols> {
+        let mut variables = Vec::new();
+        for r#type in self.input_tangent_types.iter().chain(&self.output_tangent_types) {
+            for variable in r#type.symbol_variables() {
+                if !variables.contains(&variable) {
+                    variables.push(variable);
+                }
+            }
+        }
+        OperationSymbols { variables, ..OperationSymbols::default() }
+    }
+
+    fn substitute_symbols(&self, substitution: &SymbolSubstitution<T>) -> Result<Self, TypeError> {
+        Ok(Self {
+            residual_count: self.residual_count,
+            transposed: self.transposed,
+            input_tangent_types: self
+                .input_tangent_types
+                .iter()
+                .map(|r#type| r#type.substitute_symbols(substitution))
+                .collect::<Result<Vec<_>, _>>()?,
+            output_tangent_types: self
+                .output_tangent_types
+                .iter()
+                .map(|r#type| r#type.substitute_symbols(substitution))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
     #[inline]
     fn region_names(&self) -> &'static [&'static str] {
         &["backward"]
@@ -677,7 +805,7 @@ impl<C: Domain> InterpretableOperation<C> for CustomVjpTangentOperation<C::Type>
         _driver: &D,
         _inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        Err(TypeError {
+        Err(TypeError::Invalid {
             message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                 value_and_gradient, or jacobian_reverse) instead"
                 .to_string(),
@@ -773,7 +901,7 @@ where
     O: Operation<V::Type> + From<ZeroOperation<V::Type>>,
 {
     if operation.transposed {
-        return Err(TypeError {
+        return Err(TypeError::Invalid {
             message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
                 supported"
                 .to_string(),
@@ -982,7 +1110,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError { message: "custom_jvp requires at least one input".to_string() }.into());
+            return Err(TypeError::Invalid { message: "custom_jvp requires at least one input".to_string() }.into());
         };
         let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let input_tangent_types =
@@ -1114,7 +1242,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError { message: "custom_vjp requires at least one input".to_string() }.into());
+            return Err(TypeError::Invalid { message: "custom_vjp requires at least one input".to_string() }.into());
         };
         let (output_types, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let (forward_output_types, forward) = D::trace(|xs| (self.forward)(xs), input_types.clone())?;
@@ -1156,13 +1284,16 @@ mod tests {
     use crate::programs::effects::Effects;
     use crate::programs::regions::{RegionDriver, RegionRef};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use crate::types::{DataType, Shape, Size};
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionScope, Shape};
 
     use super::*;
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().map(|dimension| Size::Static(*dimension)).collect()))
+        ArrayType::new(
+            DataType::F64,
+            Shape::new(dimensions.iter().map(|dimension| Dimension::from(*dimension)).collect()),
+        )
     }
 
     /// Builds `f(x) = sin(x)` over one input of the provided type.
@@ -1300,6 +1431,45 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_derivative_region_rebinding_uses_operation_specific_boundaries() {
+        let symbolic_type = |name: &str| {
+            let scope =
+                DimensionScope::new_named(vec![(Some(name.to_owned()), DimensionBounds::positive(None).unwrap())]);
+            ArrayType::new(DataType::F64, Shape::new(vec![scope.dimension(0).unwrap()]))
+        };
+        let actual = symbolic_type("actual");
+        let primal = symbolic_type("primal");
+        let jvp = symbolic_type("jvp");
+        let primal_interface = RegionInterface::new(vec![primal.clone()], vec![primal.clone()], Effects::PURE);
+        let jvp_interface = RegionInterface::new(vec![jvp.clone(), jvp.clone()], vec![jvp.clone(), jvp], Effects::PURE);
+        assert_eq!(
+            CustomJvpOperation::new()
+                .region_input_types_for_rebinding(
+                    std::slice::from_ref(&actual),
+                    &[primal_interface.clone(), jvp_interface],
+                )
+                .unwrap(),
+            vec![Some(vec![actual.clone()]), Some(vec![actual.clone(), actual.clone()])],
+        );
+
+        let forward = symbolic_type("forward");
+        let backward = symbolic_type("backward");
+        let forward_interface =
+            RegionInterface::new(vec![forward.clone()], vec![forward.clone(), forward], Effects::PURE);
+        let backward_interface =
+            RegionInterface::new(vec![backward.clone(), backward.clone()], vec![backward], Effects::PURE);
+        assert_eq!(
+            CustomVjpOperation::new()
+                .region_input_types_for_rebinding(
+                    std::slice::from_ref(&actual),
+                    &[primal_interface, forward_interface, backward_interface],
+                )
+                .unwrap(),
+            vec![Some(vec![actual.clone()]), Some(vec![actual.clone()]), Some(vec![actual.clone(), actual]),],
+        );
+    }
+
+    #[test]
     fn test_custom_derivative_inference_uses_differential_types() {
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
@@ -1401,7 +1571,7 @@ mod tests {
             assert!(matches!(
                 CustomVjpTangentOperation::new(2, transposed, Vec::new(), Vec::new())
                     .infer_output_types(&[], std::slice::from_ref(&backward_interface)),
-                Err(TypeError { message })
+                Err(TypeError::Invalid { message })
                     if message == "custom_vjp residual count 2 exceeds backward region input count 1",
             ));
         }
@@ -1589,7 +1759,7 @@ mod tests {
                         &crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver,
                                         &[Array::scalar(1.0)],
                     ),
-                    Err(ProgramError::Type(TypeError { message }))
+                    Err(ProgramError::Type(TypeError::Invalid { message }))
                         if message.starts_with("custom_vjp does not support forward-mode differentiation"),
                 ));
     }
