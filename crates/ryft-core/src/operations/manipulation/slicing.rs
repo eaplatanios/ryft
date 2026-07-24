@@ -26,7 +26,7 @@ use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Memory, Shape, Size};
 
 // TODO(eaplatanios): Review this.

@@ -10855,7 +10855,7 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_lowering_inlines_only_the_primal_program() {
-        use ryft_core::tracing_v2::operations::custom_derivatives::CustomJvpOperation;
+        use ryft_core::tracing_v2::custom_derivatives::CustomJvpOperation;
 
         // Phase 0 boundary pin for the first-class-program-regions plan: a retained `custom_jvp` call lowers only
         // its primal program; nothing from the user-supplied JVP program (marked here by the multiply on the
@@ -10914,7 +10914,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_tangent_lowering_is_rejected() {
-        use ryft_core::tracing_v2::operations::custom_derivatives::CustomVjpTangentOperation;
+        use ryft_core::tracing_v2::custom_derivatives::CustomVjpTangentOperation;
 
         // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed `custom_vjp_tangent`
         // carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.

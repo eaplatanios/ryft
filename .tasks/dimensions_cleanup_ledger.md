@@ -35,21 +35,55 @@ ledger disagrees with Git.
 - Verification: archive manifest equality and the archived `ryft-core` build passed; S0 formatting and staged-diff
   checks passed before handoff
 - Residual search: branch, PR, `S6`, phase-ordering, and restore-policy searches passed before handoff
-- Next action: complete and review `S1`
+- Next action: land `B1`, then resume the preserved S1 branch
 
 ## S1: region arena rerooting
 
 - Status: in progress
 - Branch: `u/eaplatanios/increment/s1-region-reroot`
-- Source commit: pending; fill from the pushed increment in the next ledger update
-- Integration commit: pending owner review
+- Source commit: `2519600c59cc07a75e5d2729d82a93425ac3bfb1` is a pushed recovery commit, not ready for review
+- Integration commit: pending owner review after B1 lands
 - Remainder reconciliation commit: pending integration
 - Immutable archive unchanged: yes
 - Landed: pending; introduce `RegionRef::reroot` and replace reconstruction from an existing `RegionRef`'s arena
 - Deferred: identity-signature retention remains in `P1`; `S1` provides the metadata-preserving seam without
   introducing identity machinery
-- Verification: focused `ryft-core` compilation is blocked before reaching S1 by the pre-existing integration baseline:
-  the committed custom-derivatives move references its old module path and dimension APIs absent from integration
-- Residual search: the S1 production change leaves only initial arena-entry `RegionRef::new` calls and its direct
-  constructor error test; final classification follows the baseline repair
-- Next action: land the independent baseline repair before resuming S1 verification
+- Verification: focused compilation is blocked before reaching S1 by the pre-existing custom-derivatives baseline
+  failure
+- Residual search: the production change leaves only initial arena-entry `RegionRef::new` calls and its direct
+  constructor error test; final classification follows B0
+- Next action: merge B1 into S1 after B1 lands, then rerun scoped verification
+
+## B0: repair the custom-derivatives module move
+
+- Status: landed locally; remote integration ref not yet observed after fetch
+- Branch: `u/eaplatanios/increment/b0-custom-derivatives-baseline`
+- Source commit: `656a49d417ae2f3e469ac9846e90aa8beeaf580b`
+- Integration commit: `957ca8a66f1e6519773fffe9cf1e35c0ef3b0afe`
+- Remainder reconciliation commit: `5a46403b48d78d27025ccedc07f2216dd840e05b`
+- Immutable archive unchanged: yes
+- Landed: reconstructed the moved module from its last compiling pre-move implementation and updated every
+  production path to `tracing_v2::custom_derivatives`
+- Deferred: symbolic identity/rebinding changes accidentally mixed into the original move remain assigned to the
+  dimension phases that own them
+- Verification: `cargo check -p ryft-core` and `cargo check -p ryft-xla` passed;
+  `cargo test -p ryft-core --lib` passed all 911 tests; `cargo test -p ryft-core --doc` passed 43 tests with 13
+  ignored; `cargo test -p ryft-xla --lib` passed 395 tests with 1 ignored
+- Residual search: no `tracing_v2::operations` reference remains in Rust source under `crates/`
+- Next action: publish the local integration ref, then land `B1`
+
+## B1: rename the public array/data type modules
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/b1-type-module-renames`
+- Source commit: `2f613bdb32e52becb55b248c3611b00f35e09f66`
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: pending; rename `types::array_types` to `types::arrays` and `types::data_types` to `types::data`
+- Deferred: all type semantics, item names, and the later `Size`/`Dimension` restructuring remain unchanged
+- Verification: formatting and core/XLA checks passed; all 911 core library tests passed; core doctests passed 43
+  tests with 13 ignored; XLA library tests passed 395 tests with 1 ignored
+- Residual search: no old module path or filename remains; the five `data_types` matches are ordinary local
+  variable/parameter names and are intentionally retained
+- Next action: review the staged no-commit B1 merge on `u/eaplatanios/dynamic-shapes`

@@ -12,7 +12,7 @@ use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
-use crate::types::data_types::DataType;
+use crate::types::data::DataType;
 use crate::types::layouts::Layout;
 use crate::types::memories::Memory;
 
@@ -797,7 +797,7 @@ mod tests {
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::types::data_types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
+    use crate::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
     use crate::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;

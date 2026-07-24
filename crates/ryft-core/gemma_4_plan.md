@@ -894,7 +894,7 @@ the model stays in `bf16`.
 - `DataType::F4E2M1FN` (NVFP4 data), `DataType::F8E4M3FN` (FP8 forward), `DataType::F8E5M2`
   (FP8 backward), `DataType::F8E8M0FNU` (UE8M0 microscale), `DataType::F8E4M3` (UE4M3
   microscale) are all already in the enum at
-  [crates/ryft-core/src/types/data_types.rs:759](crates/ryft-core/src/types/data_types.rs:759).
+  [crates/ryft-core/src/types/data.rs:759](crates/ryft-core/src/types/data.rs:759).
   These mirror the StableHLO type set — see the
   [StableHLO specification](https://openxla.org/stablehlo/spec), the
   [F8E4M3/F8E3M4 RFC](https://github.com/openxla/stablehlo/blob/main/rfcs/20240808-f8E4M3_f8E3M4.md),
@@ -1651,7 +1651,7 @@ A consolidated list of every external source cited in this document, grouped by 
 
 ### 6.6 In-repo references
 
-- [`crates/ryft-core/src/types/data_types.rs:759`](crates/ryft-core/src/types/data_types.rs:759) —
+- [`crates/ryft-core/src/types/data.rs:759`](crates/ryft-core/src/types/data.rs:759) —
   the `DataType` enum entries for `F4E2M1FN`, `F8E4M3FN`, `F8E5M2`, `F8E8M0FNU`, and friends.
 - [`crates/ryft-core/src/tracing_v2/operations/`](crates/ryft-core/src/tracing_v2/operations/) —
   existing operation types used as the template for new primitives in §1.

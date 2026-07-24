@@ -607,7 +607,7 @@ mod tests {
     fn test_eager_custom_call_differentiates_through_custom_vjp() {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
         use ryft_core::tracing::DomainTracer;
-        use ryft_core::tracing_v2::operations::custom_vjp;
+        use ryft_core::tracing_v2::custom_derivatives::custom_vjp;
 
         use crate::XlaDomain;
 

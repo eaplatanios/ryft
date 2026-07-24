@@ -7,7 +7,7 @@ use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_p
 
 use ryft_core::Typed;
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::types::data_types::DataType;
+use ryft_core::types::data::DataType;
 use ryft_core::types::{ArrayType, Layout, Memory, Shape, Size, StaticShape, TiledLayout};
 
 use crate::experimental::domains::XlaDomain;

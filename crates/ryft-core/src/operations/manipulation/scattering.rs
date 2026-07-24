@@ -23,7 +23,7 @@ use crate::programs::values::Value;
 use crate::programs::{MaybeZero, ProgramError};
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Size};
 
 // TODO(eaplatanios): Review this.

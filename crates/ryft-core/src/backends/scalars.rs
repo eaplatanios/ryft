@@ -47,9 +47,7 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
-use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
-};
+use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::DataType;
 
