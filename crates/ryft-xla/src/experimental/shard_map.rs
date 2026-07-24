@@ -2000,7 +2000,7 @@ mod tests {
     use ryft_core::differentiation::ReverseModeDifferentiate;
     use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::types::data_types::DataType;
+    use ryft_core::types::data::DataType;
 
     use super::*;
 

@@ -907,7 +907,7 @@ mod tests {
     use ryft_core::programs::{ProgramError, Value};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::DomainTracingContext;
-    use ryft_core::types::data_types::DataType;
+    use ryft_core::types::data::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
