@@ -85,9 +85,7 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
-use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
-};
+use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
 
@@ -95,7 +93,8 @@ use crate::types::{ArrayType, DataType, Shape, Size, StaticShape};
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`] the
 /// same way [`ScalarOperation`](crate::backends::scalars::ScalarOperation) pairs with [`Scalar`]. Most variants are
-/// thin tags around one semantic primitive defined in [`crate::operations`] or [`crate::tracing_v2::operations`].
+/// thin tags around one semantic primitive defined in [`crate::operations`] or
+/// [`crate::tracing_v2::custom_derivatives`].
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and

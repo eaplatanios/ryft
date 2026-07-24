@@ -59,9 +59,7 @@ use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::memory::TransferToMemoryOperation;
 use ryft_core::operations::tag::TagOperation;
 use ryft_core::programs::types::{TypeError, Typed};
-use ryft_core::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
-};
+use ryft_core::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::types::ArrayType;
 
