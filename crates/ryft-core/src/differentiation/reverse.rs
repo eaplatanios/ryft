@@ -682,11 +682,7 @@ impl<
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let transposition_driver = RecursiveTranspositionDriver {
-                regions: instruction
-                    .regions()
-                    .iter()
-                    .map(|id| RegionRef::new(self.regions(), *id))
-                    .collect::<Result<Vec<_>, _>>()?,
+                regions: instruction.regions().iter().map(|id| self.with_id(*id)).collect::<Result<Vec<_>, _>>()?,
             };
             let input_cotangents = instruction.operation().transpose(
                 &mut context,
