@@ -1500,6 +1500,22 @@ Verification completed:
   tests. The parameter compile-fail snapshot retains the independently reproduced S4 integration-baseline mismatch
   caused by rustc listing `Axes`.
 
-The only remaining `Size` references under `ryft-core`, `ryft-xla`, and `ryft` are the unrelated
-`ryft_mlir::Size as MlirSize` import and its five uses. No old public `Size` declaration, `Size` variant use, old test
-name, or stale `types::arrays` path for the moved types remains.
+At the S5a handoff, the only reported `Size` reference under `ryft-core`, `ryft-xla`, and `ryft` was the unrelated
+`ryft_mlir::Size as MlirSize` import. That residual audit missed three low-level example expressions that the broad
+rename had incorrectly changed to `Dimension`; S5b below corrects the omission. No old public core `Size` declaration,
+core `Size` variant use, old core test name, or stale `types::arrays` path for the moved types remains.
+
+### Execution: S5b MLIR size correction
+
+- [x] Reproduce the integration failure by compiling the touched example target directly.
+- [x] Restore only the three unrelated `ryft_mlir::Size` expressions.
+- [x] Re-run the example check, scoped formatting, diff check, and exact residual classification.
+
+S5a incorrectly renamed the low-level StableHLO example's `ryft_mlir::Size` uses. That type is unrelated to the
+former `ryft_core::types::Size`; `cargo check -p ryft` did not compile the example target, so the original verification
+missed the error. S5b restores those three expressions and adds
+`cargo check -p ryft --example stable_hlo_matmul` as the direct regression check before P0.
+
+The baseline command failed with six unresolved `Dimension` uses. After the correction, the same command passes.
+`cargo fmt -p ryft -- --check` and `git diff --check` also pass. The four remaining exact `Size` matches are the three
+restored example expressions and XLA lowering's `ryft_mlir::Size as MlirSize` import; all are intentional MLIR uses.

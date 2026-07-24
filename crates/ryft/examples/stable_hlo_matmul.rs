@@ -28,9 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let f32_type = context.float32_type();
 
     // Types of the left-hand side, right-hand side, and result tensors in our matrix multiplication.
-    let lhs_type = context.tensor_type(f32_type, &[Dimension::Static(2), Dimension::Static(3)], None, location)?;
-    let rhs_type = context.tensor_type(f32_type, &[Dimension::Static(3), Dimension::Static(2)], None, location)?;
-    let result_type = context.tensor_type(f32_type, &[Dimension::Static(2), Dimension::Static(2)], None, location)?;
+    let lhs_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(3)], None, location)?;
+    let rhs_type = context.tensor_type(f32_type, &[Size::Static(3), Size::Static(2)], None, location)?;
+    let result_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location)?;
 
     // Body of the StableHLO module.
     module.body()?.append_operation({
