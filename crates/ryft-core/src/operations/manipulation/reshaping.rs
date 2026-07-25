@@ -270,7 +270,9 @@ fn invert_symbolic_reshape_target(
         .iter()
         .enumerate()
         .map(|(input_dimension, size)| match size {
-            Dimension::Static(value) => Ok(ReshapeDimensionExpression::Constant(*value)),
+            Dimension::Static(value) => {
+                Ok::<ReshapeDimensionExpression, TypeError>(ReshapeDimensionExpression::Constant(*value))
+            }
             Dimension::Dynamic(_) => {
                 let (output_dimension, monomial) = output_monomials
                     .iter()

@@ -177,11 +177,12 @@ ledger disagrees with Git.
 
 ## P0: behavioral and architectural evidence freeze
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p0-evidence-freeze`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `ba0e5f862ca083baf54ee58b8809560cdbe2de6c`
+- Integration commit: `34b86d75663900bd3ac5446ac3a626ff50c953a5`, completed by the artifact-only correction
+  `07f6b22dcb47ed52cc717632a9fab7c71b5b44e9`
+- Remainder reconciliation commit: `71f613224`, completed by the artifact-only reconciliation `0484d4e8c`
 - Immutable archive unchanged: yes
 - Landed: freezes revisions, environment, source/generated size, compile/memory, graph, runtime-smoke, allocation,
   diagnostic, proof, operation-family, transform, reconstruction, collector, and projection-ownership evidence;
@@ -194,4 +195,27 @@ ledger disagrees with Git.
 - Residual search: the archive-disposition path column mechanically matches the 142-path archive manifest exactly,
   with 142 unique rows and no missing or extra path; every dual contract, constructor overlap, context view,
   reconstruction path, runtime-dimension collector class, and transpose witness has a named destination
-- Next action: push the P0 evidence increment and stage its no-commit integration merge for owner review
+- Next action: none
+
+## P1a: dimension identity foundations
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/p1a-leaf-dimensions`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: introduces validated inclusive-lower/exclusive-upper `DimensionBounds`, fresh clone-preserving
+  `DimensionVariable` identities with diagnostic-only names, one immutable bounds authority per identity, and typed
+  `DimensionError::InvalidBounds` recovery through `TypeError::Custom`; `DimensionError` derives `thiserror::Error`
+  rather than duplicating standard error boilerplate
+- Deferred: changing `Dimension::Dynamic` to carry an identity belongs to P1b; generic `Type` identity/refinement
+  hooks, structural closure, canonical signatures, and `OutputIdentityRole` deletion belong to P1c
+- Verification: the 16 focused `types::dimensions` tests passed; `cargo check -p ryft-core` passed;
+  `cargo test -p ryft-core --lib` passed all 915 tests; `cargo test -p ryft-core --doc` passed 43 tests with 13
+  ignored; scoped formatting and `git diff --check` passed
+- Residual search: existing `Dimension::Dynamic(Option<usize>)` construction remains intentionally unchanged for P1b;
+  `DimensionVariable` production ownership is confined to `types::dimensions`; the only additional production path is
+  one explicit `Ok::<ReshapeDimensionExpression, TypeError>` annotation required because the new typed error
+  conversion made an existing inferred `Result<_, _>` ambiguous
+- Next action: push the P1a increment and stage its no-commit integration merge for owner review

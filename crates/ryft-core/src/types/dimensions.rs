@@ -1,11 +1,201 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::ops::Index;
+use std::sync::Arc;
+
+use thiserror::Error;
 
 use ryft_macros::Parameter;
 
 use crate::axes::Axis;
 use crate::parameters::Parameter;
 use crate::programs::types::TypeError;
+
+/// Errors produced while constructing or validating [`Dimension`]s.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
+pub enum DimensionError {
+    /// The provided inclusive lower and exclusive upper bounds admit no values.
+    #[error("invalid dimension bounds [{lower}, {upper})")]
+    InvalidBounds {
+        /// Inclusive lower bound.
+        lower: usize,
+
+        /// Exclusive upper bound.
+        upper: usize,
+    },
+}
+
+impl From<DimensionError> for TypeError {
+    #[inline]
+    fn from(error: DimensionError) -> Self {
+        Self::custom(error)
+    }
+}
+
+/// Inclusive lower and exclusive upper bounds for a dynamic dimension.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
+pub struct DimensionBounds {
+    /// Inclusive lower bound.
+    lower: usize,
+
+    /// Exclusive upper bound, or [`None`] when unbounded.
+    upper: Option<usize>,
+}
+
+impl DimensionBounds {
+    /// Creates a new [`DimensionBounds`] instance with an inclusive lower and optional exclusive upper bound.
+    #[inline]
+    pub fn new(lower: usize, upper: Option<usize>) -> Result<Self, DimensionError> {
+        if let Some(upper) = upper
+            && upper <= lower
+        {
+            return Err(DimensionError::InvalidBounds { lower, upper });
+        }
+        Ok(Self { lower, upper })
+    }
+
+    /// Creates a new [`DimensionBounds`] instance admitting non-negative extents below `upper`, when provided.
+    #[inline]
+    pub fn non_negative(upper: Option<usize>) -> Result<Self, DimensionError> {
+        Self::new(0, upper)
+    }
+
+    /// Creates a new [`DimensionBounds`] instance admitting positive extents below `upper`, when provided.
+    #[inline]
+    pub fn positive(upper: Option<usize>) -> Result<Self, DimensionError> {
+        Self::new(1, upper)
+    }
+
+    /// Creates a new [`DimensionBounds`] instance with the provided lower bound and no finite upper bound.
+    #[inline]
+    pub const fn at_least(lower: usize) -> Self {
+        Self { lower, upper: None }
+    }
+
+    /// Creates a new [`DimensionBounds`] instance admitting every non-negative extent.
+    #[inline]
+    pub const fn unbounded() -> Self {
+        Self::at_least(0)
+    }
+
+    /// Returns the inclusive lower bound of this [`DimensionBounds`] instance.
+    #[inline]
+    pub const fn lower(&self) -> usize {
+        self.lower
+    }
+
+    /// Returns the exclusive upper bound of this [`DimensionBounds`] instance.
+    #[inline]
+    pub const fn upper(&self) -> Option<usize> {
+        self.upper
+    }
+
+    /// Returns `true` if this [`DimensionBounds`] instance contains (i.e., admits) `value`.
+    #[inline]
+    pub fn contains(&self, value: usize) -> bool {
+        value >= self.lower && self.upper.is_none_or(|upper| value < upper)
+    }
+
+    /// Returns `true` if every value contained in `other` is also contained in this [`DimensionBounds`] instance.
+    #[inline]
+    pub fn contains_bounds(&self, other: Self) -> bool {
+        self.lower <= other.lower
+            && match (self.upper, other.upper) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(left), Some(right)) => left >= right,
+            }
+    }
+}
+
+impl Display for DimensionBounds {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.upper {
+            Some(upper) => write!(formatter, "[{}, {upper})", self.lower),
+            None => write!(formatter, "[{}, ∞)", self.lower),
+        }
+    }
+}
+
+/// Shared allocation representing one unique symbolic [`DimensionVariable`] and owning its immutable metadata.
+/// Cloning a [`DimensionVariable`] shares this allocation, so every clone continues to refer to the same symbolic
+/// variable after either handle is moved. Each [`DimensionVariable::new`] call creates a fresh allocation and therefore
+/// an independent variable, even when its name and bounds match an existing variable. Keeping the diagnostic name and
+/// authoritative bounds in the shared payload also prevents handles to the same variable from observing different
+/// metadata.
+struct DimensionVariablePayload {
+    /// Diagnostic name, excluded from semantic equality.
+    name: String,
+
+    /// [`DimensionBounds`] owned by the symbolic variable.
+    bounds: DimensionBounds,
+}
+
+/// A symbolic variable representing a dynamic [`Dimension`]. Reusing a [`DimensionVariable`] in multiple array types
+/// declares that those occurrences have the same runtime extent. Cloning preserves that relationship, whereas each call
+/// to [`DimensionVariable::new`] creates an independent variable even when its name and bounds match another variable.
+/// Names exist only for diagnostics, and the shared payload owns the authoritative immutable bounds observed by every
+/// reference to the variable.
+#[derive(Clone, Parameter)]
+pub struct DimensionVariable {
+    /// Shared symbolic variable and its authoritative metadata.
+    payload: Arc<DimensionVariablePayload>,
+}
+
+impl DimensionVariable {
+    /// Creates a new independent symbolic [`DimensionVariable`] with the provided name and [`DimensionBounds`].
+    #[inline]
+    pub fn new<N: Into<String>>(name: N, bounds: DimensionBounds) -> Self {
+        Self { payload: Arc::new(DimensionVariablePayload { name: name.into(), bounds }) }
+    }
+
+    /// Returns the name of this [`DimensionVariable`], which is only meant be used for diagnostic purposes.
+    #[inline]
+    pub fn name(&self) -> &str {
+        self.payload.name.as_str()
+    }
+
+    /// Returns the [`DimensionBounds`] of this [`DimensionVariable`].
+    #[inline]
+    pub fn bounds(&self) -> DimensionBounds {
+        self.payload.bounds
+    }
+}
+
+impl Display for DimensionVariable {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.payload.name)
+    }
+}
+
+impl Debug for DimensionVariable {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DimensionVariable")
+            .field("name", &self.payload.name)
+            .field("bounds", &self.payload.bounds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DimensionVariable {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.payload, &other.payload)
+    }
+}
+
+impl Eq for DimensionVariable {}
+
+impl Hash for DimensionVariable {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.payload).hash(state);
+    }
+}
 
 /// Represents the extent of one array axis. A [`Dimension`] can be either statically known at compilation time or
 /// dynamic, in which case its extent is only known at runtime. Dynamic dimensions may optionally have an upper bound
@@ -349,9 +539,66 @@ impl TryFrom<&Shape> for StaticShape {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_dimension_bounds() {
+        assert_eq!(DimensionBounds::new(0, Some(0)), Err(DimensionError::InvalidBounds { lower: 0, upper: 0 }));
+        assert_eq!(DimensionBounds::new(3, Some(3)), Err(DimensionError::InvalidBounds { lower: 3, upper: 3 }));
+        assert_eq!(DimensionBounds::new(4, Some(3)), Err(DimensionError::InvalidBounds { lower: 4, upper: 3 }));
+
+        let nonnegative = DimensionBounds::non_negative(Some(5)).unwrap();
+        assert_eq!(nonnegative.lower(), 0);
+        assert_eq!(nonnegative.upper(), Some(5));
+        assert!(nonnegative.contains(0));
+        assert!(nonnegative.contains(4));
+        assert!(!nonnegative.contains(5));
+        assert_eq!(nonnegative.to_string(), "[0, 5)");
+
+        let positive = DimensionBounds::positive(Some(5)).unwrap();
+        assert!(!positive.contains(0));
+        assert!(positive.contains(1));
+        assert!(nonnegative.contains_bounds(positive));
+        assert!(!positive.contains_bounds(nonnegative));
+
+        let unbounded = DimensionBounds::unbounded();
+        assert_eq!(unbounded, DimensionBounds::at_least(0));
+        assert!(unbounded.contains(usize::MAX));
+        assert!(unbounded.contains_bounds(nonnegative));
+        assert!(!nonnegative.contains_bounds(unbounded));
+        assert_eq!(unbounded.to_string(), "[0, ∞)");
+
+        let error = DimensionError::InvalidBounds { lower: 7, upper: 7 };
+        assert_eq!(error.to_string(), "invalid dimension bounds [7, 7)");
+        let type_error = TypeError::from(error.clone());
+        assert_eq!(type_error.downcast_custom::<DimensionError>(), Some(&error));
+    }
+
+    #[test]
+    fn test_dimension_variable() {
+        let bounds = DimensionBounds::positive(Some(65)).unwrap();
+        let batch = DimensionVariable::new("batch", bounds);
+        let batch_clone = batch.clone();
+        let same_declaration = DimensionVariable::new("batch", bounds);
+
+        assert_eq!(batch, batch_clone);
+        assert_ne!(batch, same_declaration);
+        assert_eq!(batch.bounds(), bounds);
+        assert_eq!(batch.to_string(), "batch");
+        assert_eq!(
+            format!("{batch:?}"),
+            "DimensionVariable { name: \"batch\", bounds: DimensionBounds { lower: 1, upper: Some(65) }, .. }",
+        );
+
+        let mut variables = HashSet::new();
+        variables.insert(batch);
+        assert!(variables.contains(&batch_clone));
+        assert!(!variables.contains(&same_declaration));
+    }
 
     #[test]
     fn test_dimension_value() {

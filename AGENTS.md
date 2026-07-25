@@ -161,6 +161,9 @@ update this file so that they do not need to remind you again in the future.
 
 ### Error Handling
 
+- For ordinary error enums with declarative variant messages, derive `thiserror::Error` instead of writing manual
+  `Display` and `std::error::Error` implementations. Keep manual formatting only when the message requires genuinely
+  procedural rendering.
 - Do not silently discard fallible operations (e.g., `let _ = ...` on `Result`-returning code is disallowed).
 - Use `?` for error propagation when the caller should decide what to do with the error.
 - Use explicit `match`/`if let` when mapping to domain-specific errors.
