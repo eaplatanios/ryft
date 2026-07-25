@@ -8,8 +8,9 @@ use crate::parameters::Parameter;
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::regions::RegionId;
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -85,6 +86,34 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// Returns the [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the
     /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
     fn execution_domain(&self) -> Self::ExecutionDomain;
+
+    /// Returns an equivalent value whose identity-bearing type metadata has been simultaneously renamed according to
+    /// `renaming`. [`Value`] represents every kind of leaf that can participate in a [`Program`](crate::Program), not
+    /// only concrete runtime payloads. Some values, such as metadata-only values and captured-value references, store
+    /// their [`Type`](Self::Type) or other type metadata directly. When a program or region is instantiated under
+    /// renamed [`TypeIdentity`](crate::TypeIdentity)s, that metadata must be renamed together with atom types and
+    /// [`Operation`](crate::Operation) metadata so that [`Typed::r#type`] cannot continue to expose stale identities.
+    ///
+    /// This compiler-managed operation must preserve the represented runtime data, Single Static Assignment (SSA)
+    /// identity, and execution semantics; it may only reconstruct metadata that depends on the value's type. The
+    /// default implementation clones values whose type is unchanged by [`Type::rename_identities`] and rejects
+    /// identity-bearing changes. Value types that can safely reconstruct their stored type metadata must override
+    /// this method.
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        let current_type = self.r#type();
+        let renamed_type = current_type.rename_identities(renaming)?;
+        if current_type.as_ref() != &renamed_type {
+            return Err(TypeError::invalid(format!(
+                "cannot rename type identities in value of type {} without a value-specific \
+                reconstruction implementation",
+                current_type.as_ref(),
+            )));
+        }
+        Ok(self.clone())
+    }
 }
 
 /// Supports extracting this value as a concrete host-side value of type `V`. Concretization is distinct from a staged
@@ -164,5 +193,71 @@ impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for A
             });
         }
         self.value().concretize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::contexts::EagerContext;
+    use crate::types::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+
+    use super::*;
+
+    #[test]
+    fn test_value_rename_type_identities() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct TestValue {
+            r#type: ArrayType,
+        }
+
+        impl Display for TestValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.r#type, formatter)
+            }
+        }
+
+        impl Parameter for TestValue {}
+
+        impl Typed for TestValue {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl Value for TestValue {
+            type DispatchDomain = EagerContext<Self>;
+            type ExecutionDomain = EagerContext<Self>;
+
+            fn dispatch_domain(&self) -> Self::DispatchDomain {
+                EagerContext::new()
+            }
+
+            fn execution_domain(&self) -> Self::ExecutionDomain {
+                EagerContext::new()
+            }
+        }
+
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let value =
+            TestValue { r#type: ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])) };
+        assert_eq!(value.rename_type_identities(&TypeIdentityRenaming::new()), Ok(value.clone()));
+
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source, target).unwrap();
+        assert_eq!(
+            value.rename_type_identities(&renaming),
+            Err(TypeError::invalid(
+                "cannot rename identity metadata in value of type f32[source] without a value-specific reconstruction \
+                 implementation",
+            )),
+        );
     }
 }
