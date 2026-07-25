@@ -120,19 +120,6 @@ impl Operation<ArrayType> for SortOperation {
         SORT_OPERATION_NAME
     }
 
-    /// Renders as `sort [axis=..., direction=...]` for the default single-key sort, adding a `key_count=N` field
-    /// only when `N > 1` so single-key renderings (the overwhelmingly common case) stay unchanged.
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, SORT_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("axis", &self.axis)?;
-            operation.field("direction", &self.direction)?;
-            if self.key_count > 1 {
-                operation.field("key_count", &self.key_count)?;
-            }
-            Ok(())
-        })
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -179,6 +166,19 @@ impl Operation<ArrayType> for SortOperation {
             }
         }
         Ok(input_types.to_vec())
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // Renders as `sort [axis=..., direction=...]` for the default single-key sort, adding a `key_count=N`
+        // field only when `N > 1` so single-key renderings (the overwhelmingly common case) stay unchanged.
+        OperationFormatter::new(formatter, indentation, SORT_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis", &self.axis)?;
+            operation.field("direction", &self.direction)?;
+            if self.key_count > 1 {
+                operation.field("key_count", &self.key_count)?;
+            }
+            Ok(())
+        })
     }
 }
 

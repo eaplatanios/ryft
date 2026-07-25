@@ -28,6 +28,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
@@ -229,7 +230,7 @@ impl<
         captures: Vec<V>,
     ) -> Result<Self, ProgramError> {
         // Every region in the arena participates in the single capture scope, so validation walks all of them.
-        for region in program.regions() {
+        for region in program.regions().iter() {
             for (atom_index, atom) in region.atoms().iter().enumerate() {
                 let Atom::Constant(value) = atom else {
                     continue;
@@ -282,7 +283,7 @@ impl<
         // single capture scope, so the marking pass walks all of them. Indexing into `is_referenced` cannot fail
         // because `new` validated every capture reference at construction time.
         let mut is_referenced = vec![false; captures.len()];
-        for region in program.regions() {
+        for region in program.regions().iter() {
             for atom in region.atoms() {
                 if let Atom::Constant(capture_reference) = atom {
                     is_referenced[capture_reference.index()] = true;
@@ -305,8 +306,9 @@ impl<
         // structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved exactly. The
         // `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every capture
         // referenced by any constant atom.
-        let mut program = program;
-        for region in &mut program.regions {
+        let Program { input_structure, output_structure, regions, entry, .. } = program;
+        let mut regions = regions.into_regions();
+        for region in &mut regions {
             for atom in &mut region.atoms {
                 if let Atom::Constant(capture_reference) = atom {
                     let index = capture_index_map[capture_reference.index()].unwrap();
@@ -314,6 +316,7 @@ impl<
                 }
             }
         }
+        let program = Program::new(input_structure, output_structure, regions, entry)?;
 
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
@@ -366,7 +369,9 @@ impl<
         // of the replay. Their identifiers are arena indices assigned in order, so copying them in order preserves
         // every entry-instruction region reference.
         let mut builder = ProgramBuilder::new();
-        builder.regions = self.program.regions()[..self.program.entry().index()].to_vec();
+        builder.regions = RegionArena::from_regions(
+            self.program.regions().iter().take(self.program.entry().index()).cloned().collect(),
+        )?;
         let capture_inputs = self
             .captures
             .iter()

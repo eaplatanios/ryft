@@ -14,10 +14,12 @@ use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::builders::ProgramBuilder;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::sharding::ShardingDimension;
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
@@ -120,13 +122,6 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
         RNG_BIT_GENERATOR_OPERATION_NAME
     }
 
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("algorithm", &self.algorithm)?;
-            operation.field("output_type", &self.output_type)
-        })
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -153,10 +148,7 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
         }
         let has_sharded_dimension = |array_type: &ArrayType| {
             array_type.sharding().is_some_and(|sharding| {
-                sharding
-                    .dimensions()
-                    .iter()
-                    .any(|dimension| matches!(dimension, crate::sharding::ShardingDimension::Sharded(_)))
+                sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
             })
         };
         if has_sharded_dimension(&input_types[0]) || has_sharded_dimension(&self.output_type) {
@@ -167,6 +159,20 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
             ));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { algorithm: self.algorithm, output_type: self.output_type.rename_identities(renaming)? })
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, RNG_BIT_GENERATOR_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("algorithm", &self.algorithm)?;
+            operation.field("output_type", &self.output_type)
+        })
     }
 }
 

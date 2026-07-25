@@ -94,6 +94,13 @@ pub(crate) mod tests {
             }
         }
 
+        fn region_names(&self) -> &'static [&'static str] {
+            match self {
+                Self::Add | Self::Effectful => &[],
+                Self::WithRegions(names) => names,
+            }
+        }
+
         fn infer_output_types(
             &self,
             input_types: &[DataType],
@@ -119,13 +126,6 @@ pub(crate) mod tests {
                     }
                     Ok(region_interfaces[0].output_types().to_vec())
                 }
-            }
-        }
-
-        fn region_names(&self) -> &'static [&'static str] {
-            match self {
-                Self::Add | Self::Effectful => &[],
-                Self::WithRegions(names) => names,
             }
         }
 

@@ -7,9 +7,10 @@ use crate::macros::impl_differentiable_operation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::ProgramError;
 use crate::programs::effects::{Effect, Effects};
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 use crate::types::ArrayType;
 
@@ -204,6 +205,22 @@ impl Operation<ArrayType> for CustomCallOperation {
     #[inline]
     fn effects(&self) -> Effects {
         if self.has_side_effect { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
+    }
+
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            target_name: self.target_name.clone(),
+            output_types: self
+                .output_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            attributes: self.attributes.clone(),
+            has_side_effect: self.has_side_effect,
+        })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
