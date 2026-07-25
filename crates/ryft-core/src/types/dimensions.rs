@@ -9,8 +9,9 @@ use ryft_macros::Parameter;
 
 use crate::axes::Axis;
 use crate::parameters::Parameter;
-use crate::programs::identities::{TypeIdentity, TypeIdentityRenaming};
-use crate::programs::types::TypeError;
+use crate::programs::ProgramError;
+use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
+use crate::programs::types::{Type, TypeError};
 
 /// Errors produced while constructing or validating [`Dimension`]s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -24,6 +25,21 @@ pub enum DimensionError {
         upper: usize,
     },
 
+    #[error("dimension extent {value} exceeds backend maximum {maximum}")]
+    ExtentExceedsBackendWidth {
+        /// Concrete extent that exceeded the portable backend representation.
+        value: usize,
+
+        /// Largest extent supported by that representation.
+        maximum: usize,
+    },
+
+    #[error("{message}")]
+    ArithmeticOverflow {
+        /// Complete user-facing diagnostic for overflowing dimension arithmetic.
+        message: String,
+    },
+
     #[error("input dimension `{variable}` = {value} is outside its declared bounds {bounds}")]
     BindingOutOfBounds {
         /// Diagnostic name of the dynamic dimension variable.
@@ -34,6 +50,12 @@ pub enum DimensionError {
 
         /// Declared bounds of the variable.
         bounds: DimensionBounds,
+    },
+
+    #[error("{message}")]
+    RequirementViolation {
+        /// Complete user-facing requirement and observed-value diagnostic.
+        message: String,
     },
 
     #[error("input dimension `{dimension}` expected {expected} but got {actual}")]
@@ -50,6 +72,13 @@ pub enum DimensionError {
 }
 
 impl From<DimensionError> for TypeError {
+    #[inline]
+    fn from(error: DimensionError) -> Self {
+        Self::custom(error)
+    }
+}
+
+impl From<DimensionError> for ProgramError {
     #[inline]
     fn from(error: DimensionError) -> Self {
         Self::custom(error)
@@ -222,6 +251,120 @@ impl Hash for DimensionVariable {
 }
 
 impl TypeIdentity for DimensionVariable {}
+
+/// Type of one first-class runtime dimension value.
+///
+/// A value with this type defines `variable` as an ordinary SSA value. Array axes may refer to that same
+/// [`DimensionVariable`], while arithmetic relationships between dimension values remain explicit operation edges in
+/// the program graph.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct DimensionType {
+    /// Variable defined by values of this type.
+    variable: DimensionVariable,
+}
+
+impl DimensionType {
+    /// Creates a new [`DimensionType`] whose values define `variable`.
+    #[inline]
+    pub fn new(variable: DimensionVariable) -> Self {
+        Self { variable }
+    }
+
+    /// Returns the [`DimensionVariable`] defined by values of this type.
+    #[inline]
+    pub fn variable(&self) -> &DimensionVariable {
+        &self.variable
+    }
+
+    /// Returns the authoritative [`DimensionBounds`] of this type.
+    #[inline]
+    pub fn bounds(&self) -> DimensionBounds {
+        self.variable.bounds()
+    }
+}
+
+impl Display for DimensionType {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "dimension<{}: {}>", self.variable, self.bounds())
+    }
+}
+
+impl From<DimensionVariable> for DimensionType {
+    #[inline]
+    fn from(variable: DimensionVariable) -> Self {
+        Self::new(variable)
+    }
+}
+
+impl Type for DimensionType {
+    type Identity = DimensionVariable;
+    type Refinements = ();
+
+    #[inline]
+    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
+        visitor(TypeIdentityPosition::Definition, &self.variable);
+    }
+
+    fn derive_identity_renaming(
+        declared: &[Self],
+        actual: &[Self],
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        declared
+            .iter()
+            .zip(actual)
+            .try_fold(TypeIdentityRenaming::new(), |mut renaming, (declared, actual)| {
+                if !declared.bounds().contains_bounds(actual.bounds()) {
+                    return Err(TypeError::invalid(format!(
+                        "dimension type {actual} cannot instantiate declared type {declared}",
+                    )));
+                }
+                renaming.insert(declared.variable.clone(), actual.variable.clone())?;
+                Ok(renaming)
+            })
+    }
+
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+        let variable = renaming.rename(&self.variable);
+        if !self.bounds().contains_bounds(variable.bounds()) {
+            return Err(TypeError::invalid(format!(
+                "cannot rename dimension variable {} with bounds {} to {variable} with bounds {}",
+                self.variable,
+                self.bounds(),
+                variable.bounds(),
+            )));
+        }
+        Ok(Self::new(variable))
+    }
+
+    #[inline]
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    #[inline]
+    fn is_refined_by(&self, other: &Self) -> bool {
+        self.bounds().contains_bounds(other.bounds())
+    }
+
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        false
+    }
+
+    #[inline]
+    fn is_complex(&self) -> bool {
+        false
+    }
+}
 
 /// Represents the extent of one array axis as either a static value or one symbolic [`DimensionVariable`]. Reusing the
 /// same variable in multiple dimensions declares that their runtime extents are equal. Arithmetic relationships between
@@ -668,6 +811,41 @@ mod tests {
         variables.insert(batch);
         assert!(variables.contains(&batch_clone));
         assert!(!variables.contains(&same_declaration));
+    }
+
+    #[test]
+    fn test_dimension_type() {
+        let declared_variable = DimensionVariable::new("declared", DimensionBounds::new(1, Some(65)).unwrap());
+        let actual_variable = DimensionVariable::new("actual", DimensionBounds::new(1, Some(33)).unwrap());
+        let declared = DimensionType::new(declared_variable.clone());
+        let actual = DimensionType::new(actual_variable.clone());
+
+        assert_eq!(declared.variable(), &declared_variable);
+        assert_eq!(declared.bounds(), DimensionBounds::new(1, Some(65)).unwrap());
+        assert_eq!(declared.to_string(), "dimension<declared: [1, 65)>");
+        assert!(!declared.is_scalar());
+        assert!(!declared.is_complex());
+        assert!(declared.is_refined_by(&actual));
+
+        let mut identities = Vec::new();
+        declared.visit_identities(&mut |position, variable| identities.push((position, variable.clone())));
+        assert_eq!(identities, vec![(TypeIdentityPosition::Definition, declared_variable.clone())]);
+
+        let renaming =
+            DimensionType::derive_identity_renaming(std::slice::from_ref(&declared), std::slice::from_ref(&actual))
+                .unwrap();
+        assert_eq!(renaming.replacements(), &[(declared_variable.clone(), actual_variable.clone())]);
+        assert_eq!(declared.rename_identities(&renaming), Ok(actual.clone()));
+
+        let wider = DimensionType::new(DimensionVariable::new("wider", DimensionBounds::new(0, Some(129)).unwrap()));
+        assert!(!declared.is_refined_by(&wider));
+        assert_eq!(
+            DimensionType::derive_identity_renaming(&[declared], &[wider]),
+            Err(TypeError::invalid(
+                "dimension type dimension<wider: [0, 129)> cannot instantiate declared type \
+                 dimension<declared: [1, 65)>",
+            )),
+        );
     }
 
     #[test]

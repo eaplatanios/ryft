@@ -692,7 +692,10 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `S5a`  | Pure `Size` to `Dimension` rename and `Shape` module move, semantics intact | Pattern, residual, sample |
 | `P0`   | Behavioral/evidence freeze and archive implementation disposition          | Evidence review           |
 | `P1`   | Leaf identity, bounds, refinements, structural closure, alpha-equivalent cache identity | Line by line     |
-| `P2`   | Dimension SSA/value operations, storage sum, and projection vertical slice | Line by line              |
+| `P2a`  | Homogeneous dimension SSA values and checked arithmetic                     | Line by line              |
+| `P2b`  | Ordered dimension requirements and partial-evaluation behavior              | Line by line              |
+| `P2c`  | Generic storage-sum type/value projection                                  | Line by line              |
+| `P2d`  | Zero-state projected binding and third-member extensibility gate           | Line by line              |
 | `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
 | `P4`   | Control flow, partial evaluation, import, and higher-order composition       | Line by line              |
 | `P5`   | Batching and replicated dimension authority                               | Line by line              |
@@ -992,6 +995,14 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
 
 ### Phase 2: introduce generic member projection and direct binding
 
+Phase 2 is split at compile-safe boundaries to stay within the review budget. `P2a` introduces and verifies
+homogeneous dimension SSA values and checked arithmetic without depending on the heterogeneous storage sum. `P2b`
+adds ordered requirements, static proof behavior, and partial-evaluation placement. `P2c` introduces the storage sum
+and generic borrowed/consuming member projection. `P2d` adds direct zero-state projected binding and completes the
+vertical and third-member extensibility gates.
+
+- [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
+      arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
 - [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
@@ -1139,7 +1150,7 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
 - [ ] Begin only after Phases 1 through 7 have removed dual semantic contracts, implicit replay, and overlapping mixed
       constructors. Capture the resulting implementor and bound inventory before changing the trait.
 - [ ] Prototype `Operation` with an associated `Type` on a bounded vertical slice:
-      `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionAddOperation`,
+      `AddOperation`, `ZeroOperation<T>`, `ArrayPrimitiveOperation`, `DimensionArithmeticOperation`,
       `DimensionSizeOperation`, one mixed shaped-constructor wrapper, `ReshapeOperation`, and
       `ArrayProgramOperation`.
 - [ ] Parameterize `SelectOperation`, `StopGradientOperation`, and `TestNullaryOperation` by their operation type so
@@ -1673,3 +1684,25 @@ their result extents as first-class dimension operands; the rule is recorded in 
 deletion ledger.
 
 Verification and residual-audit results are recorded in the P1c cleanup-ledger entry at handoff.
+
+### Execution: P2a dimension SSA foundations
+
+P2a introduces the first homogeneous graph in which dimensions are ordinary SSA values. `DimensionType` owns one
+definition-position `DimensionVariable`; `DimensionValue` carries a checked portable host extent; and the existing
+generic `ConstantOperation` represents literals. Binary arithmetic is intentionally one
+`DimensionArithmeticOperation` parameterized by a semantic `DimensionArithmetic` enum rather than nine parallel
+payload types. Each application derives one fresh result variable with conservative bounds and performs checked eager
+host arithmetic. The generic region-closure algorithm now recognizes definition-position constant types as immutable
+internal SSA definitions, which lets the existing constant path carry dimensions without a special tracing rule while
+preserving the prior unresolved-reference diagnostic.
+
+Dimension input refinement is directional and bounds-based: a runtime or instantiated dimension with narrower bounds
+may satisfy a broader declared operand even though it owns a different definition identity. Program instantiation
+continues to derive explicit identity renamings, while ordinary interpretation can therefore accept fresh exact
+dimension literals. The focused vertical slice passes through checked construction, inference, eager interpretation,
+ordinary tracing, rendering, and known-side partial evaluation without introducing expression trees, witnesses,
+projection wrappers, or special program machinery.
+
+Ordered requirements, comparisons, gateways, `dimension_size`, heterogeneous storage, and projected binding remain
+separate P2b–P2d/P3 increments. Verification and residual-audit results are recorded in the P2a cleanup-ledger entry at
+handoff.
