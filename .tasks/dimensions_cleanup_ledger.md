@@ -291,7 +291,7 @@ ledger disagrees with Git.
 
 - Status: ready for owner review
 - Branch: `u/eaplatanios/increment/p2a-dimension-ssa-foundations`
-- Source commit: pending
+- Source commit: `e73dde1d4cebf560d5abfead1ce44132e0bd3124`
 - Integration commit: pending owner review
 - Remainder reconciliation commit: pending integration
 - Immutable archive unchanged: yes
