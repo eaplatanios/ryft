@@ -3,7 +3,7 @@ use crate::programs::Value;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
@@ -207,15 +207,21 @@ pub trait Operation<T: Type>: Clone {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
-    /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
-    /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
-    /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
+    /// Returns declarations for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in operation-defined
+    /// order. Each [`RegionSlot`] supplies the stable name used by diagnostics and rendering together with the
+    /// [`RegionRole`] that determines whether the region may execute during ordinary interpretation. The declared
+    /// region count must match the number of regions attached to every [`Instruction`](crate::Instruction).
     /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
-    /// [`Program`] is built. The names also label the region slots when rendering [`Program`]s. The default declares
-    /// no region slots, which is correct for region-free operations.
+    /// [`Program`] is built. The default declares no region slots, which is correct for region-free operations.
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
+    fn region_slots(&self) -> &'static [RegionSlot] {
         &[]
+    }
+
+    /// Returns the declared [`RegionRole`] for the attached region at `index` or [`None`] when `index` is out of range.
+    #[inline]
+    fn region_role(&self, index: usize) -> Option<RegionRole> {
+        self.region_slots().get(index).map(|slot| slot.role)
     }
 
     /// Derives the input [`Type`]s with which each attached [`Region`](crate::Region) will be invoked when this
@@ -254,7 +260,7 @@ pub trait Operation<T: Type>: Clone {
     ///
     ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
     ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
-    ///     [`Operation`]-defined [`region_names`](Self::region_names) region order. Region-free operations receive an
+    ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
     ///     empty slice and ignore it.
     fn infer_output_types(
         &self,
@@ -334,8 +340,8 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     }
 
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        self.as_ref().region_names()
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        self.as_ref().region_slots()
     }
 
     #[inline]
@@ -473,7 +479,8 @@ mod tests {
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
         ];
 
-        assert_eq!(Operation::<DataType>::region_names(&operation), &[] as &[&str]);
+        assert_eq!(Operation::<DataType>::region_slots(&operation), &[]);
+        assert_eq!(Operation::<DataType>::region_role(&operation, 0), None);
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
         assert_eq!(Operation::<DataType>::output_region_provenance(&operation, 0), Vec::new());
         assert!(!Operation::<DataType>::is_zero(&operation, 0));
@@ -498,8 +505,8 @@ mod tests {
                 "forwarding"
             }
 
-            fn region_names(&self) -> &'static [&'static str] {
-                &["body"]
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
             }
 
             fn infer_region_input_types(
@@ -547,7 +554,9 @@ mod tests {
         let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
 
         assert_eq!(Operation::<DataType>::name(&operation), "forwarding");
-        assert_eq!(Operation::<DataType>::region_names(&operation), &["body"]);
+        assert_eq!(Operation::<DataType>::region_slots(&operation), &[RegionSlot::computation("body")]);
+        assert_eq!(Operation::<DataType>::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<DataType>::region_role(&operation, 1), None);
         assert_eq!(
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
