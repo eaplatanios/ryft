@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::parameters::Parameterized;
 use crate::programs::Value;
 use crate::programs::effects::Effects;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
 use crate::programs::types::{Type, TypeError};
@@ -208,6 +209,39 @@ pub trait Operation<T: Type>: Clone {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
+    /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
+    /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
+    /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
+    /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
+    /// [`Program`] is built. The names also label the region slots when rendering [`Program`]s. The default declares
+    /// no region slots, which is correct for region-free operations.
+    #[inline]
+    fn region_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Derives the input [`Type`]s with which each attached [`Region`](crate::Region) will be invoked when this
+    /// [`Operation`] receives `input_types`. An attached region is traced independently with a declared input
+    /// signature. Before importing that region into the caller's [`Program`], staging must rename the signature's
+    /// formal [`TypeIdentity`](crate::TypeIdentity)s to the identities supplied by this particular operation
+    /// application. The mapping is operation-specific. For example, a condition passes every instruction input except
+    /// its predicate to both branches, while a scan passes loop-carried values together with element types derived from
+    /// its stacked inputs.
+    ///
+    /// Each returned entry corresponds to the same-index entry in `region_interfaces`. [`None`] preserves the region's
+    /// declared signature and its existing sharing. [`Some`] provides the concrete region input types from which the
+    /// generic staging machinery derives and applies the necessary type-identity renaming. Implementations must return
+    /// exactly one entry per attached region.
+    #[inline]
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        let _ = input_types;
+        Ok(vec![None; region_interfaces.len()])
+    }
+
     /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and
     /// attached-region [`RegionInterface`]s without executing it, validating the complete hypothetical
     /// [`Instruction`](crate::Instruction) that the arguments describe.
@@ -229,17 +263,6 @@ pub trait Operation<T: Type>: Clone {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError>;
-
-    /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
-    /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
-    /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
-    /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
-    /// [`Program`] is built. The names also label the region slots when rendering [`Program`]s. The default declares
-    /// no region slots, which is correct for region-free operations.
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &[]
-    }
 
     /// Returns information about which attached-[`Region`](crate::Region) `output_index`-th output can come from.
     /// An empty vector means that the [`Instruction`](crate::Instruction) result is produced by the [`Operation`]
@@ -269,6 +292,17 @@ pub trait Operation<T: Type>: Clone {
     #[inline]
     fn effects(&self) -> Effects {
         Effects::PURE
+    }
+
+    /// Returns this [`Operation`] after simultaneously renaming any [`TypeIdentity`](crate::TypeIdentity)s stored
+    /// in its payload, as specified by the provided [`TypeIdentityRenaming`]. Operations whose payload contains no
+    /// identity-bearing type metadata return `self.clone()`. An operation that stores shapes, output types, or nested
+    /// signature metadata must apply the same renaming as its surrounding program so the payload and atom types remain
+    /// consistent.
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let _ = renaming;
+        Ok(self.clone())
     }
 
     /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation
@@ -302,17 +336,26 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     }
 
     #[inline]
+    fn region_names(&self) -> &'static [&'static str] {
+        self.as_ref().region_names()
+    }
+
+    #[inline]
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        self.as_ref().infer_region_input_types(input_types, region_interfaces)
+    }
+
+    #[inline]
     fn infer_output_types(
         &self,
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         self.as_ref().infer_output_types(input_types, region_interfaces)
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        self.as_ref().region_names()
     }
 
     #[inline]
@@ -328,6 +371,11 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
     #[inline]
     fn effects(&self) -> Effects {
         self.as_ref().effects()
+    }
+
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Box::new(self.as_ref().rename_type_identities(renaming)?))
     }
 
     #[inline]
