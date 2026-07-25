@@ -159,11 +159,11 @@ ledger disagrees with Git.
 
 ## S5b: restore the MLIR size in the StableHLO example
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/s5b-mlir-size-example`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `1c92e69d868706d9efc41e5174d07697bc605306`
+- Integration commit: `20eefa3085e70a44995862ff0fc9986f80158c0d`
+- Remainder reconciliation commit: `9bcc73d7093a1a001c8c0539e5307851558ad9cd`
 - Immutable archive unchanged: yes
 - Landed: restores the three low-level StableHLO tensor-shape expressions to `ryft_mlir::Size`, leaving the
   `ryft_core::types::Dimension` rename unchanged
@@ -173,4 +173,25 @@ ledger disagrees with Git.
   the same command passes; `cargo fmt -p ryft -- --check` and `git diff --check` pass
 - Residual search: exact `Size` matches are the three restored example expressions plus the XLA lowering import
   aliased as `MlirSize`; all four are intentional `ryft_mlir::Size` uses
-- Next action: push the corrective increment and stage its no-commit integration merge for owner review
+- Next action: none
+
+## P0: behavioral and architectural evidence freeze
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/p0-evidence-freeze`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: freezes revisions, environment, source/generated size, compile/memory, graph, runtime-smoke, allocation,
+  diagnostic, proof, operation-family, transform, reconstruction, collector, and projection-ownership evidence;
+  classifies all 142 archive paths and every affected operation
+- Deferred: all semantic implementation begins in P1; P0 includes only the one-line feature-gated S1 call-site
+  correction required to compile the existing golden benchmark emitter
+- Verification: archive `cargo test -p ryft-core --lib` passed 1,035 tests with one documented ignored batching gap;
+  integration `cargo test -p ryft-core --lib` passed all 913 tests; integration
+  `cargo check -p ryft-core --features benchmarking`, `cargo fmt --all -- --check`, and `git diff --check` passed
+- Residual search: the archive-disposition path column mechanically matches the 142-path archive manifest exactly,
+  with 142 unique rows and no missing or extra path; every dual contract, constructor overlap, context view,
+  reconstruction path, runtime-dimension collector class, and transpose witness has a named destination
+- Next action: push the P0 evidence increment and stage its no-commit integration merge for owner review

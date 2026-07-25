@@ -906,41 +906,47 @@ Execute these specifications in order: `P0`, `P1`, `P2`, `P3.*`, `P4`, `P5`, `P6
 
 ### Phase 0: freeze evidence and classify the migration
 
-- [ ] Record the exact source revision, toolchain, machine, and feature configuration. After bootstrap there is no
+The first release-baseline build found one feature-gated S1 call site that normal core checks did not compile:
+`tracing_v2::benchmarking` invoked `RegionRef::region_ref(...)` after that borrowed traversal API was renamed to
+`RegionRef::with_id(...)`. P0 owns the one-line correction because the benchmark emitter cannot serve as baseline
+evidence until it compiles. This is a compatibility correction to the already-reviewed S1 seam, not dimension
+semantics; the P0 release build is its regression gate.
+
+- [x] Record the exact source revision, toolchain, machine, and feature configuration. After bootstrap there is no
       dirty state to fingerprint: behavioral and code-size baselines come from the immutable archive commit. Also
       report the final net feature cost relative to the reviewed integration branch after `S5a`, but do not require the
       feature-bearing result to be smaller than the branch before the feature existed.
-- [ ] Create an archive-disposition table covering every archived changed path: independent extraction, behavioral/test
+- [x] Create an archive-disposition table covering every archived changed path: independent extraction, behavioral/test
       source for a named `P*` increment, explicitly superseded design, or deliberate deletion. No path may remain
       unclassified merely because the archive happened to compile.
-- [ ] Capture the code-size, occurrence-count, operation-family, trait-implementation, compile-time, memory, generated
+- [x] Capture the code-size, occurrence-count, operation-family, trait-implementation, compile-time, memory, generated
       code, graph-size, allocation, runtime, and diagnostics baselines listed above.
-- [ ] Separate production lines from unit/integration tests and generated code.
-- [ ] Inventory every `Operation<ArrayType>` and `Operation<ArrayProgramType>` implementation and classify it as
+- [x] Separate production lines from unit/integration tests and generated code.
+- [x] Inventory every `Operation<ArrayType>` and `Operation<ArrayProgramType>` implementation and classify it as
       array-only, dimension-only, mixed, region-polymorphic, or erroneous dual contract.
-- [ ] Separately inventory blanket generic constructor implementations that overlap array-program-specific
+- [x] Separately inventory blanket generic constructor implementations that overlap array-program-specific
       instantiations: zero, one, fill, and iota. Assign each static, dynamic, public-API, transform, and lowering use to
       the homogeneous constructor, operand-relative operation, or mixed shaped-constructor wrapper.
-- [ ] Inventory every use of the complete homogeneous `ArrayOperation` outside tests and assign its migration target.
-- [ ] Inventory every `ArrayContextView`/`DimensionContextView` construction and state why the caller needs a view.
-- [ ] For every `with_dimensions`, `with_source_array`, and `bind_replayed` path, record the explicit SSA dependency
+- [x] Inventory every use of the complete homogeneous `ArrayOperation` outside tests and assign its migration target.
+- [x] Inventory every `ArrayContextView`/`DimensionContextView` construction and state why the caller needs a view.
+- [x] For every `with_dimensions`, `with_source_array`, and `bind_replayed` path, record the explicit SSA dependency
       that must replace it.
-- [ ] Inventory every batching, differentiation, transposition, and partial-evaluation special case in
+- [x] Inventory every batching, differentiation, transposition, and partial-evaluation special case in
       `backends/array_programs`.
-- [ ] Inventory every transpose that needs primal dimension values unavailable from the cotangent and record the
+- [x] Inventory every transpose that needs primal dimension values unavailable from the cotangent and record the
       explicit SSA residuals it requires. Include reshape, concatenate, mean/reductions, slice, pad, and gather.
-- [ ] Inventory every independent `runtime_dimension_variables` collector and every copied dimension-operand
+- [x] Inventory every independent `runtime_dimension_variables` collector and every copied dimension-operand
       validation loop; design its centralized schema segment before the sweep.
-- [ ] Audit eager backend clone cost, beginning with reference `Array`'s `Vec<Scalar>` payload, and identify every
+- [x] Audit eager backend clone cost, beginning with reference `Array`'s `Vec<Scalar>` payload, and identify every
       current or proposed projection that clones an eager value.
-- [ ] Decide the projection ownership model—borrowed views, immutable shared eager payloads, or both—before the
+- [x] Decide the projection ownership model—borrowed views, immutable shared eager payloads, or both—before the
       Phase 2 prototype. Record allocation/latency measurements and land any reference-array storage change separately.
-- [ ] Capture exact rendered IR and diagnostics for the existing static, direct-dynamic, derived-dynamic,
+- [x] Capture exact rendered IR and diagnostics for the existing static, direct-dynamic, derived-dynamic,
       control-flow, batching, differentiation, and assertion golden programs.
-- [ ] Add a code-ownership map for core types, operations, transforms, public API, reference eager values, and XLA.
-- [ ] Record a migration table with one row per affected operation and columns for canonical signature, eager rule,
+- [x] Add a code-ownership map for core types, operations, transforms, public API, reference eager values, and XLA.
+- [x] Record a migration table with one row per affected operation and columns for canonical signature, eager rule,
       tracing, PE, batching, JVP, VJP, transpose, regions, lowering, tests, and old-code deletion.
-- [ ] Gate: do not begin the sweep until every dual-contract operation and every hidden reconstruction path has an
+- [x] Gate: do not begin the sweep until every dual-contract operation and every hidden reconstruction path has an
       explicit destination.
 
 ### Phase 1: introduce leaf identity and derive ownership structurally
@@ -1519,3 +1525,37 @@ missed the error. S5b restores those three expressions and adds
 The baseline command failed with six unresolved `Dimension` uses. After the correction, the same command passes.
 `cargo fmt -p ryft -- --check` and `git diff --check` also pass. The four remaining exact `Size` matches are the three
 restored example expressions and XLA lowering's `ryft_mlir::Size as MlirSize` import; all are intentional MLIR uses.
+
+### Execution: P0 behavioral and architectural evidence freeze
+
+P0 produces three review artifacts:
+
+- `.tasks/dimensions_p0_evidence.md` freezes the exact revisions and environment; source, generated, compile, memory,
+  graph, runtime-smoke, allocation, diagnostic, and proof baselines; all operation-family, context-view,
+  reconstruction, collector, transform, residual, and eager-clone inventories; the projection ownership decision; and
+  final code ownership.
+- `.tasks/dimensions_operation_migration.md` gives every affected mixed, region-polymorphic, homogeneous, and
+  constructor operation an explicit canonical signature and destination across eager execution, tracing, PE,
+  batching, differentiation, regions, lowering, testing, and old-code deletion.
+- `.tasks/dimensions_archive_disposition.md` classifies all 142 archived paths as independently extracted,
+  behavioral input to a named phase, architecturally superseded, or deliberately deleted. A mechanical comparison
+  found exactly 142 unique document rows with no missing or extra archive path.
+
+The projection ownership decision is borrowed projection for read-only use plus consuming projection for ownership
+transfer. P2 will not change reference `Array` storage to `Arc<Vec<Scalar>>` merely to compensate for an owned
+projection API; it must first prove zero allocation and zero payload copying for a large eager array.
+
+P0 also records two pre-existing deficiencies rather than hiding them: `shard_map_grad_inside` panics in both graph
+benchmark revisions, and the archive has one ignored composite-while batching test because a batch-varying predicate
+is not handled. P5/P6/P10 own their explicit resolution.
+
+Verification completed:
+
+- `cargo fmt --all -- --check` and `git diff --check` passed;
+- `cargo check -p ryft-core --features benchmarking` passed, directly covering the one-line S1 benchmark call-site
+  correction;
+- the reviewed integration `cargo test -p ryft-core --lib` passed all 913 tests; and
+- the immutable archive `cargo test -p ryft-core --lib` passed 1,035 tests with the one documented ignored batching
+  gap.
+
+The existing ambiguous `arrays` glob-re-export warning remains assigned to P9. P0 changes no dimension semantics.
