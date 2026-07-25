@@ -31,6 +31,7 @@ impl InstructionId {
         self.index
     }
 }
+
 /// [`Instruction`]s represent applications of [`Operation`](crate::Operation)s to input values in
 /// [`Program`](crate::Program)s. Each [`Region`](crate::Region) executes its [`Instruction`]s in sequential order.
 /// Beyond its operation and its input and output [`Atom`](crate::Atom)s, an instruction carries the [`RegionId`]s of

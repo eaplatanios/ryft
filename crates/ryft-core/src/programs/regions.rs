@@ -347,7 +347,8 @@ impl<V: Value, O: Operation<V::Type>> RegionWithMetadata<V, O> {
             .copied()
             .try_for_each(|id| region.atoms.get(id.index()).map(|_| ()).ok_or(ProgramError::UnboundAtomId { id }))?;
         let effects = region.instructions.iter().try_fold(Effects::PURE, |effects, instruction| {
-            let declared_region_count = instruction.operation().region_names().len();
+            let region_slots = instruction.operation().region_slots();
+            let declared_region_count = region_slots.len();
             if instruction.regions().len() != declared_region_count {
                 return Err(ProgramError::MalformedProgram(format!(
                     "operation `{}` declares {} region slots but {} regions were attached",
@@ -356,17 +357,26 @@ impl<V: Value, O: Operation<V::Type>> RegionWithMetadata<V, O> {
                     instruction.regions().len(),
                 )));
             }
-            instruction.regions().iter().copied().try_fold(
+            instruction.regions().iter().copied().enumerate().try_fold(
                 effects.union(instruction.operation().effects()),
-                |effects, nested_region| {
-                    sealed_regions
+                |effects, (region_index, nested_region)| {
+                    let nested_effects = sealed_regions
                         .get(nested_region.index())
-                        .map(|nested_region| effects.union(nested_region.effects))
+                        .map(|nested_region| nested_region.effects)
                         .ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "instruction references region {nested_region} which has not been sealed yet",
                             ))
-                        })
+                        })?;
+
+                    // Only computation regions may execute as part of the owning operation, so their effects are
+                    // observable and must propagate outward. Rule regions are dormant transform definitions. Merely
+                    // attaching one does not execute it and therefore must not make the owning computation effectful.
+                    Ok(if region_slots[region_index].role == RegionRole::Computation {
+                        effects.union(nested_effects)
+                    } else {
+                        effects
+                    })
                 },
             )
         })?;
@@ -593,6 +603,36 @@ impl<'r, V: Value, O: Operation<V::Type>> RegionRef<'r, V, O> {
         self.region().instructions()
     }
 
+    /// Returns the observable effects of the [`Instruction`] at `instruction_index`, combining its operation's
+    /// intrinsic effects with the recursively derived effects of attached computation regions. Dormant rule regions
+    /// are excluded according to their declared [`RegionRole`].
+    pub fn instruction_effects(self, instruction_index: usize) -> Result<Effects, ProgramError> {
+        let instruction = self.instructions().get(instruction_index).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "instruction index {instruction_index} is out of range for region {}",
+                self.id,
+            ))
+        })?;
+        instruction.regions().iter().copied().enumerate().try_fold(
+            instruction.operation().effects(),
+            |effects, (region_index, attached)| {
+                let attached_effects = self
+                    .arena
+                    .effects(attached)
+                    .ok_or_else(|| ProgramError::MalformedProgram(format!("region {attached} is out of range")))?;
+
+                // Include effects from regions the operation may execute during ordinary interpretation. Dormant rule
+                // regions are inputs to later transforms rather than executed children of this instruction, so their
+                // effects are intentionally excluded.
+                Ok(if instruction.operation().region_role(region_index) == Some(RegionRole::Computation) {
+                    effects.union(attached_effects)
+                } else {
+                    effects
+                })
+            },
+        )
+    }
+
     /// Returns the [`RegionInterface`] of the rooted [`Region`].
     #[inline]
     pub fn interface(self) -> RegionInterface<V::Type>
@@ -642,6 +682,43 @@ impl<V: Value, O: Operation<V::Type>> Clone for RegionRef<'_, V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+/// Semantic role of a slot for a [`Region`] in an [`Operation`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RegionRole {
+    /// The [`Region`] may execute as part of ordinary interpretation, such as a control-flow bodies, callees, or primal
+    /// computations. Its recursively derived [`Effects`] are consequently observable effects of the owning operation.
+    Computation,
+
+    /// The [`Region`] represents a dormant transformation rule, such as a custom derivative or rematerialization rule.
+    /// It is consumed by a transform rather than ordinary interpretation and so its [`Effects`] do not belong to the
+    /// owning computation.
+    Rule,
+}
+
+/// Represents a slot for a [`Region`] in an [`Operation`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RegionSlot {
+    /// Stable [`Region`] name used in diagnostics, rendering, and analysis reports.
+    pub name: &'static str,
+
+    /// Semantic [`RegionRole`] of the attached [`Region`].
+    pub role: RegionRole,
+}
+
+impl RegionSlot {
+    /// Creates a [`RegionSlot`] for a [`Region`] that may execute during ordinary interpretation.
+    #[inline]
+    pub const fn computation(name: &'static str) -> Self {
+        Self { name, role: RegionRole::Computation }
+    }
+
+    /// Creates a [`RegionSlot`] for a [`Region`] that represents a dormant transformation rule.
+    #[inline]
+    pub const fn rule(name: &'static str) -> Self {
+        Self { name, role: RegionRole::Rule }
     }
 }
 
@@ -1283,10 +1360,18 @@ mod tests {
         let region = builder.import_program(identity_program(DataType::F64));
         let input = builder.add_input(DataType::F64);
         let first = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![region], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![region],
+                vec![input],
+            )
             .unwrap()[0];
         let second = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![region], vec![first])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![region],
+                vec![first],
+            )
             .unwrap()[0];
         builder.build(vec![second], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1297,7 +1382,11 @@ mod tests {
         let descendant = root_builder.import_program(identity_program(DataType::F64));
         let input = root_builder.add_input(DataType::F64);
         let output = root_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["nested"]), vec![descendant], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("nested")] }),
+                vec![descendant],
+                vec![input],
+            )
             .unwrap()[0];
         let root_program: TestProgram = root_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let mut root_region = root_program.entry_region().clone();
@@ -1313,7 +1402,9 @@ mod tests {
         let input = builder.add_input(DataType::F64);
         let output = builder
             .add_instruction(
-                TestRegionOperation::WithRegions(&["first", "second"]),
+                TestRegionOperation::WithRegions(
+                    const { &[crate::RegionSlot::computation("first"), crate::RegionSlot::computation("second")] },
+                ),
                 vec![first_root, second_root],
                 vec![input],
             )
@@ -1451,7 +1542,11 @@ mod tests {
         let body = builder.import_program(body);
         let input = builder.add_input(DataType::F64);
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![body], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![body],
+                vec![input],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1477,7 +1572,7 @@ mod tests {
             input_ids: vec![atom],
             output_ids: vec![atom],
             instructions: vec![Instruction::new(
-                TestRegionOperation::WithRegions(&["body"]),
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![atom],
                 vec![atom],
                 vec![RegionId::new(0)],

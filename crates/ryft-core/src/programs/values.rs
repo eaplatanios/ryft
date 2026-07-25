@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(
             value.rename_type_identities(&renaming),
             Err(TypeError::invalid(
-                "cannot rename identity metadata in value of type f32[source] without a value-specific reconstruction \
+                "cannot rename type identities in value of type f32[source] without a value-specific reconstruction \
                  implementation",
             )),
         );
