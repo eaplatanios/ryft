@@ -1,5 +1,3 @@
-use std::fmt::Display;
-
 use crate::parameters::Parameterized;
 use crate::programs::Value;
 use crate::programs::effects::Effects;
@@ -48,7 +46,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 
     /// Renders the provided field name-value pair.
     #[inline]
-    pub fn field(&mut self, name: &str, value: impl Display) -> std::fmt::Result {
+    pub fn field<V: std::fmt::Display>(&mut self, name: &str, value: V) -> std::fmt::Result {
         if self.is_multiline {
             write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)
         } else {
@@ -389,16 +387,20 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
-    use crate::contexts::Domain;
+    use crate::contexts::{Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder, ProgramError};
+    use crate::programs::ProgramError;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::effects::Effect;
+    use crate::programs::programs::Program;
+    use crate::programs::regions::EmptyRegionDriver;
     use crate::types::DataType;
 
     use super::*;
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct IdentityOperation;
 
     impl Operation<DataType> for IdentityOperation {
@@ -532,36 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn default_operation_rendering_uses_the_operation_name() {
-        assert_eq!(render_operation(&IdentityOperation), "identity");
-    }
-
-    #[test]
-    fn operation_inference_and_interpretation_use_concrete_inputs() {
-        let operation = IdentityOperation;
-        assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
-        );
-        assert_eq!(
-            operation
-                .interpret(&crate::EagerContext::<Scalar>::new(), &crate::EmptyRegionDriver, &[Scalar::from(3.0)],),
-            Ok(vec![Scalar::from(3.0)]),
-        );
-        assert_eq!(
-            operation.interpret(&crate::EagerContext::<Scalar>::new(), &crate::EmptyRegionDriver, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-    }
-
-    #[test]
-    fn operation_formatter_renders_short_fields_inline() {
+    fn test_operation_formatter() {
+        // Check that short fields are rendered inline.
         assert_eq!(render_operation(&InlineMetadataOperation), "metadata [mode=test, count=2]");
-    }
-
-    #[test]
-    fn operation_formatter_wraps_long_fields_over_multiple_lines() {
+        
+        // Check that long fields are wrapped over multiple lines.
         assert_eq!(
             render_operation(&LongMetadataOperation),
             format!(
@@ -574,10 +551,8 @@ mod tests {
             )
             .trim_end()
         );
-    }
-
-    #[test]
-    fn operation_formatter_renders_program_fields_over_multiple_lines() {
+        
+        // Check that program fields are rendered over multiple lines.
         assert_eq!(
             render_operation(&NestedProgramOperation { program: identity_program() }),
             indoc! {"
@@ -593,5 +568,123 @@ mod tests {
             "}
             .trim_end()
         );
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
+    
+    #[test]
+    fn test_operation() {
+        let operation = IdentityOperation;
+        assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
+        assert_eq!(
+            operation.infer_output_types(&[], &[]),
+            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
+        );
+        assert_eq!(render_operation(&operation), "identity");
+
+        let region_interfaces = [
+            RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE),
+            RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
+        ];
+
+        assert_eq!(Operation::<DataType>::region_names(&operation), &[] as &[&str]);
+        assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
+        assert_eq!(Operation::<DataType>::output_region_provenance(&operation, 0), Vec::new());
+        assert!(!Operation::<DataType>::is_zero(&operation, 0));
+        assert_eq!(Operation::<DataType>::effects(&operation), Effects::PURE);
+        assert_eq!(
+            Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
+            Ok(operation.clone()),
+        );
+
+        // Test interpretation.
+        assert_eq!(
+            operation.interpret(&EagerContext::<Scalar>::new(), &EmptyRegionDriver, &[Scalar::from(3.0)],),
+            Ok(vec![Scalar::from(3.0)]),
+        );
+        assert_eq!(
+            operation.interpret(&EagerContext::<Scalar>::new(), &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+    }
+
+    #[test]
+    fn test_boxed_operation_forwards_complete_contract() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct ForwardingOperation {
+            renamed: bool,
+        }
+
+        impl Operation<DataType> for ForwardingOperation {
+            fn name(&self) -> &'static str {
+                "forwarding"
+            }
+
+            fn region_names(&self) -> &'static [&'static str] {
+                &["body"]
+            }
+
+            fn infer_region_input_types(
+                &self,
+                input_types: &[DataType],
+                _region_interfaces: &[RegionInterface<DataType>],
+            ) -> Result<Vec<Option<Vec<DataType>>>, TypeError> {
+                Ok(vec![Some(input_types.to_vec())])
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[DataType],
+                region_interfaces: &[RegionInterface<DataType>],
+            ) -> Result<Vec<DataType>, TypeError> {
+                Ok(region_interfaces[0].output_types().to_vec())
+            }
+
+            fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+                vec![OutputRegionProvenance { region_index: 0, output_index }]
+            }
+
+            fn is_zero(&self, output_index: usize) -> bool {
+                output_index == 2
+            }
+
+            fn effects(&self) -> Effects {
+                Effects::single(Effect::OrderedIo)
+            }
+
+            fn rename_type_identities(
+                &self,
+                _renaming: &TypeIdentityRenaming<<DataType as Type>::Identity>,
+            ) -> Result<Self, TypeError> {
+                Ok(Self { renamed: true })
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, _indentation: usize) -> std::fmt::Result {
+                formatter.write_str("forwarded")
+            }
+        }
+
+        let operation = Box::new(ForwardingOperation { renamed: false });
+        let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
+
+        assert_eq!(Operation::<DataType>::name(&operation), "forwarding");
+        assert_eq!(Operation::<DataType>::region_names(&operation), &["body"]);
+        assert_eq!(
+            operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
+            Ok(vec![Some(vec![DataType::F32])]),
+        );
+        assert_eq!(operation.infer_output_types(&[DataType::F32], &region_interfaces), Ok(vec![DataType::F64]),);
+        assert_eq!(
+            Operation::<DataType>::output_region_provenance(&operation, 3),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
+        );
+        assert!(!Operation::<DataType>::is_zero(&operation, 1));
+        assert!(Operation::<DataType>::is_zero(&operation, 2));
+        assert_eq!(Operation::<DataType>::effects(&operation), Effects::single(Effect::OrderedIo));
+        assert_eq!(
+            Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
+            Ok(Box::new(ForwardingOperation { renamed: true })),
+        );
+        assert_eq!(render_operation(&operation), "forwarded");
     }
 }
