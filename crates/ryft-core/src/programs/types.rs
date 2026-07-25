@@ -192,9 +192,28 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     /// Establishes refinement facts from `actual` relative to `declared`.
     fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError>;
 
-    /// Validates `actual` against `declared` using the already-established facts. Identities in `internal_identities`
-    /// may establish new facts at this boundary. All other identities must already be bound.
-    fn validate(&self, declared: &[T], actual: &[T], internal_identities: &[T::Identity]) -> Result<(), TypeError>;
+    /// Validates `actual` against `declared` using the refinement facts previously established from the corresponding
+    /// input signature. Facts already stored in `self` must remain consistent at every occurrence of the corresponding
+    /// identity. An identity listed in `locally_defined_identities` was defined by an instruction inside the program or
+    /// region rather than introduced at its input boundary. Its first concrete occurrence in the validated signature
+    /// may therefore establish a new refinement fact, and subsequent occurrences must agree with that fact. An unbound
+    /// identity that was neither established from the inputs nor locally defined is rejected.
+    ///
+    /// `locally_defined_identities` is only an authority list identifying which identities may establish facts during
+    /// validation. It does not contain concrete extents or inspect runtime value payloads.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Complete declared type signature being validated, normally a program or region output signature.
+    ///   - `actual`: Corresponding refining type signature supplied at the validation site.
+    ///   - `locally_defined_identities`: Type identities structurally defined by instructions inside the program or
+    ///     region and therefore permitted to establish refinement facts when first encountered in `actual`.
+    fn validate(
+        &self,
+        declared: &[T],
+        actual: &[T],
+        locally_defined_identities: &[T::Identity],
+    ) -> Result<(), TypeError>;
 }
 
 impl<T: Type> TypeRefinements<T> for () {
@@ -203,7 +222,12 @@ impl<T: Type> TypeRefinements<T> for () {
         Self::validate(&(), declared, actual, &[])
     }
 
-    fn validate(&self, declared: &[T], actual: &[T], _internal_identities: &[T::Identity]) -> Result<(), TypeError> {
+    fn validate(
+        &self,
+        declared: &[T],
+        actual: &[T],
+        _locally_defined_identities: &[T::Identity],
+    ) -> Result<(), TypeError> {
         if declared.len() != actual.len() {
             return Err(TypeError::invalid(format!(
                 "declared type count {} does not match actual type count {}",
@@ -241,6 +265,8 @@ pub trait Typed {
 mod tests {
     use std::collections::HashSet;
 
+    use crate::types::DataType;
+
     use super::*;
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -272,5 +298,23 @@ mod tests {
         let mut errors = HashSet::new();
         errors.insert(custom);
         assert!(errors.contains(&equal));
+    }
+
+    #[test]
+    fn test_type_refinements() {
+        let refinements = <() as TypeRefinements<DataType>>::establish(
+            &[DataType::F32, DataType::I32],
+            &[DataType::F32, DataType::I32],
+        )
+        .unwrap();
+        assert_eq!(refinements.validate(&[DataType::F32, DataType::I32], &[DataType::F32, DataType::I32], &[]), Ok(()));
+        assert_eq!(
+            <() as TypeRefinements<DataType>>::establish(&[DataType::F32], &[DataType::F32, DataType::I32]),
+            Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
+        );
+        assert_eq!(
+            refinements.validate(&[DataType::F32], &[DataType::F64], &[]),
+            Err(TypeError::invalid("type f64 does not refine declared type f32")),
+        );
     }
 }
