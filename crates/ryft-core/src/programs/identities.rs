@@ -95,7 +95,7 @@ impl<I: TypeIdentity> Default for TypeIdentityRenaming<I> {
 /// ordered by first occurrence in formal input types. Internal identities follow in instruction, result, and
 /// type-occurrence order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TypeIdentitySignature<I: TypeIdentity> {
+pub struct TypeIdentitySignature<I: TypeIdentity> {
     /// [`TypeIdentity`]s established by formal input types.
     input_identities: Vec<I>,
 
@@ -106,19 +106,19 @@ pub(crate) struct TypeIdentitySignature<I: TypeIdentity> {
 impl<I: TypeIdentity> TypeIdentitySignature<I> {
     /// Creates a new [`TypeIdentitySignature`].
     #[inline]
-    pub(crate) fn new(input_identities: Vec<I>, internal_identities: Vec<I>) -> Self {
+    pub fn new(input_identities: Vec<I>, internal_identities: Vec<I>) -> Self {
         Self { input_identities, internal_identities }
     }
 
     /// Returns the [`TypeIdentity`]s established by formal input types.
     #[inline]
-    pub(crate) fn input_identities(&self) -> &[I] {
+    pub fn input_identities(&self) -> &[I] {
         self.input_identities.as_slice()
     }
 
     /// Returns the [`TypeIdentity`]s established by [`Instruction`](crate::Instruction) results.
     #[inline]
-    pub(crate) fn internal_identities(&self) -> &[I] {
+    pub fn internal_identities(&self) -> &[I] {
         self.internal_identities.as_slice()
     }
 }
