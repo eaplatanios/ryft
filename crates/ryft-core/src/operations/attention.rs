@@ -202,24 +202,6 @@ impl Operation<ArrayType> for DotProductAttentionOperation {
         DOT_PRODUCT_ATTENTION_OPERATION_NAME
     }
 
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, DOT_PRODUCT_ATTENTION_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("scale", &self.scale)?;
-            operation.field("mask", &self.mask)?;
-            if let Some(sliding_window) = self.sliding_window {
-                operation.field("sliding_window", &sliding_window)?;
-            }
-            if let Some((rate, seed)) = self.dropout {
-                operation.field("dropout_rate", &rate)?;
-                operation.field("dropout_seed", &seed)?;
-            }
-            if self.activation_output {
-                operation.field("activation", &self.activation_output)?;
-            }
-            Ok(())
-        })
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -266,6 +248,24 @@ impl Operation<ArrayType> for DotProductAttentionOperation {
             output_types.push(attention_activation_type(&dimensions, &input_types[0])?);
         }
         Ok(output_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, DOT_PRODUCT_ATTENTION_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("scale", &self.scale)?;
+            operation.field("mask", &self.mask)?;
+            if let Some(sliding_window) = self.sliding_window {
+                operation.field("sliding_window", &sliding_window)?;
+            }
+            if let Some((rate, seed)) = self.dropout {
+                operation.field("dropout_rate", &rate)?;
+                operation.field("dropout_seed", &seed)?;
+            }
+            if self.activation_output {
+                operation.field("activation", &self.activation_output)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -373,23 +373,6 @@ impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
         DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME
     }
 
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME)?.bracketed(
-            |operation| {
-                operation.field("scale", &self.scale)?;
-                operation.field("mask", &self.mask)?;
-                if let Some(sliding_window) = self.sliding_window {
-                    operation.field("sliding_window", &sliding_window)?;
-                }
-                if let Some((rate, seed)) = self.dropout {
-                    operation.field("dropout_rate", &rate)?;
-                    operation.field("dropout_seed", &seed)?;
-                }
-                Ok(())
-            },
-        )
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -458,6 +441,23 @@ impl Operation<ArrayType> for DotProductAttentionBackwardOperation {
             output_types.push(input_types[3].clone());
         }
         Ok(output_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME)?.bracketed(
+            |operation| {
+                operation.field("scale", &self.scale)?;
+                operation.field("mask", &self.mask)?;
+                if let Some(sliding_window) = self.sliding_window {
+                    operation.field("sliding_window", &sliding_window)?;
+                }
+                if let Some((rate, seed)) = self.dropout {
+                    operation.field("dropout_rate", &rate)?;
+                    operation.field("dropout_seed", &seed)?;
+                }
+                Ok(())
+            },
+        )
     }
 }
 

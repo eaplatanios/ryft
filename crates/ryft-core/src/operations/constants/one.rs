@@ -11,6 +11,7 @@ use crate::macros::{
 };
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
@@ -64,6 +65,11 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
+    }
+
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self { r#type: self.r#type.rename_identities(renaming)? })
     }
 
     #[inline]

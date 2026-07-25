@@ -18,6 +18,7 @@ use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
@@ -547,6 +548,14 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearGatherOperation<
         check_count!("input", input_types, 1, TypeError);
         self.operation
             .infer_output_types(&[input_types[0].clone(), self.indices.r#type().into_owned()], &[])
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { operation: self.operation.clone(), indices: self.indices.rename_type_identities(renaming)? })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {

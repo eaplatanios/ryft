@@ -266,6 +266,28 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
         WHILE_OPERATION_NAME
     }
 
+    #[inline]
+    fn region_names(&self) -> &'static [&'static str] {
+        &["condition", "body"]
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 2 {
+            return Err(TypeError::invalid(format!(
+                "while expects 2 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        if region_interfaces.iter().all(|interface| interface.input_types() == input_types) {
+            return Ok(vec![None, None]);
+        }
+        Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec())])
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -276,11 +298,6 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
         check_count!("input", input_types, state_types.len(), TypeError);
         check_types!(@same, "while input", [state_types, input_types]);
         Ok(state_types.to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["condition", "body"]
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -2543,6 +2560,13 @@ mod tests {
             }
         }
 
+        fn region_names(&self) -> &'static [&'static str] {
+            match self {
+                Self::While(while_operation) => Operation::<ArrayType>::region_names(while_operation),
+                _ => &[],
+            }
+        }
+
         fn infer_output_types(
             &self,
             input_types: &[ArrayType],
@@ -2559,13 +2583,6 @@ mod tests {
                     Ok(vec![ArrayType::scalar(DataType::Boolean)])
                 }
                 Self::While(while_operation) => while_operation.infer_output_types(input_types, region_interfaces),
-            }
-        }
-
-        fn region_names(&self) -> &'static [&'static str] {
-            match self {
-                Self::While(while_operation) => Operation::<ArrayType>::region_names(while_operation),
-                _ => &[],
             }
         }
 

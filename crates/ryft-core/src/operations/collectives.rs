@@ -594,15 +594,6 @@ macro_rules! shape_changing_collective {
                 $operation_name
             }
 
-            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-                OperationFormatter::new(formatter, indentation, $operation_name)?.bracketed(|operation| {
-                    operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
-                    operation.field("axis_size", &self.axis_size)?;
-                    $(operation.field(stringify!($field), format_args!("{:?}", &self.$field))?;)*
-                    Ok(())
-                })
-            }
-
             fn infer_output_types(
                 &self,
                 input_types: &[ArrayType],
@@ -616,6 +607,15 @@ macro_rules! shape_changing_collective {
                     &input_types[0],
                     output_dimensions,
                 )?])
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+                OperationFormatter::new(formatter, indentation, $operation_name)?.bracketed(|operation| {
+                    operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+                    operation.field("axis_size", &self.axis_size)?;
+                    $(operation.field(stringify!($field), format_args!("{:?}", &self.$field))?;)*
+                    Ok(())
+                })
             }
         }
 

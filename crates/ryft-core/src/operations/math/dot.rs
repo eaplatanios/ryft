@@ -1033,13 +1033,6 @@ impl Operation<ArrayType> for ScaledDotOperation {
         SCALED_DOT_OPERATION_NAME
     }
 
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, SCALED_DOT_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("block_size", &self.block_size)?;
-            operation.field("accumulation_type", &self.accumulation_type)
-        })
-    }
-
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -1129,6 +1122,13 @@ impl Operation<ArrayType> for ScaledDotOperation {
         output_dimensions.push(Dimension::Static(lhs[rank - 2]));
         output_dimensions.push(Dimension::Static(rhs[rank - 2]));
         Ok(vec![ArrayType::new(self.accumulation_type, Shape::new(output_dimensions))])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, SCALED_DOT_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("block_size", &self.block_size)?;
+            operation.field("accumulation_type", &self.accumulation_type)
+        })
     }
 }
 
