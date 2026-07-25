@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -8,10 +9,11 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::Effects;
+use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
-use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
@@ -29,8 +31,8 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
     /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
     pub(crate) output_structure: Output::ParameterStructure,
 
-    /// [`Region`] arena containing the public entry computation and every nested computation.
-    pub(crate) regions: Vec<Region<V, O>>,
+    /// Validated [`Region`] arena containing the public entry computation and every nested computation.
+    pub(crate) regions: RegionArena<V, O>,
 
     /// [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
     pub(crate) entry: RegionId,
@@ -41,6 +43,21 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
 }
 
 impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
+    /// Creates a new [`Program`] containing the provided [`Region`]s after validating them
+    /// and their structural ordering.
+    pub fn new(
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
+        regions: Vec<Region<V, O>>,
+        entry: RegionId,
+    ) -> Result<Self, ProgramError> {
+        let regions = RegionArena::from_regions(regions)?;
+        if regions.get(entry).is_none() {
+            return Err(ProgramError::MalformedProgram(format!("entry region {entry} is out of range")));
+        }
+        Ok(Self { input_structure, output_structure, regions, entry, marker: PhantomData })
+    }
+
     /// Returns the [`Atom`]s contained in this [`Program`]'s entry [`Region`],
     /// in the order in which they will be evaluated.
     #[inline]
@@ -136,9 +153,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self.output_structure
     }
 
-    /// Returns the [`Region`]s in this [`Program`].
+    /// Returns this [`Program`]'s validated [`RegionArena`].
     #[inline]
-    pub fn regions(&self) -> &[Region<V, O>] {
+    pub fn regions(&self) -> &RegionArena<V, O> {
         &self.regions
     }
 
@@ -146,14 +163,14 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     #[inline]
     pub fn region(&self, id: RegionId) -> Result<&Region<V, O>, ProgramError> {
         self.regions
-            .get(id.index())
+            .get(id)
             .ok_or_else(|| ProgramError::MalformedProgram(format!("region {id} is out of range")))
     }
 
     /// Returns a borrowed view of the [`Region`] that corresponds to the provided [`RegionId`].
     #[inline]
     pub fn region_ref(&self, id: RegionId) -> Result<RegionRef<'_, V, O>, ProgramError> {
-        RegionRef::new(self.regions.as_slice(), id)
+        RegionRef::new(&self.regions, id)
     }
 
     /// Returns the [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
@@ -171,7 +188,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns a borrowed view of this [`Program`]'s entry [`Region`].
     #[inline]
     pub fn entry_region_ref(&self) -> RegionRef<'_, V, O> {
-        RegionRef::new(self.regions.as_slice(), self.entry).unwrap()
+        RegionRef::new(&self.regions, self.entry).unwrap()
     }
 
     /// Returns the operation-inference [`RegionInterface`] of this [`Program`]'s entry [`Region`].
@@ -338,13 +355,51 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn instruction_effects(&self, id: InstructionId) -> Result<Effects, ProgramError> {
         let instruction = self.instruction(id)?;
         let mut effects = instruction.operation().effects();
-        if !instruction.regions().is_empty() {
-            let instruction_effects = Region::effects(self.regions.as_slice());
-            for attached in instruction.regions().iter().copied() {
-                effects = effects.union(instruction_effects[attached.index()]);
-            }
+        for attached in instruction.regions().iter().copied() {
+            effects = effects.union(self.regions.effects(attached).unwrap());
         }
         Ok(effects)
+    }
+
+    /// Returns this [`Program`]'s entry point's closed [`TypeIdentitySignature`].
+    #[inline]
+    pub fn type_identity_signature(&self) -> &TypeIdentitySignature<<V::Type as Type>::Identity> {
+        self.regions.type_identity_signature(self.entry).unwrap()
+    }
+
+    /// Returns this [`Program`] with `renaming` applied to every [`Region`] [`Atom`], constant, and [`Operation`]
+    /// payload inside this [`Program`].
+    #[inline]
+    pub fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<Self, ProgramError> {
+        Self::new(
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+            self.regions
+                .iter()
+                .map(|region| region.rename_type_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            self.entry,
+        )
+    }
+
+    /// Returns this [`Program`] with its formal [`TypeIdentity`](crate::TypeIdentity)s instantiated for `input_types`.
+    /// This method validates `input_types` against the declared program input types and derives the simultaneous
+    /// [`TypeIdentityRenaming`] implied by that complete boundary. It applies a nonempty renaming throughout the
+    /// program, rebuilding and structurally reclosing the complete [`RegionArena`]. Static refinements are validated
+    /// but do not specialize the returned program's types. When no renaming is required, the result borrows this
+    /// program.
+    pub fn with_instantiated_type_identities<'p, 't>(
+        &'p self,
+        input_types: &'t [V::Type],
+    ) -> Result<Cow<'p, Self>, ProgramError> {
+        let renaming = V::Type::derive_identity_renaming(self.input_types().as_slice(), input_types)?;
+        if renaming.is_identity() {
+            return Ok(Cow::Borrowed(self));
+        }
+        Ok(Cow::Owned(self.rename_type_identities(&renaming)?))
     }
 
     /// Rebuilds this [`Program`] with each [`Operation`] mapped using the provided `map_fn`. The atom table,
@@ -358,11 +413,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self,
         mut map_fn: F,
     ) -> Result<Program<V, P, Input, Output>, ProgramError> {
-        Ok(Program {
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            regions: self
-                .regions
+        Program::new(
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+            self.regions
                 .iter()
                 .map(|region| {
                     Ok(Region {
@@ -384,9 +438,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                     })
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?,
-            entry: self.entry,
-            marker: PhantomData,
-        })
+            self.entry,
+        )
     }
 
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
@@ -415,6 +468,16 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn into_flat_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         let input_structure = vec![Placeholder; self.input_count()];
         let output_structure = vec![Placeholder; self.output_count()];
+        self.restructured(input_structure, output_structure)
+    }
+
+    /// Replaces this [`Program`]'s structured boundary metadata and returns the resulting _restructured_ [`Program`].
+    #[inline]
+    pub fn restructured<NewInput: Parameterized<V>, NewOutput: Parameterized<V>>(
+        self,
+        input_structure: NewInput::ParameterStructure,
+        output_structure: NewOutput::ParameterStructure,
+    ) -> Program<V, O, NewInput, NewOutput> {
         Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData }
     }
 
@@ -431,7 +494,6 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         // survive, so per-region dead-code elimination only removes internal dead work. Retained instructions keep
         // their attached-region references, and regions that lose their last reference are dropped afterward by the
         // compaction step, which also rewrites the surviving references.
-        let effects = Region::effects(self.regions.as_slice());
         let regions = self
             .regions
             .iter()
@@ -461,7 +523,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                 for instruction in region.instructions.iter() {
                     let mut instruction_effects = instruction.operation().effects();
                     for attached in instruction.regions().iter().copied() {
-                        instruction_effects = instruction_effects.union(effects[attached.index()]);
+                        instruction_effects = instruction_effects.union(self.regions.effects(attached).unwrap());
                     }
                     if instruction_effects.is_pure() {
                         continue;
@@ -522,13 +584,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (regions, entry) = compact_regions(regions, self.entry);
-        Ok(Self {
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            regions,
-            entry,
-            marker: PhantomData,
-        })
+        Self::new(self.input_structure.clone(), self.output_structure.clone(), regions, entry)
     }
 
     /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
@@ -546,9 +602,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
         // Simplify every region independently, exactly like `Self::simplified` but moving live atoms and
         // instructions into the rebuilt regions instead of cloning them.
-        let arena_effects = Region::effects(self.regions.as_slice());
+        let arena_effects = (0..self.regions.len())
+            .map(|index| self.regions.effects(RegionId::new(index)).unwrap())
+            .collect::<Vec<_>>();
         let Self { regions, input_structure, output_structure, entry, .. } = self;
         let regions = regions
+            .into_regions()
             .into_iter()
             .map(|region| {
                 let instruction_by_output = region.instruction_by_output();
@@ -653,7 +712,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (regions, entry) = compact_regions(regions, entry);
-        Ok(Self { input_structure, output_structure, regions, entry, marker: PhantomData })
+        Self::new(input_structure, output_structure, regions, entry)
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
@@ -743,16 +802,15 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
         // Nested regions of retained instructions pass through unchanged (filtering is an entry-boundary projection);
         // regions that lost their last reference are dropped and the surviving references are rewritten.
-        let mut regions = self.regions[..self.entry.index()].to_vec();
+        let mut regions = self.regions.iter().take(self.entry.index()).cloned().collect::<Vec<_>>();
         regions.push(Region { atoms: new_atoms, input_ids: new_input_ids, output_ids, instructions: new_instructions });
         let (regions, entry) = compact_regions(regions, self.entry);
-        let program = Program {
-            input_structure: vec![Placeholder; live_input_indices.len()],
-            output_structure: vec![Placeholder; outputs.len()],
+        let program = Program::new(
+            vec![Placeholder; live_input_indices.len()],
+            vec![Placeholder; outputs.len()],
             regions,
             entry,
-            marker: PhantomData,
-        };
+        )?;
         Ok((program, live_input_indices))
     }
 
@@ -769,7 +827,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
         let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let entry = self.entry;
-        let mut nested_regions = self.regions;
+        let mut nested_regions = self.regions.into_regions();
         let Region { atoms, instructions, .. } = nested_regions.pop().unwrap();
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
         let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
@@ -842,7 +900,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         });
 
         let (regions, entry) = compact_regions(nested_regions, entry);
-        Ok((Program { input_structure, output_structure, regions, entry, marker: PhantomData }, live_input_indices))
+        Ok((
+            Program::<V, O, Vec<V>, Vec<V>>::new(input_structure, output_structure, regions, entry)?,
+            live_input_indices,
+        ))
     }
 
     /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability from
@@ -925,7 +986,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         /// Renders one [`Region`] as a `lambda ... in (...)` block, recursively rendering the regions attached to its
         /// instructions according to `reference_counts` and `rendered`.
         fn render_region<V: Value, O: Operation<V::Type>>(
-            regions: &[Region<V, O>],
+            regions: &RegionArena<V, O>,
             id: RegionId,
             formatter: &mut std::fmt::Formatter<'_>,
             indentation: usize,
@@ -1035,7 +1096,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         let mut reference_counts = vec![0usize; self.regions.len()];
-        for region in &self.regions {
+        for region in self.regions.iter() {
             for instruction in &region.instructions {
                 for attached in instruction.regions().iter().copied() {
                     reference_counts[attached.index()] += 1;
@@ -1045,7 +1106,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
         let mut rendered = vec![false; self.regions.len()];
         render_region(
-            self.regions.as_slice(),
+            &self.regions,
             self.entry,
             formatter,
             indentation,
@@ -1204,7 +1265,7 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<V::Type>>(
 /// references), compacts the surviving regions' identifiers while preserving their relative order, and rewrites every
 /// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
 /// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
-/// remains valid for ascending-order recursive derivations such as [`Region::effects`].
+/// remains valid for ascending-order recursive metadata derivation by [`RegionArena`].
 fn compact_regions<V: Typed, O>(regions: Vec<Region<V, O>>, entry: RegionId) -> (Vec<Region<V, O>>, RegionId) {
     let mut reachable = vec![false; regions.len()];
     let mut pending = vec![entry];
