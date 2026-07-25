@@ -317,31 +317,46 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
-        if let Some(input_types) = input_types
-            && let Some(instantiation) = self.callee_instantiations.iter().find(|instantiation| {
-                Rc::ptr_eq(&instantiation.callee, callee) && instantiation.input_types == input_types
+        // An exact repeated instantiation can immediately reuse its previously imported root. Keep this lookup
+        // separate from the plain-callee cache below because the caller input types are part of this cache key.
+        let cached_region = input_types.and_then(|input_types| {
+            self.callee_instantiations.iter().find_map(|instantiation| {
+                let same_callee = Rc::ptr_eq(&instantiation.callee, callee);
+                let same_input_types = instantiation.input_types == input_types;
+                (same_callee && same_input_types).then_some(instantiation.region)
             })
-        {
-            return Ok(instantiation.region);
+        });
+        if let Some(region) = cached_region {
+            return Ok(region);
         }
 
+        // Deriving the renaming both validates the requested boundary and determines whether importing the callee
+        // would actually change any live identity. Calls without `input_types` have no instantiation to derive.
         let renaming = input_types
             .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
             .transpose()?;
 
-        let region = if let Some(renaming) = renaming.as_ref().filter(|renaming| !renaming.is_identity()) {
+        let non_identity_renaming = renaming.as_ref().filter(|renaming| !renaming.is_identity());
+        let region = if let Some(renaming) = non_identity_renaming {
+            // A non-identity renaming is embedded in the imported region's types, so it requires its own root.
             self.import_program(callee.rename_type_identities(renaming)?)
-        } else if let Some(region) =
-            self.callees.iter().find_map(|(interned, region)| Rc::ptr_eq(interned, callee).then_some(*region))
-        {
-            region
         } else {
-            let region = self.import_region(callee.entry_region_ref());
-            self.callees.push((callee.clone(), region));
-            region
+            // No renaming, or an identity renaming, can reuse the one plain root interned for this exact `Rc` callee.
+            let existing_region = self.callees.iter().find_map(|(interned, region)| {
+                let same_callee = Rc::ptr_eq(interned, callee);
+                same_callee.then_some(*region)
+            });
+            if let Some(region) = existing_region {
+                region
+            } else {
+                let region = self.import_region(callee.entry_region_ref());
+                self.callees.push((callee.clone(), region));
+                region
+            }
         };
 
         if let Some(input_types) = input_types {
+            // Record even identity-renaming requests so that their next exact call avoids deriving the renaming again.
             self.callee_instantiations.push(CalleeInstantiation {
                 callee: callee.clone(),
                 input_types: input_types.to_vec(),
