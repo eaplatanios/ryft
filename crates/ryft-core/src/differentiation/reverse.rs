@@ -15,11 +15,10 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId, MaybeZero};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::Effects;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{
-    BindingRegionDriver, EmptyRegionDriver, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+    BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -162,7 +161,7 @@ impl<V: Value, O: Operation<V::Type>> TranspositionDriver<V, O> for EmptyRegionD
 
 /// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
 /// [`Region`]s attached to that instruction.
-struct RecursiveTranspositionDriver<'r, V: Value, O> {
+struct RecursiveTranspositionDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Borrowed attached [`Region`](crate::Region)s, in region order.
     regions: Vec<RegionRef<'r, V, O>>,
 }
@@ -398,7 +397,6 @@ impl<
         ///   - `instruction_by_output`: Source-instruction index for each produced atom, or `None` for atoms
         ///     without an instruction producer.
         ///   - `linear`: Per-source-atom mask indicating whether the atom depends on a selected linear input.
-        ///   - `region_effects`: Recursively derived effects of the source arena.
         ///   - `region_mappings`: Replay-scoped region remapping shared by every known producer
         ///     materialized from the source arena.
         ///   - `builder`: Destination pullback builder into which demanded pure producers are replayed.
@@ -410,7 +408,6 @@ impl<
             program: RegionRef<'_, V, O>,
             instruction_by_output: &[Option<usize>],
             linear: &[bool],
-            region_effects: &[Effects],
             region_mappings: &RegionReplayMappings<V, O>,
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             known_map: &mut [Option<AtomId>],
@@ -444,18 +441,7 @@ impl<
                             .instructions()
                             .get(instruction_index)
                             .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
-                        let effects = instruction.regions().iter().try_fold(
-                            instruction.operation().effects(),
-                            |effects, region| {
-                                region_effects
-                                    .get(region.index())
-                                    .copied()
-                                    .map(|region_effects| effects.union(region_effects))
-                                    .ok_or_else(|| {
-                                        ProgramError::MalformedProgram(format!("region {region} is out of range"))
-                                    })
-                            },
-                        )?;
+                        let effects = program.instruction_effects(instruction_index)?;
                         if !effects.is_pure() {
                             return Err(ProgramError::UnsupportedOperation {
                                 message: format!(
@@ -500,7 +486,8 @@ impl<
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let driver = ReplayRegionDriver::new(program, instruction.regions(), region_mappings)?;
-                        let regions = driver.import_into(builder)?;
+                        let region_input_types = vec![None; instruction.regions().len()];
+                        let regions = driver.import_into(builder, &region_input_types)?;
                         let outputs = builder
                             .borrow_mut()
                             .add_instruction(instruction.operation().clone(), regions, inputs)?
@@ -597,7 +584,6 @@ impl<
         // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
         // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
         let instruction_by_output = self.region().instruction_by_output();
-        let region_effects = Region::effects(self.regions());
         let region_mappings = RegionReplayMappings::new();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
@@ -670,7 +656,6 @@ impl<
                             *self,
                             instruction_by_output.as_slice(),
                             linear.as_slice(),
-                            region_effects.as_slice(),
                             &region_mappings,
                             &builder,
                             known_map.as_mut_slice(),
@@ -767,14 +752,7 @@ where
         let flat = self
             .entry_region_ref()
             .transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
-        let Program { regions, entry, .. } = flat;
-        Ok(Program {
-            input_structure: self.output_structure().clone(),
-            output_structure: self.input_structure().clone(),
-            regions,
-            entry,
-            marker: PhantomData,
-        })
+        Ok(flat.restructured(self.output_structure().clone(), self.input_structure().clone())?)
     }
 
     /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ with respect to selected
@@ -1423,7 +1401,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::marker::PhantomData;
 
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
@@ -1446,7 +1423,7 @@ mod tests {
     use crate::programs::instructions::Instruction;
     use crate::programs::operations::Operation;
     use crate::programs::programs::Program;
-    use crate::programs::regions::{Region, RegionId, RegionInterface};
+    use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{TypeError, Typed};
     use crate::programs::values::{Concretizable, Value};
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
@@ -1516,6 +1493,13 @@ mod tests {
             }
         }
 
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            match self {
+                Self::RegionIdentity => const { &[RegionSlot::computation("body")] },
+                _ => &[],
+            }
+        }
+
         fn infer_output_types(
             &self,
             input_types: &[DataType],
@@ -1549,13 +1533,6 @@ mod tests {
                     Ok(vec![input_types[0].clone(), input_types[0].clone()])
                 }
                 Self::Zero(zero) => zero.infer_output_types(input_types, region_interfaces),
-            }
-        }
-
-        fn region_names(&self) -> &'static [&'static str] {
-            match self {
-                Self::RegionIdentity => &["body"],
-                _ => &[],
             }
         }
 
@@ -1902,30 +1879,29 @@ mod tests {
 
         // Test that an unbound program input atom is reported.
         let input = AtomId::new(0);
-        let program = Program::<Scalar, TestLinearOperation, Scalar, ()> {
-            input_structure: Placeholder,
-            output_structure: (),
-            regions: vec![Region {
+        let program = Program::<Scalar, TestLinearOperation, Scalar, ()>::new(
+            Placeholder,
+            (),
+            vec![Region {
                 atoms: Vec::new(),
                 input_ids: vec![input],
                 output_ids: Vec::new(),
                 instructions: Vec::new(),
             }],
-            entry: RegionId::new(0),
-            marker: PhantomData,
-        };
+            RegionId::new(0),
+        );
         assert!(matches!(
-            program.transpose(),
-            Err(DifferentiationError::Program(ProgramError::UnboundAtomId { id })) if id == input,
+            program,
+            Err(ProgramError::UnboundAtomId { id }) if id == input,
         ));
 
         // Test that an unbound instruction output atom is reported.
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
-        let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar> {
-            input_structure: Placeholder,
-            output_structure: Placeholder,
-            regions: vec![Region {
+        let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar>::new(
+            Placeholder,
+            Placeholder,
+            vec![Region {
                 atoms: vec![Atom::Variable(DataType::F64)],
                 input_ids: vec![input],
                 output_ids: vec![input],
@@ -1936,12 +1912,11 @@ mod tests {
                     Vec::new(),
                 )],
             }],
-            entry: RegionId::new(0),
-            marker: PhantomData,
-        };
+            RegionId::new(0),
+        );
         assert!(matches!(
-            program.transpose(),
-            Err(DifferentiationError::Program(ProgramError::UnboundAtomId { id })) if id == missing_output,
+            program,
+            Err(ProgramError::UnboundAtomId { id }) if id == missing_output,
         ));
     }
 

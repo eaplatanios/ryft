@@ -51,10 +51,54 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         regions: Vec<Region<V, O>>,
         entry: RegionId,
     ) -> Result<Self, ProgramError> {
+        // Seal regions in arena order first. Sealing validates atom and attached-region references while deriving the
+        // immutable recursive metadata used by effect analysis and type-identity instantiation. Because a region may
+        // reference only previously sealed regions, this also establishes the arena's descendant-before-parent order.
         let regions = RegionArena::from_regions(regions)?;
-        if regions.get(entry).is_none() {
+
+        // The entry identifier is supplied separately from the arena, so validate it before using the entry boundary
+        // to establish the structured program signature.
+        let Some(entry_region) = regions.get(entry) else {
             return Err(ProgramError::MalformedProgram(format!("entry region {entry} is out of range")));
+        };
+
+        // The parameter structures describe the public structured signature, while the entry region stores its flat
+        // atom boundary. Their leaf counts must agree so flattening inputs and reconstructing outputs are total.
+        check_count!("input", entry_region.input_ids(), input_structure.parameter_count(), ProgramError);
+        check_count!("output", entry_region.output_ids(), output_structure.parameter_count(), ProgramError);
+
+        // A complete program arena is rooted at its final sealed region. Every attached descendant must precede its
+        // parent, and the entry has no enclosing parent. Keeping the entry final lets imports and transforms append or
+        // remove complete rooted region closures without maintaining a separate arbitrary-root ordering.
+        if entry.index() + 1 != regions.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "entry region {entry} must be the final region in the arena",
+            )));
         }
+
+        // Walk the attached-region graph from the entry. Shared descendants may be encountered through several
+        // instructions, so `reachable` both records the final closure and prevents traversing the same region twice.
+        let mut reachable = vec![false; regions.len()];
+        let mut pending = vec![entry];
+        while let Some(current) = pending.pop() {
+            if std::mem::replace(&mut reachable[current.index()], true) {
+                continue;
+            }
+            for instruction in regions[current.index()].instructions() {
+                pending.extend(instruction.regions().iter().copied());
+            }
+        }
+
+        // Reject sealed but orphaned regions. Requiring the arena to equal the entry's complete reachable closure
+        // prevents dead nested programs from being retained or unexpectedly copied by whole-program transforms and
+        // imports.
+        if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region {} is not reachable from the program entry region",
+                RegionId::new(unreachable),
+            )));
+        }
+
         Ok(Self { input_structure, output_structure, regions, entry, marker: PhantomData })
     }
 
@@ -339,9 +383,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
     /// Returns the [`Effect`](crate::Effect) classes reachable from this [`Program`]'s entry region, or
     /// [`Effects::PURE`] for programs with no instructions. Because attached regions live in the same arena,
-    /// nested-computation effects are visible through higher-order boundaries without any per-operation forwarding.
-    /// The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`], which merges one
-    /// instruction's own effects with its attached [`Region`]s' effects.
+    /// nested-computation effects are visible through higher-order boundaries. Attached
+    /// [`RegionRole::Rule`](crate::RegionRole::Rule) regions are excluded because they are dormant during ordinary
+    /// interpretation. The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`].
     #[inline]
     pub fn effects(&self) -> Effects {
         self.entry_region_ref().effects()
@@ -349,16 +393,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
     /// Returns the [`Effect`](crate::Effect) classes of the [`Instruction`] at the provided [`InstructionId`]. That is
     /// defined as the union of its [`Operation`]'s intrinsic [`Operation::effects`] and the recursively derived effects
-    /// of its attached [`Region`]s (including regions attached to instructions inside those regions). Consulting only
-    /// the operation's intrinsic effects would be unsound for region-carrying instructions because an effect inside an
-    /// attached region is observable whenever the instruction executes that region.
+    /// of attached [`RegionRole::Computation`](crate::RegionRole::Computation) regions. Consulting only the operation's
+    /// intrinsic effects would be unsound for control-flow and call operations, while unconditionally including
+    /// transform-only rule regions would incorrectly make the ordinary computation effectful.
+    #[inline]
     pub fn instruction_effects(&self, id: InstructionId) -> Result<Effects, ProgramError> {
-        let instruction = self.instruction(id)?;
-        let mut effects = instruction.operation().effects();
-        for attached in instruction.regions().iter().copied() {
-            effects = effects.union(self.regions.effects(attached).unwrap());
-        }
-        Ok(effects)
+        self.region_ref(id.region())?.instruction_effects(id.index())
     }
 
     /// Returns this [`Program`]'s entry point's closed [`TypeIdentitySignature`].
@@ -468,17 +508,20 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn into_flat_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         let input_structure = vec![Placeholder; self.input_count()];
         let output_structure = vec![Placeholder; self.output_count()];
-        self.restructured(input_structure, output_structure)
+        Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData }
     }
 
-    /// Replaces this [`Program`]'s structured boundary metadata and returns the resulting _restructured_ [`Program`].
+    /// Replaces this [`Program`]'s structured boundary metadata after validating that the new structures
+    /// are compatible with this program's number of input and output values.
     #[inline]
     pub fn restructured<NewInput: Parameterized<V>, NewOutput: Parameterized<V>>(
         self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
-    ) -> Program<V, O, NewInput, NewOutput> {
-        Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData }
+    ) -> Result<Program<V, O, NewInput, NewOutput>, ProgramError> {
+        check_count!("input", self.input_ids(), input_structure.parameter_count(), ProgramError);
+        check_count!("output", self.output_ids(), output_structure.parameter_count(), ProgramError);
+        Ok(Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData })
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -497,7 +540,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         let regions = self
             .regions
             .iter()
-            .map(|region| {
+            .enumerate()
+            .map(|(region_index, region)| {
                 let instruction_by_output = region.instruction_by_output();
                 let mut new_atoms = Vec::with_capacity(region.atoms.len());
                 let mut new_input_ids = Vec::with_capacity(region.input_ids.len());
@@ -520,12 +564,11 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                 // Make sure that effectful instructions and their transitive dependencies are processed in original
                 // instruction order before the outputs, so that instructions with observable effects survive even
                 // when dead and ordered effects keep their relative order.
-                for instruction in region.instructions.iter() {
-                    let mut instruction_effects = instruction.operation().effects();
-                    for attached in instruction.regions().iter().copied() {
-                        instruction_effects = instruction_effects.union(self.regions.effects(attached).unwrap());
-                    }
-                    if instruction_effects.is_pure() {
+                for (instruction_index, instruction) in region.instructions.iter().enumerate() {
+                    if self
+                        .instruction_effects(InstructionId::new(RegionId::new(region_index), instruction_index))?
+                        .is_pure()
+                    {
                         continue;
                     }
                     if instruction.outputs().is_empty() {
@@ -602,28 +645,32 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
         // Simplify every region independently, exactly like `Self::simplified` but moving live atoms and
         // instructions into the rebuilt regions instead of cloning them.
-        let arena_effects = (0..self.regions.len())
-            .map(|index| self.regions.effects(RegionId::new(index)).unwrap())
+        let effectful_instructions = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(region_index, region)| {
+                region
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .filter(|(instruction_index, _)| {
+                        !self
+                            .instruction_effects(InstructionId::new(RegionId::new(region_index), *instruction_index))
+                            .unwrap()
+                            .is_pure()
+                    })
+                    .map(|(instruction_index, instruction)| (instruction_index, instruction.outputs().to_vec()))
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let Self { regions, input_structure, output_structure, entry, .. } = self;
         let regions = regions
             .into_regions()
             .into_iter()
-            .map(|region| {
+            .zip(effectful_instructions)
+            .map(|(region, effectful_instructions)| {
                 let instruction_by_output = region.instruction_by_output();
-                let effectful_instructions = region
-                    .instructions
-                    .iter()
-                    .enumerate()
-                    .filter(|instruction| {
-                        let mut effects = instruction.1.operation().effects();
-                        for attached in instruction.1.regions().iter().copied() {
-                            effects = effects.union(arena_effects[attached.index()]);
-                        }
-                        !effects.is_pure()
-                    })
-                    .map(|(index, instruction)| (index, instruction.outputs().to_vec()))
-                    .collect::<Vec<_>>();
                 let Region { atoms, input_ids, output_ids, instructions } = region;
                 let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
                 let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
@@ -716,11 +763,11 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
-    /// keeps only the [`Instruction`]s reachable from `outputs` or from the provided `keep_alive` atoms and lifts
-    /// embedded constants directly into the result. Entries of `inputs` that are not reachable from any requested
-    /// output or keep-alive atom are dropped. The returned index vector lists, in order, the positions of `inputs`
-    /// that remain live and become the public inputs of the rebuilt program, so that callers can map rebuilt inputs
-    /// back to the original boundary.
+    /// keeps only the [`Instruction`]s reachable from `outputs`, from the provided `keep_alive` atoms, or from
+    /// observable effects, and lifts embedded constants directly into the result. Entries of `inputs` that are not
+    /// reachable from any requested output, keep-alive atom, or effectful instruction are dropped. The returned index
+    /// vector lists, in order, the positions of `inputs` that remain live and become the public inputs of the rebuilt
+    /// program, so that callers can map rebuilt inputs back to the original boundary.
     ///
     /// Each [`Atom::Variable`] reachable from an output or keep-alive atom must either appear in `inputs` or be
     /// produced by an [`Instruction`] of this program. Reaching any other source variable (e.g., an original program
@@ -749,7 +796,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     where
         O: Clone,
     {
-        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
+        let (instruction_by_output, input_liveness, effectful_instructions) =
+            self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let entry_region = self.entry_region();
         let mut new_atoms = Vec::with_capacity(entry_region.atoms.len());
         let mut new_input_ids = Vec::new();
@@ -771,9 +819,47 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             live_input_indices.push(position);
         }
 
-        // Make sure that the keep-alive-atom-producing instructions and their transitive dependencies are processed in
-        // original instruction order before the outputs, so that instructions with observable effects survive even when
-        // dead and ordered effects keep their relative order.
+        // Process effectful instructions first, in original order, so dead effects survive and ordered effects retain
+        // their relative order. Instructions without outputs need explicit rebuilding because they cannot be reached
+        // through the instruction-by-output map.
+        for (instruction_index, effect_outputs) in effectful_instructions {
+            let instruction = &entry_region.instructions()[instruction_index];
+            if effect_outputs.is_empty() {
+                let effect_inputs = instruction
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .map(|input| {
+                        clone_atom_subgraph_into_region(
+                            &mut atom_id_mapping,
+                            input,
+                            entry_region,
+                            instruction_by_output.as_slice(),
+                            &mut new_atoms,
+                            &mut new_instructions,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                new_instructions.push(Instruction::new(
+                    instruction.operation().clone(),
+                    effect_inputs,
+                    Vec::new(),
+                    instruction.regions().to_vec(),
+                ));
+            } else {
+                for root in effect_outputs {
+                    clone_atom_subgraph_into_region(
+                        &mut atom_id_mapping,
+                        root,
+                        entry_region,
+                        instruction_by_output.as_slice(),
+                        &mut new_atoms,
+                        &mut new_instructions,
+                    )?;
+                }
+            }
+        }
+
         for root in keep_alive.iter().copied() {
             clone_atom_subgraph_into_region(
                 &mut atom_id_mapping,
@@ -825,7 +911,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         outputs: &[AtomId],
         keep_alive: &[AtomId],
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
-        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
+        let (instruction_by_output, input_liveness, effectful_instructions) =
+            self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let entry = self.entry;
         let mut nested_regions = self.regions.into_regions();
         let Region { atoms, instructions, .. } = nested_regions.pop().unwrap();
@@ -856,9 +943,51 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             live_input_indices.push(position);
         }
 
-        // Make sure that the keep-alive-atom-producing instructions and their transitive dependencies are processed in
-        // original instruction order before the outputs, so that instructions with observable effects survive even when
-        // dead and ordered effects keep their relative order.
+        // Process effectful instructions first, in original order, so dead effects survive and ordered effects retain
+        // their relative order. Instructions without outputs need explicit rebuilding because they cannot be reached
+        // through the instruction-by-output map.
+        for (instruction_index, effect_outputs) in effectful_instructions {
+            if effect_outputs.is_empty() {
+                let instruction = instructions[instruction_index]
+                    .take()
+                    .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
+                let effect_inputs = instruction
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .map(|input| {
+                        move_atom_to_program(
+                            &mut atom_id_mapping,
+                            input,
+                            atoms.as_mut_slice(),
+                            instructions.as_mut_slice(),
+                            instruction_by_output.as_slice(),
+                            &mut new_atoms,
+                            &mut new_instructions,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                new_instructions.push(Instruction::new(
+                    instruction.operation,
+                    effect_inputs,
+                    Vec::new(),
+                    instruction.regions,
+                ));
+            } else {
+                for root in effect_outputs {
+                    move_atom_to_program(
+                        &mut atom_id_mapping,
+                        root,
+                        atoms.as_mut_slice(),
+                        instructions.as_mut_slice(),
+                        instruction_by_output.as_slice(),
+                        &mut new_atoms,
+                        &mut new_instructions,
+                    )?;
+                }
+            }
+        }
+
         for root in keep_alive.iter().copied() {
             move_atom_to_program(
                 &mut atom_id_mapping,
@@ -906,17 +1035,18 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         ))
     }
 
+    // TODO(eaplatanios): This is a bit of a weird interface and also, is it necessary that we return the third part?
     /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability from
-    /// `outputs` and the provided `keep_alive` atoms, which of them are live (i.e., reachable from a requested output
-    /// or a keep-alive atom). Returns this program's instruction-by-output map together with one liveness flag per
-    /// `inputs` entry. Reaching any variable that is neither listed in `inputs` nor produced by an [`Instruction`]
-    /// is reported as a [`ProgramError::MalformedProgram`].
+    /// `outputs`, the provided `keep_alive` atoms, and all effectful instructions, which of them are live. Returns this
+    /// program's instruction-by-output map, one liveness flag per `inputs` entry, and the effectful [`Instruction`]s in
+    /// program order. Reaching any variable that is neither listed in `inputs` nor produced by an [`Instruction`] is
+    /// reported as a [`ProgramError::MalformedProgram`].
     fn compute_live_inputs(
         &self,
         inputs: &[AtomId],
         outputs: &[AtomId],
         keep_alive: &[AtomId],
-    ) -> Result<(Vec<Option<usize>>, Vec<bool>), ProgramError> {
+    ) -> Result<(Vec<Option<usize>>, Vec<bool>, Vec<(usize, Vec<AtomId>)>), ProgramError> {
         let mut input_position = vec![None; self.atoms().len()];
         for (position, id) in inputs.iter().copied().enumerate() {
             let atom = self.atoms().get(id.index()).ok_or(ProgramError::UnboundAtomId { id })?;
@@ -933,10 +1063,22 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         let instruction_by_output = self.instruction_by_output();
+        let effectful_instructions = self
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter(|(instruction_index, _)| {
+                !self.instruction_effects(InstructionId::new(self.entry, *instruction_index)).unwrap().is_pure()
+            })
+            .map(|(instruction_index, instruction)| (instruction_index, instruction.outputs().to_vec()))
+            .collect::<Vec<_>>();
         let mut needed = vec![false; self.atoms().len()];
         let mut input_liveness = vec![false; inputs.len()];
         let mut stack = Vec::new();
-        for output in outputs.iter().copied().chain(keep_alive.iter().copied()) {
+        let effect_roots = effectful_instructions.iter().flat_map(|(instruction_index, outputs)| {
+            if outputs.is_empty() { self.instructions()[*instruction_index].inputs() } else { outputs.as_slice() }
+        });
+        for output in outputs.iter().chain(keep_alive).chain(effect_roots).copied() {
             if output.index() >= self.atoms().len() {
                 return Err(ProgramError::UnboundAtomId { id: output });
             }
@@ -969,7 +1111,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             }
         }
 
-        Ok((instruction_by_output, input_liveness))
+        Ok((instruction_by_output, input_liveness, effectful_instructions))
     }
 }
 
@@ -977,7 +1119,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
     /// are nested within other programs like with control flow [`Operation`]s. [`Instruction`]s with attached
     /// [`Region`]s render a bracketed region section after their inputs, pairing each region with its declared
-    /// name from [`Operation::region_names`] (falling back to the region index for undeclared regions). A region
+    /// name from [`Operation::region_slots`] (falling back to the region index for undeclared regions). A region
     /// referenced exactly once renders nested beneath its referencing instruction, while a region referenced multiple
     /// times renders its body exactly once (at its first reference, labeled with its [`RegionId`]), and every later
     /// reference renders as that identifier alone. [`RegionId`]s are arena indices and therefore deterministic
@@ -1046,13 +1188,13 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                             instruction.operation.render(formatter, line_indentation)?;
                             instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
                             if !instruction.regions.is_empty() {
-                                let names = instruction.operation.region_names();
+                                let slots = instruction.operation.region_slots();
                                 write!(formatter, " [")?;
                                 for (slot, attached) in instruction.regions.iter().copied().enumerate() {
                                     writeln!(formatter)?;
                                     write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
-                                    match names.get(slot) {
-                                        Some(name) => write!(formatter, "{name}=")?,
+                                    match slots.get(slot) {
+                                        Some(slot) => write!(formatter, "{}=", slot.name)?,
                                         None => write!(formatter, "{slot}=")?,
                                     }
                                     let is_shared = reference_counts[attached.index()] > 1;
@@ -1402,6 +1544,7 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationFormatter;
+    use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::tests::TestRegionOperation;
     use crate::types::DataType;
@@ -1460,6 +1603,42 @@ mod tests {
 
         fn effects(&self) -> Effects {
             Effects::single(Effect::OrderedIo)
+        }
+    }
+
+    /// Pure test operation whose attached region is transform metadata rather than an executable computation.
+    #[derive(Clone, Debug)]
+    enum DormantRegionOperation {
+        Dormant,
+        Effectful,
+    }
+
+    impl Operation<DataType> for DormantRegionOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Dormant => "dormant_region",
+                Self::Effectful => "effectful",
+            }
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            match self {
+                Self::Dormant => const { &[RegionSlot::rule("rule")] },
+                Self::Effectful => &[],
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[DataType],
+            _region_interfaces: &[RegionInterface<DataType>],
+        ) -> Result<Vec<DataType>, TypeError> {
+            check_count!("input", input_types, 1, TypeError);
+            Ok(input_types.to_vec())
+        }
+
+        fn effects(&self) -> Effects {
+            if matches!(self, Self::Effectful) { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
         }
     }
 
@@ -1803,6 +1982,52 @@ mod tests {
     }
 
     #[test]
+    fn test_program_construction_and_restructuring_validate_boundaries() {
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let program = builder.build::<Scalar, Scalar>(vec![input], Placeholder, Placeholder).unwrap();
+        let entry = program.entry();
+        let regions = program.regions.clone().into_regions();
+
+        assert!(matches!(
+            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+                Vec::new(),
+                vec![Placeholder],
+                regions.clone(),
+                entry,
+            ),
+            Err(ProgramError::InvalidInputCount { actual: 1, expected: 0 }),
+        ));
+        assert!(matches!(
+            program.to_flat_program().restructured::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), vec![Placeholder]),
+            Err(ProgramError::InvalidInputCount { actual: 1, expected: 0 }),
+        ));
+
+        let mut unreachable_regions = regions;
+        unreachable_regions.push(unreachable_regions[0].clone());
+        assert!(matches!(
+            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+                vec![Placeholder],
+                vec![Placeholder],
+                unreachable_regions.clone(),
+                RegionId::new(0),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "entry region ^0 must be the final region in the arena",
+        ));
+        assert!(matches!(
+            Program::<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>::new(
+                vec![Placeholder],
+                vec![Placeholder],
+                unreachable_regions,
+                RegionId::new(1),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is not reachable from the program entry region",
+        ));
+    }
+
+    #[test]
     fn test_program_simplified() {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
@@ -2029,6 +2254,27 @@ mod tests {
         assert_eq!(pinned_live, vec![0, 1]);
         assert_eq!(pinned.input_ids().len(), 2);
         assert_eq!(pinned.interpret(vec![Scalar::from(4.0), Scalar::from(9.0)]), Ok(vec![Scalar::from(-2.0)]));
+
+        // Observable effects are implicit roots even when neither their results nor their operands are explicitly
+        // kept alive.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(NegOperation, Vec::new(), vec![input]).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
+        let effectful = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.instructions().len(), 2);
+        assert_eq!(filtered.effects(), Effects::single(Effect::OrderedIo));
+
+        // Zero-output effects are preserved explicitly because they have no result atom that can serve as a root.
+        let mut builder = ProgramBuilder::<Scalar, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
+        let effectful = builder.build::<Scalar, Vec<Scalar>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+        let (filtered, live) = effectful.filtered(&[input], &[], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.instructions().len(), 1);
     }
 
     #[test]
@@ -2068,6 +2314,14 @@ mod tests {
         assert_eq!(kept.instructions().len(), 2);
         assert_eq!(kept.output_ids().len(), 1);
         assert_eq!(kept.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-4.0)]));
+
+        let mut builder = ProgramBuilder::<Scalar, ZeroOutputEffectOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
+        let effectful = builder.build::<Scalar, Vec<Scalar>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+        let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.instructions().len(), 1);
     }
 
     #[test]
@@ -2085,10 +2339,20 @@ mod tests {
         let inline = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(DataType::F64);
         let first = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["first", "second"]), vec![shared, shared], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![shared, shared],
+                vec![input],
+            )
             .unwrap()[0];
         let second = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![inline], vec![first])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![inline],
+                vec![first],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
@@ -2132,7 +2396,11 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(DataType::F64);
         let with_regions = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+            )
             .unwrap()[0];
         let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, with_regions]).unwrap();
         let output = output[0];
@@ -2146,6 +2414,22 @@ mod tests {
         );
         assert_eq!(program.instruction_effects(InstructionId::new(entry, 1)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::single(Effect::OrderedIo));
+
+        // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
+        // containing instruction or program effectful.
+        let mut rule_builder = ProgramBuilder::<Scalar, DormantRegionOperation>::new();
+        let rule_input = rule_builder.add_input(DataType::F64);
+        let rule_output = rule_builder
+            .add_instruction(DormantRegionOperation::Effectful, Vec::new(), vec![rule_input])
+            .unwrap()[0];
+        let rule_program = rule_builder.build::<Scalar, Scalar>(vec![rule_output], Placeholder, Placeholder).unwrap();
+        let mut builder = ProgramBuilder::<Scalar, DormantRegionOperation>::new();
+        let dormant = builder.import_region(rule_program.entry_region_ref());
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(), Effects::PURE);
+        assert_eq!(program.effects(), Effects::PURE);
     }
 
     #[test]
@@ -2172,10 +2456,18 @@ mod tests {
         let effectful_region = builder.import_region(effectful_program.entry_region_ref());
         let input = builder.add_input(DataType::F64);
         builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![pure_region], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![pure_region],
+                vec![input],
+            )
             .unwrap();
         builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![effectful_region], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![effectful_region],
+                vec![input],
+            )
             .unwrap();
         let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
         let program = builder
@@ -2185,7 +2477,10 @@ mod tests {
         let simplified = program.simplified().unwrap();
         assert_eq!(simplified.regions().len(), 2);
         assert_eq!(simplified.instructions().len(), 2);
-        assert_eq!(simplified.instructions()[0].operation(), &TestRegionOperation::WithRegions(&["body"]));
+        assert_eq!(
+            simplified.instructions()[0].operation(),
+            &TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+        );
         assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
         assert_eq!(simplified.instructions()[1].operation(), &TestRegionOperation::Add);
         assert!(!simplified.region(RegionId::new(0)).unwrap().instructions()[0].operation().effects().is_pure());

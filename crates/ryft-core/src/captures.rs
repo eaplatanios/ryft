@@ -28,7 +28,6 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
@@ -369,9 +368,8 @@ impl<
         // of the replay. Their identifiers are arena indices assigned in order, so copying them in order preserves
         // every entry-instruction region reference.
         let mut builder = ProgramBuilder::new();
-        builder.regions = RegionArena::from_regions(
-            self.program.regions().iter().take(self.program.entry().index()).cloned().collect(),
-        )?;
+        builder.regions = self.program.regions().clone();
+        builder.regions.pop().unwrap();
         let capture_inputs = self
             .captures
             .iter()
@@ -471,7 +469,9 @@ mod tests {
     use crate::operations::control_flow::WhileOperation;
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, TypeIdentityRenaming};
+    use crate::programs::{
+        EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming,
+    };
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
     use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
@@ -608,7 +608,11 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let entry_capture = builder.add_constant(CaptureReference::new(2, DataType::F64));
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![entry_capture])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![entry_capture],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
@@ -709,7 +713,11 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let entry_capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![entry_capture])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![entry_capture],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
@@ -739,7 +747,11 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let entry_input = builder.add_input(DataType::F64);
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![entry_input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![entry_input],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
