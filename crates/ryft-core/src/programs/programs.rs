@@ -796,8 +796,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     where
         O: Clone,
     {
-        let (instruction_by_output, input_liveness, effectful_instructions) =
-            self.compute_live_inputs(inputs, outputs, keep_alive)?;
+        let ProgramLivenessAnalysis { instruction_by_output, input_liveness, effectful_instruction_indices } =
+            self.analyze_liveness(inputs, outputs, keep_alive)?;
         let entry_region = self.entry_region();
         let mut new_atoms = Vec::with_capacity(entry_region.atoms.len());
         let mut new_input_ids = Vec::new();
@@ -822,9 +822,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         // Process effectful instructions first, in original order, so dead effects survive and ordered effects retain
         // their relative order. Instructions without outputs need explicit rebuilding because they cannot be reached
         // through the instruction-by-output map.
-        for (instruction_index, effect_outputs) in effectful_instructions {
+        for instruction_index in effectful_instruction_indices {
             let instruction = &entry_region.instructions()[instruction_index];
-            if effect_outputs.is_empty() {
+            if instruction.outputs().is_empty() {
                 let effect_inputs = instruction
                     .inputs()
                     .iter()
@@ -847,7 +847,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                     instruction.regions().to_vec(),
                 ));
             } else {
-                for root in effect_outputs {
+                for root in instruction.outputs().iter().copied() {
                     clone_atom_subgraph_into_region(
                         &mut atom_id_mapping,
                         root,
@@ -911,8 +911,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         outputs: &[AtomId],
         keep_alive: &[AtomId],
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
-        let (instruction_by_output, input_liveness, effectful_instructions) =
-            self.compute_live_inputs(inputs, outputs, keep_alive)?;
+        let ProgramLivenessAnalysis { instruction_by_output, input_liveness, effectful_instruction_indices } =
+            self.analyze_liveness(inputs, outputs, keep_alive)?;
         let entry = self.entry;
         let mut nested_regions = self.regions.into_regions();
         let Region { atoms, instructions, .. } = nested_regions.pop().unwrap();
@@ -946,8 +946,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         // Process effectful instructions first, in original order, so dead effects survive and ordered effects retain
         // their relative order. Instructions without outputs need explicit rebuilding because they cannot be reached
         // through the instruction-by-output map.
-        for (instruction_index, effect_outputs) in effectful_instructions {
-            if effect_outputs.is_empty() {
+        for instruction_index in effectful_instruction_indices {
+            if instructions[instruction_index].as_ref().unwrap().outputs().is_empty() {
                 let instruction = instructions[instruction_index]
                     .take()
                     .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
@@ -974,6 +974,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                     instruction.regions,
                 ));
             } else {
+                // Moving one output may consume its producing instruction, so retain the small output-ID list
+                // before mutating the instruction table.
+                let effect_outputs = instructions[instruction_index].as_ref().unwrap().outputs().to_vec();
                 for root in effect_outputs {
                     move_atom_to_program(
                         &mut atom_id_mapping,
@@ -1035,18 +1038,16 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         ))
     }
 
-    // TODO(eaplatanios): This is a bit of a weird interface and also, is it necessary that we return the third part?
-    /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability from
-    /// `outputs`, the provided `keep_alive` atoms, and all effectful instructions, which of them are live. Returns this
-    /// program's instruction-by-output map, one liveness flag per `inputs` entry, and the effectful [`Instruction`]s in
-    /// program order. Reaching any variable that is neither listed in `inputs` nor produced by an [`Instruction`] is
-    /// reported as a [`ProgramError::MalformedProgram`].
-    fn compute_live_inputs(
+    /// Analyzes entry-region liveness for a filtered program boundary. `inputs` must be a deduplicated collection of
+    /// [`Atom::Variable`]s. Reverse reachability begins at `outputs`, the provided `keep_alive` atoms, and every
+    /// effectful instruction, including instructions without outputs. Reaching a variable that is neither listed in
+    /// `inputs` nor produced by an [`Instruction`] is reported as a [`ProgramError::MalformedProgram`].
+    fn analyze_liveness(
         &self,
         inputs: &[AtomId],
         outputs: &[AtomId],
         keep_alive: &[AtomId],
-    ) -> Result<(Vec<Option<usize>>, Vec<bool>, Vec<(usize, Vec<AtomId>)>), ProgramError> {
+    ) -> Result<ProgramLivenessAnalysis, ProgramError> {
         let mut input_position = vec![None; self.atoms().len()];
         for (position, id) in inputs.iter().copied().enumerate() {
             let atom = self.atoms().get(id.index()).ok_or(ProgramError::UnboundAtomId { id })?;
@@ -1063,20 +1064,21 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         let instruction_by_output = self.instruction_by_output();
-        let effectful_instructions = self
+        let effectful_instruction_indices = self
             .instructions()
             .iter()
             .enumerate()
             .filter(|(instruction_index, _)| {
                 !self.instruction_effects(InstructionId::new(self.entry, *instruction_index)).unwrap().is_pure()
             })
-            .map(|(instruction_index, instruction)| (instruction_index, instruction.outputs().to_vec()))
+            .map(|(instruction_index, _)| instruction_index)
             .collect::<Vec<_>>();
         let mut needed = vec![false; self.atoms().len()];
         let mut input_liveness = vec![false; inputs.len()];
         let mut stack = Vec::new();
-        let effect_roots = effectful_instructions.iter().flat_map(|(instruction_index, outputs)| {
-            if outputs.is_empty() { self.instructions()[*instruction_index].inputs() } else { outputs.as_slice() }
+        let effect_roots = effectful_instruction_indices.iter().flat_map(|instruction_index| {
+            let instruction = &self.instructions()[*instruction_index];
+            if instruction.outputs().is_empty() { instruction.inputs() } else { instruction.outputs() }
         });
         for output in outputs.iter().chain(keep_alive).chain(effect_roots).copied() {
             if output.index() >= self.atoms().len() {
@@ -1111,7 +1113,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             }
         }
 
-        Ok((instruction_by_output, input_liveness, effectful_instructions))
+        Ok(ProgramLivenessAnalysis { instruction_by_output, input_liveness, effectful_instruction_indices })
     }
 }
 
@@ -1328,6 +1330,19 @@ impl ProgramLiveSets {
         self.instructions.as_slice()
     }
 }
+
+/// Entry-[`Region`] liveness analysis result shared by the borrowing and consuming [`Program`] filter implementations.
+struct ProgramLivenessAnalysis {
+    /// Source [`Instruction`] index producing each entry-[`Region`] [`Atom`], or [`None`] for atoms without a producer.
+    instruction_by_output: Vec<Option<usize>>,
+
+    /// Liveness flag for each input [`Atom`], in caller-provided input order.
+    input_liveness: Vec<bool>,
+
+    /// Indices of effectful entry-[`Region`] [`Instruction`]s, retained in original [`Program`] order.
+    effectful_instruction_indices: Vec<usize>,
+}
+
 /// Copies the [`Atom`] that corresponds to `atom_id` in `region` (and its transitive producers) into `new_atoms` and
 /// `new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already present in the
 /// mapping (e.g., rebuilt region inputs) are reused, [`Atom::Constant`]s are cloned directly, and [`Atom::Variable`]s
