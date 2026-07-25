@@ -557,8 +557,9 @@ impl<'c> XlaDomain<'c> {
         // Trace the single-instruction program over the inputs' physical types, shardings included, attaching the
         // provided region bodies to that instruction.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let region_input_types = vec![None; driver.regions().count()];
         let builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
-        let region_ids = driver.import_into(&builder)?;
+        let region_ids = driver.import_into(&builder, &region_input_types)?;
         let output_atoms = {
             let mut builder = builder.borrow_mut();
             let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();

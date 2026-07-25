@@ -15,7 +15,7 @@ use ryft_core::partial::{
     PartiallyEvaluatableOperation,
 };
 use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{RegionInterface, RegionRef};
+use ryft_core::programs::regions::{RegionInterface, RegionRef, RegionSlot};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
@@ -197,6 +197,11 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
         "shard_map"
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("body")] }
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -208,11 +213,6 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
             self.output_types.as_slice(),
             input_types,
         )
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["body"]
     }
 }
 

@@ -5699,7 +5699,7 @@ where
     let location = context.unknown_location();
     let module = context.module(location)?;
     let mut mesh = None;
-    for region in program.regions() {
+    for region in program.regions().iter() {
         for atom in region.atoms() {
             let atom_type = atom.r#type();
             let Some(sharding) = atom_type.sharding() else {
@@ -5780,7 +5780,7 @@ where
     // regions of this program's one canonical arena, so iterating every arena region covers them without any
     // per-operation recursion; only `shard_map` still carries its body as a payload and recurses explicitly.
     let mut mesh = existing;
-    for region in program.regions() {
+    for region in program.regions().iter() {
         for instruction in region.instructions() {
             match &instruction.operation() {
                 XlaOperation::ShardMap(shard_map_op) => {
@@ -6712,9 +6712,11 @@ fn supports_structural_dedup_region<V: MlirLowerableValue>(region: RegionRef<'_,
         region.atoms().iter().all(|atom| !atom.is_constant())
             && region.instructions().iter().all(|instruction| {
                 !matches!(instruction.operation(), XlaOperation::ShardMap(_))
-                    && instruction.regions().iter().copied().all(|nested| {
-                        RegionRef::new(region.regions(), nested).is_ok_and(|nested| walk(nested, visited))
-                    })
+                    && instruction
+                        .regions()
+                        .iter()
+                        .copied()
+                        .all(|nested| RegionRef::new(region.arena(), nested).is_ok_and(|nested| walk(nested, visited)))
             })
     }
 
@@ -7141,7 +7143,7 @@ where
                 .regions()
                 .iter()
                 .map(|attached| {
-                    RegionRef::new(region.regions(), *attached)?
+                    RegionRef::new(region.arena(), *attached)?
                         .to_program()
                         .map_operations(|operation| Ok(XlaOperation::from(operation.clone())))
                 })
@@ -10642,7 +10644,7 @@ mod tests {
         callee: &std::rc::Rc<FlatXlaProgram>,
         inputs: Vec<AtomId>,
     ) -> AtomId {
-        let callee_region = builder.intern_callee(callee);
+        let callee_region = builder.intern_callee(callee, None).unwrap();
         builder
             .add_instruction(
                 XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new()),

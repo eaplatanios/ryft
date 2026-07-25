@@ -44,7 +44,7 @@ use ryft_core::partial::{
     PartiallyEvaluatableOperation,
 };
 use ryft_core::programs::operations::Operation;
-use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface};
+use ryft_core::programs::regions::{CalleeRegionDriver, RegionInterface, RegionSlot};
 use ryft_core::programs::{Concretizable, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
@@ -346,6 +346,11 @@ impl Operation<ArrayType> for JitCallOperation {
         "jit_call"
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("callee")] }
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -360,11 +365,6 @@ impl Operation<ArrayType> for JitCallOperation {
         let callee_interface = &region_interfaces[0];
         ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
         Ok(callee_interface.output_types().to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["callee"]
     }
 }
 
@@ -859,7 +859,7 @@ mod tests {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
-        let callee_region = builder.intern_callee(&Rc::new(callee));
+        let callee_region = builder.intern_callee(&Rc::new(callee), None).unwrap();
         let call = XlaOperation::JitCall(JitCallOperation::new());
         let outputs = builder
             .add_instruction(call, vec![callee_region], vec![known_input, runtime_input])

@@ -424,13 +424,54 @@ impl OperationEnum {
                 },
             }
         });
-        let region_name_arms = self.variants.iter().map(|variant| {
+        let type_identity_renaming_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let renamed = if variant.is_boxed {
+                quote! {
+                    ::std::boxed::Box::new(
+                        <#payload_type as #ryft::Operation<#primary_type>>::rename_type_identities(
+                            #receiver,
+                            renaming,
+                        )?
+                    )
+                }
+            } else {
+                quote! {
+                    <#payload_type as #ryft::Operation<#primary_type>>::rename_type_identities(
+                        #receiver,
+                        renaming,
+                    )?
+                }
+            };
+            quote! {
+                Self::#variant_ident(operation) => {
+                    ::std::result::Result::Ok(Self::#variant_ident(#renamed))
+                },
+            }
+        });
+        let region_instantiation_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation<#primary_type>>::region_names(#receiver)
+                    <#payload_type as #ryft::Operation<#primary_type>>::infer_region_input_types(
+                        #receiver,
+                        input_types,
+                        region_interfaces,
+                    )
+                },
+            }
+        });
+        let region_slot_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_type as #ryft::Operation<#primary_type>>::region_slots(#receiver)
                 },
             }
         });
@@ -487,16 +528,27 @@ impl OperationEnum {
                     match self { #(#name_arms)* }
                 }
 
+                fn region_slots(&self) -> &'static [#ryft::RegionSlot] {
+                    match self { #(#region_slot_arms)* }
+                }
+
+                fn infer_region_input_types(
+                    &self,
+                    input_types: &[#primary_type],
+                    region_interfaces: &[#ryft::RegionInterface<#primary_type>],
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<::std::option::Option<::std::vec::Vec<#primary_type>>>,
+                    #ryft::TypeError,
+                > {
+                    match self { #(#region_instantiation_arms)* }
+                }
+
                 fn infer_output_types(
                     &self,
                     input_types: &[#primary_type],
                     region_interfaces: &[#ryft::RegionInterface<#primary_type>],
                 ) -> ::std::result::Result<::std::vec::Vec<#primary_type>, #ryft::TypeError> {
                     match self { #(#infer_output_type_arms)* }
-                }
-
-                fn region_names(&self) -> &'static [&'static str] {
-                    match self { #(#region_name_arms)* }
                 }
 
                 fn output_region_provenance(
@@ -512,6 +564,15 @@ impl OperationEnum {
 
                 fn effects(&self) -> #ryft::Effects {
                     match self { #(#effects_arms)* }
+                }
+
+                fn rename_type_identities(
+                    &self,
+                    renaming: &#ryft::TypeIdentityRenaming<
+                        <#primary_type as #ryft::Type>::Identity,
+                    >,
+                ) -> ::std::result::Result<Self, #ryft::TypeError> {
+                    match self { #(#type_identity_renaming_arms)* }
                 }
 
                 fn render(
