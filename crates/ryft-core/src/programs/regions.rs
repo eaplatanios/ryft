@@ -766,16 +766,14 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EmptyRegionDriver {
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
 pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, O> + Sized {
-    /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order
-    /// and returns their [`RegionId`]s in the same order.
-    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError>;
-
-    // TODO(eaplatanios): Why do we need this?
-    /// Imports attached regions after instantiating the region inputs supplied by each non-`None` entry.
-    fn import_instantiation_into(
+    /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order and returns their
+    /// [`RegionId`]s in the same order. Each type in `input_types` corresponds to the corresponding attached [`Region`]
+    /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
+    /// [`Some`] instantiates them from the supplied input types.
+    fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        region_input_types: &[Option<Vec<V::Type>>],
+        input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError>;
 }
 
@@ -785,33 +783,25 @@ impl<
     R: AsRef<[Program<V, O, Vec<V>, Vec<V>>]> + IntoIterator<Item = Program<V, O, Vec<V>, Vec<V>>>,
 > BindingRegionDriver<V, O> for R
 {
-    #[inline]
-    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        let mut builder = builder.borrow_mut();
-        Ok(self.into_iter().map(|region| builder.import_program(region)).collect())
-    }
-
-    // TODO(eaplatanios): Review this.
-    fn import_instantiation_into(
+    fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        region_input_types: &[Option<Vec<V::Type>>],
+        input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError> {
-        let programs = self.into_iter().collect::<Vec<_>>();
-        if programs.len() != region_input_types.len() {
+        let region_count = self.as_ref().len();
+        if region_count != input_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "region identity instantiation count {} does not match attached region count {}",
-                region_input_types.len(),
-                programs.len(),
+                "region type-identity instantiation count {} does not match attached region count {}",
+                input_types.len(),
+                region_count,
             )));
         }
         let mut builder = builder.borrow_mut();
-        programs
-            .into_iter()
-            .zip(region_input_types)
+        self.into_iter()
+            .zip(input_types)
             .map(|(program, input_types)| {
                 Ok(builder.import_program(match input_types {
-                    Some(input_types) => program.instantiate_input_identities(input_types)?.into_owned(),
+                    Some(input_types) => program.with_instantiated_type_identities(input_types)?.into_owned(),
                     None => program,
                 }))
             })
@@ -848,33 +838,23 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for CalleeRegionDriver<
 }
 
 impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegionDriver<'_, V, O> {
-    #[inline]
-    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        let mut builder = builder.borrow_mut();
-        Ok(self.callees.iter().map(|callee| builder.intern_callee(callee)).collect())
-    }
-
-    // TODO(eaplatanios): Review this.
-    fn import_instantiation_into(
+    fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        region_input_types: &[Option<Vec<V::Type>>],
+        input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError> {
-        if self.callees.len() != region_input_types.len() {
+        if self.callees.len() != input_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "region identity instantiation count {} does not match attached region count {}",
-                region_input_types.len(),
+                "region type-identity instantiation count {} does not match attached region count {}",
+                input_types.len(),
                 self.callees.len(),
             )));
         }
         let mut builder = builder.borrow_mut();
         self.callees
             .iter()
-            .zip(region_input_types)
-            .map(|(callee, input_types)| match input_types {
-                Some(input_types) => builder.intern_callee_instantiation(callee, input_types),
-                None => Ok(builder.intern_callee(callee)),
-            })
+            .zip(input_types)
+            .map(|(callee, input_types)| builder.intern_callee(callee, input_types.as_deref()))
             .collect()
     }
 }
@@ -884,7 +864,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegion
 /// imports them, `mappings` preserves their source identities across every instruction in the surrounding replay.
 /// Construction validates that every root belongs to `source`'s arena, which lets [`RegionDriver::regions`] remain
 /// non-fallible without trusting callers to preserve that relationship.
-pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
+pub struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Borrowed [`Region`] view used to access every root's shared source arena.
     source: RegionRef<'r, V, O>,
 
@@ -926,7 +906,7 @@ pub(crate) struct ReplayRegionDriver<'r, V: Value, O: Operation<V::Type>> {
 impl<'r, V: Value, O: Operation<V::Type>> ReplayRegionDriver<'r, V, O> {
     /// Creates a new [`ReplayRegionDriver`].
     #[inline]
-    pub(crate) fn new(
+    pub fn new(
         source: RegionRef<'r, V, O>,
         roots: &'r [RegionId],
         mappings: &'r RegionReplayMappings<V, O>,
@@ -950,49 +930,18 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for ReplayRegionDriver<
 }
 
 impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
-    #[inline]
-    fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
-        let builder_identity = Rc::downgrade(builder);
-        let mut destinations = self.mappings.destinations.borrow_mut();
-        destinations.retain(|mapping| mapping.builder.strong_count() > 0);
-        let destination_index = destinations
-            .iter()
-            .position(|mapping| Weak::ptr_eq(&mapping.builder, &builder_identity))
-            .unwrap_or_else(|| {
-                destinations.push(DestinationRegionMapping {
-                    builder: builder_identity,
-                    remapping: HashMap::new(),
-                    identity_instantiations: Vec::new(),
-                });
-                destinations.len() - 1
-            });
-        let remapping = &mut destinations[destination_index].remapping;
-        let mut builder = builder.borrow_mut();
-        self.roots
-            .iter()
-            .map(|root| {
-                let region = self.source.with_id(*root)?;
-                Ok(builder.import_region_with_remapping(region, remapping))
-            })
-            .collect()
-    }
-
-    // TODO(eaplatanios): Review this.
-    fn import_instantiation_into(
+    fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-        region_input_types: &[Option<Vec<V::Type>>],
+        input_types: &[Option<Vec<V::Type>>],
     ) -> Result<Vec<RegionId>, ProgramError> {
-        if self.roots.len() != region_input_types.len() {
+        if self.roots.len() != input_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "region identity instantiation count {} does not match attached region count {}",
-                region_input_types.len(),
+                "region type-identity instantiation count {} does not match attached region count {}",
+                input_types.len(),
                 self.roots.len(),
             )));
         }
-        if region_input_types.iter().all(Option::is_none) {
-            return self.import_into(builder);
-        }
         let builder_identity = Rc::downgrade(builder);
         let mut destinations = self.mappings.destinations.borrow_mut();
         destinations.retain(|mapping| mapping.builder.strong_count() > 0);
@@ -1003,7 +952,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
                 destinations.push(DestinationRegionMapping {
                     builder: builder_identity,
                     remapping: HashMap::new(),
-                    identity_instantiations: Vec::new(),
+                    instantiated_region_mappings: Vec::new(),
                 });
                 destinations.len() - 1
             });
@@ -1011,30 +960,32 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
         let mut builder = builder.borrow_mut();
         self.roots
             .iter()
-            .zip(region_input_types)
+            .zip(input_types)
             .map(|(root, input_types)| {
                 let region = self.source.with_id(*root)?;
                 let Some(input_types) = input_types else {
                     return Ok(builder.import_region_with_remapping(region, &mut destination.remapping));
                 };
                 let renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
-                if let Some((_, _, imported)) =
-                    destination.identity_instantiations.iter().find(|(candidate_root, candidate_input_types, _)| {
-                        candidate_root == root
-                            && Program::<V, O, Vec<V>, Vec<V>>::same_identity_instantiation(
-                                candidate_input_types,
-                                input_types,
-                            )
-                    })
-                {
-                    return Ok(*imported);
+                if let Some(mapping) = destination.instantiated_region_mappings.iter().find(|mapping| {
+                    &mapping.source_region == root
+                        && Program::<V, O, Vec<V>, Vec<V>>::same_type_identity_instantiation(
+                            &mapping.input_types,
+                            input_types,
+                        )
+                }) {
+                    return Ok(mapping.destination_region);
                 }
                 let imported = if renaming.is_identity() {
                     builder.import_region_with_remapping(region, &mut destination.remapping)
                 } else {
                     builder.import_program(region.to_program().rename_type_identities(&renaming)?)
                 };
-                destination.identity_instantiations.push((*root, input_types.clone(), imported));
+                destination.instantiated_region_mappings.push(InstantiatedRegionMapping {
+                    source_region: *root,
+                    input_types: input_types.clone(),
+                    destination_region: imported,
+                });
                 Ok(imported)
             })
             .collect()
@@ -1047,7 +998,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
 /// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
 /// spaces of different builders. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is
 /// used and why it is necessary.
-pub(crate) struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
+pub struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
 }
@@ -1055,7 +1006,14 @@ pub(crate) struct RegionReplayMappings<V: Value, O: Operation<V::Type>> {
 impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
     /// Creates a new [`RegionReplayMappings`].
     #[inline]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<V: Value, O: Operation<V::Type>> Default for RegionReplayMappings<V, O> {
+    #[inline]
+    fn default() -> Self {
         Self { destinations: RefCell::new(Vec::new()) }
     }
 }
@@ -1064,17 +1022,35 @@ impl<V: Value, O: Operation<V::Type>> RegionReplayMappings<V, O> {
 /// [`Region`] replay. [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local
 /// to their owning arenas. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is used and why
 /// it is necessary.
-pub(crate) struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
+pub struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
     /// Weak identity of the destination [`ProgramBuilder`]. Weak ownership prevents replay bookkeeping from keeping
     /// a completed builder alive or interfering with trace finalization through `Rc::try_unwrap`.
-    builder: Weak<RefCell<ProgramBuilder<V, O>>>,
+    pub builder: Weak<RefCell<ProgramBuilder<V, O>>>,
 
     /// Source-to-destination [`RegionId`] remapping for the destination [`ProgramBuilder`].
-    remapping: HashMap<RegionId, RegionId>,
+    pub remapping: HashMap<RegionId, RegionId>,
 
-    // TODO(eaplatanios): Why do we need this?
-    /// Instantiated source roots imported into this destination.
-    identity_instantiations: Vec<(RegionId, Vec<V::Type>, RegionId)>,
+    /// Instantiated source-[`Region`] imports that cannot use `remapping` because one source [`RegionId`] may map
+    /// to multiple destination regions under different [`TypeIdentity`](crate::TypeIdentity) instantiations.
+    pub instantiated_region_mappings: Vec<InstantiatedRegionMapping<V::Type>>,
+}
+
+/// Cached import of one source [`Region`] instantiated for a particular input type signature. A source region can
+/// be imported into the same destination [`ProgramBuilder`] under multiple [`TypeIdentity`](crate::TypeIdentity)
+/// renamings, so the source [`RegionId`] alone cannot identify the resulting destination region. This mapping retains
+/// the complete instantiation key and the corresponding imported root so equivalent later applications can preserve
+/// region sharing.
+pub struct InstantiatedRegionMapping<T: Type> {
+    /// Root of the [`Region`] in the replay's source [`RegionArena`].
+    pub source_region: RegionId,
+
+    /// Complete actual input [`Type`] signature used to instantiate `source_region`. The full types are retained
+    /// so that cache lookup can recognize equivalent [`TypeIdentity`](crate::TypeIdentity)s without conflating
+    /// permutations of overlapping live identities.
+    pub input_types: Vec<T>,
+
+    /// Root of the instantiated [`Region`] in the destination [`ProgramBuilder`]'s [`RegionArena`].
+    pub destination_region: RegionId,
 }
 
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
@@ -1554,7 +1530,7 @@ mod tests {
     fn test_binding_region_driver_for_owned_collections() {
         let empty_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let empty_driver: [TestProgram; 0] = [];
-        assert_eq!(empty_driver.import_into(&empty_builder), Ok(Vec::new()));
+        assert_eq!(empty_driver.import_into(&empty_builder, &[]), Ok(Vec::new()));
         assert!(empty_builder.borrow().regions.is_empty());
         let array_driver = [identity_program(DataType::F32), identity_program(DataType::F64)];
         assert_eq!(
@@ -1562,7 +1538,10 @@ mod tests {
             vec![DataType::F32, DataType::F64],
         );
         let array_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(array_driver.import_into(&array_builder), Ok(vec![RegionId::new(0), RegionId::new(1)]));
+        assert_eq!(
+            array_driver.import_into(&array_builder, &[None, None]),
+            Ok(vec![RegionId::new(0), RegionId::new(1)]),
+        );
         assert_eq!(array_builder.borrow().regions.len(), 2);
 
         let vector_driver = vec![identity_program(DataType::F64), identity_program(DataType::F32)];
@@ -1571,7 +1550,10 @@ mod tests {
             vec![DataType::F64, DataType::F32],
         );
         let vector_builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(vector_driver.import_into(&vector_builder), Ok(vec![RegionId::new(0), RegionId::new(1)]));
+        assert_eq!(
+            vector_driver.import_into(&vector_builder, &[None, None]),
+            Ok(vec![RegionId::new(0), RegionId::new(1)]),
+        );
         assert_eq!(vector_builder.borrow().regions.len(), 2);
     }
 
@@ -1585,7 +1567,7 @@ mod tests {
             vec![DataType::F64, DataType::F64],
         );
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&builder), Ok(vec![RegionId::new(0), RegionId::new(0)]));
+        assert_eq!(driver.import_into(&builder, &[None, None]), Ok(vec![RegionId::new(0), RegionId::new(0)]));
         assert_eq!(builder.borrow().regions.len(), 1);
     }
 
@@ -1616,7 +1598,7 @@ mod tests {
         let roots = [first_root, first_root];
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1), RegionId::new(1)]));
+        assert_eq!(driver.import_into(&destination, &[None, None]), Ok(vec![RegionId::new(1), RegionId::new(1)]),);
         assert_eq!(destination.borrow().regions.len(), 2);
     }
 
@@ -1627,7 +1609,7 @@ mod tests {
         let roots = [first_root, second_root];
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
-        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1), RegionId::new(2)]));
+        assert_eq!(driver.import_into(&destination, &[None, None]), Ok(vec![RegionId::new(1), RegionId::new(2)]),);
         let destination = destination.borrow();
         assert_eq!(destination.regions.len(), 3);
         assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
@@ -1641,12 +1623,12 @@ mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let first_roots = [first_root];
         let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
-        assert_eq!(first_driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
+        assert_eq!(first_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
         let second_roots = [second_root];
         let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &second_roots, &mappings).unwrap();
-        assert_eq!(second_driver.import_into(&destination), Ok(vec![RegionId::new(2)]));
+        assert_eq!(second_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(2)]));
         let repeated_driver = ReplayRegionDriver::new(program.entry_region_ref(), &first_roots, &mappings).unwrap();
-        assert_eq!(repeated_driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
+        assert_eq!(repeated_driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
         let destination = destination.borrow();
         assert_eq!(destination.regions.len(), 3);
         assert_eq!(destination.region_ref(RegionId::new(1)).unwrap().instructions()[0].regions(), &[RegionId::new(0)]);
@@ -1662,9 +1644,9 @@ mod tests {
         second_destination.borrow_mut().import_program(identity_program(DataType::F32));
         let roots = [first_root];
         let first_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(first_driver.import_into(&first_destination), Ok(vec![RegionId::new(1)]));
+        assert_eq!(first_driver.import_into(&first_destination, &[None]), Ok(vec![RegionId::new(1)]));
         let second_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(second_driver.import_into(&second_destination), Ok(vec![RegionId::new(2)]));
+        assert_eq!(second_driver.import_into(&second_destination, &[None]), Ok(vec![RegionId::new(2)]));
         assert_eq!(first_destination.borrow().regions.len(), 2);
         assert_eq!(second_destination.borrow().regions.len(), 3);
     }
@@ -1677,14 +1659,14 @@ mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         let weak_destination = Rc::downgrade(&destination);
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(driver.import_into(&destination), Ok(vec![RegionId::new(1)]));
+        assert_eq!(driver.import_into(&destination, &[None]), Ok(vec![RegionId::new(1)]));
         assert_eq!(Rc::strong_count(&destination), 1);
         assert_eq!(mappings.destinations.borrow().len(), 1);
         drop(destination);
         assert!(weak_destination.upgrade().is_none());
         let replacement = Rc::new(RefCell::new(ProgramBuilder::new()));
         let replacement_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
-        assert_eq!(replacement_driver.import_into(&replacement), Ok(vec![RegionId::new(1)]));
+        assert_eq!(replacement_driver.import_into(&replacement, &[None]), Ok(vec![RegionId::new(1)]));
         assert_eq!(mappings.destinations.borrow().len(), 1);
     }
 }

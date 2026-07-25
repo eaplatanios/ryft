@@ -136,8 +136,9 @@ pub use instructions::{Instruction, InstructionId};
 pub use operations::{Operation, OperationFormatter};
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionWithMetadata,
+    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,
+    Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
+    RegionWithMetadata, ReplayRegionDriver,
 };
 pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{Concretizable, Value, ValueId};
