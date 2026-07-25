@@ -426,7 +426,7 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 
 /// Summarizes one [`Program`], including every attached nested region: each region-carrying instruction contributes
 /// one nested-region summary per attached region (recursively), labeled `"{operation}.{region_name}"` per the
-/// operation's declared [`region_names`](Operation::region_names) (or the slot index when the operation declares
+/// operation's declared [`region_slots`](Operation::region_slots) (or the slot index when the operation declares
 /// fewer names than attached regions).
 ///
 /// # Parameters
@@ -477,10 +477,10 @@ where
             depth_by_atom[output.index()] = input_depth + 1;
         }
 
-        let region_names = instruction.operation().region_names();
+        let region_slots = instruction.operation().region_slots();
         for (slot, region) in instruction.regions().iter().copied().enumerate() {
-            let label = match region_names.get(slot) {
-                Some(name) => format!("{}.{name}", instruction.operation().name()),
+            let label = match region_slots.get(slot) {
+                Some(region_slot) => format!("{}.{}", instruction.operation().name(), region_slot.name),
                 None => format!("{}.{slot}", instruction.operation().name()),
             };
             nested_regions.push(nested_region(label, summarize_region(program.with_id(region)?)?));

@@ -39,7 +39,7 @@ use crate::partial::{
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
-use crate::programs::regions::{RegionInterface, RegionRef};
+use crate::programs::regions::{RegionInterface, RegionRef, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, Program, ProgramError};
@@ -57,7 +57,7 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 /// operation outputs the final state once the condition produces false.
 ///
 /// The condition and body computations are not part of this payload: they are [`Region`](crate::Region)s attached to
-/// the [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
+/// the [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
 /// order `["condition", "body"]`, and semantic rules reach them through their driver-granted region access. Owned
 /// loops supply the two [`Program`]s through the `driver` argument of
 /// [`Context::bind`]. [`Operation::infer_output_types`] validates the loop contract over the
@@ -267,8 +267,8 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
     }
 
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["condition", "body"]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] }
     }
 
     fn infer_region_input_types(
@@ -1846,7 +1846,10 @@ mod tests {
 
         // Operation identity, declared region slots, and payload-free rendering.
         assert_eq!(Operation::<ArrayType>::name(&operation), WHILE_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::region_names(&operation), &["condition", "body"]);
+        assert_eq!(
+            Operation::<ArrayType>::region_slots(&operation),
+            &[RegionSlot::computation("condition"), RegionSlot::computation("body")],
+        );
         assert_eq!(format!("{operation}"), "while");
 
         // Type inference validates the region interfaces and the input types, and returns the state types.
@@ -2560,9 +2563,9 @@ mod tests {
             }
         }
 
-        fn region_names(&self) -> &'static [&'static str] {
+        fn region_slots(&self) -> &'static [RegionSlot] {
             match self {
-                Self::While(while_operation) => Operation::<ArrayType>::region_names(while_operation),
+                Self::While(while_operation) => Operation::<ArrayType>::region_slots(while_operation),
                 _ => &[],
             }
         }

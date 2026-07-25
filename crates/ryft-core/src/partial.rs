@@ -840,7 +840,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///   - `operation`: [`Operation`] to fold into the known-side context when all inputs are known, or to emit into
     ///     the residual [`Program`] otherwise.
     ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in
-    ///     the order defined by [`Operation::region_names`]. Folding binds these regions with the operation, while
+    ///     the order defined by [`Operation::region_slots`]. Folding binds these regions with the operation, while
     ///     residualization imports them into the residual [`Program`].
     ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order.
     ///     Their known-ness determines whether the operation is folded or residualized.
@@ -884,7 +884,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     ///   - `operation`: [`Operation`] to emit into the residual [`Program`].
     ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in the
-    ///     order defined by [`Operation::region_names`]. These programs are imported into the residual [`Program`]
+    ///     order defined by [`Operation::region_slots`]. These programs are imported into the residual [`Program`]
     ///     before the operation is emitted.
     ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order. Known
     ///     inputs are materialized as residual inputs or constants, while unknown inputs reuse their existing residual

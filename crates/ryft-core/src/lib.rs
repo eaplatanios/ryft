@@ -62,7 +62,7 @@ pub(crate) mod tests {
     use crate::macros::check_count;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::Operation;
-    use crate::programs::regions::RegionInterface;
+    use crate::programs::regions::{RegionInterface, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::types::DataType;
 
@@ -80,9 +80,9 @@ pub(crate) mod tests {
         /// Region-free unary identity stand-in with an observable ordered-IO effect.
         Effectful,
 
-        /// Region-carrying operation declaring the region slot names. Its inferred output types are the first attached
+        /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
-        WithRegions(&'static [&'static str]),
+        WithRegions(&'static [RegionSlot]),
     }
 
     impl Operation<DataType> for TestRegionOperation {
@@ -94,10 +94,10 @@ pub(crate) mod tests {
             }
         }
 
-        fn region_names(&self) -> &'static [&'static str] {
+        fn region_slots(&self) -> &'static [RegionSlot] {
             match self {
                 Self::Add | Self::Effectful => &[],
-                Self::WithRegions(names) => names,
+                Self::WithRegions(slots) => slots,
             }
         }
 

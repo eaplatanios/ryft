@@ -30,7 +30,7 @@ use crate::partial::{
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
+use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::programs::{MaybeZero, ProgramError};
@@ -47,7 +47,7 @@ pub const CONDITION_OPERATION_NAME: &str = "condition";
 /// to the selected branch.
 ///
 /// The branch computations are not part of this payload: they are [`Region`](crate::Region)s attached to the
-/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_names`](Operation::region_names)
+/// [`Instruction`](crate::Instruction) applying the operation, in the [`region_slots`](Operation::region_slots)
 /// order `["true", "false"]`, and semantic rules reach them through their driver-granted region access. Conditions
 /// with owned branches supply the two branch [`Program`]s through the region driver passed to [`Context::bind`].
 ///
@@ -127,8 +127,8 @@ where
     }
 
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["true", "false"]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("true"), RegionSlot::computation("false")] }
     }
 
     fn infer_region_input_types(
@@ -1283,7 +1283,7 @@ mod tests {
 
         // Operation identity, declared region slots, output provenance, and payload-free rendering.
         assert_eq!(operation.name(), CONDITION_OPERATION_NAME);
-        assert_eq!(operation.region_names(), &["true", "false"]);
+        assert_eq!(operation.region_slots(), &[RegionSlot::computation("true"), RegionSlot::computation("false")],);
         assert_eq!(
             operation.output_region_provenance(0),
             vec![

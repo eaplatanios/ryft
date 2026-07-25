@@ -35,7 +35,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::programs::Program;
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef};
+use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
@@ -76,7 +76,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// per loop trip — and a fully unrolled straight-line lowering with no loop at all when `unroll` equals `length`.
 ///
 /// The body computation is not part of this payload: it is a [`Region`](crate::Region) attached to the
-/// [`Instruction`](crate::Instruction) applying the operation (the single [`region_names`](Operation::region_names)
+/// [`Instruction`](crate::Instruction) applying the operation (the single [`region_slots`](Operation::region_slots)
 /// slot `["body"]`), and semantic rules reach it through their driver-granted region access. Scans with owned bodies
 /// supply the body [`Program`] through the region driver passed to [`Context::bind`];
 /// [`Operation::infer_output_types`] validates the body signature over the attached [`RegionInterface`].
@@ -537,8 +537,8 @@ where
     }
 
     #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["body"]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("body")] }
     }
 
     fn infer_region_input_types(
@@ -2380,7 +2380,7 @@ mod tests {
 
         // Operation identity, declared region slots, output provenance, and accessors.
         assert_eq!(operation.name(), SCAN_OPERATION_NAME);
-        assert_eq!(Operation::<ArrayType>::region_names(&operation), &["body"]);
+        assert_eq!(Operation::<ArrayType>::region_slots(&operation), &[RegionSlot::computation("body")]);
         assert_eq!(
             Operation::<ArrayType>::output_region_provenance(&operation, 1),
             vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],

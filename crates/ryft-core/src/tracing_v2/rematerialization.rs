@@ -65,7 +65,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::{Region, RegionId, RegionInterface};
+use crate::programs::regions::{Region, RegionId, RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Value, ValueId};
 use crate::tracing::{DomainTracer, Trace, TracingContext};
@@ -182,6 +182,61 @@ impl<T: Type> Operation<T> for RematerializeOperation {
         "rematerialize"
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const {
+            &[
+                RegionSlot::computation("primal"),
+                RegionSlot::rule("forward"),
+                RegionSlot::rule("backward"),
+                RegionSlot::rule("tangent"),
+            ]
+        }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 4 {
+            return Err(TypeError::invalid(format!(
+                "rematerialize expects 4 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let primal_interface = &region_interfaces[0];
+        let forward_interface = &region_interfaces[1];
+        let primal_renaming = T::derive_identity_renaming(primal_interface.input_types(), input_types)?;
+        let primal_output_types = primal_interface
+            .output_types()
+            .iter()
+            .map(|r#type| r#type.rename_identities(&primal_renaming))
+            .collect::<Result<Vec<_>, _>>()?;
+        let forward_renaming = T::derive_identity_renaming(forward_interface.input_types(), input_types)?;
+        let forward_output_types = forward_interface
+            .output_types()
+            .iter()
+            .map(|r#type| r#type.rename_identities(&forward_renaming))
+            .collect::<Result<Vec<_>, _>>()?;
+        if forward_output_types.len() < primal_output_types.len() {
+            return Err(TypeError::invalid(format!(
+                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                primal_output_types.len(),
+                forward_output_types.len(),
+            )));
+        }
+        let residual_types = &forward_output_types[primal_output_types.len()..];
+        let backward_input_types = residual_types.iter().chain(primal_output_types.iter()).cloned().collect::<Vec<_>>();
+        let tangent_input_types = residual_types.iter().chain(input_types.iter()).cloned().collect::<Vec<_>>();
+        Ok(vec![
+            Some(input_types.to_vec()),
+            Some(input_types.to_vec()),
+            Some(backward_input_types),
+            Some(tangent_input_types),
+        ])
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -190,11 +245,6 @@ impl<T: Type> Operation<T> for RematerializeOperation {
         let primal_interface = validated_rematerialize_interfaces(region_interfaces)?;
         check_types!(@same, "rematerialize input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["primal", "forward", "backward", "tangent"]
     }
 }
 
@@ -1914,16 +1964,10 @@ where
             // The rewritten boundary replaces only the entry region; the attached regions of copied instructions
             // stay valid because the rest of the arena is carried over verbatim (the entry region's identifier is
             // assigned last, so the copied instructions' region ids are unchanged).
-            let mut regions = source.regions().to_vec();
+            let mut regions = source.regions().iter().cloned().collect::<Vec<_>>();
             regions[source.entry().index()] =
                 Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions };
-            let forward = Program {
-                input_structure: vec![Placeholder; input_count],
-                output_structure,
-                regions,
-                entry: source.entry(),
-                marker: PhantomData,
-            };
+            let forward = Program::new(vec![Placeholder; input_count], output_structure, regions, source.entry())?;
             (forward.into_simplified()?, saved_types)
         };
 
@@ -1986,6 +2030,7 @@ mod tests {
     use crate::operations::math::{Cos, Dot, DotDimensionNumbers, Sin};
     use crate::operations::tag::Tag;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::regions::RegionRole;
     use crate::types::{ArrayType, DataType, Dimension, Memory, Shape};
 
     /// Shorthand for the policy contract over the `Array` array domain used throughout these tests.
@@ -2072,6 +2117,13 @@ mod tests {
 
     fn vector_type(size: usize) -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
+    }
+
+    #[test]
+    fn test_rematerialize_effects_only_include_the_primal_region() {
+        let operation = RematerializeOperation::new();
+        assert_eq!(Operation::<ArrayType>::region_role(&operation, 0), Some(RegionRole::Computation));
+        assert!((1..4).all(|index| Operation::<ArrayType>::region_role(&operation, index) == Some(RegionRole::Rule)));
     }
 
     #[test]
@@ -3467,6 +3519,10 @@ mod tests {
                 "invalid_origin"
             }
 
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
+            }
+
             fn infer_output_types(
                 &self,
                 input_types: &[ArrayType],
@@ -3474,10 +3530,6 @@ mod tests {
             ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
-            }
-
-            fn region_names(&self) -> &'static [&'static str] {
-                &["body"]
             }
 
             fn output_region_provenance(
@@ -3559,6 +3611,10 @@ mod tests {
                 "pass_through_origin"
             }
 
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
+            }
+
             fn infer_output_types(
                 &self,
                 input_types: &[ArrayType],
@@ -3566,10 +3622,6 @@ mod tests {
             ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![input_types[0].clone()])
-            }
-
-            fn region_names(&self) -> &'static [&'static str] {
-                &["body"]
             }
 
             fn output_region_provenance(

@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
@@ -586,7 +586,15 @@ impl ArrayTypeRefinements {
 }
 
 impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
-    fn establish(declared: &[ArrayType], actual: &[ArrayType]) -> Result<Self, TypeError> {
+    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<ArrayType>,
+        A::Item: Borrow<ArrayType>,
+    {
+        let declared = declared.into_iter();
+        let actual = actual.into_iter();
         if declared.len() != actual.len() {
             return Err(TypeError::invalid(format!(
                 "declared type count {} does not match actual type count {}",
@@ -594,20 +602,28 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
                 actual.len(),
             )));
         }
-        declared.iter().zip(actual).try_fold(Self::default(), |mut refinements, (declared, actual)| {
-            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
+        declared.zip(actual).try_fold(Self::default(), |mut refinements, (declared, actual)| {
+            Self::visit_dynamic_to_static_refinements(declared.borrow(), actual.borrow(), |variable, extent| {
                 refinements.bind(variable, extent)
             })?;
             Ok(refinements)
         })
     }
 
-    fn validate(
+    fn validate<D: IntoIterator, A: IntoIterator>(
         &self,
-        declared: &[ArrayType],
-        actual: &[ArrayType],
+        declared: D,
+        actual: A,
         locally_defined_identities: &[DimensionVariable],
-    ) -> Result<(), TypeError> {
+    ) -> Result<(), TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<ArrayType>,
+        A::Item: Borrow<ArrayType>,
+    {
+        let declared = declared.into_iter();
+        let actual = actual.into_iter();
         if declared.len() != actual.len() {
             return Err(TypeError::invalid(format!(
                 "declared type count {} does not match actual type count {}",
@@ -616,8 +632,8 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
             )));
         }
         let mut refinements = self.clone();
-        declared.iter().zip(actual).try_for_each(|(declared, actual)| {
-            Self::visit_dynamic_to_static_refinements(declared, actual, |variable, extent| {
+        declared.zip(actual).try_for_each(|(declared, actual)| {
+            Self::visit_dynamic_to_static_refinements(declared.borrow(), actual.borrow(), |variable, extent| {
                 match refinements
                     .bindings
                     .iter()

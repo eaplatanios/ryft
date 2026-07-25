@@ -28,6 +28,7 @@ use crate::programs::builders::ProgramBuilder;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::regions::RegionArena;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 use crate::tracing::{NestedTracingContext, TracingContext};
@@ -368,8 +369,9 @@ impl<
         // of the replay. Their identifiers are arena indices assigned in order, so copying them in order preserves
         // every entry-instruction region reference.
         let mut builder = ProgramBuilder::new();
-        builder.regions = self.program.regions().clone();
-        builder.regions.pop().unwrap();
+        builder.regions = RegionArena::from_regions(
+            self.program.regions().iter().take(self.program.entry().index()).cloned().collect(),
+        )?;
         let capture_inputs = self
             .captures
             .iter()
