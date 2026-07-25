@@ -4,6 +4,12 @@
 /// mirroring [JAX's side effect sequencing design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
+    /// Observable runtime assertion whose execution order relative to other
+    /// [`OrderedAssertion`](Self::OrderedAssertion) effects determines which failing requirement is reported first.
+    /// Operations with this effect must not be eliminated without execution unless their requirement has been proven,
+    /// and the relative execution order of retained assertions must be preserved.
+    OrderedAssertion,
+
     /// Observable input/output (e.g., printing) [`Effect`] whose execution order relative to other
     /// [`OrderedIo`](Self::OrderedIo) effects is observable (e.g., interleaved printed output). Operations with this
     /// effect must not be folded away or get eliminated, and their relative execution order must be preserved.
@@ -17,14 +23,15 @@ pub enum Effect {
 
 impl Effect {
     /// All declared [`Effect`] classes, in bit order, backing [`Effects`]'s [`IntoIterator`] implementation.
-    const ALL: [Effect; 2] = [Effect::OrderedIo, Effect::UnorderedIo];
+    const ALL: [Effect; 3] = [Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo];
 
     /// Returns the bit representing this [`Effect`] class inside an [`Effects`] set.
     #[inline]
     const fn bit(self) -> u8 {
         match self {
-            Effect::OrderedIo => 1 << 0,
-            Effect::UnorderedIo => 1 << 1,
+            Effect::OrderedAssertion => 1 << 0,
+            Effect::OrderedIo => 1 << 1,
+            Effect::UnorderedIo => 1 << 2,
         }
     }
 
@@ -33,7 +40,7 @@ impl Effect {
     #[inline]
     pub const fn is_ordered(self) -> bool {
         match self {
-            Effect::OrderedIo => true,
+            Effect::OrderedAssertion | Effect::OrderedIo => true,
             Effect::UnorderedIo => false,
         }
     }
@@ -152,44 +159,58 @@ mod tests {
     fn test_effects() {
         // The empty set is pure, contains nothing, reports no ordering, and iterates over nothing.
         assert!(Effects::PURE.is_pure());
+        assert!(!Effects::PURE.contains(Effect::OrderedAssertion));
         assert!(!Effects::PURE.contains(Effect::OrderedIo));
         assert!(!Effects::PURE.contains(Effect::UnorderedIo));
         assert!(!Effects::PURE.is_ordered());
         assert_eq!(Effects::PURE.into_iter().collect::<Vec<_>>(), Vec::<Effect>::new());
 
-        // A singleton set contains only its effect, and only the ordered-I/O class reports observable ordering.
-        let ordered = Effects::single(Effect::OrderedIo);
+        // A singleton set contains only its effect, and both ordered classes report observable ordering.
+        let assertion = Effects::single(Effect::OrderedAssertion);
+        let ordered_io = Effects::single(Effect::OrderedIo);
         let unordered = Effects::single(Effect::UnorderedIo);
-        assert!(!ordered.is_pure());
-        assert!(ordered.contains(Effect::OrderedIo));
-        assert!(!ordered.contains(Effect::UnorderedIo));
-        assert!(ordered.is_ordered());
+        assert!(!assertion.is_pure());
+        assert!(assertion.contains(Effect::OrderedAssertion));
+        assert!(!assertion.contains(Effect::OrderedIo));
+        assert!(assertion.is_ordered());
+        assert!(!ordered_io.is_pure());
+        assert!(!ordered_io.contains(Effect::OrderedAssertion));
+        assert!(ordered_io.contains(Effect::OrderedIo));
+        assert!(!ordered_io.contains(Effect::UnorderedIo));
+        assert!(ordered_io.is_ordered());
         assert!(!unordered.is_pure());
         assert!(!unordered.is_ordered());
-        assert_eq!(ordered.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo]);
+        assert_eq!(assertion.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedAssertion]);
+        assert_eq!(ordered_io.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo]);
         assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![Effect::UnorderedIo]);
 
-        // Union is commutative and idempotent, `PURE` is its identity element, and the combined set contains both
-        // classes and iterates in declaration order.
-        let both = ordered.union(unordered);
-        assert_eq!(both, unordered.union(ordered));
-        assert_eq!(both.union(both), both);
-        assert_eq!(both.union(Effects::PURE), both);
-        assert_eq!(Effects::PURE.union(ordered), ordered);
-        assert!(!both.is_pure());
-        assert!(both.contains(Effect::OrderedIo));
-        assert!(both.contains(Effect::UnorderedIo));
-        assert!(both.is_ordered());
-        assert_eq!(both.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo, Effect::UnorderedIo]);
+        // Union is commutative and idempotent, `PURE` is its identity element, and the combined set contains every
+        // class and iterates in declaration order.
+        let all = assertion.union(ordered_io).union(unordered);
+        assert_eq!(all, unordered.union(ordered_io).union(assertion));
+        assert_eq!(all.union(all), all);
+        assert_eq!(all.union(Effects::PURE), all);
+        assert_eq!(Effects::PURE.union(assertion), assertion);
+        assert!(!all.is_pure());
+        assert!(all.contains(Effect::OrderedAssertion));
+        assert!(all.contains(Effect::OrderedIo));
+        assert!(all.contains(Effect::UnorderedIo));
+        assert!(all.is_ordered());
+        assert_eq!(
+            all.into_iter().collect::<Vec<_>>(),
+            vec![Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo],
+        );
 
         // Equality distinguishes distinct sets, self-equality holds for rebuilt sets, and hashing supports map lookups.
-        assert_eq!(ordered, Effects::single(Effect::OrderedIo));
-        assert_ne!(ordered, unordered);
-        assert_ne!(ordered, both);
-        assert_ne!(both, Effects::PURE);
-        let lookup = HashMap::from([(ordered, "ordered"), (both, "both")]);
-        assert_eq!(lookup.get(&Effects::single(Effect::OrderedIo)), Some(&"ordered"));
-        assert_eq!(lookup.get(&unordered.union(ordered)), Some(&"both"));
+        assert_eq!(assertion, Effects::single(Effect::OrderedAssertion));
+        assert_ne!(assertion, ordered_io);
+        assert_ne!(ordered_io, unordered);
+        assert_ne!(ordered_io, all);
+        assert_ne!(all, Effects::PURE);
+        let lookup = HashMap::from([(assertion, "assertion"), (ordered_io, "ordered I/O"), (all, "all")]);
+        assert_eq!(lookup.get(&Effects::single(Effect::OrderedAssertion)), Some(&"assertion"));
+        assert_eq!(lookup.get(&Effects::single(Effect::OrderedIo)), Some(&"ordered I/O"));
+        assert_eq!(lookup.get(&unordered.union(ordered_io).union(assertion)), Some(&"all"));
         assert_eq!(lookup.get(&unordered), None);
     }
 }

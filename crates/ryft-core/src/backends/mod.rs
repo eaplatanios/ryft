@@ -8,6 +8,7 @@ pub mod scalars;
 
 pub use arrays::{Array, ArrayOperation, ArrayTracingContext};
 pub use dimensions::{
-    DimensionArithmetic, DimensionArithmeticOperation, DimensionOperation, DimensionTracingContext, DimensionValue,
+    DimensionArithmetic, DimensionArithmeticOperation, DimensionOperation, DimensionRequirement,
+    DimensionRequirementOperation, DimensionTracingContext, DimensionValue,
 };
 pub use scalars::{Scalar, ScalarOperation, ScalarTracingContext};
