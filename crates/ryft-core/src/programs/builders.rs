@@ -464,16 +464,16 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 /// shared callee. The source [`Rc`] supplies a stable identity key and keeps its allocation alive, `input_types`
 /// identifies the exact instantiated boundary, and `region` points at the corresponding imported root.
 #[derive(Clone, Debug)]
-struct CalleeInstantiation<V: Typed + Parameter, O> {
+pub(crate) struct CalleeInstantiation<V: Typed + Parameter, O> {
     /// Shared source callee.
-    callee: Rc<Program<V, O, Vec<V>, Vec<V>>>,
+    pub(crate) callee: Rc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Complete caller input [`Type`]s. An imported [`Region`] carries these exact live identities in its boundary
     /// types, so only another invocation with the same types can reuse it.
-    input_types: Vec<V::Type>,
+    pub(crate) input_types: Vec<V::Type>,
 
     /// [`RegionId`] of the imported root [`Region`].
-    region: RegionId,
+    pub(crate) region: RegionId,
 }
 
 #[cfg(test)]
