@@ -187,11 +187,17 @@ mod tests {
         let context = EagerContext::<Array, FillOperation<ArrayType, Scalar>>::new();
 
         // Dynamically sized outputs cannot be materialized by the eager array backend.
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            ))]),
+        );
         assert_eq!(
             context.fill(&dynamic_type, Scalar::from(3.5)),
             Err(ProgramError::Type(TypeError::invalid(
-                "cannot materialize a value of dynamically sized type f64[*]".to_string(),
+                "cannot materialize a value of dynamically sized type f64[dynamic]".to_string(),
             ))),
         );
 

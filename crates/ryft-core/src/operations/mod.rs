@@ -224,8 +224,16 @@ mod tests {
         // Dynamic dimensions flow through elementwise congruence when they match exactly, while static-vs-dynamic
         // mismatches are rejected.
         let operation = TestElementwiseArrayOperation { input_count: 2 };
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                )),
+                Dimension::Static(3),
+            ]),
+        );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()], &[]),
             Ok(vec![dynamic_type.clone()]),

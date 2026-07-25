@@ -465,6 +465,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Dimension, Layout, Memory, StridedLayout};
 
     use super::*;
@@ -523,6 +524,8 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
         let placed_output_type = output_type.clone().with_memory(Memory::Host { pinned: true });
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(4)).unwrap());
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -533,11 +536,14 @@ mod tests {
                 {
                     input_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4))]),
+                        Shape::new(vec![
+                            Dimension::Dynamic(rows.clone()),
+                            Dimension::Dynamic(columns.clone()),
+                        ]),
                     )],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Dynamic(None)]),
+                        Shape::new(vec![Dimension::Dynamic(columns), Dimension::Dynamic(rows)]),
                     )],
                 },
                 {
@@ -692,8 +698,11 @@ mod tests {
         // Transpose only reorders axes, so its batching rule also works when the mapped dimension is symbolic. It
         // stages the physical permutation [3, 1, 0, 2] without demanding a concrete batch size from the input type.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let symbolic_input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![2.into(), Dimension::Dynamic(None), 3.into(), 4.into()]));
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let symbolic_input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![2.into(), Dimension::Dynamic(batch.clone()), 3.into(), 4.into()]),
+        );
         let symbolic_input = context.input(symbolic_input_type.clone());
         let symbolic_input = ArrayBatch::new(symbolic_input_type, symbolic_input, BatchAxis::new(1)).unwrap();
         let symbolic_output = TransposeOperation::new([2, 0, 1])
@@ -703,7 +712,7 @@ mod tests {
         assert_eq!(symbolic_output.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             symbolic_output.r#type().as_ref(),
-            &ArrayType::new(DataType::F64, Shape::new(vec![4.into(), Dimension::Dynamic(None), 2.into(), 3.into()]),),
+            &ArrayType::new(DataType::F64, Shape::new(vec![4.into(), Dimension::Dynamic(batch), 2.into(), 3.into()]),),
         );
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert_eq!(

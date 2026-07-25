@@ -2802,7 +2802,7 @@ mod tests {
                     input_types = [
                         ArrayType::new(
                             DataType::F32,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
+                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded())), Dimension::Static(2), Dimension::Static(3)]),
                         ),
                         key_value.clone(),
                         key_value.clone(),

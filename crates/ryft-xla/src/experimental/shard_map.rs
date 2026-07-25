@@ -2001,6 +2001,7 @@ mod tests {
     use ryft_core::operations::math::{Dot, DotDimensionNumbers, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::types::data::DataType;
+    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 
     use super::*;
 
@@ -2816,7 +2817,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_rejects_dynamic_input_types() {
-        let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
+        );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,

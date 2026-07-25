@@ -159,13 +159,15 @@ impl Broadcastable for Shape {
         let other_offset = broadcasted_rank - other.rank();
         let mut broadcasted_dimensions = Vec::with_capacity(broadcasted_rank);
         for i in 0..broadcasted_rank {
-            let self_size = if i < self_offset { Dimension::Static(1) } else { self.dimensions()[i - self_offset] };
-            let other_size = if i < other_offset { Dimension::Static(1) } else { other.dimensions()[i - other_offset] };
+            let self_size =
+                if i < self_offset { Dimension::Static(1) } else { self.dimensions()[i - self_offset].clone() };
+            let other_size =
+                if i < other_offset { Dimension::Static(1) } else { other.dimensions()[i - other_offset].clone() };
             let broadcasted_size = match (&self_size, &other_size) {
                 (_, Dimension::Static(1)) => self_size,
                 (Dimension::Static(1), _) => other_size,
                 (Dimension::Static(x), Dimension::Static(y)) if x == y => Dimension::Static(*x),
-                (Dimension::Dynamic(x), Dimension::Dynamic(y)) if x == y => Dimension::Dynamic(*x),
+                (Dimension::Dynamic(x), Dimension::Dynamic(y)) if x == y => Dimension::Dynamic(x.clone()),
                 _ => {
                     return Err(BroadcastingError::IncompatibleShapes { lhs: self.clone(), rhs: other.clone() });
                 }
@@ -187,12 +189,12 @@ impl Broadcastable for Shape {
         let offset = broadcasted_rank - self.rank();
         let mut broadcasted_shape = Vec::with_capacity(broadcasted_rank);
         for i in 0..broadcasted_rank {
-            let self_size = if i < offset { Dimension::Static(1) } else { self.dimensions()[i - offset] };
-            let other_size = other.dimensions()[i];
+            let self_size = if i < offset { Dimension::Static(1) } else { self.dimensions()[i - offset].clone() };
+            let other_size = other.dimensions()[i].clone();
             let broadcasted_size = match (&self_size, &other_size) {
                 (Dimension::Static(1), _) => other_size,
                 (Dimension::Static(x), Dimension::Static(y)) if x == y => Dimension::Static(*y),
-                (Dimension::Dynamic(x), Dimension::Dynamic(y)) if x == y => Dimension::Dynamic(*y),
+                (Dimension::Dynamic(x), Dimension::Dynamic(y)) if x == y => Dimension::Dynamic(y.clone()),
                 _ => {
                     return Err(BroadcastingError::IncompatibleShapes { lhs: self.clone(), rhs: other.clone() });
                 }
@@ -211,8 +213,8 @@ impl Broadcastable for Shape {
         let broadcasted_rank = other.rank();
         let offset = broadcasted_rank - self.rank();
         for i in 0..broadcasted_rank {
-            let self_size = if i < offset { Dimension::Static(1) } else { self.dimensions()[i - offset] };
-            let other_size = other.dimensions()[i];
+            let self_size = if i < offset { Dimension::Static(1) } else { self.dimensions()[i - offset].clone() };
+            let other_size = other.dimensions()[i].clone();
             match (&self_size, &other_size) {
                 (Dimension::Static(1), _) => continue,
                 (Dimension::Static(x), Dimension::Static(y)) if x == y => continue,
@@ -359,9 +361,9 @@ fn broadcast_sharding(
     let mut broadcasted_dimensions = Vec::with_capacity(result_rank);
     for index in 0..result_rank {
         let lhs_size =
-            if index < lhs_offset { Dimension::Static(1) } else { lhs_shape.dimensions()[index - lhs_offset] };
+            if index < lhs_offset { Dimension::Static(1) } else { lhs_shape.dimensions()[index - lhs_offset].clone() };
         let rhs_size =
-            if index < rhs_offset { Dimension::Static(1) } else { rhs_shape.dimensions()[index - rhs_offset] };
+            if index < rhs_offset { Dimension::Static(1) } else { rhs_shape.dimensions()[index - rhs_offset].clone() };
         let lhs_dimension = padded_sharding_dimension(lhs_sharding, lhs_offset, index);
         let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
         let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {
@@ -451,9 +453,9 @@ fn is_sharding_broadcastable_to(
     let mut used_axes = BTreeSet::new();
     for index in 0..result_rank {
         let lhs_size =
-            if index < lhs_offset { Dimension::Static(1) } else { lhs_shape.dimensions()[index - lhs_offset] };
+            if index < lhs_offset { Dimension::Static(1) } else { lhs_shape.dimensions()[index - lhs_offset].clone() };
         let rhs_size =
-            if index < rhs_offset { Dimension::Static(1) } else { rhs_shape.dimensions()[index - rhs_offset] };
+            if index < rhs_offset { Dimension::Static(1) } else { rhs_shape.dimensions()[index - rhs_offset].clone() };
         let lhs_dimension = padded_sharding_dimension(lhs_sharding, lhs_offset, index);
         let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
         let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {

@@ -2373,7 +2373,13 @@ mod tests {
             )),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            ))]),
+        );
         let dynamic_carry = builder.add_input(dynamic_type.clone());
         let dynamic_body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![dynamic_carry], vec![Placeholder], vec![Placeholder])
@@ -2382,7 +2388,8 @@ mod tests {
             TestScanOperation::new(1, 3)
                 .infer_output_types(std::slice::from_ref(&dynamic_type), &[region_interface(&dynamic_body)]),
             Err(TypeError::invalid(
-                "scan body input 0 must have a fully static type but axis 0 of f64[*] has size *".to_string()
+                "scan body input 0 must have a fully static type but axis 0 of f64[dynamic] has size dynamic"
+                    .to_string()
             )),
         );
 

@@ -643,7 +643,7 @@ where
 /// the sharding rank still matches the shape rank.
 fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType, XlaDomainError> {
     let mut dims: Vec<ryft_core::Dimension> = vec![ryft_core::Dimension::Static(size)];
-    dims.extend(array_type.shape().dimensions().iter().copied());
+    dims.extend(array_type.shape().dimensions().iter().cloned());
     let sharding = match array_type.sharding() {
         Some(existing) => {
             let mut extended_dims = vec![ryft_core::sharding::ShardingDimension::replicated()];

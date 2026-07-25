@@ -1479,7 +1479,7 @@ mod tests {
                     error = "'all_gather' concat axis 0 is out of bounds for rank 0",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]))],
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded()))]))],
                     error = "'all_gather' does not support dynamically shaped operands",
                 },
             ],

@@ -1968,6 +1968,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::types::TypeError;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
@@ -2365,7 +2366,7 @@ mod tests {
         // The rank-3 form has no rank-4 analogue: batching an already-batched operation is rejected.
         let stacked_rank_3 = |values: &[f64], r#type: &ArrayType| {
             let dimensions: Vec<Dimension> =
-                std::iter::once(Dimension::Static(2)).chain(r#type.shape().dimensions().iter().copied()).collect();
+                std::iter::once(Dimension::Static(2)).chain(r#type.shape().dimensions().iter().cloned()).collect();
             let value = Array::from_f64s(
                 ArrayType::new(r#type.data_type(), Shape::new(dimensions)),
                 values.iter().chain(values.iter()).copied().collect(),
@@ -2831,19 +2832,25 @@ mod tests {
 
         // Dynamic dimension sizes that compare equal flow through inference into the output type: the dynamic
         // batching dimension is preserved and the equal bounded dynamic contracting dimensions are dropped.
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let contracting = DimensionVariable::new("contracting", DimensionBounds::non_negative(Some(4)).unwrap());
         let lhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![
+                Dimension::Dynamic(batch.clone()),
+                Dimension::Static(2),
+                Dimension::Dynamic(contracting.clone()),
+            ]),
         );
         let rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4)), Dimension::Static(3)]),
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(contracting), Dimension::Static(3)]),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
             Ok(vec![ArrayType::new(
                 DataType::F64,
-                Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
+                Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2), Dimension::Static(3)]),
             )]),
         );
 
@@ -2851,7 +2858,7 @@ mod tests {
         // for batching and contracting dimensions.
         let static_rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(4), Dimension::Static(3)]),
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(4), Dimension::Static(3)]),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs.clone(), static_rhs], &[]),
@@ -2861,7 +2868,17 @@ mod tests {
         );
         let mismatched_batch_rhs = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(Some(8)), Dimension::Dynamic(Some(4)), Dimension::Static(3)]),
+            Shape::new(vec![
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::non_negative(Some(8)).unwrap(),
+                )),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap(),
+                )),
+                Dimension::Static(3),
+            ]),
         );
         assert_eq!(
             operation.infer_output_types(&[lhs, mismatched_batch_rhs], &[]),

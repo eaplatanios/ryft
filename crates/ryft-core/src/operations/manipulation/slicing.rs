@@ -234,10 +234,12 @@ impl Operation<ArrayType> for SliceOperation {
                         }
                         output_dimensions.push(match input_type.dimension(axis) {
                             Dimension::Static(size) => Dimension::Static(size.div_ceil(stride)),
-                            Dimension::Dynamic(None) => Dimension::Dynamic(None),
-                            Dimension::Dynamic(Some(0)) => Dimension::Dynamic(Some(0)),
-                            Dimension::Dynamic(Some(upper_bound)) => {
-                                Dimension::Dynamic((upper_bound - 1).div_ceil(stride).checked_add(1))
+                            Dimension::Dynamic(variable) if stride == 1 => Dimension::Dynamic(variable),
+                            Dimension::Dynamic(_) => {
+                                return Err(TypeError::invalid(format!(
+                                    "'slice' dynamic full-extent axis {axis} with stride {stride} requires an explicit \
+                                     result-dimension operand",
+                                )));
                             }
                         });
                         continue;
@@ -1260,7 +1262,10 @@ impl DynamicSlice for ArrayType {
                     ))
                     .into());
                 }
-                Dimension::Dynamic(Some(upper_bound)) if size >= upper_bound => {
+                Dimension::Dynamic(variable)
+                    if variable.bounds().upper().is_some_and(|upper_bound| size >= upper_bound) =>
+                {
+                    let upper_bound = variable.bounds().upper().unwrap();
                     return Err(TypeError::invalid(format!(
                         "'dynamic_slice' size {size} cannot fit axis {axis} with exclusive upper bound \
                              {upper_bound}",
@@ -2263,9 +2268,9 @@ mod tests {
                 {
                     input_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]),
+                        Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded())), Dimension::Static(3)]),
                     )],
-                    error = "'slice' does not support dynamic input axis 0 with size *; slice bounds cannot be \
+                    error = "'slice' does not support dynamic input axis 0 with size dynamic; slice bounds cannot be \
                         validated against an unknown extent",
                 },
             ],
@@ -2537,12 +2542,21 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::unbounded()
+                            )),
+                            Dimension::Static(2)
+                        ])
+                    ),
                 ],
                 &[],
             ),
             Err(TypeError::invalid(
-                "'update_slice' does not support dynamic update axis 0 with size *; update shapes must be \
+                "'update_slice' does not support dynamic update axis 0 with size dynamic; update shapes must be \
                     static"
                     .to_string()
             )),
@@ -2556,13 +2570,23 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Static(3)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap()
+                            )),
+                            Dimension::Static(3)
+                        ])
+                    ),
                     update_type.clone(),
                 ],
                 &[],
             ),
             Err(TypeError::invalid(
-                "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size <4".to_string()
+                "'update_slice' cannot prove that the update fits along dynamic input axis 0 with size dynamic"
+                    .to_string()
             )),
         );
         assert_eq!(
@@ -2777,7 +2801,16 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::unbounded()
+                            )),
+                            Dimension::Static(3)
+                        ])
+                    ),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2789,7 +2822,16 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::non_negative(Some(2)).unwrap()
+                            )),
+                            Dimension::Static(3)
+                        ])
+                    ),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2800,7 +2842,16 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(1)), Dimension::Static(3)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::non_negative(Some(1)).unwrap()
+                            )),
+                            Dimension::Static(3)
+                        ])
+                    ),
                     index_type.clone(),
                     index_type.clone(),
                 ],
@@ -2996,14 +3047,23 @@ mod tests {
             operation.infer_output_types(
                 &[
                     input_type.clone(),
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::unbounded()
+                            )),
+                            Dimension::Static(2)
+                        ])
+                    ),
                     index_type.clone(),
                     index_type.clone(),
                 ],
                 &[],
             ),
             Err(TypeError::invalid(
-                "'dynamic_update_slice' does not support dynamic update axis 0 with size *; update shapes \
+                "'dynamic_update_slice' does not support dynamic update axis 0 with size dynamic; update shapes \
                     must be static"
                     .to_string()
             )),
@@ -3025,7 +3085,16 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[
-                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)])),
+                    ArrayType::new(
+                        DataType::F64,
+                        Shape::new(vec![
+                            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                                "dynamic",
+                                crate::types::dimensions::DimensionBounds::unbounded()
+                            )),
+                            Dimension::Static(3)
+                        ])
+                    ),
                     update_type.clone(),
                     index_type.clone(),
                     index_type.clone(),
@@ -3034,7 +3103,7 @@ mod tests {
             ),
             Err(TypeError::invalid(
                 "'dynamic_update_slice' cannot prove that the update fits along dynamic input axis 0 with \
-                    size *"
+                    size dynamic"
                     .to_string()
             )),
         );

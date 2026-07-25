@@ -608,7 +608,7 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
         coordinate_shape
             .dimensions()
             .iter()
-            .copied()
+            .cloned()
             .chain(item_shape.dimensions().iter().copied().map(Dimension::Static))
             .collect(),
     );
@@ -843,7 +843,13 @@ mod tests {
             0,
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            ))]),
+        );
         assert_eq!(
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
                 &dynamic_type,

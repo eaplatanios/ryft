@@ -1128,6 +1128,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed,
@@ -1635,10 +1636,13 @@ mod tests {
         assert_eq!(scalar_type.size_in_bytes(), Ok(16));
         assert_eq!(token_type.size_in_bytes(), Ok(0));
 
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![DimensionVariable::new("dynamic", DimensionBounds::unbounded()).into()]),
+        );
         let error = dynamic_type.size_in_bytes().unwrap_err();
         assert_eq!(error, Error::DynamicShape { shape: dynamic_type.shape().clone() });
-        assert_eq!(error.to_string(), "expected static shape but got [*]");
+        assert_eq!(error.to_string(), "expected static shape but got [dynamic]");
 
         let oversized_type = ArrayType::new(DataType::U16, Shape::new(vec![Dimension::Static(usize::MAX)]));
         let error = oversized_type.size_in_bytes().unwrap_err();

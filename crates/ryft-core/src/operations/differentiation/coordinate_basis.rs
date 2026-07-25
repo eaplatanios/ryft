@@ -357,13 +357,19 @@ mod tests {
             ),
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            ))]),
+        );
         assert_eq!(
             CoordinateBasisOperation::new(dynamic_type, 0, 1)
                 .infer_output_types(&[], &[])
                 .unwrap_err()
                 .to_string(),
-            "coordinate basis requires a fully static leaf type but got f32[*]",
+            "coordinate basis requires a fully static leaf type but got f32[dynamic]",
         );
 
         let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));

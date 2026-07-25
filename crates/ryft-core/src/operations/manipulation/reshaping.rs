@@ -228,30 +228,23 @@ impl ReshapeDimensionMonomial {
         Ok(self)
     }
 
-    /// Converts this monomial to the most precise [`Dimension`] representable by the current type system.
-    fn to_size(&self, input_shape: &Shape) -> Dimension {
+    /// Converts this monomial to a static extent or an unchanged dynamic input leaf.
+    fn to_dimension(&self, input_shape: &Shape) -> Result<Dimension, TypeError> {
         if self.coefficient == 0 {
-            return Dimension::Static(0);
+            return Ok(Dimension::Static(0));
         }
         if self.dynamic_dimensions.is_empty() {
-            return Dimension::Static(self.coefficient);
+            return Ok(Dimension::Static(self.coefficient));
         }
-        let mut maximum = self.coefficient;
-        for (dimension, exponent) in &self.dynamic_dimensions {
-            let Some(upper_bound) = input_shape[*dimension].upper_bound() else {
-                return Dimension::Dynamic(None);
-            };
-            let Some(dimension_maximum) = upper_bound.checked_sub(1) else {
-                return Dimension::Dynamic(Some(0));
-            };
-            for _ in 0..*exponent {
-                let Some(product) = maximum.checked_mul(dimension_maximum) else {
-                    return Dimension::Dynamic(None);
-                };
-                maximum = product;
-            }
+        if self.coefficient == 1
+            && self.dynamic_dimensions.len() == 1
+            && let Some((&dimension, &1)) = self.dynamic_dimensions.first_key_value()
+        {
+            return Ok(input_shape[dimension].clone());
         }
-        Dimension::Dynamic(maximum.checked_add(1))
+        Err(TypeError::invalid(
+            "'reshape' dynamic dimension arithmetic requires explicit result-dimension operands".to_string(),
+        ))
     }
 }
 
@@ -375,7 +368,12 @@ fn infer_symbolic_reshape_shape(
     if input_elements != output_elements {
         return Err(TypeError::invalid("'reshape' changes the number of elements".to_string()));
     }
-    Ok(Shape::new(output_dimensions.iter().map(|dimension| dimension.to_size(input_shape)).collect()))
+    Ok(Shape::new(
+        output_dimensions
+            .iter()
+            .map(|dimension| dimension.to_dimension(input_shape))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
 }
 
 /// Evaluates one reshape dimension expression for a concrete input shape.
@@ -813,14 +811,14 @@ fn infer_reshape_sharding(input: &ArrayType, output_shape: &Shape, sharding: &Sh
         .shape()
         .dimensions()
         .iter()
-        .copied()
+        .cloned()
         .enumerate()
         .filter(|(_, size)| *size != Dimension::Static(1))
         .collect::<Vec<_>>();
     let output_dimensions = output_shape
         .dimensions()
         .iter()
-        .copied()
+        .cloned()
         .enumerate()
         .filter(|(_, size)| *size != Dimension::Static(1))
         .collect::<Vec<_>>();
@@ -863,19 +861,20 @@ fn infer_reshape_sharding(input: &ArrayType, output_shape: &Shape, sharding: &Sh
         }
         let input_group_start = input_start;
         let output_group_start = output_start;
-        let mut input_product = static_positive_size(input_dimensions[input_start].1)?;
-        let mut output_product = static_positive_size(output_dimensions[output_start].1)?;
+        let mut input_product = static_positive_size(input_dimensions[input_start].1.clone())?;
+        let mut output_product = static_positive_size(output_dimensions[output_start].1.clone())?;
         input_start += 1;
         output_start += 1;
         while input_product != output_product {
             if input_product < output_product {
                 let (_, size) = input_dimensions.get(input_start).ok_or_else(alignment_error)?;
-                input_product = input_product.checked_mul(static_positive_size(*size)?).ok_or_else(alignment_error)?;
+                input_product =
+                    input_product.checked_mul(static_positive_size(size.clone())?).ok_or_else(alignment_error)?;
                 input_start += 1;
             } else {
                 let (_, size) = output_dimensions.get(output_start).ok_or_else(alignment_error)?;
                 output_product =
-                    output_product.checked_mul(static_positive_size(*size)?).ok_or_else(alignment_error)?;
+                    output_product.checked_mul(static_positive_size(size.clone())?).ok_or_else(alignment_error)?;
                 output_start += 1;
             }
         }
@@ -981,7 +980,7 @@ fn propagate_static_reshape_group(
 
     let mut mesh_axis_index = 0usize;
     for (output_axis, size) in output_group {
-        let mut remaining = static_positive_size(*size)?;
+        let mut remaining = static_positive_size(size.clone())?;
         let start = mesh_axis_index;
         while remaining > 1 && mesh_axis_index < mesh_axes.len() {
             let mesh_axis = &mesh_axes[mesh_axis_index];
@@ -1056,6 +1055,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
@@ -1282,12 +1282,20 @@ mod tests {
         assert_eq!(operation.output_shape(), None);
         assert_eq!(format!("{operation}"), "reshape [shape=[((dim(0) * 4) / 2), 2]]",);
 
-        // Abstract evaluation preserves a checked relation to the dynamic input and propagates an exclusive bound.
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(9)), Dimension::Static(4)]));
+        // Abstract evaluation cannot manufacture a stable leaf identity for a derived extent. The future mixed
+        // operation signature supplies that extent as an explicit result-dimension operand.
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::non_negative(Some(9)).unwrap())),
+                Dimension::Static(4),
+            ]),
+        );
         assert_eq!(
             input_type.reshape_with(&operation),
-            Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(17)), Dimension::Static(2)]),)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'reshape' dynamic dimension arithmetic requires explicit result-dimension operands".to_string(),
+            ))),
         );
 
         // Eager execution resolves the same expressions from the concrete runtime shape.
@@ -1428,10 +1436,16 @@ mod tests {
 
     #[test]
     fn test_array_type_reshape() {
-        // Anonymous dynamic dimensions can only be reshaped when equality follows directly from identical shapes.
-        // Dimension expressions below encode non-identity runtime relationships explicitly.
+        // Dynamic dimensions can only be reshaped without explicit dimension operands when equality follows directly
+        // from identical identity-bearing shapes. Dimension expressions encode other runtime relationships.
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
-        let dynamic_shape = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]);
+        let dynamic_shape = Shape::new(vec![
+            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            )),
+            Dimension::Static(3),
+        ]);
         let dynamic_type = ArrayType::new(DataType::F64, dynamic_shape.clone());
         assert_eq!(
             dynamic_type.reshape(Shape::new(vec![Dimension::Static(6)])),
@@ -1461,10 +1475,17 @@ mod tests {
 
         // A static zero product does not justify anonymous dynamic output dimensions unless a permutation identifies
         // their runtime source. A fully static zero-sized target needs no runtime witness.
+        let trailing = DimensionVariable::new("trailing", DimensionBounds::unbounded());
         let zero_dynamic_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(None)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(trailing.clone())]));
         assert_eq!(
-            zero_dynamic_type.reshape(Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(0)])),
+            zero_dynamic_type.reshape(Shape::new(vec![
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded()
+                )),
+                Dimension::Static(0)
+            ])),
             Err(ProgramError::Type(TypeError::invalid(
                 "'reshape' requires dimension expressions for a dynamic output shape".to_string()
             ))),
@@ -1474,9 +1495,11 @@ mod tests {
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]))),
         );
         assert_eq!(
-            zero_dynamic_type
-                .reshape_with_dimensions(Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(0)]), [1, 0],),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(0)]),)),
+            zero_dynamic_type.reshape_with_dimensions(
+                Shape::new(vec![Dimension::Dynamic(trailing.clone()), Dimension::Static(0)]),
+                [1, 0],
+            ),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(trailing), Dimension::Static(0)]),)),
         );
 
         // A non-identity reshape preserves memory placement but clears a layout whose output strides cannot be
@@ -1745,15 +1768,23 @@ mod tests {
         // Zero-product reshapes preserve fully replicated metadata. A sharded dynamic axis is ambiguous without an
         // explicit output request, and remains available to a caller that supplies one.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let replicated_input =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(None)]))
-                .with_sharding(
-                    Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-                        .unwrap()
-                        .with_varying_manual_axes(["x"])
-                        .unwrap(),
-                )
-                .unwrap();
+        let replicated_input = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(0),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                )),
+            ]),
+        )
+        .with_sharding(
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_varying_manual_axes(["x"])
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             replicated_input.reshape(Shape::new(vec![Dimension::Static(0)])),
             Ok(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0)]))
@@ -1765,16 +1796,21 @@ mod tests {
                 )
                 .unwrap()),
         );
-        let sharded_dynamic_input =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(None)]))
-                .with_sharding(
-                    Sharding::new(
-                        mesh.clone(),
-                        vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
+        let sharded_dynamic_input = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(0),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                )),
+            ]),
+        )
+        .with_sharding(
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             sharded_dynamic_input.reshape(Shape::new(vec![Dimension::Static(0)])),
             Err(ProgramError::Type(TypeError::invalid(

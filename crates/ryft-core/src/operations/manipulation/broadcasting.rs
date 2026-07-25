@@ -605,7 +605,7 @@ pub trait Broadcast: Sized {
     {
         let input_type = self.r#type().into_owned();
         let mut output_dimensions: Vec<Dimension> = sizes.iter().map(|size| Dimension::Static(*size)).collect();
-        output_dimensions.extend(input_type.shape().dimensions().iter().copied());
+        output_dimensions.extend(input_type.shape().dimensions().iter().cloned());
         let output_axes = (0..input_type.rank()).map(|axis| axis + sizes.len()).collect::<Vec<_>>();
         let sharding = input_type
             .sharding()
@@ -734,7 +734,7 @@ impl Broadcast for ArrayType {
 
             let input_dimension = self.dimension(input_axis);
             let output_dimension = output_type.dimension(output_axis);
-            match (input_dimension, output_dimension) {
+            match (input_dimension, output_dimension.clone()) {
                 // Identical sizes always map through, including identical dynamic sizes.
                 (input_dimension, output_dimension) if input_dimension == output_dimension => {}
                 // A static size-1 input dimension is replicated to match any static output extent. Expanding it
@@ -857,6 +857,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::TracingContext;
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{DataType, Layout, Memory, StridedLayout};
 
     use super::*;
@@ -1255,9 +1256,11 @@ mod tests {
 
     #[test]
     fn test_dynamic_broadcast() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let width = DimensionVariable::new("width", DimensionBounds::non_negative(Some(4)).unwrap());
         let output_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3), Dimension::Dynamic(width)]),
         );
         let operation = DynamicBroadcastOperation::new(output_type.clone(), vec![2, 1]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(3)]));
@@ -1265,7 +1268,7 @@ mod tests {
 
         // Type inference validates both the broadcast mapping and the runtime dimension-vector contract.
         assert_eq!(operation.name(), DYNAMIC_BROADCAST_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "dynamic_broadcast [output_type=f64[*, 3, <4], output_axes=[2, 1]]",);
+        assert_eq!(format!("{operation}"), "dynamic_broadcast [output_type=f64[batch, 3, width], output_axes=[2, 1]]",);
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -1317,7 +1320,7 @@ mod tests {
         assert_eq!(
             input.dynamic_broadcast(&out_of_bounds_dimensions, output_type, &[2, 1]),
             Err(ProgramError::Type(TypeError::invalid(
-                "dynamic broadcast runtime shape [2, 3, 5] does not refine declared output shape [*, 3, <4]"
+                "dynamic broadcast runtime shape [2, 3, 5] does not refine declared output shape [batch, 3, width]"
                     .to_string(),
             ))),
         );
@@ -1330,7 +1333,17 @@ mod tests {
         );
         let output_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                )),
+                Dimension::Static(3),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap(),
+                )),
+            ]),
         );
         let outputs = DynamicBroadcastOperation::new(output_type, vec![2, 1])
             .jvp(
@@ -1357,7 +1370,17 @@ mod tests {
                 &dimensions,
                 ArrayType::new(
                     DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+                    Shape::new(vec![
+                        Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                            "dynamic",
+                            crate::types::dimensions::DimensionBounds::unbounded(),
+                        )),
+                        Dimension::Static(3),
+                        Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                            "dynamic",
+                            crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap(),
+                        )),
+                    ]),
                 ),
                 &[2, 1],
             )
@@ -1367,7 +1390,7 @@ mod tests {
             operation = DynamicBroadcastOperation::new(
                 ArrayType::new(
                     DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+                    Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded())), Dimension::Static(3), Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap()))]),
                 ),
                 vec![2, 1],
             ),
@@ -1406,10 +1429,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(batched.batch_axis(), BatchAxis::from_position(0));
-        assert_eq!(
-            batched.unbatched_type().shape(),
-            &Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
-        );
+        assert_eq!(batched.unbatched_type().shape(), operation.output_type().shape());
         assert_eq!(*batched.value().r#type(), expected_type);
         assert_eq!(batched.value().to_f64s(), expected_values);
 
@@ -1477,7 +1497,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             DynamicBroadcastOperation::new(
-                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), 3.into(), Dimension::Dynamic(None)])),
+                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded())), 3.into(), Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded()))])),
                 vec![2, 1],
             )
             .batch(
@@ -1496,7 +1516,7 @@ mod tests {
             operation = DynamicBroadcastOperation::new(
                 ArrayType::new(
                     DataType::F64,
-                    Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+                    Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::unbounded())), Dimension::Static(3), Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new("dynamic", crate::types::dimensions::DimensionBounds::non_negative(Some(4)).unwrap()))]),
                 ),
                 vec![2, 1],
             ),
@@ -1548,19 +1568,32 @@ mod tests {
 
         // A dynamic input dimension maps only to the identical dynamic dimension, while replicated output axes must
         // remain static because their replication counts need to be known.
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
         let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]));
         let output_type = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
         );
         assert_eq!(input_type.broadcast(output_type.clone(), &[0, 2]), Ok(output_type));
 
-        let unbounded = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
+        let unbounded = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()))]),
+        );
         assert_eq!(
-            unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4))])), &[0]),
+            unbounded.broadcast(
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                        "output",
+                        DimensionBounds::non_negative(Some(4)).unwrap(),
+                    ))]),
+                ),
+                &[0],
+            ),
             Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size * but the output has size <4; a dynamic dimension \
+                "broadcasting input axis 0 has size input but the output has size output; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
                     .to_string(),
             ))),
@@ -1568,7 +1601,7 @@ mod tests {
         assert_eq!(
             unbounded.broadcast(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])), &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size * but the output has size 3; a dynamic dimension \
+                "broadcasting input axis 0 has size input but the output has size 3; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
                     .to_string(),
             ))),
@@ -1576,24 +1609,34 @@ mod tests {
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)])).broadcast(unbounded.clone(), &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting cannot expand input axis 0 of size 1 into dynamic output size *".to_string(),
+                "broadcasting cannot expand input axis 0 of size 1 into dynamic output size input".to_string(),
             ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(unbounded, &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting input axis 0 has size 3 but the output has size *; a dynamic dimension \
+                "broadcasting input axis 0 has size 3 but the output has size input; a dynamic dimension \
                     only broadcasts to an identical dynamic dimension"
                     .to_string(),
             ))),
         );
         assert_eq!(
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])).broadcast(
-                ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)])),
+                ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![
+                        Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                            "dynamic",
+                            crate::types::dimensions::DimensionBounds::unbounded()
+                        )),
+                        Dimension::Static(3)
+                    ])
+                ),
                 &[1],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size *".to_string(),
+                "broadcasting cannot replicate the input into unmapped dynamic output axis 0 of size dynamic"
+                    .to_string(),
             ))),
         );
     }

@@ -2059,11 +2059,17 @@ mod tests {
                 if message == "array type f64[3] requires 3 elements but got 1",
         ));
         // Dynamically shaped types cannot describe a materialized payload.
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            ))]),
+        );
         assert!(matches!(
             Array::new(dynamic_type, vec![Scalar::F64(1.0)]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f64[*]",
+                if message == "cannot materialize a value of dynamically sized type f64[dynamic]",
         ));
         // A well-formed payload constructs successfully and round-trips through the accessors.
         let array = Array::new(array_type(DataType::F64, &[2]), vec![Scalar::F64(1.0), Scalar::F64(2.0)]).unwrap();
@@ -2162,9 +2168,17 @@ mod tests {
         );
         assert_eq!(context.iota(&array_type(DataType::F64, &[3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
         // Kernels that materialize a payload from a type reject dynamically sized types.
-        let dynamic_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
-        let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                )),
+                Dimension::Static(3),
+            ]),
+        );
+        let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]";
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,

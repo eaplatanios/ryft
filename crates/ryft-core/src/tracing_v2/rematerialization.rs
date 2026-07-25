@@ -2779,7 +2779,7 @@ mod tests {
             // Every batched forward output carries the batch axis at position 0.
             for output_type in &forward_output_types {
                 assert_eq!(
-                    output_type.shape().dimensions().first().copied(),
+                    output_type.shape().dimensions().first().cloned(),
                     Some(Dimension::Static(2)),
                     "batched forward outputs should carry the batch axis for policy {policy:?}",
                 );
@@ -3259,7 +3259,7 @@ mod tests {
         let forward_output_types = forward.output_types();
         assert_eq!(forward_output_types.len(), 3);
         let saved_type = &forward_output_types[2];
-        assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Dimension::Static(2)));
+        assert_eq!(saved_type.shape().dimensions().first().cloned(), Some(Dimension::Static(2)));
         assert_eq!(saved_type.memory(), PINNED_HOST);
 
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.

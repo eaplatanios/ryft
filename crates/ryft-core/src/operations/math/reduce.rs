@@ -135,7 +135,7 @@ pub fn reduce_abstract(
         .dimensions()
         .iter()
         .enumerate()
-        .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(*size))
+        .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(size.clone()))
         .collect::<Vec<_>>();
     let sharding = reduce_sharding(input.sharding(), &reduce_mask, op)?;
     ArrayType::new(data_type, Shape::new(dimensions))
@@ -747,6 +747,7 @@ mod tests {
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;
     use crate::programs::types::Typed;
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::{ArrayType, DataType, Dimension, Shape};
 
     use super::*;
@@ -804,13 +805,19 @@ mod tests {
     fn test_reduce_abstract_propagates_dynamic_dimensions() {
         // Dynamic dimensions flow through reduce inference: reduced axes are dropped whether they are static or
         // dynamic, and the remaining dynamic dimensions are preserved in order.
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let width = DimensionVariable::new("width", DimensionBounds::non_negative(Some(4)).unwrap());
         let input = ArrayType::new(
             DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![
+                Dimension::Dynamic(batch.clone()),
+                Dimension::Static(3),
+                Dimension::Dynamic(width.clone()),
+            ]),
         );
         assert_eq!(
             reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(Some(4))]))),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Dynamic(width)]),)),
         );
         assert_eq!(
             reduce_abstract(&input, &[0, 2], ReductionKind::Sum, "reduce_sum"),

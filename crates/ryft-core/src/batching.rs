@@ -2638,7 +2638,13 @@ mod tests {
         // A mapped input whose batch dimension is `Dimension::Dynamic` cannot be batched since `batch`
         // has no way of determining the batch size.
         let dynamic_input = Array::with_unchecked_type(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded(),
+                ))]),
+            ),
             vec![Scalar::F64(1.0), Scalar::F64(2.0), Scalar::F64(3.0)],
         );
         let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(

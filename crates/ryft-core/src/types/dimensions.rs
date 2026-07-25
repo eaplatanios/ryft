@@ -197,80 +197,98 @@ impl Hash for DimensionVariable {
     }
 }
 
-/// Represents the extent of one array axis. A [`Dimension`] can be either statically known at compilation time or
-/// dynamic, in which case its extent is only known at runtime. Dynamic dimensions may optionally have an upper bound
-/// that the compiler can use for optimization. Note that compilation here refers to compiling an array program, not
-/// the Rust program containing it.
+/// Represents the extent of one array axis as either a static value or one symbolic [`DimensionVariable`].
 ///
-/// The [`Display`] implementation renders static dimensions as a number, bounded dynamic dimensions as `<` followed by
-/// the upper bound, and unbounded dynamic dimensions as `*`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+/// Reusing the same variable in multiple dimensions declares that their runtime extents are equal. Arithmetic
+/// relationships between dynamic extents are deliberately not represented in this type and instead belong in the
+/// ordinary program graph.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Dimension {
-    /// Static extent that is known at compilation time.
+    /// Extent known statically.
     Static(usize),
 
-    /// Dynamic extent that is not known until runtime and has an optional exclusive upper bound.
-    Dynamic(Option<usize>),
+    /// Runtime extent represented by one symbolic variable.
+    Dynamic(DimensionVariable),
 }
 
 impl Dimension {
-    /// Returns the value of this [`Dimension`] if it is a [`Dimension::Static`] and `None` otherwise.
+    /// Returns the statically known extent, or [`None`] for a dynamic dimension.
     #[inline]
     pub fn value(&self) -> Option<usize> {
-        match &self {
-            Self::Static(size) => Some(*size),
+        match self {
+            Self::Static(value) => Some(*value),
             Self::Dynamic(_) => None,
         }
     }
 
-    /// Returns an exclusive upper bound for this [`Dimension`] when one is known. For [`Dimension::Static`],
-    /// this is the static extent plus one. For [`Dimension::Dynamic`], this is its stored bound.
+    /// Returns the symbolic variable represented by this dimension, or [`None`] for a static dimension.
     #[inline]
-    pub fn upper_bound(&self) -> Option<usize> {
-        match &self {
-            Self::Static(size) => Some(*size + 1),
-            Self::Dynamic(upper_bound) => *upper_bound,
+    pub fn variable(&self) -> Option<&DimensionVariable> {
+        match self {
+            Self::Static(_) => None,
+            Self::Dynamic(variable) => Some(variable),
         }
     }
 
-    /// Returns `true` if every concrete extent allowed by `other` is also allowed by this [`Dimension`]. The receiver
-    /// is the more general dimension (e.g., a declared dimension), and the argument is the more precise one (e.g., the
-    /// dimension carried by a runtime value's type), so the relation is directional: `declared.is_refined_by(&actual)`.
-    /// The relation is defined as follows, recalling that the upper bound carried by [`Dimension::Dynamic`]
-    /// is *exclusive*:
+    /// Returns the inclusive lower and exclusive upper bounds of this dimension.
     ///
-    ///   - `Static(n)` is refined by `Static(m)` only when `n == m`.
-    ///   - `Static(_)` is never refined by `Dynamic(_)`.
-    ///   - `Dynamic(None)` is refined by every dimension.
-    ///   - `Dynamic(Some(bound))` is refined by `Static(m)` only when `m < bound`.
-    ///   - `Dynamic(Some(bound))` is refined by `Dynamic(Some(other))` only when `other <= bound`.
-    ///   - `Dynamic(Some(_))` is never refined by `Dynamic(None)`.
+    /// A static extent `n` has bounds `[n, n + 1)`. If `n + 1` cannot be represented, the upper bound is unbounded.
     #[inline]
-    pub fn is_refined_by(&self, other: &Dimension) -> bool {
+    pub fn bounds(&self) -> DimensionBounds {
+        match self {
+            Self::Static(value) => DimensionBounds { lower: *value, upper: value.checked_add(1) },
+            Self::Dynamic(variable) => variable.bounds(),
+        }
+    }
+
+    /// Returns an exclusive upper bound for this dimension when one is known.
+    #[inline]
+    pub fn upper_bound(&self) -> Option<usize> {
+        self.bounds().upper()
+    }
+
+    /// Returns whether `other` is a valid refinement of this dimension.
+    ///
+    /// Static dimensions require the same value. A dynamic dimension accepts a static extent within its bounds or the
+    /// same symbolic variable; a different symbolic variable represents an independent runtime extent.
+    #[inline]
+    pub fn is_refined_by(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Static(declared), Self::Static(actual)) => declared == actual,
+            (Self::Static(left), Self::Static(right)) => left == right,
             (Self::Static(_), Self::Dynamic(_)) => false,
-            (Self::Dynamic(None), _) => true,
-            (Self::Dynamic(Some(bound)), Self::Static(actual)) => actual < bound,
-            (Self::Dynamic(Some(bound)), Self::Dynamic(Some(other_bound))) => other_bound <= bound,
-            (Self::Dynamic(Some(_)), Self::Dynamic(None)) => false,
+            (Self::Dynamic(variable), Self::Static(value)) => variable.bounds().contains(*value),
+            (Self::Dynamic(left), Self::Dynamic(right)) => left == right,
         }
     }
 }
 
 impl Display for Dimension {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            Self::Static(size) => write!(formatter, "{size}"),
-            Self::Dynamic(Some(upper_bound)) => write!(formatter, "<{upper_bound}"),
-            Self::Dynamic(None) => write!(formatter, "*"),
+        match self {
+            Self::Static(value) => Display::fmt(value, formatter),
+            Self::Dynamic(variable) => Display::fmt(variable, formatter),
         }
     }
 }
 
 impl From<usize> for Dimension {
+    #[inline]
     fn from(value: usize) -> Self {
         Self::Static(value)
+    }
+}
+
+impl From<DimensionVariable> for Dimension {
+    #[inline]
+    fn from(variable: DimensionVariable) -> Self {
+        Self::Dynamic(variable)
+    }
+}
+
+impl From<&DimensionVariable> for Dimension {
+    #[inline]
+    fn from(variable: &DimensionVariable) -> Self {
+        Self::Dynamic(variable.clone())
     }
 }
 
@@ -307,6 +325,7 @@ impl Shape {
     ///
     /// ```rust
     /// # use ryft_core::types::{Shape, Dimension};
+    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
     ///
     /// // Scalar.
     /// assert_eq!(Shape::scalar().rank(), 0);
@@ -315,10 +334,12 @@ impl Shape {
     /// assert_eq!(Shape::new(vec![Dimension::Static(42)]).rank(), 1);
     ///
     /// // Matrix with 42 rows and up to 10 columns.
-    /// assert_eq!(Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(Some(10))]).rank(), 2);
+    /// let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(10)).unwrap());
+    /// assert_eq!(Shape::new(vec![Dimension::Static(42), columns.into()]).rank(), 2);
     ///
     /// // Matrix with an unknown number of rows and 42 columns.
-    /// assert_eq!(Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(42)]).rank(), 2);
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+    /// assert_eq!(Shape::new(vec![rows.into(), Dimension::Static(42)]).rank(), 2);
     /// ```
     #[inline]
     pub fn rank(&self) -> usize {
@@ -329,7 +350,7 @@ impl Shape {
     /// so `-1` returns the innermost dimension.
     #[inline]
     pub fn dimension<A: Into<Axis>>(&self, index: A) -> Dimension {
-        self[index]
+        self[index].clone()
     }
 
     /// Returns the number of elements in arrays with this [`Shape`]. A statically zero [`Dimension`] makes the result
@@ -358,14 +379,17 @@ impl Shape {
     /// more general shape (e.g., a declared shape), and the argument is the more precise one (e.g., the one carried by
     /// a runtime value's type), and so the relation is directional: `declared.is_refined_by(&actual)`. The two shapes
     /// must have equal rank and every receiver dimension must be refined by the corresponding dimension of `other`
-    /// per [`Dimension::is_refined_by`].
+    /// per [`Dimension::is_refined_by`]. Repeated occurrences of one dynamic variable must also refine to equal
+    /// dimensions.
     ///
     /// # Examples
     ///
     /// ```rust
     /// # use ryft_core::types::{Shape, Dimension};
+    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
     ///
-    /// let declared = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]);
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+    /// let declared = Shape::new(vec![rows.into(), Dimension::Static(3)]);
     ///
     /// // Dynamic declared dimensions are refined by any static size, while static ones require equality.
     /// assert!(declared.is_refined_by(&Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])));
@@ -377,12 +401,25 @@ impl Shape {
     /// ```
     #[inline]
     pub fn is_refined_by(&self, other: &Shape) -> bool {
-        self.rank() == other.rank()
-            && self
-                .dimensions
-                .iter()
-                .zip(other.dimensions.iter())
-                .all(|(declared, actual)| declared.is_refined_by(actual))
+        if self.rank() != other.rank() {
+            return false;
+        }
+        for (axis, (declared, actual)) in self.dimensions.iter().zip(other.dimensions.iter()).enumerate() {
+            if !declared.is_refined_by(actual) {
+                return false;
+            }
+            let Dimension::Dynamic(variable) = declared else {
+                continue;
+            };
+            for previous_axis in 0..axis {
+                if self.dimensions[previous_axis].variable() == Some(variable)
+                    && other.dimensions[previous_axis] != *actual
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -602,61 +639,74 @@ mod tests {
 
     #[test]
     fn test_dimension_value() {
+        let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let bounded = DimensionVariable::new("bounded", DimensionBounds::non_negative(Some(42)).unwrap());
         assert_eq!(Dimension::Static(1).value(), Some(1));
         assert_eq!(Dimension::Static(42).value(), Some(42));
-        assert_eq!(Dimension::Dynamic(None).value(), None);
-        assert_eq!(Dimension::Dynamic(Some(42)).value(), None);
+        assert_eq!(Dimension::Dynamic(unbounded).value(), None);
+        assert_eq!(Dimension::Dynamic(bounded).value(), None);
     }
 
     #[test]
     fn test_dimension_upper_bound() {
+        let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let bounded = DimensionVariable::new("bounded", DimensionBounds::non_negative(Some(42)).unwrap());
         assert_eq!(Dimension::Static(1).upper_bound(), Some(2));
         assert_eq!(Dimension::Static(42).upper_bound(), Some(43));
-        assert_eq!(Dimension::Dynamic(None).upper_bound(), None);
-        assert_eq!(Dimension::Dynamic(Some(42)).upper_bound(), Some(42));
+        assert_eq!(Dimension::Dynamic(unbounded).upper_bound(), None);
+        assert_eq!(Dimension::Dynamic(bounded).upper_bound(), Some(42));
     }
 
     #[test]
     fn test_dimension_is_refined_by() {
+        let unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let bounded = DimensionVariable::new("bounded", DimensionBounds::non_negative(Some(4)).unwrap());
+        let other_unbounded = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let other_bounded = DimensionVariable::new("bounded", DimensionBounds::non_negative(Some(4)).unwrap());
+
         // Static declared sizes accept only equal static actual sizes.
         assert!(Dimension::Static(3).is_refined_by(&Dimension::Static(3)));
         assert!(!Dimension::Static(3).is_refined_by(&Dimension::Static(4)));
-        assert!(!Dimension::Static(3).is_refined_by(&Dimension::Dynamic(None)));
-        assert!(!Dimension::Static(3).is_refined_by(&Dimension::Dynamic(Some(3))));
+        assert!(!Dimension::Static(3).is_refined_by(&Dimension::Dynamic(unbounded.clone())));
+        assert!(!Dimension::Static(3).is_refined_by(&Dimension::Dynamic(bounded.clone())));
 
-        // Unbounded dynamic declared sizes accept every actual size.
-        assert!(Dimension::Dynamic(None).is_refined_by(&Dimension::Static(0)));
-        assert!(Dimension::Dynamic(None).is_refined_by(&Dimension::Static(42)));
-        assert!(Dimension::Dynamic(None).is_refined_by(&Dimension::Dynamic(None)));
-        assert!(Dimension::Dynamic(None).is_refined_by(&Dimension::Dynamic(Some(42))));
+        // Dynamic declarations accept static extents admitted by their bounds.
+        assert!(Dimension::Dynamic(unbounded.clone()).is_refined_by(&Dimension::Static(0)));
+        assert!(Dimension::Dynamic(unbounded.clone()).is_refined_by(&Dimension::Static(42)));
+        assert!(Dimension::Dynamic(bounded.clone()).is_refined_by(&Dimension::Static(0)));
+        assert!(Dimension::Dynamic(bounded.clone()).is_refined_by(&Dimension::Static(3)));
+        assert!(!Dimension::Dynamic(bounded.clone()).is_refined_by(&Dimension::Static(4)));
+        assert!(!Dimension::Dynamic(bounded.clone()).is_refined_by(&Dimension::Static(5)));
 
-        // Bounded dynamic declared sizes accept static actual sizes strictly below the exclusive bound.
-        assert!(Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Static(0)));
-        assert!(Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Static(3)));
-        assert!(!Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Static(4)));
-        assert!(!Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Static(5)));
-
-        // Bounded dynamic declared sizes accept bounded dynamic actual sizes with bounds at most as large,
-        // and never accept unbounded dynamic actual sizes.
-        assert!(Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Dynamic(Some(3))));
-        assert!(Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Dynamic(Some(4))));
-        assert!(!Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Dynamic(Some(5))));
-        assert!(!Dimension::Dynamic(Some(4)).is_refined_by(&Dimension::Dynamic(None)));
+        // A dynamic occurrence refines only the same symbolic variable, not an independent declaration with matching
+        // name and bounds.
+        assert!(Dimension::Dynamic(unbounded.clone()).is_refined_by(&Dimension::Dynamic(unbounded.clone())));
+        assert!(Dimension::Dynamic(bounded.clone()).is_refined_by(&Dimension::Dynamic(bounded.clone())));
+        assert!(!Dimension::Dynamic(unbounded).is_refined_by(&Dimension::Dynamic(other_unbounded)));
+        assert!(!Dimension::Dynamic(bounded).is_refined_by(&Dimension::Dynamic(other_bounded)));
     }
 
     #[test]
     fn test_dimension_to_string() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(42)).unwrap());
         assert_eq!(Dimension::Static(1).to_string(), "1");
         assert_eq!(Dimension::Static(42).to_string(), "42");
-        assert_eq!(Dimension::Dynamic(None).to_string(), "*");
-        assert_eq!(Dimension::Dynamic(Some(42)).to_string(), "<42");
+        assert_eq!(Dimension::Dynamic(rows).to_string(), "rows");
+        assert_eq!(Dimension::Dynamic(columns).to_string(), "columns");
     }
 
     #[test]
     fn test_shape_rank() {
         let s0 = Shape::scalar();
         let s1 = Shape::new(vec![Dimension::Static(42)]);
-        let s2 = Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(None)]);
+        let s2 = Shape::new(vec![
+            Dimension::Static(4),
+            Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                "dynamic",
+                crate::types::dimensions::DimensionBounds::unbounded(),
+            )),
+        ]);
 
         assert_eq!(s0.rank(), 0);
         assert_eq!(s1.rank(), 1);
@@ -665,17 +715,18 @@ mod tests {
 
     #[test]
     fn test_shape_dimension() {
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let s0 = Shape::new(vec![Dimension::Static(42)]);
-        let s1 = Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(None)]);
+        let s1 = Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(columns.clone())]);
 
         assert_eq!(s0.dimension(0), Dimension::Static(42));
-        assert_eq!(s1.dimension(1), Dimension::Dynamic(None));
+        assert_eq!(s1.dimension(1), Dimension::Dynamic(columns.clone()));
         assert_eq!(s1.dimension(-2), Dimension::Static(4));
 
         assert_eq!(s0[0usize], Dimension::Static(42));
         assert_eq!(s1[0usize], Dimension::Static(4));
-        assert_eq!(s1[1usize], Dimension::Dynamic(None));
-        assert_eq!(s1[-1isize], Dimension::Dynamic(None));
+        assert_eq!(s1[1usize], Dimension::Dynamic(columns.clone()));
+        assert_eq!(s1[-1isize], Dimension::Dynamic(columns));
         assert_eq!(s1[-2isize], Dimension::Static(4));
     }
 
@@ -698,9 +749,39 @@ mod tests {
             Ok(Some(0)),
         );
         assert_eq!(Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(0)]).element_count(), Ok(Some(0)));
-        assert_eq!(Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]).element_count(), Ok(None));
-        assert_eq!(Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(Some(8))]).element_count(), Ok(None));
-        assert_eq!(Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(None)]).element_count(), Ok(Some(0)));
+        assert_eq!(
+            Shape::new(vec![
+                Dimension::Static(42),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded()
+                ))
+            ])
+            .element_count(),
+            Ok(None)
+        );
+        assert_eq!(
+            Shape::new(vec![
+                Dimension::Static(42),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::non_negative(Some(8)).unwrap()
+                ))
+            ])
+            .element_count(),
+            Ok(None)
+        );
+        assert_eq!(
+            Shape::new(vec![
+                Dimension::Static(0),
+                Dimension::Dynamic(crate::types::dimensions::DimensionVariable::new(
+                    "dynamic",
+                    crate::types::dimensions::DimensionBounds::unbounded()
+                ))
+            ])
+            .element_count(),
+            Ok(Some(0))
+        );
         assert_eq!(
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]).element_count(),
             Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
@@ -709,7 +790,8 @@ mod tests {
 
     #[test]
     fn test_shape_is_refined_by() {
-        let declared = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]);
+        let dynamic = DimensionVariable::new("dynamic", DimensionBounds::unbounded());
+        let declared = Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Static(3)]);
 
         // Pairwise size compatibility with matching ranks.
         assert!(declared.is_refined_by(&Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])));
@@ -726,6 +808,11 @@ mod tests {
         ])));
         assert!(!declared.is_refined_by(&Shape::scalar()));
         assert!(Shape::scalar().is_refined_by(&Shape::scalar()));
+
+        // Repeated occurrences of one variable declare an equality relationship across axes.
+        let square = Shape::new(vec![Dimension::Dynamic(dynamic.clone()), Dimension::Dynamic(dynamic)]);
+        assert!(square.is_refined_by(&Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])));
+        assert!(!square.is_refined_by(&Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])));
     }
 
     #[test]
@@ -733,16 +820,26 @@ mod tests {
         let s0 = Shape::scalar();
         let s1 = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
         let s2 = Shape::new(vec![Dimension::Static(4), Dimension::Static(1)]);
-        let s3 = Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(Some(1))]);
-        let s4 = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(42), Dimension::Dynamic(None)]);
-        let s5 = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let s3 = Shape::new(vec![
+            Dimension::Static(4),
+            Dimension::Dynamic(DimensionVariable::new("depth", DimensionBounds::non_negative(Some(1)).unwrap())),
+        ]);
+        let s4 = Shape::new(vec![
+            Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::unbounded())),
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("columns", DimensionBounds::unbounded())),
+        ]);
+        let s5 = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("columns", DimensionBounds::unbounded())),
+        ]);
 
         assert_eq!(format!("{s0}"), "[]");
         assert_eq!(format!("{s1}"), "[42, 4, 2]");
         assert_eq!(format!("{s2}"), "[4, 1]");
-        assert_eq!(format!("{s3}"), "[4, <1]");
-        assert_eq!(format!("{s4}"), "[*, 42, *]");
-        assert_eq!(format!("{s5}"), "[42, *]");
+        assert_eq!(format!("{s3}"), "[4, depth]");
+        assert_eq!(format!("{s4}"), "[rows, 42, columns]");
+        assert_eq!(format!("{s5}"), "[42, columns]");
     }
 
     #[test]
@@ -798,18 +895,27 @@ mod tests {
     fn test_static_shape_from_shape() {
         let static_shape = StaticShape::new(vec![42, 4, 2]);
         let shape = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
-        let dynamic_shape = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
-        let bounded_dynamic_shape = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(Some(8))]);
+        let dynamic_shape = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("columns", DimensionBounds::unbounded())),
+        ]);
+        let bounded_dynamic_shape = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new(
+                "bounded_columns",
+                DimensionBounds::non_negative(Some(8)).unwrap(),
+            )),
+        ]);
 
         assert_eq!(StaticShape::try_from(shape.clone()), Ok(static_shape.clone()));
         assert_eq!(StaticShape::try_from(&shape), Ok(static_shape));
         assert_eq!(
             StaticShape::try_from(dynamic_shape),
-            Err(TypeError::invalid("shape dimension 1 must be static, but got *".to_string())),
+            Err(TypeError::invalid("shape dimension 1 must be static, but got columns".to_string())),
         );
         assert_eq!(
             StaticShape::try_from(&bounded_dynamic_shape),
-            Err(TypeError::invalid("shape dimension 1 must be static, but got <8".to_string())),
+            Err(TypeError::invalid("shape dimension 1 must be static, but got bounded_columns".to_string())),
         );
     }
 }
