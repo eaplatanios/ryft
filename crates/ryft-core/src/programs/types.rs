@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::errors::CustomError;
 use crate::parameters::Parameter;
+use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
 
 /// Represents errors produced while inferring or validating [`Type`]s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -59,6 +60,73 @@ impl TypeError {
 /// requires [`Parameter`] so that types can be used as leaves in [`Parameterized`](crate::Parameterized) data
 /// structures.
 pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
+    /// Nominal identity carried by this type family's metadata. A [`TypeIdentity`] represents a declared equality
+    /// relationship between otherwise dynamic parts of types, rather than a runtime value or a Single Static
+    /// Assignment (SSA) atom. Repeating the same identity means those occurrences denote the same runtime quantity.
+    /// Type families without such relationships use [`NoIdentity`](crate::NoIdentity).
+    type Identity: TypeIdentity;
+
+    /// Cross-occurrence facts accumulated while validating complete type signatures at [`Program`](crate::Program) and
+    /// [`Region`](crate::Region) boundaries. These facts relate declared [`TypeIdentity`]s to refinements observed in
+    /// corresponding actual types, ensuring that repeated identity occurrences remain consistent across boundary leaves
+    /// and outputs. For example, an array refinement environment remembers the concrete extent first observed for a
+    /// dynamic dimension and rejects a conflicting extent elsewhere in the same signature. Type families that need no
+    /// cross-value facts use `()`. Also, type refinements never inspect or retain runtime value payloads.
+    type Refinements: TypeRefinements<Self>;
+
+    /// Visits the [`TypeIdentity`]s carried by this [`Type`] in deterministic positional order.
+    #[inline]
+    fn visit_identities(&self, visitor: &mut impl FnMut(TypeIdentityPosition, &Self::Identity)) {
+        let _ = visitor;
+    }
+
+    /// Derives the simultaneous [`TypeIdentityRenaming`] implied by matching a complete declared type signature
+    /// against an actual type signature. Matching is directional: `declared` contains the formal types of a
+    /// [`Program`](crate::Program) or [`Region`](crate::Region) boundary, while `actual` contains the corresponding
+    /// types supplied at an instantiation site. The method validates that the actual signature can instantiate the
+    /// declared signature and derives every declared-identity-to-actual-identity correspondence. For example:
+    ///
+    /// ```text
+    /// declared: [array<n>, array<m>]
+    /// actual:   [array<batch>, array<sequence>]
+    /// renaming: n -> batch, m -> sequence
+    /// ```
+    ///
+    /// The renaming is derived once from the complete boundary signature and then reused with
+    /// [`Type::rename_identities`] to update all metadata related to that boundary, including intermediate and output
+    /// types. Values, operations, and nested regions that store such types must apply the same renaming. Those internal
+    /// types do not generally have corresponding actual types from which they could independently derive the mapping.
+    ///
+    /// Note that the returned [`TypeIdentityRenaming`] is simultaneous meaning that applying it does not recursively
+    /// rename a target merely because that target is also a source. This makes swaps and permutations well-defined.
+    ///
+    /// When a declared identity is instantiated by a static component, there is no actual identity to place in the
+    /// renaming. The implementation must still validate bounds and ensure that repeated occurrences of the declared
+    /// identity observe consistent static refinements.
+    ///
+    /// Returns a [`TypeError`] when the signatures are structurally incompatible, an actual type cannot instantiate its
+    /// declared type, bounds are violated, or repeated occurrences imply conflicting identity mappings or refinements.
+    ///
+    /// # Parameters
+    ///
+    ///   - `declared`: Complete formal type signature declared by the program or region boundary.
+    ///   - `actual`: Corresponding type signature supplied at the instantiation site.
+    #[inline]
+    fn derive_identity_renaming(
+        declared: &[Self],
+        actual: &[Self],
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+        Self::Refinements::establish(declared, actual)?;
+        Ok(TypeIdentityRenaming::new())
+    }
+
+    /// Returns this [`Type`] after simultaneously renaming all of its live [`TypeIdentity`]s.
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+        let _ = renaming;
+        Ok(self.clone())
+    }
+
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.
@@ -108,6 +176,48 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// `*_holomorphic` variants. The plain entry points reject output types for which this returns `true`, and the
     /// holomorphic ones reject output types for which it returns `false`.
     fn is_complex(&self) -> bool;
+}
+
+/// Cross-occurrence established while validating one complete type signature at a [`Program`](crate::Program) or
+/// [`Region`](crate::Region) boundary. These facts relate declared [`TypeIdentity`]s to refinements observed in
+/// corresponding actual types, ensuring that repeated identity occurrences remain consistent across boundary leaves
+/// and outputs.
+///
+/// [`Type::is_refined_by`] checks one type pair. This companion contract checks a complete boundary so relationships
+/// repeated across several inputs or outputs remain consistent. Establishment via [`Self::establish`] is transactional
+/// across the complete input signature, and the resulting environment validates outputs against those same facts.
+/// [`TypeIdentity`]s produced inside the [`Program`](crate::Program) or [`Region`](crate::Region) may establish
+/// additional output facts, while unrelated, unbound output identities are rejected.
+pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
+    /// Establishes refinement facts from `actual` relative to `declared`.
+    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError>;
+
+    /// Validates `actual` against `declared` using the already-established facts. Identities in `internal_identities`
+    /// may establish new facts at this boundary. All other identities must already be bound.
+    fn validate(&self, declared: &[T], actual: &[T], internal_identities: &[T::Identity]) -> Result<(), TypeError>;
+}
+
+impl<T: Type> TypeRefinements<T> for () {
+    #[inline]
+    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError> {
+        Self::validate(&(), declared, actual, &[])
+    }
+
+    fn validate(&self, declared: &[T], actual: &[T], _internal_identities: &[T::Identity]) -> Result<(), TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        for (declared, actual) in declared.iter().zip(actual) {
+            if !declared.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Associates a runtime value with the abstract [`Type`] that Ryft should use to reason about it. [`Typed`] is the
