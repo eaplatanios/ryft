@@ -250,11 +250,12 @@ ledger disagrees with Git.
 
 ## P1c: structural dimension identities
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p1c-structural-dimension-identities`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `d8292119cb5cfb2d58ea3292aec3328fd4bc3f78`
+- Integration commit: `7bb5bf4aad7005b369a981cc3daacfe1369787f6`; owner review corrections continued on the integration
+  branch through `7bdddddc33a9c0a377017bf894eb76096e1f7e1a`
+- Remainder reconciliation commit: `d638ada5a`
 - Immutable archive unchanged: yes
 - Landed on increment: adds only the generic `Type::Identity`/`Type::Refinements` contracts required by program
   boundaries; derives boundary/internal ownership structurally from type positions and graph dataflow; validates shared
@@ -280,4 +281,50 @@ ledger disagrees with Git.
   inventory either implement renaming or contain only derived transform-local bookkeeping; the temporary output-reference
   producer fallback is named in code, Phase 3, and the deletes ledger
 - Known warning: the inherited ambiguous `arrays` glob re-export remains assigned to P9
-- Next action: owner review and direct merge into `u/eaplatanios/dynamic-shapes`
+- Remainder reconciliation: `d638ada5a` preserves the nonconflicting later archived edits as an audit diff while
+  resolving superseded P1c foundation paths in favor of the reviewed integration. That mutable remainder is not
+  expected to compile against the new contracts until its assigned later increments are reconstructed; the immutable
+  archive remains the compiling historical reference.
+- Next action: none
+
+## P2a: dimension SSA foundations
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p2a-dimension-ssa-foundations`
+- Source commit: `e73dde1d4cebf560d5abfead1ce44132e0bd3124`
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Scope: introduce the homogeneous `DimensionType`/`DimensionValue` SSA foundation and checked dimension arithmetic
+  operation family without yet introducing assertions, the heterogeneous array/dimension storage sum, or projected
+  contexts
+- Deferred: ordered requirements and their effects/partial-evaluation contract belong to `P2b`; generic storage-sum
+  projection belongs to `P2c`; direct zero-state projected binding and the third-member extensibility gate belong to
+  `P2d`; mixed array/dimension operation signatures remain in `P3`
+- Implemented: adds `DimensionType` as a definition-position type, checked host `DimensionValue`s, a homogeneous
+  tracing context, generic constant reuse, and one `DimensionArithmeticOperation` parameterized by nine arithmetic
+  functions. Every arithmetic result owns a fresh bounded variable, runtime values may refine declared operands by
+  narrowing their bounds, and arithmetic remains ordinary SSA through tracing, interpretation, and partial evaluation.
+- Generic closure correction: definition-position constant types now establish immutable internal identities, all
+  constant definitions are collected before references so atom-table order is irrelevant, duplicate definitions are
+  rejected, and the existing unresolved-reference diagnostic remains unchanged. This is the general SSA rule required
+  by any future definition-bearing constant type, not a dimension-specific exception.
+- Surface control: nine arithmetic functions share one operation payload and one outer operation-family variant rather
+  than nine nominal payload types and dispatch variants. P2a adds no expression tree, witness, substitution, custom
+  constant operation, heterogeneous storage sum, projected context, or dimension-specific program machinery.
+- Verification: `cargo check -p ryft-core -p ryft-xla` passed; `cargo test -p ryft-core --lib` passed all 934 tests;
+  `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; all 53 `ryft-macros` unit tests and all 17 operation
+  macro-integration tests passed; `cargo test -p ryft-xla --lib` passed 396 tests with one documented ignored benchmark;
+  focused tests cover exact/narrowed inputs, fresh result identities, bound inference, all arithmetic functions, portable
+  width and invalid-operation failures, eager execution, tracing, and known-side partial evaluation; formatting and
+  `git diff --check` passed
+- Inherited verification issue: the parameter trybuild golden mismatch reproduces unchanged because rustc includes
+  `Axes` in a non-exhaustive implementor help list; P2a does not touch that diagnostic or its fixture
+- Lint audit: strict workspace Clippy still reports the existing repository-wide warning backlog, but a targeted
+  diagnostic search reports no warning in either P2a dimension file
+- Residual search: no nominal per-function dimension operation payload, custom dimension constant operation, old
+  arithmetic error name, projection wrapper, replay hook, or expression representation was introduced; comparisons,
+  gateways, `dimension_size`, requirements, the storage sum, and direct projected binding remain assigned to their
+  explicit later increments
+- Review method: line by line
+- Next action: stage the no-commit integration merge for owner review

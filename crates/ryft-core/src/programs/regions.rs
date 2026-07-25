@@ -187,12 +187,13 @@ impl<V: Typed, O> Region<V, O> {
         Ok(Self { atoms, input_ids: self.input_ids.clone(), output_ids: self.output_ids.clone(), instructions })
     }
 
-    /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A result definition whose
-    /// [`TypeIdentity`](crate::TypeIdentity) occurs on an input/operand forwards that available identity. Any other
-    /// result definition establishes one fresh internal identity. During the staged migration to explicit dimension
-    /// inputs/operands, a fresh identity whose first occurrence is a result reference also establishes an internal
-    /// identity. That fallback keeps existing [`Shape`](crate::Shape)-producing array [`Operation`]s closed until their
-    /// first-class [`Dimension`](crate::Dimension) producer operands make the reference available before the result.
+    /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A definition-position constant establishes one
+    /// immutable internal identity. A result definition whose [`TypeIdentity`](crate::TypeIdentity) occurs on an
+    /// input/operand forwards that available identity, while any other result definition establishes one fresh internal
+    /// identity. During the staged migration to explicit dimension inputs/operands, a fresh identity whose first
+    /// occurrence is a result reference also establishes an internal identity. That fallback keeps existing
+    /// [`Shape`](crate::Shape)-producing array [`Operation`]s closed until their first-class
+    /// [`Dimension`](crate::Dimension) producer operands make the reference available before the result.
     pub(crate) fn type_identity_signature(
         &self,
     ) -> Result<TypeIdentitySignature<<V::Type as Type>::Identity>, TypeError>
@@ -216,12 +217,34 @@ impl<V: Typed, O> Region<V, O> {
         let mut available_identities = input_identities.clone();
         let mut internal_identities = Vec::new();
 
-        // Constants cannot establish a dynamic identity. Unlike a region input or instruction result, they have no
-        // defining SSA boundary. Consequently, every identity mentioned by a constant type must already be available
-        // from the region inputs.
+        // A definition-position occurrence on a constant establishes one immutable Single Static Assignment (SSA) value
+        // just like a definition-position instruction result. Process all such definitions before constant references
+        // so the atom-table order does not impose an artificial dominance relationship among constants.
         self.atoms.iter().filter_map(Atom::as_constant).try_for_each(|value| {
             let r#type = value.r#type();
-            Self::visit_type_identities(r#type.as_ref(), |_, identity| {
+            Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+                if position != TypeIdentityPosition::Definition {
+                    return Ok(());
+                }
+                if available_identities.contains(identity) {
+                    return Err(TypeError::invalid(format!(
+                        "constant type defines identity {identity} more than once in this region",
+                    )));
+                }
+                available_identities.push(identity.clone());
+                internal_identities.push(identity.clone());
+                Ok(())
+            })
+        })?;
+
+        // Reference-position constant metadata must refer to an identity supplied by the boundary or defined by a
+        // constant. Constants cannot depend on instruction results because all constants exist before execution.
+        self.atoms.iter().filter_map(Atom::as_constant).try_for_each(|value| {
+            let r#type = value.r#type();
+            Self::visit_type_identities(r#type.as_ref(), |position, identity| {
+                if position != TypeIdentityPosition::Reference {
+                    return Ok(());
+                }
                 if available_identities.contains(identity) {
                     Ok(())
                 } else {
@@ -1457,6 +1480,34 @@ mod tests {
         let signature = arithmetic.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[boundary]);
         assert_eq!(signature.internal_identities(), &[fresh]);
+
+        // A constant value is also a Single Static Assignment (SSA) definition and may therefore establish
+        // its own fresh identity.
+        let constant_identity = StructuralIdentity::new("constant");
+        let constant: Region<StructuralType, StructuralOperation> = Region {
+            atoms: vec![Atom::Constant(StructuralType::definition(constant_identity.clone()))],
+            input_ids: Vec::new(),
+            output_ids: vec![AtomId::new(0)],
+            instructions: Vec::new(),
+        };
+        let signature = constant.type_identity_signature().unwrap();
+        assert_eq!(signature.input_identities(), &[]);
+        assert_eq!(signature.internal_identities(), &[constant_identity.clone()]);
+
+        // Constant references may precede their definition in the atom table because constants have no execution
+        // order and are all available before the first instruction.
+        let constant_reference: Region<StructuralType, StructuralOperation> = Region {
+            atoms: vec![
+                Atom::Constant(StructuralType::reference(constant_identity.clone())),
+                Atom::Constant(StructuralType::definition(constant_identity.clone())),
+            ],
+            input_ids: Vec::new(),
+            output_ids: vec![AtomId::new(0)],
+            instructions: Vec::new(),
+        };
+        let signature = constant_reference.type_identity_signature().unwrap();
+        assert_eq!(signature.input_identities(), &[]);
+        assert_eq!(signature.internal_identities(), &[constant_identity]);
     }
 
     #[test]
@@ -1509,6 +1560,21 @@ mod tests {
             Err(TypeError::Invalid { message })
                 if message
                     == "operation `structural` output type references identity boundary without consuming or defining it",
+        ));
+
+        let duplicate_constant_definition: Region<StructuralType, StructuralOperation> = Region {
+            atoms: vec![
+                Atom::Constant(StructuralType::definition(fresh.clone())),
+                Atom::Constant(StructuralType::definition(fresh.clone())),
+            ],
+            input_ids: Vec::new(),
+            output_ids: Vec::new(),
+            instructions: Vec::new(),
+        };
+        assert!(matches!(
+            duplicate_constant_definition.type_identity_signature(),
+            Err(TypeError::Invalid { message })
+                if message == "constant type defines identity fresh more than once in this region",
         ));
 
         let constant_reference: Region<StructuralType, StructuralOperation> = Region {

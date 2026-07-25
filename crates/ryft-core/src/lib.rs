@@ -25,6 +25,9 @@ pub mod utilities;
 
 // TODO(eaplatanios): Make all of the following more specific.
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
+// Both `backends` and `types` currently expose public `arrays` and `dimensions` modules. P9 replaces these temporary
+// glob exports with an explicit facade; suppress the known ambiguity until that dedicated API increment.
+#[allow(ambiguous_glob_reexports)]
 pub use backends::*;
 pub use batching::{
     ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingDriver,
