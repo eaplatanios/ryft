@@ -210,7 +210,7 @@ ledger disagrees with Git.
   `DimensionError::InvalidBounds` recovery through `TypeError::Custom`; `DimensionError` derives `thiserror::Error`
   rather than duplicating standard error boilerplate
 - Deferred: changing `Dimension::Dynamic` to carry an identity belongs to P1b; generic `Type` identity/refinement
-  hooks, structural closure, canonical signatures, and `OutputIdentityRole` deletion belong to P1c
+  hooks, structural closure, alpha-equivalent cache matching, and `OutputIdentityRole` deletion belong to P1c
 - Verification: the 16 focused `types::dimensions` tests passed; `cargo check -p ryft-core` passed;
   `cargo test -p ryft-core --lib` passed all 915 tests; `cargo test -p ryft-core --doc` passed 43 tests with 13
   ignored; scoped formatting and `git diff --check` passed
@@ -222,18 +222,18 @@ ledger disagrees with Git.
 
 ## P1b: dynamic dimension leaves
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p1b-dynamic-dimension-leaves`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `e82396bef14516b183d86535429961ee65989835`
+- Integration commit: `42c2a3f3ca973ed6af8e6ab1085a3229acb13e63`
+- Remainder reconciliation commit: `2156a584865c946cd088d56b00eb15efd0089fbb`
 - Immutable archive unchanged: yes
 - Landed: replaces `Dimension::Dynamic(Option<usize>)` with one `DimensionVariable` leaf and migrates shape/type
   consumers without a compatibility variant or expression representation; shared leaves retain equality through
   broadcasting, reshaping, transpose, reduction, dot, and repeated-axis refinement; XLA bounds lowering reads the
   variable's authoritative bounds directly; persistent XLA signatures use a version-3 typed variable table that
   preserves sharing while excluding diagnostic names from canonical cache keys
-- Deferred: generic `Type` identity/refinement hooks, structural closure, canonical signatures, and
+- Deferred: generic `Type` identity/refinement hooks, structural closure, alpha-equivalent cache matching, and
   `OutputIdentityRole` deletion remain assigned to P1c; derived dynamic reshape, concatenate, pad, and strided
   full-extent slice results reject with exact diagnostics until P3 supplies explicit result-dimension operands
 - Verification: `cargo check -p ryft-core -p ryft-xla` passed; `cargo test -p ryft-core --lib` passed all 915 tests;
@@ -246,4 +246,38 @@ ledger disagrees with Git.
   identifiers, invalid zero-bound lowering variant, or non-static `Dimension` `.copied()` use remains under `crates`;
   the sole non-test/non-doc `DimensionVariable::new` outside `types::dimensions` recreates validated shared variables
   while decoding the version-3 XLA persistent signature
-- Next action: push the P1b increment and stage its no-commit integration merge for owner review
+- Next action: none
+
+## P1c: structural dimension identities
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p1c-structural-dimension-identities`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed on increment: adds only the generic `Type::Identity`/`Type::Refinements` contracts required by program
+  boundaries; derives boundary/internal ownership structurally from type positions and graph dataflow; validates shared
+  dynamic extents transactionally across complete input/output signatures; and applies simultaneous alpha-renaming to
+  atom types, constant/capture metadata, identity-bearing operation payloads, and attached regions
+- Region composition: condition, while, scan, custom JVP/VJP, custom-VJP tangent, and rematerialization declare their
+  ordinary operand-to-region input mapping; all owned, shared-callee, and replayed-region drivers use one generic
+  instantiation/import path with cache sharing for disjoint alpha-equivalent identities and isolation for overlapping
+  permutations
+- Surface reduction: boundary-refinement helpers remain private interpretation functions rather than new `Value`
+  methods; live identity closures and cache metadata remain crate-private; the unused generic canonical-signature
+  representation and `TypeIdentity::CanonicalProperties` hook were deleted because exact-source core caches have no
+  consumer for them and persistent XLA keys already own their canonical schema
+- Transitional rule: before P2/P3 add first-class dimension results/operands, one fresh output-reference occurrence may
+  establish an internal identity for a legacy shape-producing array operation; Phase 3 and the deletes ledger explicitly
+  require removing this fallback once result-dimension operands are present
+- Verification: `cargo check -p ryft-core -p ryft-xla` passed; `cargo test -p ryft-core --lib` passed all 922 tests;
+  `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; all 53 `ryft-macros` unit tests and all 17 operation
+  macro-integration tests passed; `cargo test -p ryft-xla --lib` passed 396 tests with one documented ignored benchmark;
+  `cargo fmt --all` and `git diff --check` passed
+- Residual search: no production `OutputIdentityRole`, `output_identity_role`, generic canonical-identity object, or
+  `TypeIdentity::CanonicalProperties` remains; all identity-bearing operation payload fields found by the P0/P1c
+  inventory either implement renaming or contain only derived transform-local bookkeeping; the temporary output-reference
+  producer fallback is named in code, Phase 3, and the deletes ledger
+- Known warning: the inherited ambiguous `arrays` glob re-export remains assigned to P9
+- Next action: owner review and direct merge into `u/eaplatanios/dynamic-shapes`

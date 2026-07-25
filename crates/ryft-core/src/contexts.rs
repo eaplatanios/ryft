@@ -839,13 +839,13 @@ mod tests {
                 vec![region.clone()],
                 std::slice::from_ref(&input),
             ),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+            Err(ProgramError::MalformedProgram(actual))
+            if actual == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
         ));
         assert!(matches!(
             context.builder().borrow().error(),
-            Some(ProgramError::MalformedProgram(message))
-                if message == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+            Some(ProgramError::MalformedProgram(actual))
+            if actual == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
         ));
 
         // Region-input inference failures are recorded on the builder just like output-inference and import failures.
