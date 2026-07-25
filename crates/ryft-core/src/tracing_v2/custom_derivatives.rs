@@ -20,11 +20,21 @@ use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, 
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::Operation;
-use crate::programs::regions::RegionInterface;
+use crate::programs::regions::{RegionInterface, RegionSlot};
 use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::{MaybeZero, Program, ProgramError, Value};
+use crate::programs::{MaybeZero, Program, ProgramError, TypeIdentityRenaming, Value};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::types::ArrayType;
+
+/// Applies the type-identity instantiation induced by `actual_inputs` to related types in the formal input scope.
+fn instantiate_boundary_types<T: Type>(
+    formal_inputs: &[T],
+    actual_inputs: &[T],
+    types: &[T],
+) -> Result<Vec<T>, TypeError> {
+    let renaming = T::derive_identity_renaming(formal_inputs, actual_inputs)?;
+    types.iter().map(|r#type| r#type.rename_identities(&renaming)).collect()
+}
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
@@ -100,6 +110,27 @@ impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
         "custom_jvp"
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("primal"), RegionSlot::rule("jvp")] }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 2 {
+            return Err(TypeError::invalid(format!(
+                "custom_jvp expects 2 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let mut jvp_input_types = input_types.to_vec();
+        jvp_input_types.extend(input_types.iter().map(DifferentiableType::tangent));
+        Ok(vec![Some(input_types.to_vec()), Some(jvp_input_types)])
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -108,11 +139,6 @@ impl<T: DifferentiableType> Operation<T> for CustomJvpOperation {
         let primal_interface = validated_custom_jvp_interfaces(region_interfaces)?;
         check_types!(@same, "custom_jvp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["primal", "jvp"]
     }
 }
 
@@ -376,6 +402,40 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
         "custom_vjp"
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("primal"), RegionSlot::rule("forward"), RegionSlot::rule("backward")] }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 3 {
+            return Err(TypeError::invalid(format!(
+                "custom_vjp expects 3 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let primal_interface = &region_interfaces[0];
+        let forward_interface = &region_interfaces[1];
+        let primal_output_types =
+            instantiate_boundary_types(primal_interface.input_types(), input_types, primal_interface.output_types())?;
+        let forward_output_types =
+            instantiate_boundary_types(forward_interface.input_types(), input_types, forward_interface.output_types())?;
+        if forward_output_types.len() < primal_output_types.len() {
+            return Err(TypeError::invalid(format!(
+                "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+                primal_output_types.len(),
+                forward_output_types.len(),
+            )));
+        }
+        let mut backward_input_types = forward_output_types[primal_output_types.len()..].to_vec();
+        backward_input_types.extend(primal_output_types.iter().map(DifferentiableType::cotangent));
+        Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec()), Some(backward_input_types)])
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -384,11 +444,6 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
         let primal_interface = validated_custom_vjp_interfaces(region_interfaces)?;
         check_types!(@same, "custom_vjp input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
-    }
-
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["primal", "forward", "backward"]
     }
 }
 
@@ -622,6 +677,53 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
         if self.transposed { "custom_vjp_backward" } else { "custom_vjp_tangent" }
     }
 
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::rule("backward")] }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError::invalid(format!(
+                "{} expects 1 attached region but got {}",
+                self.name(),
+                region_interfaces.len(),
+            )));
+        }
+        let backward_interface = &region_interfaces[0];
+        let (_, cotangent_types) = self.split_backward_inputs(backward_interface)?;
+        let backward_input_types = if self.transposed {
+            check_count!(
+                "custom_vjp backward input type",
+                input_types,
+                cotangent_types.len() + self.residual_count,
+                TypeError,
+            );
+            input_types[cotangent_types.len()..]
+                .iter()
+                .chain(&input_types[..cotangent_types.len()])
+                .cloned()
+                .collect()
+        } else {
+            check_count!(
+                "custom_vjp tangent input type",
+                input_types,
+                self.input_tangent_types.len() + self.residual_count,
+                TypeError,
+            );
+            input_types[self.input_tangent_types.len()..]
+                .iter()
+                .chain(&self.output_tangent_types)
+                .cloned()
+                .collect()
+        };
+        Ok(vec![Some(backward_input_types)])
+    }
+
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -659,9 +761,21 @@ impl<T: Type> Operation<T> for CustomVjpTangentOperation<T> {
         }
     }
 
-    #[inline]
-    fn region_names(&self) -> &'static [&'static str] {
-        &["backward"]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self {
+            residual_count: self.residual_count,
+            transposed: self.transposed,
+            input_tangent_types: self
+                .input_tangent_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            output_tangent_types: self
+                .output_tangent_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 }
 
@@ -1156,7 +1270,7 @@ mod tests {
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
     use crate::programs::effects::Effects;
-    use crate::programs::regions::{RegionDriver, RegionRef};
+    use crate::programs::regions::{RegionDriver, RegionRef, RegionRole};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::types::{DataType, Dimension, Shape};
 
@@ -1274,6 +1388,8 @@ mod tests {
     #[test]
     fn test_custom_jvp_inference_validates_the_rule_signature() {
         let scalar = test_type(&[]);
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation::new(), 0), Some(RegionRole::Computation),);
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomJvpOperation::new(), 1), Some(RegionRole::Rule));
         // The JVP interface must take `(inputs..., tangents...)`; a primal-only signature is rejected.
         assert!(
             CustomJvpOperation::new()
@@ -1288,6 +1404,9 @@ mod tests {
     #[test]
     fn test_custom_vjp_inference_validates_the_rule_signatures() {
         let scalar = test_type(&[]);
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 0), Some(RegionRole::Computation));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 1), Some(RegionRole::Rule));
+        assert_eq!(Operation::<ArrayType>::region_role(&CustomVjpOperation::new(), 2), Some(RegionRole::Rule));
         // The backward interface must consume `(residuals..., output cotangents...)`; a single-input program whose
         // signature cannot line up with the forward residuals is rejected.
         assert!(
@@ -1343,6 +1462,10 @@ mod tests {
             CustomVjpTangentOperation::new(1, false, vec![tangent_type.clone()], vec![tangent_type.clone()],)
                 .infer_output_types(&[tangent_type.clone(), residual_type], std::slice::from_ref(&backward_interface),),
             Ok(vec![tangent_type]),
+        );
+        assert_eq!(
+            CustomVjpTangentOperation::new(1, false, Vec::<ArrayType>::new(), Vec::new()).region_role(0),
+            Some(RegionRole::Rule),
         );
     }
 

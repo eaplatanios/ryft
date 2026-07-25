@@ -188,8 +188,8 @@ pub trait Context: Domain + Clone {
     /// borrowed regions from a replayed program, or shared callee programs through one ordered
     /// [`Region`](crate::Region) namespace. Eager and transform contexts make those regions available to the
     /// operation's interpretation or transform driver. Staging contexts import or intern them into the destination
-    /// program and attach their [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence must
-    /// match the number and order returned by [`Operation::region_names`].
+    /// program and attach their [`RegionId`](crate::RegionId)s to the recorded instruction. The resulting sequence
+    /// must match the number and order returned by [`Operation::region_slots`].
     ///
     /// # Parameters
     ///
@@ -269,13 +269,7 @@ pub trait Context: Domain + Clone {
         let flat_program = flat_program.into_simplified()?;
         let output_values = flat_program.interpret_in_context(self, input_values)?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
-        let program = Program {
-            input_structure,
-            output_structure,
-            regions: flat_program.regions,
-            entry: flat_program.entry,
-            marker: PhantomData,
-        };
+        let program = flat_program.restructured(input_structure, output_structure)?;
         Ok((output, program))
     }
 }
@@ -444,22 +438,82 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         inputs: &[I],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
+
+        // Every live input atom is local to exactly one builder. Validate that ownership before inspecting regions or
+        // mutating this trace so a foreign tracer cannot alias an unrelated atom with the same numeric identifier.
         check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
             .map_err(|error| self.error(error))?;
-        if self.builder().borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+
+        // Region input identities are instantiated from the caller operand types before the regions enter this builder.
+        // First validate the operation's complete attachment declaration so later zips cannot silently omit either a
+        // region or its instantiation request. Region-free operations avoid collecting input types here as the checked
+        // builder path will infer them directly from its atoms.
+        let declared_region_count = operation.region_slots().len();
+        let (input_types, region_input_types) = if declared_region_count == 0 {
+            if driver.regions().next().is_some() {
+                return Err(self.error(ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares no region slots but {} regions were attached",
+                    operation.name(),
+                    driver.region_count(),
+                ))));
+            }
+            (None, Vec::new())
+        } else {
             let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+            if region_interfaces.len() != declared_region_count {
+                return Err(self.error(ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares {} region slots but {} regions were attached",
+                    operation.name(),
+                    declared_region_count,
+                    region_interfaces.len(),
+                ))));
+            }
+            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+            let region_input_types = operation
+                .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
+                .map_err(|error| self.error(error.into()))?;
+            if region_input_types.len() != declared_region_count {
+                return Err(self.error(ProgramError::MalformedProgram(format!(
+                    "operation `{}` returned {} region instantiation entries for {} attached regions",
+                    operation.name(),
+                    region_input_types.len(),
+                    declared_region_count,
+                ))));
+            }
+            (Some(input_types), region_input_types)
+        };
+
+        if self.builder().borrow().error.is_some() {
+            // A previously failed trace cannot append atoms, regions, or instructions, but callers still need correctly
+            // typed poison tracers so tracing can continue to the boundary that reports the original error. Reconstruct
+            // each hypothetical instantiated interface without importing it, then run ordinary output inference.
+            let input_types = input_types
+                .unwrap_or_else(|| inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>());
+            let region_interfaces = driver
+                .regions()
+                .zip(&region_input_types)
+                .map(|(region, input_types)| match input_types {
+                    Some(input_types) => {
+                        Ok(region.to_program().with_instantiated_type_identities(input_types)?.interface())
+                    }
+                    None => Ok(region.interface()),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
             let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
             Ok(output_types
                 .into_iter()
                 .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
                 .collect())
         } else {
+            // Only a healthy trace consumes the driver and mutates the builder. Importing with the operation-derived
+            // input types makes each attached region boundary agree with this invocation before `add_instruction`
+            // derives its output types and records the final instruction.
             let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
                 Ok(input_atom_ids) => input_atom_ids,
                 Err(error) => return Err(self.error(error)),
             };
-            let region_ids = driver.import_into(self.builder()).map_err(|error| self.error(error))?;
+            let region_ids =
+                driver.import_into(self.builder(), &region_input_types).map_err(|error| self.error(error))?;
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
                 match builder.add_instruction(operation, region_ids, inputs) {
@@ -522,6 +576,7 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneOperation, ZeroOperation};
@@ -531,10 +586,10 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::programs::atoms::{Atom, AtomId};
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::regions::CalleeRegionDriver;
-    use crate::programs::types::Typed;
-    use crate::tracing::{DomainTracingContext, TracerState};
-    use crate::types::DataType;
+    use crate::programs::regions::{CalleeRegionDriver, RegionInterface};
+    use crate::programs::types::{TypeError, Typed};
+    use crate::tracing::{DomainTracingContext, TracerState, TracingContext};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -666,6 +721,199 @@ mod tests {
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_staging_context_validates_and_instantiates_region_attachments() {
+        #[derive(Clone)]
+        struct StagingRegionOperation {
+            region_input_type_count: usize,
+            fail_region_input_inference: bool,
+        }
+
+        impl Operation<DataType> for StagingRegionOperation {
+            fn name(&self) -> &'static str {
+                "staging_region"
+            }
+
+            fn region_slots(&self) -> &'static [crate::RegionSlot] {
+                const { &[crate::RegionSlot::computation("body")] }
+            }
+
+            fn infer_region_input_types(
+                &self,
+                _input_types: &[DataType],
+                _region_interfaces: &[RegionInterface<DataType>],
+            ) -> Result<Vec<Option<Vec<DataType>>>, TypeError> {
+                if self.fail_region_input_inference {
+                    return Err(TypeError::invalid("failed to infer staging region input types"));
+                }
+                Ok(vec![None; self.region_input_type_count])
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[DataType],
+                region_interfaces: &[RegionInterface<DataType>],
+            ) -> Result<Vec<DataType>, TypeError> {
+                let [region_interface] = region_interfaces else {
+                    return Err(TypeError::invalid(format!(
+                        "staging region expects 1 attached region but got {}",
+                        region_interfaces.len(),
+                    )));
+                };
+                if region_interface.input_types() != input_types {
+                    return Err(TypeError::invalid("staging region input types do not match its operand types"));
+                }
+                Ok(region_interface.output_types().to_vec())
+            }
+        }
+
+        #[derive(Clone)]
+        struct IdentityInstantiatingRegionOperation;
+
+        impl Operation<ArrayType> for IdentityInstantiatingRegionOperation {
+            fn name(&self) -> &'static str {
+                "identity_instantiating_region"
+            }
+
+            fn region_slots(&self) -> &'static [crate::RegionSlot] {
+                const { &[crate::RegionSlot::computation("body")] }
+            }
+
+            fn infer_region_input_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<Option<Vec<ArrayType>>>, TypeError> {
+                Ok(vec![Some(input_types.to_vec())])
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                let [region_interface] = region_interfaces else {
+                    return Err(TypeError::invalid(format!(
+                        "identity-instantiating region expects 1 attached region but got {}",
+                        region_interfaces.len(),
+                    )));
+                };
+                Ok(region_interface.output_types().to_vec())
+            }
+        }
+
+        let region = {
+            let mut builder = ProgramBuilder::<Scalar, StagingRegionOperation>::new();
+            let input = builder.add_input(DataType::F64);
+            builder
+                .build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        // Attachment-count mismatches are rejected before inference or import and become the trace's recorded error.
+        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
+        let input = context.input(DataType::F64);
+        assert!(matches!(
+            context.stage_operation(
+                StagingRegionOperation { region_input_type_count: 1, fail_region_input_inference: false },
+                Vec::new(),
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` declares 1 region slots but 0 regions were attached",
+        ));
+        assert!(matches!(
+            context.builder().borrow().error(),
+            Some(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` declares 1 region slots but 0 regions were attached",
+        ));
+
+        // The operation must return exactly one instantiation request per declared region.
+        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
+        let input = context.input(DataType::F64);
+        assert!(matches!(
+            context.stage_operation(
+                StagingRegionOperation { region_input_type_count: 0, fail_region_input_inference: false },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+        ));
+        assert!(matches!(
+            context.builder().borrow().error(),
+            Some(ProgramError::MalformedProgram(message))
+                if message == "operation `staging_region` returned 0 region instantiation entries for 1 attached regions",
+        ));
+
+        // Region-input inference failures are recorded on the builder just like output-inference and import failures.
+        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
+        let input = context.input(DataType::F64);
+        let error = ProgramError::Type(TypeError::invalid("failed to infer staging region input types"));
+        assert!(matches!(
+            context.stage_operation(
+                StagingRegionOperation { region_input_type_count: 1, fail_region_input_inference: true },
+                vec![region.clone()],
+                std::slice::from_ref(&input),
+            ),
+            Err(actual) if actual == error,
+        ));
+        assert_eq!(context.builder().borrow().error(), Some(&error));
+
+        // A poisoned trace infers the outputs against the hypothetical instantiated interface but imports and records
+        // nothing, preserving the original builder error.
+        let context = TracingContext::<Scalar, StagingRegionOperation>::new();
+        let input = context.input(DataType::F64);
+        let original_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        context.error(original_error.clone());
+        let outputs = context
+            .stage_operation(
+                StagingRegionOperation { region_input_type_count: 1, fail_region_input_inference: false },
+                vec![region],
+                std::slice::from_ref(&input),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].state(), &TracerState::Poison);
+        assert_eq!(outputs[0].r#type().as_ref(), &DataType::F64);
+        let builder = context.builder().borrow();
+        assert_eq!(builder.error(), Some(&original_error));
+        assert!(builder.instructions().is_empty());
+        assert!(builder.regions.is_empty());
+
+        // A live trace imports the region only after instantiating its formal input identity from the caller type.
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let formal_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("batch", bounds))]),
+        );
+        let caller_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("caller_batch", bounds))]),
+        );
+        let region = {
+            let mut builder = ProgramBuilder::<Array, IdentityInstantiatingRegionOperation>::new();
+            let input = builder.add_input(formal_type);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let context = TracingContext::<Array, IdentityInstantiatingRegionOperation>::new();
+        let input = context.input(caller_type.clone());
+        let outputs = context
+            .stage_operation(IdentityInstantiatingRegionOperation, vec![region], std::slice::from_ref(&input))
+            .unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &caller_type);
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected one staged instruction");
+        };
+        let [region_id] = instruction.regions() else {
+            panic!("expected one attached region");
+        };
+        let interface = builder.region_ref(*region_id).unwrap().interface();
+        assert_eq!(interface.input_types(), std::slice::from_ref(&caller_type));
+        assert_eq!(interface.output_types(), std::slice::from_ref(&caller_type));
     }
 
     #[test]
