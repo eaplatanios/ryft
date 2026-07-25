@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use crate::programs::types::TypeError;
+use crate::programs::types::{Type, TypeError};
 
 /// Nominal identity embedded in [`Program`](crate::Program) [`Type`](crate::Type) metadata. A nominal identity records
 /// that repeated metadata occurrences denote the same unknown runtime quantity. It is distinct from a Single Static
@@ -123,9 +123,43 @@ impl<I: TypeIdentity> TypeIdentitySignature<I> {
     }
 }
 
+/// Returns `true` if a cache entry imported for `cached_input_types` can safely serve `requested_input_types`. Exact
+/// signatures can always share an entry. Non-exact signatures that contain any of the same live [`TypeIdentity`]s
+/// cannot share because a permutation of those identities would alias a differently instantiated region. Signatures
+/// with disjoint live identities can share when each signature can instantiate the other, proving that they differ
+/// only by a safe alpha-renaming.
+pub(crate) fn can_reuse_type_identity_instantiation<T: Type>(
+    cached_input_types: &[T],
+    requested_input_types: &[T],
+) -> bool {
+    if cached_input_types == requested_input_types {
+        return true;
+    }
+    
+    let mut identities_overlap = false;
+    for cached_type in cached_input_types {
+        cached_type.visit_identities(&mut |_, cached_identity| {
+            for requested_type in requested_input_types {
+                requested_type.visit_identities(&mut |_, requested_identity| {
+                    identities_overlap |= cached_identity == requested_identity;
+                });
+            }
+        });
+    }
+    
+    if identities_overlap {
+        return false;
+    }
+    
+    T::derive_identity_renaming(cached_input_types, requested_input_types).is_ok()
+        && T::derive_identity_renaming(requested_input_types, cached_input_types).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Display;
+
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -156,5 +190,31 @@ mod tests {
             Err(TypeError::Invalid { message })
                 if message == "identity first is renamed to both second and third",
         ));
+    }
+
+    #[test]
+    fn test_can_reuse_type_identity_instantiation() {
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let cached_first = DimensionVariable::new("cached_first", bounds);
+        let cached_second = DimensionVariable::new("cached_second", bounds);
+        let requested_first = DimensionVariable::new("requested_first", bounds);
+        let requested_second = DimensionVariable::new("requested_second", bounds);
+        let array_type =
+            |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let cached_input_types = vec![array_type(cached_first.clone()), array_type(cached_second.clone())];
+
+        // Exact signatures and structurally equivalent signatures with disjoint identities can share a cache entry.
+        assert!(can_reuse_type_identity_instantiation(&cached_input_types, &cached_input_types));
+        assert!(can_reuse_type_identity_instantiation(
+            &cached_input_types,
+            &[array_type(requested_first.clone()), array_type(requested_second)],
+        ));
+
+        // Overlapping permutations and structurally incompatible signatures must remain separate.
+        assert!(!can_reuse_type_identity_instantiation(
+            &cached_input_types,
+            &[array_type(cached_second), array_type(cached_first)],
+        ));
+        assert!(!can_reuse_type_identity_instantiation(&cached_input_types, &[array_type(requested_first)],));
     }
 }
