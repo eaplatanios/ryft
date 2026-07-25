@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -116,7 +116,7 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
         declared: &[Self],
         actual: &[Self],
     ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        Self::Refinements::establish(declared, actual)?;
+        Self::Refinements::establish(declared.iter(), actual.iter())?;
         Ok(TypeIdentityRenaming::new())
     }
 
@@ -189,8 +189,13 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// [`TypeIdentity`]s produced inside the [`Program`](crate::Program) or [`Region`](crate::Region) may establish
 /// additional output facts, while unrelated, unbound output identities are rejected.
 pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
-    /// Establishes refinement facts from `actual` relative to `declared`.
-    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError>;
+    /// Establishes refinement facts from the `actual` types relative to the corresponding `declared` types.
+    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<T>,
+        A::Item: Borrow<T>;
 
     /// Validates `actual` against `declared` using the refinement facts previously established from the corresponding
     /// input signature. Facts already stored in `self` must remain consistent at every occurrence of the corresponding
@@ -208,26 +213,45 @@ pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
     ///   - `actual`: Corresponding refining type signature supplied at the validation site.
     ///   - `locally_defined_identities`: Type identities structurally defined by instructions inside the program or
     ///     region and therefore permitted to establish refinement facts when first encountered in `actual`.
-    fn validate(
+    fn validate<D: IntoIterator, A: IntoIterator>(
         &self,
-        declared: &[T],
-        actual: &[T],
+        declared: D,
+        actual: A,
         locally_defined_identities: &[T::Identity],
-    ) -> Result<(), TypeError>;
+    ) -> Result<(), TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<T>,
+        A::Item: Borrow<T>;
 }
 
 impl<T: Type> TypeRefinements<T> for () {
     #[inline]
-    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError> {
+    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<T>,
+        A::Item: Borrow<T>,
+    {
         Self::validate(&(), declared, actual, &[])
     }
 
-    fn validate(
+    fn validate<D: IntoIterator, A: IntoIterator>(
         &self,
-        declared: &[T],
-        actual: &[T],
+        declared: D,
+        actual: A,
         _locally_defined_identities: &[T::Identity],
-    ) -> Result<(), TypeError> {
+    ) -> Result<(), TypeError>
+    where
+        D::IntoIter: ExactSizeIterator,
+        A::IntoIter: ExactSizeIterator,
+        D::Item: Borrow<T>,
+        A::Item: Borrow<T>,
+    {
+        let declared = declared.into_iter();
+        let actual = actual.into_iter();
         if declared.len() != actual.len() {
             return Err(TypeError::invalid(format!(
                 "declared type count {} does not match actual type count {}",
@@ -235,7 +259,9 @@ impl<T: Type> TypeRefinements<T> for () {
                 actual.len(),
             )));
         }
-        for (declared, actual) in declared.iter().zip(actual) {
+        for (declared, actual) in declared.zip(actual) {
+            let declared = declared.borrow();
+            let actual = actual.borrow();
             if !declared.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
             }
@@ -261,6 +287,7 @@ pub trait Typed {
     fn r#type(&self) -> Cow<'_, Self::Type>;
 }
 
+#[allow(clippy::let_unit_value)]
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -303,17 +330,30 @@ mod tests {
     #[test]
     fn test_type_refinements() {
         let refinements = <() as TypeRefinements<DataType>>::establish(
-            &[DataType::F32, DataType::I32],
-            &[DataType::F32, DataType::I32],
+            [DataType::F32, DataType::I32].iter(),
+            [DataType::F32, DataType::I32].iter(),
         )
         .unwrap();
-        assert_eq!(refinements.validate(&[DataType::F32, DataType::I32], &[DataType::F32, DataType::I32], &[]), Ok(()));
         assert_eq!(
-            <() as TypeRefinements<DataType>>::establish(&[DataType::F32], &[DataType::F32, DataType::I32]),
+            <() as TypeRefinements<DataType>>::validate(
+                &refinements,
+                [DataType::F32, DataType::I32].iter(),
+                [DataType::F32, DataType::I32].iter(),
+                &[],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            <() as TypeRefinements<DataType>>::establish([DataType::F32].iter(), [DataType::F32, DataType::I32].iter(),),
             Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
         );
         assert_eq!(
-            refinements.validate(&[DataType::F32], &[DataType::F64], &[]),
+            <() as TypeRefinements<DataType>>::validate(
+                &refinements,
+                [DataType::F32].iter(),
+                [DataType::F64].iter(),
+                &[],
+            ),
             Err(TypeError::invalid("type f64 does not refine declared type f32")),
         );
     }

@@ -80,7 +80,7 @@
 //!     to one compiled callee share one region and how lowering deduplication can count occurrences per root).
 //!
 //! Only *sealed* regions are attachable. [`ProgramBuilder::add_instruction`] validates the attached region list
-//! against the operation's declared [`Operation::region_names`] slots, and every non-entry region enters the arena
+//! against the operation's declared [`Operation::region_slots`] slots, and every non-entry region enters the arena
 //! as a complete, immutable program with an explicit boundary (i.e., an explicit [`RegionInterface`]). A region never
 //! references atoms of another region directly; values cross region boundaries only through the boundary inputs and
 //! outputs, and cross-program constants only through captures (see [`captures`](crate::captures) for the capture-scope
@@ -138,7 +138,7 @@ pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,
     Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionWithMetadata, ReplayRegionDriver,
+    RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{Concretizable, Value, ValueId};
