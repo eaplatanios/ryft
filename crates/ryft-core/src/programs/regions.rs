@@ -31,9 +31,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::effects::Effects;
-use crate::programs::identities::{
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, can_reuse_type_identity_instantiation,
-};
+use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -458,6 +456,23 @@ impl<V: Value, O: Operation<V::Type>> RegionArena<V, O> {
         let id = RegionId::new(self.regions.len());
         self.regions.push(RegionWithMetadata::new(region, self.regions.as_slice())?);
         Ok(id)
+    }
+
+    /// Appends every sealed [`Region`] in `other` to this [`RegionArena`], rebasing its internal [`RegionId`]
+    /// references by this arena's original length, and returns that offset. The derived metadata remains valid because
+    /// rebasing preserves the complete source graph's topology and does not change any region boundary, [`Operation`],
+    /// [`Effect`](crate::Effect), or [`TypeIdentity`](crate::TypeIdentity).
+    pub fn append(&mut self, mut other: Self) -> usize {
+        let offset = self.regions.len();
+        for region in &mut other.regions {
+            for instruction in &mut region.region.instructions {
+                for attached in &mut instruction.regions {
+                    *attached = RegionId::new(attached.index() + offset);
+                }
+            }
+        }
+        self.regions.append(&mut other.regions);
+        offset
     }
 
     /// Removes and returns the last [`Region`] in this [`RegionArena`].
@@ -1045,13 +1060,14 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
                 let Some(input_types) = input_types else {
                     return Ok(builder.import_region_with_remapping(region, &mut destination.remapping));
                 };
-                let renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
-                if let Some(mapping) = destination.instantiated_region_mappings.iter().find(|mapping| {
-                    &mapping.source_region == root
-                        && can_reuse_type_identity_instantiation(&mapping.input_types, input_types)
-                }) {
+                if let Some(mapping) = destination
+                    .instantiated_region_mappings
+                    .iter()
+                    .find(|mapping| &mapping.source_region == root && mapping.input_types == *input_types)
+                {
                     return Ok(mapping.destination_region);
                 }
+                let renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
                 let imported = if renaming.is_identity() {
                     builder.import_region_with_remapping(region, &mut destination.remapping)
                 } else {
@@ -1114,15 +1130,15 @@ pub struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
 /// Cached import of one source [`Region`] instantiated for a particular input type signature. A source region can
 /// be imported into the same destination [`ProgramBuilder`] under multiple [`TypeIdentity`](crate::TypeIdentity)
 /// renamings, so the source [`RegionId`] alone cannot identify the resulting destination region. This mapping retains
-/// the complete instantiation key and the corresponding imported root so equivalent later applications can preserve
-/// region sharing.
+/// the complete instantiation key and the corresponding imported root so repeated applications with the same live
+/// input [`TypeIdentity`](crate::TypeIdentity)s can preserve region sharing.
 pub struct InstantiatedRegionMapping<T: Type> {
     /// Root of the [`Region`] in the replay's source [`RegionArena`].
     pub source_region: RegionId,
 
-    /// Complete actual input [`Type`] signature used to instantiate `source_region`. The full types are retained
-    /// so that cache lookup can recognize equivalent [`TypeIdentity`](crate::TypeIdentity)s without conflating
-    /// permutations of overlapping live identities.
+    /// Complete actual input [`Type`] signature used to instantiate `source_region`. Exact types are required for
+    /// cache reuse because the imported region retains these live [`TypeIdentity`](crate::TypeIdentity)s and attached
+    /// [`Instruction`]s do not store a separate per-invocation renaming.
     pub input_types: Vec<T>,
 
     /// Root of the instantiated [`Region`] in the destination [`ProgramBuilder`]'s [`RegionArena`].
@@ -1150,6 +1166,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::backends::arrays::Array;
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::parameters::{Parameter, Placeholder};
@@ -1159,7 +1176,7 @@ mod tests {
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
     use crate::tests::TestRegionOperation;
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1694,6 +1711,55 @@ mod tests {
         let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
         assert_eq!(driver.import_into(&destination, &[None, None]), Ok(vec![RegionId::new(1), RegionId::new(1)]),);
         assert_eq!(destination.borrow().regions.len(), 2);
+    }
+
+    #[test]
+    fn test_replay_region_driver_instantiation_cache_preserves_live_type_identities() {
+        #[derive(Clone)]
+        struct ArrayIdentityOperation;
+
+        impl Operation<ArrayType> for ArrayIdentityOperation {
+            fn name(&self) -> &'static str {
+                "array_identity"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+        }
+
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let array_type =
+            |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let formal = DimensionVariable::new("formal", bounds);
+        let mut source_builder = ProgramBuilder::<Array, ArrayIdentityOperation>::new();
+        let input = source_builder.add_input(array_type(formal));
+        let source = source_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let roots = [source.entry()];
+        let mappings = RegionReplayMappings::new();
+        let destination = Rc::new(RefCell::new(ProgramBuilder::new()));
+
+        let first_input_types = vec![array_type(DimensionVariable::new("first", bounds))];
+        let first_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
+        let first = first_driver.import_into(&destination, &[Some(first_input_types.clone())]).unwrap()[0];
+
+        let second_input_types = vec![array_type(DimensionVariable::new("second", bounds))];
+        let second_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
+        let second = second_driver.import_into(&destination, &[Some(second_input_types.clone())]).unwrap()[0];
+        let repeated_driver = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
+        let repeated = repeated_driver.import_into(&destination, &[Some(second_input_types.clone())]).unwrap()[0];
+
+        assert_ne!(first, second);
+        assert_eq!(second, repeated);
+        let destination = destination.borrow();
+        assert_eq!(destination.region_ref(first).unwrap().input_types(), first_input_types);
+        assert_eq!(destination.region_ref(second).unwrap().input_types(), second_input_types);
     }
 
     #[test]

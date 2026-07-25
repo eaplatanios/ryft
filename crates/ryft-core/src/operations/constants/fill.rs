@@ -82,6 +82,8 @@ impl<T: Type, V: Clone + Display> Operation<T> for FillOperation<T, V> {
 
     #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        // The fill value (i.e., `self.value`) is scalar data independent of the output type's `TypeIdentity`-bearing
+        // metadata and so only `r#type` participates in the `T::Identity` renaming.
         Ok(Self { r#type: self.r#type.rename_identities(renaming)?, value: self.value.clone() })
     }
 
