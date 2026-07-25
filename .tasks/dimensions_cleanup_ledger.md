@@ -334,7 +334,7 @@ ledger disagrees with Git.
 
 - Status: ready for owner review
 - Branch: `u/eaplatanios/increment/p2b-ordered-dimension-requirements`
-- Source commit: pending
+- Source commit: `b5f38959b3cdba68b96a0c84b387224fabf32cda`
 - Integration commit: pending owner review
 - Remainder reconciliation commit: pending integration
 - Immutable archive unchanged: yes
