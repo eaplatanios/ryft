@@ -84,10 +84,6 @@ pub(crate) enum LoweringError {
     #[error("reshape dimension {value} cannot be represented as a StableHLO i{bit_width} shape value")]
     ReshapeDimensionOutOfRange { value: usize, bit_width: u8 },
 
-    /// Error returned when an exclusive dynamic dimension bound has no representable concrete dimension size.
-    #[error("dynamic dimension has invalid exclusive upper bound 0")]
-    InvalidDynamicDimensionBound,
-
     /// Error returned when a pad interior amount cannot be represented by StableHLO's signed attribute type.
     #[error("pad interior padding {value} cannot be represented as a StableHLO i64 attribute")]
     PadInteriorPaddingOutOfRange { value: usize },
@@ -1358,10 +1354,10 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
             .dimensions()
             .iter()
             .map(|size| match size {
-                Dimension::Static(value) => Ok(Some(*value)),
+                Dimension::Static(value) => Some(*value),
                 Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(size),
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         let reshape = block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
         let result = reshape.result(0).expect("stablehlo.dynamic_reshape should return one result").as_ref();
         let output_type = lower_tensor_type(&output_types[0], context, location)?;
@@ -1670,9 +1666,9 @@ fn lower_dynamic_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         .dimensions()
         .iter()
         .map(|dimension| match dimension {
-            Dimension::Static(size) | Dimension::Dynamic(Some(size)) => Ok(Dimension::Static(*size)),
-            Dimension::Dynamic(None) => Err(LoweringError::UnsupportedOp {
-                op: "dynamic broadcast with an unbounded output dimension".to_string(),
+            Dimension::Static(size) => Ok(Dimension::Static(*size)),
+            Dimension::Dynamic(variable) => variable.bounds().upper().map(Dimension::Static).ok_or_else(|| {
+                LoweringError::UnsupportedOp { op: "dynamic broadcast with an unbounded output dimension".to_string() }
             }),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1708,7 +1704,7 @@ fn lower_dynamic_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         .tensor_type(context.signless_integer_type(32), &[], None, location)
         .map_err(|_| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I32) })?;
     let mut refined_type = upper_bound_type;
-    for (axis, dimension) in output_type.shape().dimensions().iter().copied().enumerate() {
+    for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
         if !matches!(dimension, Dimension::Dynamic(_)) {
             continue;
         }
@@ -9279,12 +9275,7 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
             Dimension::Dynamic(_) => MlirSize::Dynamic,
         })
         .collect::<Vec<_>>();
-    let bounds = array_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(stable_hlo_dynamic_dimension_bound)
-        .collect::<Result<Vec<_>, _>>()?;
+    let bounds = array_type.shape().dimensions().iter().map(stable_hlo_dynamic_dimension_bound).collect::<Vec<_>>();
     let encoding = bounds
         .iter()
         .any(Option::is_some)
@@ -9297,12 +9288,10 @@ fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
 }
 
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
-fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Result<Option<usize>, LoweringError> {
+fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
     match size {
-        Dimension::Static(_) | Dimension::Dynamic(None) => Ok(None),
-        Dimension::Dynamic(Some(exclusive_bound)) => {
-            exclusive_bound.checked_sub(1).map(Some).ok_or(LoweringError::InvalidDynamicDimensionBound)
-        }
+        Dimension::Static(_) => None,
+        Dimension::Dynamic(variable) => variable.bounds().upper().and_then(|upper| upper.checked_sub(1)),
     }
 }
 
@@ -9577,7 +9566,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::EagerContext;
     use ryft_core::backends::arrays::Array as CpuArray;
     use ryft_core::backends::arrays::ArrayOperation;
     use ryft_core::contexts::Context;
@@ -9598,7 +9586,9 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::builders::ProgramBuilder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
     use ryft_core::types::{Dimension, Shape};
+    use ryft_core::{EagerContext, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use ryft_core::tracing::Trace;
@@ -9615,6 +9605,10 @@ mod tests {
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(cols)]))
+    }
+
+    fn dynamic_dimension(name: &str, exclusive_upper_bound: Option<usize>) -> Dimension {
+        DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
     }
 
     fn xla_identity_branch(input_type: ArrayType) -> FlatXlaProgram {
@@ -9793,7 +9787,7 @@ mod tests {
 
     #[test]
     fn test_plain_fixed_dynamic_identity_reshape_lowers_without_an_operation() {
-        let shape = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]);
+        let shape = Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, shape.clone()));
         let output = builder.add_instruction(ReshapeOperation::new(shape), Vec::new(), vec![input]).unwrap()[0];
@@ -9817,9 +9811,10 @@ mod tests {
 
     #[test]
     fn test_plain_fixed_dynamic_permuted_reshape_lowers_to_transpose() {
-        let input_shape = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3), Dimension::Dynamic(Some(5))]);
-        let output_shape =
-            Shape::new(vec![Dimension::Dynamic(Some(5)), Dimension::Dynamic(None), Dimension::Static(3)]);
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(5)).unwrap());
+        let input_shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3), columns.clone().into()]);
+        let output_shape = Shape::new(vec![columns.into(), rows.into(), Dimension::Static(3)]);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let output = builder
@@ -9846,8 +9841,10 @@ mod tests {
 
     #[test]
     fn test_plain_symbolic_reshape_lowers_runtime_shape_from_original_input_dimensions() {
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Dynamic(None)]));
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![dynamic_dimension("rows", None), dynamic_dimension("columns", None)]),
+        );
         let normalized_input_dimension = |dimension, factor| ReshapeDimensionExpression::ExactDivision {
             numerator: Box::new(ReshapeDimensionExpression::Product(vec![
                 ReshapeDimensionExpression::InputDimension(dimension),
@@ -9904,8 +9901,10 @@ mod tests {
     #[test]
     fn test_plain_symbolic_reshape_refines_inferred_mixed_output_dimensions() {
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
-        let input = builder
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(6)])));
+        let input = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(6)]),
+        ));
         let output = builder
             .add_instruction(
                 ReshapeOperation::from_dimension_expressions(vec![
@@ -9945,14 +9944,14 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_symbolic_reshape_preserves_exclusive_dynamic_bounds() {
+    fn test_plain_symbolic_reshape_rejects_derived_dynamic_bounds_without_result_operands() {
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(Some(6)), Dimension::Static(4)]),
+            Shape::new(vec![dynamic_dimension("rows", Some(6)), Dimension::Static(4)]),
         ));
-        let output = builder
-            .add_instruction(
+        assert_eq!(
+            builder.add_instruction(
                 ReshapeOperation::from_dimension_expressions(vec![
                     ReshapeDimensionExpression::Product(vec![
                         ReshapeDimensionExpression::InputDimension(0),
@@ -9962,32 +9961,10 @@ mod tests {
                 ]),
                 Vec::new(),
                 vec![input],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<?x4xf32, #stablehlo.bounds<5, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<10, ?>> {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<5, ?>>) -> tensor<i32>
-                    %c = stablehlo.constant dense<2> : tensor<i32>
-                    %1 = stablehlo.multiply %0, %c : tensor<i32>
-                    %2 = stablehlo.reshape %1 : (tensor<i32>) -> tensor<1xi32>
-                    %c_0 = stablehlo.constant dense<2> : tensor<i32>
-                    %3 = stablehlo.reshape %c_0 : (tensor<i32>) -> tensor<1xi32>
-                    %4 = stablehlo.concatenate %2, %3, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %5 = stablehlo.dynamic_reshape %arg0, %4 : (tensor<?x4xf32, #stablehlo.bounds<5, ?>>, tensor<2xi32>) -> tensor<?x?xf32, #stablehlo.bounds<10, 2>>
-                    %cast = tensor.cast %5 : tensor<?x?xf32, #stablehlo.bounds<10, 2>> to tensor<?x2xf32, #stablehlo.bounds<10, ?>>
-                    return %cast : tensor<?x2xf32, #stablehlo.bounds<10, ?>>
-                  }
-                }
-            "#},
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'reshape' dynamic dimension arithmetic requires explicit result-dimension operands".to_string(),
+            ))),
         );
     }
 
@@ -10028,9 +10005,10 @@ mod tests {
     fn test_pad_lowering_casts_inferred_type_to_requested_dynamic_bound() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(5))]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
-        let requested_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(12))]));
+        let requested_output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("output", Some(12))]));
         let input_tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
         let padding_value_tensor_type = lower_tensor_type(&padding_value_type, &context, location).unwrap();
         let mut block = context.block(&[(input_tensor_type, location), (padding_value_tensor_type, location)]);
@@ -10073,13 +10051,9 @@ mod tests {
 
     #[test]
     fn test_stable_hlo_dynamic_dimension_bound_converts_exclusive_bounds() {
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Static(4)), Ok(None));
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(None)), Ok(None));
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(Some(6))), Ok(Some(5)));
-        assert_eq!(
-            stable_hlo_dynamic_dimension_bound(&Dimension::Dynamic(Some(0))),
-            Err(LoweringError::InvalidDynamicDimensionBound),
-        );
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Static(4)), None);
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("unbounded", None)), None);
+        assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("bounded", Some(6))), Some(5));
     }
 
     #[test]
@@ -10175,7 +10149,11 @@ mod tests {
         let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let output_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![
+                dynamic_dimension("batch", Some(2)),
+                Dimension::Static(3),
+                dynamic_dimension("width", Some(4)),
+            ]),
         );
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
         let input = builder.add_input(input_type);
@@ -10230,7 +10208,11 @@ mod tests {
         let dimensions_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let output_type = ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(Some(2)), Dimension::Static(3), Dimension::Dynamic(Some(4))]),
+            Shape::new(vec![
+                dynamic_dimension("batch", Some(2)),
+                Dimension::Static(3),
+                dynamic_dimension("width", Some(4)),
+            ]),
         );
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, DynamicBroadcastOperation>::new();
         let input = builder.add_input(input_type);
@@ -13597,36 +13579,25 @@ mod tests {
             "#}
         );
 
-        // Dynamic operands lower directly too; StableHLO carries the exact runtime sum on the concatenated axis.
+        // Until P3 supplies the derived result extent as an explicit operand, dynamic concatenation fails before
+        // lowering rather than manufacturing an unstable result identity.
         let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]));
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(2)]));
         let mut builder = XlaProgramBuilder::new();
         let first = builder.add_input(dynamic_type.clone());
         let second = builder.add_input(dynamic_type);
-        let joined = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second])
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
         assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<?x2xf32>, %arg1: tensor<?x2xf32>) -> tensor<?x2xf32> {
-                    %0 = stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<?x2xf32>, tensor<?x2xf32>) -> tensor<?x2xf32>
-                    return %0 : tensor<?x2xf32>
-                  }
-                }
-            "#}
+            builder.add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'concatenate' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+            ))),
         );
 
         // Transposing a concatenate with dynamic non-concatenated dimensions lowers its full-extent slices through
         // `stablehlo.real_dynamic_slice`.
-        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]));
-        let right_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(None)]));
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
+        let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), columns.clone().into()]));
+        let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), columns.into()]));
         let mut builder = XlaProgramBuilder::new();
         let left = builder.add_input(left_type);
         let right = builder.add_input(right_type);
@@ -13772,37 +13743,20 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_preserves_dynamic_pad_bound() {
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(5))]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let padding_value = builder.add_input(padding_value_type);
-        let padded = builder
-            .add_instruction(
+        assert_eq!(
+            builder.add_instruction(
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-                vec![padded],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<?xf32, #stablehlo.bounds<4>>, %arg1: tensor<f32>) -> tensor<?xf32, #stablehlo.bounds<10>> {
-                    %0 = stablehlo.pad %arg0, %arg1, low = [1], high = [2], interior = [1] : (tensor<?xf32, #stablehlo.bounds<4>>, tensor<f32>) -> tensor<?xf32, #stablehlo.bounds<10>>
-                    return %0 : tensor<?xf32, #stablehlo.bounds<10>>
-                  }
-                }
-            "#},
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+            ))),
         );
     }
 
@@ -14123,7 +14077,7 @@ mod tests {
     #[test]
     fn test_xla_executable_signature_erases_only_static_zero_space_leaves() {
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]));
+        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("dynamic_zero", Some(3))]));
         let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
         let signature = XlaExecutableSignature::new(
             &[static_zero.clone(), boolean.clone(), dynamic_zero.clone()],
@@ -14178,7 +14132,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]));
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(zero_type.clone());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();

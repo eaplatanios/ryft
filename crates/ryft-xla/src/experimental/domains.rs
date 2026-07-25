@@ -38,6 +38,7 @@ use ryft_core::sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 };
 use ryft_core::tracing::DomainTracer;
+use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 use ryft_core::types::{
     ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout, Tile, TileDimension, TiledLayout,
 };
@@ -1107,9 +1108,9 @@ impl XlaLoweredProgram {
 }
 
 const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA2";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 2;
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 3;
 const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 1;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 2;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 3;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1209,12 +1210,11 @@ pub struct XlaOptimizedProgram {
 }
 
 #[derive(Serialize)]
-struct XlaPersistentKeyV2<'a> {
+struct XlaPersistentKeyV3<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
-    input_types: Vec<PersistentArrayTypeV1>,
-    output_types: Vec<PersistentArrayTypeV1>,
+    signature: PersistentCanonicalArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
     donation_flags: &'a [bool],
@@ -1229,12 +1229,11 @@ struct XlaPersistentKeyV2<'a> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV2 {
+struct XlaPersistentExecutableMetadataV3 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
-    input_types: Vec<PersistentArrayTypeV1>,
-    output_types: Vec<PersistentArrayTypeV1>,
+    signature: PersistentArraySignatureV3,
     input_mapping: Vec<Option<u64>>,
     output_mapping: Vec<Option<u64>>,
     donation_flags: Vec<bool>,
@@ -1253,9 +1252,36 @@ struct XlaPersistentExecutableMetadataV2 {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistentArrayTypeV1 {
+struct PersistentArraySignatureV3 {
+    variables: Vec<PersistentDimensionVariableV3>,
+    input_types: Vec<PersistentArrayTypeV3>,
+    output_types: Vec<PersistentArrayTypeV3>,
+}
+
+#[derive(Serialize)]
+struct PersistentCanonicalArraySignatureV3 {
+    variables: Vec<PersistentCanonicalDimensionVariableV3>,
+    input_types: Vec<PersistentArrayTypeV3>,
+    output_types: Vec<PersistentArrayTypeV3>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentDimensionVariableV3 {
+    name: String,
+    lower: u64,
+    upper: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PersistentCanonicalDimensionVariableV3 {
+    lower: u64,
+    upper: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentArrayTypeV3 {
     data_type: u8,
-    shape: Vec<PersistentSizeV1>,
+    shape: Vec<PersistentDimensionV3>,
     layout: Option<PersistentLayoutV1>,
     sharding: Option<PersistentShardingV1>,
     memory: PersistentMemoryV1,
@@ -1263,9 +1289,9 @@ struct PersistentArrayTypeV1 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum PersistentSizeV1 {
+enum PersistentDimensionV3 {
     Static(u64),
-    Dynamic(Option<u64>),
+    Dynamic { variable: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1330,52 +1356,106 @@ struct PersistentDeviceV1 {
     process_index: u64,
 }
 
-impl From<&ArrayType> for PersistentArrayTypeV1 {
-    fn from(value: &ArrayType) -> Self {
-        Self {
-            data_type: encode_data_type(value.data_type()),
-            shape: value
+impl PersistentArraySignatureV3 {
+    /// Encodes input and output types while alpha-normalizing their shared dynamic dimension variables by first
+    /// occurrence.
+    fn encode(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
+        let mut variables = Vec::<DimensionVariable>::new();
+        let mut encode_type = |r#type: &ArrayType| {
+            let shape = r#type
                 .shape()
                 .dimensions()
                 .iter()
-                .map(|size| match size {
-                    Dimension::Static(size) => PersistentSizeV1::Static(*size as u64),
-                    Dimension::Dynamic(bound) => PersistentSizeV1::Dynamic(bound.map(|bound| bound as u64)),
+                .map(|dimension| match dimension {
+                    Dimension::Static(value) => PersistentDimensionV3::Static(*value as u64),
+                    Dimension::Dynamic(variable) => {
+                        let index = variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
+                            variables.push(variable.clone());
+                            variables.len() - 1
+                        });
+                        PersistentDimensionV3::Dynamic { variable: index as u64 }
+                    }
                 })
+                .collect();
+            PersistentArrayTypeV3 {
+                data_type: encode_data_type(r#type.data_type()),
+                shape,
+                layout: r#type.layout().map(PersistentLayoutV1::from),
+                sharding: r#type.sharding().map(PersistentShardingV1::from),
+                memory: match r#type.memory() {
+                    Memory::Device => PersistentMemoryV1::Device,
+                    Memory::Host { pinned } => PersistentMemoryV1::Host(pinned),
+                },
+            }
+        };
+        let input_types = input_types.iter().map(&mut encode_type).collect();
+        let output_types = output_types.iter().map(&mut encode_type).collect();
+        let variables = variables
+            .into_iter()
+            .map(|variable| PersistentDimensionVariableV3 {
+                name: variable.name().to_string(),
+                lower: variable.bounds().lower() as u64,
+                upper: variable.bounds().upper().map(|upper| upper as u64),
+            })
+            .collect();
+        Self { variables, input_types, output_types }
+    }
+
+    /// Removes diagnostic-only variable names from the stable compilation-key representation.
+    fn into_canonical(self) -> PersistentCanonicalArraySignatureV3 {
+        PersistentCanonicalArraySignatureV3 {
+            variables: self
+                .variables
+                .into_iter()
+                .map(|variable| PersistentCanonicalDimensionVariableV3 { lower: variable.lower, upper: variable.upper })
                 .collect(),
-            layout: value.layout().map(PersistentLayoutV1::from),
-            sharding: value.sharding().map(PersistentShardingV1::from),
-            memory: match value.memory() {
-                Memory::Device => PersistentMemoryV1::Device,
-                Memory::Host { pinned } => PersistentMemoryV1::Host(pinned),
-            },
+            input_types: self.input_types,
+            output_types: self.output_types,
         }
     }
-}
 
-impl TryFrom<PersistentArrayTypeV1> for ArrayType {
-    type Error = XlaDomainError;
-
-    fn try_from(value: PersistentArrayTypeV1) -> Result<Self, Self::Error> {
-        let shape = Shape::new(
-            value
-                .shape
-                .into_iter()
-                .map(|size| match size {
-                    PersistentSizeV1::Static(size) => checked_usize(size).map(Dimension::Static),
-                    PersistentSizeV1::Dynamic(bound) => bound.map(checked_usize).transpose().map(Dimension::Dynamic),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let memory = match value.memory {
-            PersistentMemoryV1::Device => Memory::Device,
-            PersistentMemoryV1::Host(pinned) => Memory::Host { pinned },
+    /// Decodes input and output types while recreating each shared dynamic dimension variable exactly once.
+    fn decode(self) -> Result<(Vec<ArrayType>, Vec<ArrayType>), XlaDomainError> {
+        let variables = self
+            .variables
+            .into_iter()
+            .map(|variable| {
+                let bounds = DimensionBounds::new(
+                    checked_usize(variable.lower)?,
+                    variable.upper.map(checked_usize).transpose()?,
+                )
+                .map_err(|error| persistent_error(error.to_string()))?;
+                Ok(DimensionVariable::new(variable.name, bounds))
+            })
+            .collect::<Result<Vec<_>, XlaDomainError>>()?;
+        let decode_type = |r#type: PersistentArrayTypeV3| -> Result<ArrayType, XlaDomainError> {
+            let shape = Shape::new(
+                r#type
+                    .shape
+                    .into_iter()
+                    .map(|dimension| match dimension {
+                        PersistentDimensionV3::Static(value) => checked_usize(value).map(Dimension::Static),
+                        PersistentDimensionV3::Dynamic { variable } => variables
+                            .get(checked_usize(variable)?)
+                            .cloned()
+                            .map(Dimension::Dynamic)
+                            .ok_or_else(|| persistent_error("array type references an unknown dimension variable")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let memory = match r#type.memory {
+                PersistentMemoryV1::Device => Memory::Device,
+                PersistentMemoryV1::Host(pinned) => Memory::Host { pinned },
+            };
+            ArrayType::new(decode_data_type(r#type.data_type)?, shape)
+                .with_layout(r#type.layout.map(Layout::try_from).transpose()?)
+                .with_sharding(r#type.sharding.map(Sharding::try_from).transpose()?)
+                .map(|r#type| r#type.with_memory(memory))
+                .map_err(|error| persistent_error(error.to_string()))
         };
-        ArrayType::new(decode_data_type(value.data_type)?, shape)
-            .with_layout(value.layout.map(Layout::try_from).transpose()?)
-            .with_sharding(value.sharding.map(Sharding::try_from).transpose()?)
-            .map(|r#type| r#type.with_memory(memory))
-            .map_err(|error| persistent_error(error.to_string()))
+        let input_types = self.input_types.into_iter().map(&decode_type).collect::<Result<Vec<_>, _>>()?;
+        let output_types = self.output_types.into_iter().map(decode_type).collect::<Result<Vec<_>, _>>()?;
+        Ok((input_types, output_types))
     }
 }
 
@@ -2015,12 +2095,11 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV2 {
+        let key = XlaPersistentKeyV3 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
-            input_types: program.input_types.iter().map(PersistentArrayTypeV1::from).collect(),
-            output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types).into_canonical(),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             donation_flags: &program.donation_flags,
@@ -2107,12 +2186,11 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV2 {
+        let metadata = XlaPersistentExecutableMetadataV3 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
-            input_types: program.input_types.iter().map(PersistentArrayTypeV1::from).collect(),
-            output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            signature: PersistentArraySignatureV3::encode(&program.input_types, &program.output_types),
             input_mapping: persistent_mapping(program.signature.input_mapping())?,
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             donation_flags: program.donation_flags.to_vec(),
@@ -2166,7 +2244,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV2 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV3 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -2190,8 +2268,7 @@ impl<'c> XlaDomain<'c> {
         if mesh.devices().iter().any(|device| !live_devices.contains(device)) {
             return Ok(None);
         }
-        let input_types = metadata.input_types.into_iter().map(ArrayType::try_from).collect::<Result<Vec<_>, _>>()?;
-        let output_types = metadata.output_types.into_iter().map(ArrayType::try_from).collect::<Result<Vec<_>, _>>()?;
+        let (input_types, output_types) = metadata.signature.decode()?;
         let signature = XlaExecutableSignature::new(input_types.as_slice(), output_types.as_slice());
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
@@ -3167,9 +3244,14 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let dynamic_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(Some(3))]))
-            .with_sharding(sharding.clone())
-            .unwrap();
+        let dynamic_zero_type = ArrayType::new(
+            DataType::Zero,
+            Shape::new(vec![
+                DimensionVariable::new("dynamic_zero", DimensionBounds::non_negative(Some(3)).unwrap()).into(),
+            ]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
         let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(sharding)
             .unwrap();
@@ -3274,7 +3356,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV2 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV3 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -3287,7 +3369,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV2 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV3 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -3366,12 +3448,11 @@ mod tests {
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV2 {
+        let metadata = XlaPersistentExecutableMetadataV3 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
-            input_types: Vec::new(),
-            output_types: Vec::new(),
+            signature: PersistentArraySignatureV3::encode(&[], &[]),
             input_mapping: Vec::new(),
             output_mapping: Vec::new(),
             donation_flags: Vec::new(),
@@ -4013,12 +4094,53 @@ mod tests {
 
     #[test]
     fn test_persistent_array_type_round_trips_zero_space_metadata() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
         let array_type =
-            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(Some(4))]))
+            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(batch.clone())]))
                 .with_memory(Memory::Host { pinned: true });
+        let output_type =
+            ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
 
-        let restored = ArrayType::try_from(PersistentArrayTypeV1::from(&array_type)).unwrap();
+        let (restored_inputs, restored_outputs) =
+            PersistentArraySignatureV3::encode(std::slice::from_ref(&array_type), std::slice::from_ref(&output_type))
+                .decode()
+                .unwrap();
 
-        assert_eq!(restored, array_type);
+        assert_eq!(restored_inputs[0].data_type(), array_type.data_type());
+        assert_eq!(restored_inputs[0].memory(), array_type.memory());
+        assert_eq!(restored_inputs[0].dimension(0), Dimension::Static(2));
+        assert_eq!(restored_inputs[0].dimension(1).variable().unwrap().name(), "batch");
+        assert_eq!(
+            restored_inputs[0].dimension(1).variable().unwrap().bounds(),
+            DimensionBounds::non_negative(Some(4)).unwrap(),
+        );
+        assert_eq!(restored_outputs[0].data_type(), output_type.data_type());
+        assert_eq!(restored_inputs[0].dimension(1), restored_outputs[0].dimension(0));
+    }
+
+    #[test]
+    fn test_persistent_array_signature_canonicalizes_names_but_preserves_variable_relationships() {
+        let bounds = DimensionBounds::non_negative(Some(4)).unwrap();
+        let batch = DimensionVariable::new("batch", bounds);
+        let renamed = DimensionVariable::new("renamed", bounds);
+        let shared = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(batch)]),
+        );
+        let shared_renamed = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(renamed.clone()), Dimension::Dynamic(renamed)]),
+        );
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let independent =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first), Dimension::Dynamic(second)]));
+
+        let canonical = |r#type: &ArrayType| {
+            serde_json::to_vec(&PersistentArraySignatureV3::encode(std::slice::from_ref(r#type), &[]).into_canonical())
+                .unwrap()
+        };
+        assert_eq!(canonical(&shared), canonical(&shared_renamed));
+        assert_ne!(canonical(&shared), canonical(&independent));
     }
 }

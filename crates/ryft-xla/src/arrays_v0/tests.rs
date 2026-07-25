@@ -8,6 +8,7 @@ use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_p
 use ryft_core::Typed;
 use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::types::data::DataType;
+use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 use ryft_core::types::{ArrayType, Dimension, Layout, Memory, Shape, StaticShape, TiledLayout};
 
 use crate::experimental::domains::XlaDomain;
@@ -94,13 +95,14 @@ fn test_array_new_rejects_dynamic_shape() {
     )
     .unwrap();
     let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-    let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(Some(10))]))
+    let dynamic = DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(10)).unwrap());
+    let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dynamic.clone())]))
         .with_sharding(sharding)
         .unwrap();
 
     assert!(matches!(
         Array::from_addressable_buffers(None, array_type, mesh, Vec::new()),
-        Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Dimension::Dynamic(Some(10))]),
+        Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Dimension::Dynamic(dynamic)]),
     ));
 }
 

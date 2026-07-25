@@ -2185,6 +2185,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::sharding::ShardingDimension;
+    use crate::types::{DimensionBounds, DimensionVariable};
 
     use super::*;
 
@@ -2802,7 +2803,12 @@ mod tests {
                     input_types = [
                         ArrayType::new(
                             DataType::F32,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None), Dimension::Static(2), Dimension::Static(3)]),
+                            Shape::new(vec![
+                                Dimension::Static(2),
+                                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                                Dimension::Static(2),
+                                Dimension::Static(3),
+                            ]),
                         ),
                         key_value.clone(),
                         key_value.clone(),

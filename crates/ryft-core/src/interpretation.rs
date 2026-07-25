@@ -440,7 +440,7 @@ mod tests {
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -568,7 +568,10 @@ mod tests {
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
         let mut builder = ProgramBuilder::<Array, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])));
+        let i0 = builder.add_input(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        ));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
@@ -576,19 +579,25 @@ mod tests {
         assert!(matches!(
             program.interpret(Array::scalar(1.0)),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[] which is incompatible with the program's declared type f64[*]",
+                == "encountered input type f64[] which is incompatible with the program's declared type f64[dynamic]",
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
         let mut builder = ProgramBuilder::<Array, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(3))])));
+        let i0 = builder.add_input(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "dynamic",
+                DimensionBounds::non_negative(Some(3)).unwrap(),
+            ))]),
+        ));
         let o0 = builder.add_instruction(AddOperation, Vec::new(), vec![i0, i0]).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[<3]",
+                == "encountered input type f64[3] which is incompatible with the program's declared type f64[dynamic]",
         ));
     }
 

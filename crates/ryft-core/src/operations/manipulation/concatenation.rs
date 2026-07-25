@@ -352,8 +352,6 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
     let first = inputs[0];
     let rank = first.rank();
     let mut concatenated_static = 0usize;
-    let mut concatenated_dynamic = false;
-    let mut maximum_concatenated_size = Some(0usize);
     for (index, operand) in inputs.iter().enumerate() {
         if operand.data_type() != first.data_type() {
             return Err(TypeError::invalid(format!(
@@ -405,25 +403,16 @@ fn infer_concatenated_dimension_size(inputs: &[&ArrayType], axis: usize) -> Resu
                         "'{CONCATENATE_OPERATION_NAME}' output size overflows usize on axis {axis}",
                     ))
                 })?;
-                maximum_concatenated_size = maximum_concatenated_size.and_then(|maximum| maximum.checked_add(size));
             }
-            Dimension::Dynamic(upper_bound) => {
-                concatenated_dynamic = true;
-                maximum_concatenated_size = match (maximum_concatenated_size, upper_bound) {
-                    (Some(maximum), Some(upper_bound)) => maximum.checked_add(upper_bound.saturating_sub(1)),
-                    _ => None,
-                };
+            Dimension::Dynamic(_) => {
+                return Err(TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' dynamic axis {axis} requires an explicit result-dimension operand",
+                )));
             }
         }
     }
 
-    if concatenated_dynamic {
-        // Bounds are exclusive. Sum each operand's maximum possible size, then add one to make the result exclusive.
-        // If that final addition overflows, retain an unbounded dynamic result.
-        Ok(Dimension::Dynamic(maximum_concatenated_size.and_then(|maximum| maximum.checked_add(1))))
-    } else {
-        Ok(Dimension::Static(concatenated_static))
-    }
+    Ok(Dimension::Static(concatenated_static))
 }
 
 /// Infers the [`Sharding`] of the result of a concatenation operation using JAX's independent spatial,
@@ -518,7 +507,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Layout, Memory, StridedLayout};
+    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -543,18 +532,34 @@ mod tests {
         assert_eq!(format!("{operation}"), "concatenate [axis=0]");
         assert_eq!(operation.axis(), 0);
 
-        // Type inference sums the concatenated axis, preserves matching non-concatenated axes, and reports exact
-        // validation errors. Dynamic concatenated dimensions propagate their tight exclusive upper bound.
+        // Type inference sums static concatenated axes, preserves matching non-concatenated axes, and reports exact
+        // validation errors. Until the mixed signature lands, a dynamic result extent cannot be represented without
+        // manufacturing an unstable identity, so it requires an explicit result-dimension operand.
         let first_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let second_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)]));
-        let dynamic_stack =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]));
-        let bounded_stack =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Static(2)]));
+        let dynamic_stack = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(2),
+            ]),
+        );
+        let bounded_stack = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(4)).unwrap())),
+                Dimension::Static(2),
+            ]),
+        );
         let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
-        let dynamic_non_axis =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(None)]));
+        let dynamic_non_axis = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![
+                Dimension::Static(1),
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+            ]),
+        );
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -564,23 +569,17 @@ mod tests {
                 },
                 {
                     input_types = [dynamic_stack, fixed_slice.clone()],
-                    output_types = [ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(2)]),
-                    )],
+                    error = "'concatenate' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [bounded_stack, fixed_slice],
-                    output_types = [ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![Dimension::Dynamic(Some(5)), Dimension::Static(2)]),
-                    )],
+                    error = "'concatenate' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [dynamic_non_axis.clone(), dynamic_non_axis.clone()],
                     output_types = [ArrayType::new(
                         DataType::F64,
-                        Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]),
+                        Shape::new(vec![Dimension::Static(2), dynamic_non_axis.shape()[1].clone()]),
                     )],
                 },
                 {
@@ -611,10 +610,19 @@ mod tests {
                 {
                     input_types = [
                         dynamic_non_axis,
-                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(Some(3))])),
+                        ArrayType::new(
+                            DataType::F64,
+                            Shape::new(vec![
+                                Dimension::Static(1),
+                                Dimension::Dynamic(DimensionVariable::new(
+                                    "dynamic",
+                                    DimensionBounds::non_negative(Some(3)).unwrap(),
+                                )),
+                            ]),
+                        ),
                     ],
-                    error = "'concatenate' operands must agree on every axis other than 0 but operand 1 has size <3 \
-                        on axis 1 and operand 0 has size *",
+                    error = "'concatenate' operands must agree on every axis other than 0 but operand 1 has size \
+                        dynamic on axis 1 and operand 0 has size dynamic",
                 },
             ],
         );
@@ -779,6 +787,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         let placed_output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![5.into()])).with_memory(Memory::Host { pinned: true });
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         check_operation_transposition!(
             @exact,
             operation = ConcatenateOperation::new(0, 1).unwrap(),
@@ -815,11 +824,11 @@ mod tests {
                     inputs = [
                         (@linear(type = ArrayType::new(
                             DataType::F64,
-                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(None)]),
+                            Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]),
                         ))),
                         (@linear(type = ArrayType::new(
                             DataType::F64,
-                            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(None)]),
+                            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(columns)]),
                         ))),
                     ],
                     output_cotangents = [Array::matrix(

@@ -608,7 +608,7 @@ fn unpack_coordinate_range<V: Value<Type = ArrayType> + Broadcast + Reshape + Sl
         coordinate_shape
             .dimensions()
             .iter()
-            .copied()
+            .cloned()
             .chain(item_shape.dimensions().iter().copied().map(Dimension::Static))
             .collect(),
     );
@@ -626,7 +626,9 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::DataType::*;
-    use crate::types::{ArrayType, Dimension, Layout, Memory, Shape, StridedLayout};
+    use crate::types::{
+        ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, Memory, Shape, StridedLayout,
+    };
 
     use super::*;
 
@@ -843,7 +845,10 @@ mod tests {
             0,
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        );
         assert_eq!(
             <ArrayType as DenseDifferentiableType<EagerContext<Array, ArrayOperation<Array>>>>::coordinate_space_dimension(
                 &dynamic_type,

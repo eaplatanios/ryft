@@ -967,9 +967,9 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
 - [x] `P1a` gate: focused tests cover bounds, display, clone/fresh equality, hashing, and typed error recovery without
       changing existing `Dimension` behavior.
 
-- [ ] Replace the mechanically renamed `Dimension::Dynamic(Option<usize>)` with the reviewed leaf-only dynamic form:
+- [x] Replace the mechanically renamed `Dimension::Dynamic(Option<usize>)` with the reviewed leaf-only dynamic form:
       one `DimensionVariable` identity plus authoritative bounds, with no arithmetic expression in types.
-- [ ] Establish one source of truth for bounds. Types carry the authoritative bounds used for checking and compilation;
+- [x] Establish one source of truth for bounds. Types carry the authoritative bounds used for checking and compilation;
       public declaration helpers construct those types rather than maintaining an independently mutable copy.
 - [ ] Add only the generic `Type::Identity` and `Type::Refinements` hooks needed for program closure, alpha-renaming,
       instantiation, and canonical signatures. Do not put batching, differentiation, or dimension-specific behavior on
@@ -1601,3 +1601,38 @@ Verification completed:
 - scoped formatting and `git diff --check` passed.
 
 The known ambiguous `arrays` glob-re-export warning remains assigned to P9.
+
+### Execution: P1b dynamic dimension leaves
+
+P1b makes the P1a identity foundation the sole dynamic-axis representation:
+
+- `Dimension::Dynamic` now owns one clone-preserving `DimensionVariable`, and all bounds consumers read the variable's
+  authoritative immutable `DimensionBounds`;
+- array inference preserves existing leaves through broadcast, reshape, transpose, reduction, dot, and unchanged
+  full-extent slicing instead of reconstructing anonymous bounds;
+- `Shape::is_refined_by` enforces repeated-leaf equality within a shape without allocating a refinement table;
+- derived dynamic reshape, concatenate, pad, and strided full-extent slice results fail with exact diagnostics until
+  P3 makes their result extents explicit SSA operands; and
+- XLA lowering reads bounds from variables directly, while version-3 persistent signatures encode a typed shared
+  variable table. Canonical compilation keys omit diagnostic names but retain shared-versus-independent variable
+  relationships; executable metadata retains names and reconstructs each shared variable once.
+
+No compatibility variant, expression representation, dimension witness, generic `Type` hook, or operation-specific
+identity-source mechanism was added. Cross-type closure, boundary-wide refinement, alpha-renaming, canonical program
+signatures, and `OutputIdentityRole` deletion remain P1c work.
+
+Verification completed:
+
+- `cargo check -p ryft-core -p ryft-xla`, scoped formatting, and `git diff --check` passed;
+- `cargo test -p ryft-core --lib` passed all 915 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored;
+- `cargo test -p ryft-xla --lib` passed 396 tests with one documented ignored benchmark;
+- all 53 `ryft-macros` unit tests and all 17 operation macro-integration tests passed; and
+- the remaining parameter trybuild mismatch reproduces unchanged on reviewed integration commit
+  `7a2a0a39a96a3700c9855439faa8c2bfecece50c`: rustc includes `Axes` in a non-exhaustive implementor help list. P1b
+  deliberately does not alter that inherited golden.
+
+Targeted residual searches found no old `Dimension::Dynamic(None)`/`Dimension::Dynamic(Some(...))` construction, old
+XLA version-2 type-schema identifier, invalid zero-bound lowering variant, or non-static `Dimension` `.copied()` use
+under `crates`. The sole non-test/non-doc `DimensionVariable::new` outside `types::dimensions` is the version-3 XLA
+signature decoder, which recreates validated shared variables from persistent metadata.

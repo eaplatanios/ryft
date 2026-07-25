@@ -1710,7 +1710,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing::{DomainTracingContext, Trace};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -2638,7 +2638,10 @@ mod tests {
         // A mapped input whose batch dimension is `Dimension::Dynamic` cannot be batched since `batch`
         // has no way of determining the batch size.
         let dynamic_input = Array::with_unchecked_type(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+            ),
             vec![Scalar::F64(1.0), Scalar::F64(2.0), Scalar::F64(3.0)],
         );
         let result: Result<Array, BatchingError> = EagerContext::<Array, ArrayOperation<Array>>::new().batch(

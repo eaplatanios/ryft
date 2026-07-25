@@ -1194,7 +1194,7 @@ mod tests {
     use crate::programs::types::Typed;
     use crate::programs::values::Value;
     use crate::types::DataType::{F32, F64};
-    use crate::types::{ArrayType, DataType, Dimension, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1578,7 +1578,10 @@ mod tests {
             },
         );
 
-        let dynamic_type = ArrayType::new(F64, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        );
         let dynamic = Array::with_unchecked_type(dynamic_type.clone(), vec![Scalar::F64(1.0)]);
         assert_eq!(
             context.jacobian_forward(|x| Ok(x), dynamic).unwrap_err(),
@@ -1586,7 +1589,7 @@ mod tests {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
-                r#type: "f64[*]".to_string(),
+                r#type: "f64[dynamic]".to_string(),
             },
         );
         assert_eq!(
@@ -1602,7 +1605,7 @@ mod tests {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Output,
                 path: "$".to_string(),
-                r#type: "f64[*]".to_string(),
+                r#type: "f64[dynamic]".to_string(),
             },
         );
 
@@ -1615,7 +1618,7 @@ mod tests {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
                 path: "$".to_string(),
-                r#type: "f64[*]".to_string(),
+                r#type: "f64[dynamic]".to_string(),
             },
         );
     }

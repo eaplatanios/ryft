@@ -100,7 +100,9 @@ mod tests {
 
     use crate::programs::regions::RegionInterface;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{ArrayType, DataType, Dimension, Layout, Shape, StridedLayout};
+    use crate::types::{
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, Shape, StridedLayout,
+    };
 
     use super::*;
 
@@ -224,8 +226,13 @@ mod tests {
         // Dynamic dimensions flow through elementwise congruence when they match exactly, while static-vs-dynamic
         // mismatches are rejected.
         let operation = TestElementwiseArrayOperation { input_count: 2 };
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
         assert_eq!(
             Operation::<ArrayType>::infer_output_types(&operation, &[dynamic_type.clone(), dynamic_type.clone()], &[]),
             Ok(vec![dynamic_type.clone()]),

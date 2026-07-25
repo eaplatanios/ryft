@@ -1261,7 +1261,7 @@ mod tests {
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
-    use crate::types::{Dimension, Shape};
+    use crate::types::{Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -1479,7 +1479,7 @@ mod tests {
                     error = "'all_gather' concat axis 0 is out of bounds for rank 0",
                 },
                 {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(None)]))],
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]))],
                     error = "'all_gather' does not support dynamically shaped operands",
                 },
             ],

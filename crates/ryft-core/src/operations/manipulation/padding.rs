@@ -460,7 +460,10 @@ fn is_effective_identity(
         && input_type.shape().dimensions().iter().zip(interior_padding).all(|(dimension, padding)| {
             *padding == 0
                 || matches!(dimension, Dimension::Static(0 | 1))
-                || matches!(dimension, Dimension::Dynamic(Some(upper_bound)) if *upper_bound <= 2)
+                || matches!(
+                    dimension,
+                    Dimension::Dynamic(variable) if variable.bounds().upper().is_some_and(|upper| upper <= 2)
+                )
         })
 }
 
@@ -583,31 +586,28 @@ impl Pad for ArrayType {
                     interior_padding[axis],
                     axis,
                 )?),
-                Dimension::Dynamic(upper_bound) => {
-                    let output_upper_bound = match upper_bound {
-                        None => None,
-                        Some(upper_bound) => {
-                            let maximum_input_size = upper_bound.saturating_sub(1);
-                            match padded_extent(
-                                maximum_input_size,
-                                edge_padding_low[axis],
-                                edge_padding_high[axis],
-                                interior_padding[axis],
-                                axis,
-                            ) {
-                                Ok(maximum) if maximum < 0 => {
-                                    return Err(TypeError::invalid(format!(
-                                        "'pad' output size is negative ({maximum}) on dynamic axis {axis} even at \
-                                         its maximum input extent {maximum_input_size}",
-                                    ))
-                                    .into());
-                                }
-                                Ok(maximum) => usize::try_from(maximum).ok().and_then(|maximum| maximum.checked_add(1)),
-                                Err(_) => None,
-                            }
+                Dimension::Dynamic(variable) => {
+                    if let Some(upper) = variable.bounds().upper() {
+                        let maximum_input_extent = upper - 1;
+                        let maximum_output_extent = padded_extent(
+                            maximum_input_extent,
+                            edge_padding_low[axis],
+                            edge_padding_high[axis],
+                            interior_padding[axis],
+                            axis,
+                        )?;
+                        if maximum_output_extent < 0 {
+                            return Err(TypeError::invalid(format!(
+                                "'pad' output size is negative ({maximum_output_extent}) on dynamic axis {axis} \
+                                 even at its maximum input extent {maximum_input_extent}",
+                            ))
+                            .into());
                         }
-                    };
-                    Dimension::Dynamic(output_upper_bound)
+                    }
+                    return Err(TypeError::invalid(format!(
+                        "'pad' dynamic axis {axis} requires an explicit result-dimension operand",
+                    ))
+                    .into());
                 }
             };
             output_dimensions.push(output_dimension);
@@ -617,7 +617,11 @@ impl Pad for ArrayType {
                 || edge_padding_high[axis] > 0
                 || (interior_padding[axis] > 0
                     && !matches!(dimension, Dimension::Static(0 | 1))
-                    && !matches!(dimension, Dimension::Dynamic(Some(upper_bound)) if *upper_bound <= 2))
+                    && !matches!(
+                        dimension,
+                        Dimension::Dynamic(variable)
+                            if variable.bounds().upper().is_some_and(|upper| upper <= 2)
+                    ))
         });
         let sharding = resized_output_sharding(self, &output_dimensions, PAD_OPERATION_NAME)?;
         if padding_positions_may_exist {
@@ -709,7 +713,7 @@ mod tests {
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::{DataType, Layout, Memory, StridedLayout};
+    use crate::types::{DataType, DimensionBounds, DimensionVariable, Layout, Memory, StridedLayout};
 
     use super::*;
 
@@ -751,17 +755,23 @@ mod tests {
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                            "input",
+                            DimensionBounds::unbounded(),
+                        ))])),
                         padding_value_type.clone(),
                     ],
-                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]))],
+                    error = "'pad' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [
-                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4))])),
+                        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                            "input",
+                            DimensionBounds::non_negative(Some(4)).unwrap(),
+                        ))])),
                         padding_value_type.clone(),
                     ],
-                    output_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(9))]))],
+                    error = "'pad' dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [
@@ -791,34 +801,41 @@ mod tests {
                 "'pad' interior_padding has length 0 but input has rank 1".to_string()
             ))),
         );
-        // Negative inverse edges remain valid for dynamic dimensions. Runtime values must satisfy the resulting
-        // non-negative extent, but rejecting the abstract operation would make the transpose of positive padding
-        // impossible to stage. For an input extent below 9, cropping 1 and 2 yields an output extent below 6.
+        // Negative inverse edges still validate their abstract extent. A valid derived dynamic extent requires the
+        // explicit result-dimension operand introduced by the mixed operation signature, while an always-negative
+        // extent is rejected immediately.
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(9))])).pad(
-                &padding_value_type,
-                &[-1],
-                &[-2],
-                &[0]
-            ),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(6))]))),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                    "input",
+                    DimensionBounds::non_negative(Some(9)).unwrap(),
+                ))]),
+            )
+            .pad(&padding_value_type, &[-1], &[-2], &[0]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+            ))),
         );
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)])).pad(
-                &padding_value_type,
-                &[-1],
-                &[-2],
-                &[0]
-            ),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(None)]))),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded(),))]),
+            )
+            .pad(&padding_value_type, &[-1], &[-2], &[0]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+            ))),
         );
         assert_eq!(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(2))])).pad(
-                &padding_value_type,
-                &[-5],
-                &[0],
-                &[0]
-            ),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                    "dynamic",
+                    DimensionBounds::non_negative(Some(2)).unwrap(),
+                ))])
+            )
+            .pad(&padding_value_type, &[-5], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
                 "'pad' output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1".to_string()
             ))),
@@ -1092,39 +1109,28 @@ mod tests {
             }],
         );
 
-        // Positive edge padding over a bounded-dynamic operand must produce a fully stageable dynamic pullback: the
-        // inverse signed pad crops the cotangent and the full-extent slice applies the interior stride.
-        let dynamic_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(Some(4))]));
+        // Until the mixed pad signature lands, positive padding over a bounded-dynamic operand cannot manufacture a
+        // stable result identity. P3 restores this pullback path by supplying its derived extents as explicit
+        // dimension operands.
+        let dynamic_input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "input",
+                DimensionBounds::non_negative(Some(4)).unwrap(),
+            ))]),
+        );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let dynamic_input = builder.add_input(dynamic_input_type);
         let dynamic_padding = builder.add_input(ArrayType::scalar(DataType::F64));
-        let dynamic_output = builder
-            .add_instruction(
+        assert_eq!(
+            builder.add_instruction(
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![dynamic_input, dynamic_padding],
-            )
-            .unwrap()[0];
-        let dynamic_program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![dynamic_output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        let dynamic_pullback = dynamic_program.transpose_with_respect_to(&[0, 1]).unwrap();
-        assert_eq!(
-            dynamic_pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[<9] .
-                let %1:f64[] = zero [type=f64[]]
-                    %2:f64[<6] = pad [edge_padding_low=[-1], edge_padding_high=[-2], interior_padding=[0]] %0 %1
-                    %3:f64[<4] = slice [start_indices=[0], limit_indices=[0], strides=[2], full_extent_axes={0}] %2
-                    %4:bool[<4] = zero [type=bool[<4]]
-                    %5:bool[] = one [type=bool[]]
-                    %6:bool[<9] = pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]] %4 %5
-                    %7:f64[<9] = zero [type=f64[<9]]
-                    %8:f64[<9] = select %6 %0 %7
-                    %9:f64[] = reduce_sum [axes=[0]] %8
-                in (%3, %9)
-            "}
-            .trim_end(),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+            ))),
         );
 
         // A pure crop never reads the padding scalar, so its dependency metadata may differ from the operand's. The

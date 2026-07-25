@@ -268,7 +268,7 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::regions::EmptyRegionDriver;
     use crate::types::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
-    use crate::types::{ArrayType, Dimension, Shape};
+    use crate::types::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -357,13 +357,16 @@ mod tests {
             ),
         );
 
-        let dynamic_type = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None)]));
+        let dynamic_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        );
         assert_eq!(
             CoordinateBasisOperation::new(dynamic_type, 0, 1)
                 .infer_output_types(&[], &[])
                 .unwrap_err()
                 .to_string(),
-            "coordinate basis requires a fully static leaf type but got f32[*]",
+            "coordinate basis requires a fully static leaf type but got f32[dynamic]",
         );
 
         let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));

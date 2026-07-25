@@ -899,7 +899,7 @@ impl Gather for ArrayType {
                     let &operand_axis = offset_iterator.next().expect("offset axis count was validated");
                     Dimension::Static(slice_sizes[operand_axis])
                 } else {
-                    *batch_iterator.next().expect("batch axis count was validated")
+                    batch_iterator.next().expect("batch axis count was validated").clone()
                 }
             })
             .collect();

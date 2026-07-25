@@ -6,6 +6,6 @@ pub mod memories;
 
 pub use arrays::ArrayType;
 pub use data::{DataType, DataTypeError};
-pub use dimensions::{Dimension, Shape, StaticShape};
+pub use dimensions::{Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape, StaticShape};
 pub use layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 pub use memories::Memory;

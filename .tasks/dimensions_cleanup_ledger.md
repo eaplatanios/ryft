@@ -199,11 +199,11 @@ ledger disagrees with Git.
 
 ## P1a: dimension identity foundations
 
-- Status: ready for review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p1a-leaf-dimensions`
-- Source commit: pending
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `daa288dbae6ff50065413393127db30f55d4f8cc`
+- Integration commit: `7a2a0a39a96a3700c9855439faa8c2bfecece50c`
+- Remainder reconciliation commit: `7952e1f4e`
 - Immutable archive unchanged: yes
 - Landed: introduces validated inclusive-lower/exclusive-upper `DimensionBounds`, fresh clone-preserving
   `DimensionVariable` identities with diagnostic-only names, one immutable bounds authority per identity, and typed
@@ -218,4 +218,32 @@ ledger disagrees with Git.
   `DimensionVariable` production ownership is confined to `types::dimensions`; the only additional production path is
   one explicit `Ok::<ReshapeDimensionExpression, TypeError>` annotation required because the new typed error
   conversion made an existing inferred `Result<_, _>` ambiguous
-- Next action: push the P1a increment and stage its no-commit integration merge for owner review
+- Next action: none
+
+## P1b: dynamic dimension leaves
+
+- Status: ready for review
+- Branch: `u/eaplatanios/increment/p1b-dynamic-dimension-leaves`
+- Source commit: pending
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Landed: replaces `Dimension::Dynamic(Option<usize>)` with one `DimensionVariable` leaf and migrates shape/type
+  consumers without a compatibility variant or expression representation; shared leaves retain equality through
+  broadcasting, reshaping, transpose, reduction, dot, and repeated-axis refinement; XLA bounds lowering reads the
+  variable's authoritative bounds directly; persistent XLA signatures use a version-3 typed variable table that
+  preserves sharing while excluding diagnostic names from canonical cache keys
+- Deferred: generic `Type` identity/refinement hooks, structural closure, canonical signatures, and
+  `OutputIdentityRole` deletion remain assigned to P1c; derived dynamic reshape, concatenate, pad, and strided
+  full-extent slice results reject with exact diagnostics until P3 supplies explicit result-dimension operands
+- Verification: `cargo check -p ryft-core -p ryft-xla` passed; `cargo test -p ryft-core --lib` passed all 915 tests;
+  `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; `cargo test -p ryft-xla --lib` passed 396 tests
+  with one documented ignored benchmark; all 53 `ryft-macros` unit tests and all 17 operation macro-integration tests
+  passed; the full macro-integration command retains one inherited trybuild help-list mismatch that reproduces
+  unchanged on integration commit `7a2a0a39a96a3700c9855439faa8c2bfecece50c`; scoped formatting and
+  `git diff --check` passed
+- Residual search: no `Dimension::Dynamic(None)`/`Dimension::Dynamic(Some(...))`, old XLA version-2 type-schema
+  identifiers, invalid zero-bound lowering variant, or non-static `Dimension` `.copied()` use remains under `crates`;
+  the sole non-test/non-doc `DimensionVariable::new` outside `types::dimensions` recreates validated shared variables
+  while decoding the version-3 XLA persistent signature
+- Next action: push the P1b increment and stage its no-commit integration merge for owner review

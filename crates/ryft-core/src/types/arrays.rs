@@ -26,6 +26,7 @@ use crate::types::memories::Memory;
 ///
 /// ```rust
 /// # use ryft_core::{ArrayType, DataType, Memory, Shape, Dimension};
+/// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
 ///
 /// // Boolean scalar.
 /// assert_eq!(
@@ -48,15 +49,17 @@ use crate::types::memories::Memory;
 /// );
 ///
 /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
+/// let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(10)).unwrap());
 /// assert_eq!(
-///   ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(Some(10))])).to_string(),
-///   "f32[42, <10]",
+///   ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(42), columns.into()])).to_string(),
+///   "f32[42, columns]",
 /// );
 ///
 /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
+/// let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
 /// assert_eq!(
-///   ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(42)])).to_string(),
-///   "c64[*, 42]",
+///   ArrayType::new(DataType::C64, Shape::new(vec![rows.into(), Dimension::Static(42)])).to_string(),
+///   "c64[rows, 42]",
 /// );
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
@@ -180,6 +183,7 @@ impl ArrayType {
     /// ```rust
     /// # use ryft_core::types::DataType;
     /// # use ryft_core::types::{ArrayType, Shape, Dimension};
+    /// # use ryft_core::types::dimensions::{DimensionBounds, DimensionVariable};
     ///
     /// // Boolean scalar.
     /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar()).rank(), 0);
@@ -188,14 +192,16 @@ impl ArrayType {
     /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(42)])).rank(), 1);
     ///
     /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
+    /// let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(10)).unwrap());
     /// assert_eq!(
-    ///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(Some(10))])).rank(),
+    ///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(42), columns.into()])).rank(),
     ///     2,
     /// );
     ///
     /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
+    /// let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
     /// assert_eq!(
-    ///     ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(42)])).rank(),
+    ///     ArrayType::new(DataType::C64, Shape::new(vec![rows.into(), Dimension::Static(42)])).rank(),
     ///     2,
     /// );
     /// ```
@@ -458,6 +464,7 @@ mod tests {
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
     use crate::types::data::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
+    use crate::types::dimensions::{DimensionBounds, DimensionVariable};
     use crate::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
@@ -465,7 +472,10 @@ mod tests {
     #[test]
     fn test_array_type_static_shape() {
         let static_shape = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
-        let dynamic_shape = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let dynamic_shape = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+        ]);
 
         let scalar = ArrayType::scalar(Boolean);
         let static_array_type = ArrayType::new(F32, static_shape);
@@ -479,7 +489,10 @@ mod tests {
     #[test]
     fn test_array_type_rank() {
         let s1 = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
-        let s2 = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let s2 = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+        ]);
 
         let t0 = ArrayType::scalar(Boolean);
         let t1 = ArrayType::new(F32, s1);
@@ -492,8 +505,9 @@ mod tests {
 
     #[test]
     fn test_array_type_dimension() {
+        let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let s0 = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
-        let s1 = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let s1 = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(columns.clone())]);
 
         let t0 = ArrayType::new(F32, s0);
         let t1 = ArrayType::new(F8E3M4, s1);
@@ -502,14 +516,17 @@ mod tests {
         assert_eq!(t0.dimension(2), Dimension::Static(2));
         assert_eq!(t0.dimension(-2), Dimension::Static(4));
         assert_eq!(t1.dimension(0), Dimension::Static(42));
-        assert_eq!(t1.dimension(1), Dimension::Dynamic(None));
-        assert_eq!(t1.dimension(-1), Dimension::Dynamic(None));
+        assert_eq!(t1.dimension(1), Dimension::Dynamic(columns.clone()));
+        assert_eq!(t1.dimension(-1), Dimension::Dynamic(columns));
     }
 
     #[test]
     fn test_array_type_element_count() {
         let static_shape = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
-        let dynamic_shape = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let dynamic_shape = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+        ]);
 
         let scalar = ArrayType::scalar(Boolean);
         let static_array_type = ArrayType::new(F32, static_shape);
@@ -682,9 +699,19 @@ mod tests {
     fn test_array_type_display() {
         let s1 = Shape::new(vec![Dimension::Static(42), Dimension::Static(4), Dimension::Static(2)]);
         let s2 = Shape::new(vec![Dimension::Static(4), Dimension::Static(1)]);
-        let s3 = Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(Some(1))]);
-        let s4 = Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(42), Dimension::Dynamic(None)]);
-        let s5 = Shape::new(vec![Dimension::Static(42), Dimension::Dynamic(None)]);
+        let s3 = Shape::new(vec![
+            Dimension::Static(4),
+            Dimension::Dynamic(DimensionVariable::new("depth", DimensionBounds::non_negative(Some(1)).unwrap())),
+        ]);
+        let s4 = Shape::new(vec![
+            Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::unbounded())),
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("columns", DimensionBounds::unbounded())),
+        ]);
+        let s5 = Shape::new(vec![
+            Dimension::Static(42),
+            Dimension::Dynamic(DimensionVariable::new("columns", DimensionBounds::unbounded())),
+        ]);
 
         let t0 = ArrayType::scalar(Boolean);
         let t1 = ArrayType::new(F32, s1);
@@ -711,9 +738,9 @@ mod tests {
         assert_eq!(format!("{t0}"), "bool[]");
         assert_eq!(format!("{t1}"), "f32[42, 4, 2]");
         assert_eq!(format!("{t2}"), "bf16[4, 1]");
-        assert_eq!(format!("{t3}"), "f16[4, <1]");
-        assert_eq!(format!("{t4}"), "c64[*, 42, *]");
-        assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
+        assert_eq!(format!("{t3}"), "f16[4, depth]");
+        assert_eq!(format!("{t4}"), "c64[rows, 42, columns]");
+        assert_eq!(format!("{t5}"), "f8e4m3fn[42, columns]");
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
         assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}], varying_manual={'x'}}]");
@@ -732,7 +759,13 @@ mod tests {
 
     #[test]
     fn test_array_type_is_refined_by() {
-        let declared = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(None), Dimension::Static(3)]));
+        let declared = ArrayType::new(
+            F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
+                Dimension::Static(3),
+            ]),
+        );
         let actual = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
 
         // Identical types and refining shapes are accepted; the relation is directional.
@@ -742,7 +775,13 @@ mod tests {
         assert!(!actual.is_refined_by(&declared));
 
         // Bounded dynamic declared dimensions enforce their exclusive bound on static actual sizes.
-        let bounded = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(Some(4)), Dimension::Static(3)]));
+        let bounded = ArrayType::new(
+            F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::non_negative(Some(4)).unwrap())),
+                Dimension::Static(3),
+            ]),
+        );
         assert!(
             bounded.is_refined_by(&ArrayType::new(F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)])))
         );
