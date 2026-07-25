@@ -10,8 +10,8 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
 /// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
@@ -35,13 +35,16 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// Sealed non-entry [`Region`]s of the [`Program`] being built, in [`RegionId`] order. Regions are appended
     /// to this list with [`Self::import_region`], [`Self::import_program`], and [`Self::intern_callee`], and
     /// [`Instruction`]s reference them by [`RegionId`].
-    pub(crate) regions: Vec<Region<V, O>>,
+    pub(crate) regions: RegionArena<V, O>,
 
     /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Rc`] identity
     /// (i.e., [`Rc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
     /// equal but independently built programs remain distinct. Storing the [`Rc`] itself both provides the identity
     /// key and keeps the source alive, so a key can never be reused by a later allocation.
     pub(crate) callees: Vec<(Rc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
+
+    /// [`TypeIdentity`](crate::TypeIdentity)-instantiated shared callees cached by source and caller input [`Type`]s.
+    pub(crate) callee_instantiations: Vec<CalleeInstantiation<V, O>>,
 
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
@@ -55,8 +58,9 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             atoms: Vec::new(),
             input_ids: Vec::new(),
             instructions: Vec::new(),
-            regions: Vec::new(),
+            regions: RegionArena::new(),
             callees: Vec::new(),
+            callee_instantiations: Vec::new(),
             error: None,
         }
     }
@@ -88,7 +92,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Returns a borrowed view of the already sealed builder region that corresponds to the provided [`RegionId`].
     #[inline]
     pub fn region_ref(&self, id: RegionId) -> Result<RegionRef<'_, V, O>, ProgramError> {
-        RegionRef::new(self.regions.as_slice(), id)
+        RegionRef::new(&self.regions, id)
             .map_err(|_| ProgramError::MalformedProgram(format!("region {id} is not part of this builder")))
     }
 
@@ -119,10 +123,9 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Adds an [`Instruction`] to the [`Program`] that is being built, that corresponds to an application of the
     /// provided [`Operation`] with the provided previously sealed regions attached in the operation-defined region
     /// order (region-free operations pass an empty `regions` list) to the provided input [`Atom`]s. The number of
-    /// attached regions must match the operation's declared [`Operation::region_names`] slot count. Output types are
+    /// attached regions must match the operation's declared [`Operation::region_slots`] count. Output types are
     /// inferred through [`Operation::infer_output_types`], with the attached regions' [`RegionInterface`]s derived
-    /// from this builder's arena on the spot; interfaces are never stored, and final [`Self::build`] validation
-    /// derives them again from the frozen arena.
+    /// from this builder's sealed arena on the spot (i.e., [`RegionInterface`]s are never stored).
     pub fn add_instruction<P: Into<O>>(
         &mut self,
         operation: P,
@@ -130,12 +133,12 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         inputs: Vec<AtomId>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
-        let region_names = operation.region_names();
-        if regions.len() != region_names.len() {
+        let region_slots = operation.region_slots();
+        if regions.len() != region_slots.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{}` declares {} region slots but {} regions were attached",
                 operation.name(),
-                region_names.len(),
+                region_slots.len(),
                 regions.len(),
             )));
         }
@@ -158,12 +161,15 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         let region_interfaces = if regions.is_empty() {
             Vec::new()
         } else {
-            let effects = Region::effects(self.regions.as_slice());
             regions
                 .iter()
                 .map(|region_id| {
                     let region = &self.regions[region_id.index()];
-                    RegionInterface::new(region.input_types(), region.output_types(), effects[region_id.index()])
+                    RegionInterface::new(
+                        region.input_types(),
+                        region.output_types(),
+                        self.regions.effects(*region_id).unwrap(),
+                    )
                 })
                 .collect()
         };
@@ -244,7 +250,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         O: Clone,
     {
         if let Some((first, remaining)) = regions.split_first()
-            && remaining.iter().any(|region| !std::ptr::eq(first.regions(), region.regions()))
+            && remaining.iter().any(|region| !std::ptr::eq(first.arena(), region.arena()))
         {
             return Err(ProgramError::MalformedProgram(
                 "all imported regions must belong to the same program".to_string(),
@@ -278,8 +284,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
                 *attached = self.import_region_with_remapping(nested, remapping);
             }
         }
-        let id = RegionId::new(self.regions.len());
-        self.regions.push(imported);
+        let id = self.regions.push(imported).unwrap();
         remapping.insert(source_id, id);
         id
     }
@@ -292,32 +297,62 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         &mut self,
         program: Program<V, O, Input, Output>,
     ) -> RegionId {
-        let offset = self.regions.len();
-        let Program { mut regions, entry, .. } = program;
-        for region in &mut regions {
-            for instruction in &mut region.instructions {
-                for attached in &mut instruction.regions {
-                    *attached = RegionId::new(attached.index() + offset);
-                }
-            }
-        }
-        self.regions.extend(regions);
+        let Program { regions, entry, .. } = program;
+        let offset = self.regions.append(regions);
         RegionId::new(entry.index() + offset)
     }
 
-    /// Imports `callee` if it has not previously been imported into this builder and otherwise returns the existing
-    /// callee root [`RegionId`]. Callees are identified by [`Rc`] identity, not structural equality, so structurally
-    /// equal but independently built programs remain distinct.
-    pub fn intern_callee(&mut self, callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>) -> RegionId
+    // TODO(eaplatanios): The "alpha-equivalent" term below will be unknown to readers.
+    // TODO(eaplatanios): Can we clean up this function's implementation somehow.
+    /// Interns `callee`, optionally after instantiating its formal [`TypeIdentity`](crate::TypeIdentity)s for
+    /// `input_types`. Without `input_types`, callees are identified by [`Rc`] identity, not structural equality, so
+    /// structurally equal but independently built [`Program`]s remain distinct. With `input_types`, repeated exact
+    /// instantiations share one imported root. Alpha-equivalent types with different live identities remain distinct
+    /// because those identities are retained by the imported region's boundary and no per-attachment renaming is stored
+    /// on an [`Instruction`]. An instantiation requiring no renaming reuses the uninstantiated callee root.
+    pub fn intern_callee(
+        &mut self,
+        callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>,
+        input_types: Option<&[V::Type]>,
+    ) -> Result<RegionId, ProgramError>
     where
         O: Clone,
     {
-        if let Some((_, id)) = self.callees.iter().find(|(interned, _)| Rc::ptr_eq(interned, callee)) {
-            return *id;
+        let renaming = if let Some(input_types) = input_types {
+            if let Some(instantiation) = self.callee_instantiations.iter().find(|instantiation| {
+                Rc::ptr_eq(&instantiation.callee, callee) && instantiation.input_types == input_types
+            }) {
+                return Ok(instantiation.region);
+            }
+            Some(V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types)?)
+        } else {
+            None
+        };
+
+        let region = match renaming {
+            Some(ref renaming) if !renaming.is_identity() => {
+                self.import_program(callee.rename_type_identities(renaming)?)
+            }
+            _ => {
+                if let Some((_, region)) = self.callees.iter().find(|(interned, _)| Rc::ptr_eq(interned, callee)) {
+                    *region
+                } else {
+                    let region = self.import_region(callee.entry_region_ref());
+                    self.callees.push((callee.clone(), region));
+                    region
+                }
+            }
+        };
+
+        if let Some(input_types) = input_types {
+            self.callee_instantiations.push(CalleeInstantiation {
+                callee: callee.clone(),
+                input_types: input_types.to_vec(),
+                region,
+            });
         }
-        let id = self.import_region(callee.entry_region_ref());
-        self.callees.push((callee.clone(), id));
-        id
+
+        Ok(region)
     }
 
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
@@ -391,22 +426,9 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             }
         }
 
-        // Entry instructions may only reference previously added regions (i.e., regions with identifiers strictly
-        // below the entry's own, which is assigned last). Non-entry regions uphold the same property by construction,
-        // because region imports copy them in post-order (i.e., children before parents). Every referenced region
-        // identifier is therefore in range, and the region graph is acyclic, which is what allows the reachability walk
-        // (and any future recursive derivation over regions, such as recursive effect inference) to recurse without
-        // cycle tracking.
+        // The entry is sealed last. `RegionArena::push` verifies that every attached region already exists, preserving
+        // the arena's topological ordering and acyclicity before it publishes the entry and its derived metadata.
         let entry = RegionId::new(self.regions.len());
-        for instruction in &self.instructions {
-            for region in instruction.regions.iter().copied() {
-                if region.index() >= entry.index() {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction references region {region} which has not been sealed yet",
-                    )));
-                }
-            }
-        }
 
         // Check for well-formedness of the region graph. Every region must be reachable from the entry root. Sharing
         // is legal (i.e., several instructions may reference one region), so no ownership uniqueness is enforced.
@@ -419,7 +441,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             input_ids: self.input_ids,
             output_ids,
             instructions: self.instructions,
-        });
+        })?;
         let mut reachable = vec![false; regions.len()];
         let mut pending = vec![entry];
         while let Some(current) = pending.pop() {
@@ -437,25 +459,24 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             )));
         }
 
-        // Every instruction's attached-region count must match its operation's declared slot count. The checked
-        // instruction path already enforced this at insertion time for the entry region, but instructions can also
-        // arrive through the unchecked path, and so the final validation re-checks the complete frozen arena.
-        for region in &regions {
-            for instruction in &region.instructions {
-                let declared = instruction.operation().region_names().len();
-                if instruction.regions.len() != declared {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` declares {} region slots but {} regions were attached",
-                        instruction.operation().name(),
-                        declared,
-                        instruction.regions.len(),
-                    )));
-                }
-            }
-        }
-
         Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
     }
+}
+
+/// [`ProgramBuilder`]-private cache record for one imported [`TypeIdentity`](crate::TypeIdentity) instantiation of a
+/// shared callee. The source [`Rc`] supplies a stable identity key and keeps its allocation alive, `input_types`
+/// identifies the exact instantiated boundary, and `region` points at the corresponding imported root.
+#[derive(Clone, Debug)]
+struct CalleeInstantiation<V: Typed + Parameter, O> {
+    /// Shared source callee.
+    callee: Rc<Program<V, O, Vec<V>, Vec<V>>>,
+
+    /// Complete caller input [`Type`]s. An imported [`Region`] carries these exact live identities in its boundary
+    /// types, so only another invocation with the same types can reuse it.
+    input_types: Vec<V::Type>,
+
+    /// [`RegionId`] of the imported root [`Region`].
+    region: RegionId,
 }
 
 #[cfg(test)]
@@ -467,9 +488,12 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{InstructionId, ValueId};
+    use crate::programs::TypeError;
+    use crate::programs::instructions::InstructionId;
+    use crate::programs::regions::RegionSlot;
+    use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
 
@@ -634,7 +658,11 @@ mod tests {
         let sealed = source_builder.import_region(region_program.entry_region_ref());
         let input = source_builder.add_input(DataType::F64);
         let output = source_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+            )
             .unwrap()[0];
         let source = source_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -654,11 +682,103 @@ mod tests {
         let flat = Rc::new(source.to_flat_program());
         let equal_but_distinct = Rc::new(flat.as_ref().clone());
         let mut destination = ProgramBuilder::<Scalar, TestRegionOperation>::new();
-        let first = destination.intern_callee(&flat);
-        let second = destination.intern_callee(&flat);
-        let third = destination.intern_callee(&equal_but_distinct);
+        let first = destination.intern_callee(&flat, None).unwrap();
+        let second = destination.intern_callee(&flat, None).unwrap();
+        let third = destination.intern_callee(&equal_but_distinct, None).unwrap();
         assert_eq!(first, second);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn test_program_builder_type_identity_instantiation_cache_preserves_live_identities() {
+        #[derive(Clone)]
+        struct ArrayIdentityOperation;
+
+        impl Operation<ArrayType> for ArrayIdentityOperation {
+            fn name(&self) -> &'static str {
+                "array_identity"
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                const { &[RegionSlot::computation("body")] }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                let [region_interface] = region_interfaces else {
+                    return Err(TypeError::invalid(format!(
+                        "array identity expects 1 attached region but got {}",
+                        region_interfaces.len(),
+                    )));
+                };
+                if region_interface.input_types() != input_types {
+                    return Err(TypeError::invalid("array identity region input types do not match its operand types"));
+                }
+                Ok(region_interface.output_types().to_vec())
+            }
+        }
+
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let formal_first = DimensionVariable::new("formal_first", bounds);
+        let formal_second = DimensionVariable::new("formal_second", bounds);
+        let array_type =
+            |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut callee_builder = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let first_input = callee_builder.add_input(array_type(formal_first.clone()));
+        let second_input = callee_builder.add_input(array_type(formal_second.clone()));
+        let callee = Rc::new(
+            callee_builder
+                .build::<Vec<ArrayType>, Vec<ArrayType>>(
+                    vec![first_input, second_input],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap(),
+        );
+
+        // Repeated exact instantiations share, but fresh alpha-equivalent callers remain distinct because each
+        // imported region retains the live identities in its boundary.
+        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let caller_a = DimensionVariable::new("caller_a", bounds);
+        let caller_b = DimensionVariable::new("caller_b", bounds);
+        let caller_c = DimensionVariable::new("caller_c", bounds);
+        let caller_d = DimensionVariable::new("caller_d", bounds);
+        let first = destination.intern_callee(&callee, Some(&[array_type(caller_a), array_type(caller_b)])).unwrap();
+        let second_input_types = [array_type(caller_c), array_type(caller_d)];
+        let second = destination.intern_callee(&callee, Some(&second_input_types)).unwrap();
+        let repeated = destination.intern_callee(&callee, Some(&second_input_types)).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, repeated);
+        assert_eq!(destination.region_ref(second).unwrap().input_types(), second_input_types);
+        let inputs = second_input_types
+            .iter()
+            .cloned()
+            .map(|input_type| destination.add_input(input_type))
+            .collect::<Vec<_>>();
+        let outputs = destination.add_instruction(ArrayIdentityOperation, vec![second], inputs).unwrap().to_vec();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| destination.atoms()[output.index()].r#type().into_owned())
+                .collect::<Vec<_>>(),
+            second_input_types,
+        );
+
+        // A type-identity instantiation reuses the plain callee, while a permutation of overlapping identities
+        // does not.
+        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let plain = destination.intern_callee(&callee, None).unwrap();
+        let direct = destination
+            .intern_callee(&callee, Some(&[array_type(formal_first.clone()), array_type(formal_second.clone())]))
+            .unwrap();
+        let permuted = destination
+            .intern_callee(&callee, Some(&[array_type(formal_second), array_type(formal_first)]))
+            .unwrap();
+        assert_eq!(plain, direct);
+        assert_ne!(direct, permuted);
     }
 
     #[test]
@@ -677,7 +797,11 @@ mod tests {
 
         let input = builder.add_input(DataType::F64);
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -752,10 +876,18 @@ mod tests {
         ));
         let input = source_builder.add_input(DataType::F64);
         let first = source_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+            )
             .unwrap()[0];
         let second = source_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![first])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![first],
+            )
             .unwrap()[0];
         let source = source_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
@@ -780,7 +912,11 @@ mod tests {
         let nested = root_builder.import_region(leaf.entry_region_ref());
         let root_input = root_builder.add_input(DataType::F64);
         let root_output = root_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![nested], vec![root_input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![root_input],
+            )
             .unwrap()[0];
         let root = root_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![root_output], vec![Placeholder], vec![Placeholder])
@@ -790,13 +926,15 @@ mod tests {
         let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
         let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
         let first_root = RegionId::new(source_builder.regions.len());
-        source_builder.regions.push(root.entry_region().clone());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
         let second_root = RegionId::new(source_builder.regions.len());
-        source_builder.regions.push(root.entry_region().clone());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
         let source_input = source_builder.add_input(DataType::F64);
         let source_output = source_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(&["first", "second"]),
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
                 vec![first_root, second_root],
                 vec![source_input],
             )
@@ -849,10 +987,20 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(DataType::F64);
         let first = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["first", "second"]), vec![sealed, sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![sealed, sealed],
+                vec![input],
+            )
             .unwrap()[0];
         let second = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![first])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![first],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
@@ -876,7 +1024,11 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(DataType::F64);
         let output = builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![sealed], vec![input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![sealed],
+                vec![input],
+            )
             .unwrap()[0];
         assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), DataType::I64);
     }
@@ -893,7 +1045,11 @@ mod tests {
         let nested = root_builder.import_region(leaf.entry_region_ref());
         let root_input = root_builder.add_input(DataType::F64);
         let root_output = root_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![nested], vec![root_input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![root_input],
+            )
             .unwrap()[0];
         let root = root_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![root_output], vec![Placeholder], vec![Placeholder])
@@ -904,20 +1060,24 @@ mod tests {
         let mut source_builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
         let shared_leaf = source_builder.import_region(leaf.entry_region_ref());
         let first_root = RegionId::new(source_builder.regions.len());
-        source_builder.regions.push(root.entry_region().clone());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
         let second_root = RegionId::new(source_builder.regions.len());
-        source_builder.regions.push(root.entry_region().clone());
+        source_builder.regions.push(root.entry_region().clone()).unwrap();
         let source_input = source_builder.add_input(DataType::F64);
         let first_output = source_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(&["first", "second"]),
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
                 vec![first_root, second_root],
                 vec![source_input],
             )
             .unwrap()[0];
         let source_output = source_builder
             .add_instruction(
-                TestRegionOperation::WithRegions(&["first", "second"]),
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
                 vec![first_root, second_root],
                 vec![first_output],
             )
@@ -952,13 +1112,17 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, TestRegionOperation>::new();
         let input = builder.add_input(DataType::F64);
         assert!(matches!(
-            builder.add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![RegionId::new(3)], vec![input]),
+            builder.add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![RegionId::new(3)],
+                vec![input],
+            ),
             Err(ProgramError::MalformedProgram(message))
                 if message == "instruction references region ^3 which has not been sealed yet",
         ));
         let output = builder.add_variable(DataType::F64);
         builder.add_instruction_unchecked(Instruction::new(
-            TestRegionOperation::WithRegions(&["body"]),
+            TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
             vec![input],
             vec![output],
             vec![RegionId::new(3)],
