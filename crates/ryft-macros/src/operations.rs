@@ -424,6 +424,47 @@ impl OperationEnum {
                 },
             }
         });
+        let identity_renaming_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let renamed = if variant.is_boxed {
+                quote! {
+                    ::std::boxed::Box::new(
+                        <#payload_type as #ryft::Operation<#primary_type>>::rename_identities(
+                            #receiver,
+                            renaming,
+                        )?
+                    )
+                }
+            } else {
+                quote! {
+                    <#payload_type as #ryft::Operation<#primary_type>>::rename_identities(
+                        #receiver,
+                        renaming,
+                    )?
+                }
+            };
+            quote! {
+                Self::#variant_ident(operation) => {
+                    ::std::result::Result::Ok(Self::#variant_ident(#renamed))
+                },
+            }
+        });
+        let region_instantiation_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_type as #ryft::Operation<#primary_type>>::instantiated_region_input_types(
+                        #receiver,
+                        input_types,
+                        region_interfaces,
+                    )
+                },
+            }
+        });
         let region_name_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -493,6 +534,26 @@ impl OperationEnum {
                     region_interfaces: &[#ryft::RegionInterface<#primary_type>],
                 ) -> ::std::result::Result<::std::vec::Vec<#primary_type>, #ryft::TypeError> {
                     match self { #(#infer_output_type_arms)* }
+                }
+
+                fn rename_identities(
+                    &self,
+                    renaming: &#ryft::TypeIdentityRenaming<
+                        <#primary_type as #ryft::Type>::Identity,
+                    >,
+                ) -> ::std::result::Result<Self, #ryft::TypeError> {
+                    match self { #(#identity_renaming_arms)* }
+                }
+
+                fn instantiated_region_input_types(
+                    &self,
+                    input_types: &[#primary_type],
+                    region_interfaces: &[#ryft::RegionInterface<#primary_type>],
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<::std::option::Option<::std::vec::Vec<#primary_type>>>,
+                    #ryft::TypeError,
+                > {
+                    match self { #(#region_instantiation_arms)* }
                 }
 
                 fn region_names(&self) -> &'static [&'static str] {

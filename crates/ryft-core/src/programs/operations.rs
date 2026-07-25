@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::parameters::Parameterized;
 use crate::programs::Value;
 use crate::programs::effects::Effects;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface};
 use crate::programs::types::{Type, TypeError};
@@ -230,6 +231,32 @@ pub trait Operation<T: Type>: Clone {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError>;
 
+    /// Returns this operation after simultaneously renaming type identities stored in its payload.
+    ///
+    /// Operations whose payload contains no identity-bearing type metadata keep the cloning default. An operation that
+    /// stores shapes, output types, or nested signature metadata must apply the same renaming as its surrounding
+    /// program so the payload and atom types remain consistent.
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let _ = renaming;
+        Ok(self.clone())
+    }
+
+    /// Returns the input types each attached region should be instantiated with after this instruction receives
+    /// `input_types`.
+    ///
+    /// Each entry corresponds to the same-index region interface. [`None`] preserves that region's declared signature.
+    /// Region-carrying operations override this when their regions receive an operation-specific projection of the
+    /// instruction operands.
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        let _ = input_types;
+        Ok(vec![None; region_interfaces.len()])
+    }
+
     /// Returns stable names for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in the operation-defined
     /// region order (e.g., `["true", "false"]` for a condition operation). The declared region count must match the
     /// number of regions attached to every [`Instruction`](crate::Instruction) applying this operation.
@@ -308,6 +335,20 @@ impl<T: Type, O: Operation<T>> Operation<T> for Box<O> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         self.as_ref().infer_output_types(input_types, region_interfaces)
+    }
+
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Box::new(self.as_ref().rename_identities(renaming)?))
+    }
+
+    #[inline]
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        self.as_ref().instantiated_region_input_types(input_types, region_interfaces)
     }
 
     #[inline]

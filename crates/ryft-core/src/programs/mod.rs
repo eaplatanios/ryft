@@ -120,6 +120,7 @@ use crate::parameters::ParameterError;
 pub mod atoms;
 pub mod builders;
 pub mod effects;
+pub(crate) mod identities;
 pub mod instructions;
 pub mod operations;
 pub mod programs;
@@ -130,6 +131,7 @@ pub mod values;
 pub use atoms::{Atom, AtomId, MaybeZero};
 pub use builders::ProgramBuilder;
 pub use effects::{Effect, Effects};
+pub use identities::{IdentityPosition, NoIdentity, TypeIdentity, TypeIdentityRenaming};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{Operation, OperationFormatter};
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
@@ -137,7 +139,7 @@ pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, OutputRegionProvenance, Region, RegionDriver, RegionId,
     RegionInterface, RegionRef,
 };
-pub use types::{Type, TypeError, Typed};
+pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{Concretizable, Value, ValueId};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.

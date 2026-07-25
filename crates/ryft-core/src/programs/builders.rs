@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::macros::check_count;
@@ -11,8 +10,21 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
+
+/// One cached identity instantiation of a shared callee.
+#[derive(Clone, Debug)]
+pub(crate) struct CalleeIdentityInstantiation<V: Typed + Parameter, O> {
+    /// Shared source callee.
+    callee: Rc<Program<V, O, Vec<V>, Vec<V>>>,
+
+    /// Complete caller input types, retained to distinguish live-identity permutations.
+    input_types: Vec<V::Type>,
+
+    /// Imported region root.
+    region: RegionId,
+}
 
 /// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
 /// and [`Instruction`]s), the previously added non-entry [`Region`]s together with their callee-interning state, and
@@ -43,6 +55,9 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// key and keeps the source alive, so a key can never be reused by a later allocation.
     pub(crate) callees: Vec<(Rc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
 
+    /// Identity-instantiated shared callees cached by source and caller input types.
+    pub(crate) callee_identity_instantiations: Vec<CalleeIdentityInstantiation<V, O>>,
+
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
 }
@@ -57,6 +72,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             instructions: Vec::new(),
             regions: Vec::new(),
             callees: Vec::new(),
+            callee_identity_instantiations: Vec::new(),
             error: None,
         }
     }
@@ -320,6 +336,45 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         id
     }
 
+    /// Interns `callee` after instantiating its formal input identities at `input_types`.
+    ///
+    /// Repeated alpha-equivalent calls share one imported root, while calls that permute overlapping live identities
+    /// remain distinct.
+    pub fn intern_callee_instantiation(
+        &mut self,
+        callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>,
+        input_types: &[V::Type],
+    ) -> Result<RegionId, ProgramError>
+    where
+        O: Clone,
+    {
+        if let Some(instantiation) = self
+            .callee_identity_instantiations
+            .iter()
+            .find(|instantiation| Rc::ptr_eq(&instantiation.callee, callee) && instantiation.input_types == input_types)
+        {
+            return Ok(instantiation.region);
+        }
+        let renaming = V::Type::instantiation_identity_renaming(callee.input_types().as_slice(), input_types)?;
+        if let Some(cached) = self.callee_identity_instantiations.iter().find(|cached| {
+            Rc::ptr_eq(&cached.callee, callee)
+                && Program::<V, O, Vec<V>, Vec<V>>::same_identity_instantiation(&cached.input_types, input_types)
+        }) {
+            return Ok(cached.region);
+        }
+        let region = if renaming.is_identity() {
+            self.import_region(callee.entry_region_ref())
+        } else {
+            self.import_program(callee.rename_identities(&renaming)?)
+        };
+        self.callee_identity_instantiations.push(CalleeIdentityInstantiation {
+            callee: callee.clone(),
+            input_types: input_types.to_vec(),
+            region,
+        });
+        Ok(region)
+    }
+
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
     pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
         self,
@@ -454,7 +509,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             }
         }
 
-        Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
+        Program::from_regions(input_structure, output_structure, regions, entry)
     }
 }
 
@@ -467,11 +522,29 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{InstructionId, ValueId};
+    use crate::programs::{InstructionId, TypeError, ValueId};
     use crate::tests::TestRegionOperation;
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
+
+    /// Minimal array operation family used by identity-instantiation cache tests.
+    #[derive(Clone)]
+    struct ArrayIdentityOperation;
+
+    impl Operation<ArrayType> for ArrayIdentityOperation {
+        fn name(&self) -> &'static str {
+            "array_identity"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(input_types.to_vec())
+        }
+    }
 
     #[test]
     fn test_program_builder() {
@@ -659,6 +732,54 @@ mod tests {
         let third = destination.intern_callee(&equal_but_distinct);
         assert_eq!(first, second);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn test_program_builder_identity_instantiation_cache_handles_alpha_equivalence_and_permutations() {
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let formal_first = DimensionVariable::new("formal_first", bounds);
+        let formal_second = DimensionVariable::new("formal_second", bounds);
+        let array_type =
+            |variable: DimensionVariable| ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut callee_builder = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let first_input = callee_builder.add_input(array_type(formal_first.clone()));
+        let second_input = callee_builder.add_input(array_type(formal_second.clone()));
+        let callee = Rc::new(
+            callee_builder
+                .build::<Vec<ArrayType>, Vec<ArrayType>>(
+                    vec![first_input, second_input],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap(),
+        );
+
+        // Disjoint callers with the same bounds are alpha-equivalent and share one imported region.
+        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let caller_a = DimensionVariable::new("caller_a", bounds);
+        let caller_b = DimensionVariable::new("caller_b", bounds);
+        let caller_c = DimensionVariable::new("caller_c", bounds);
+        let caller_d = DimensionVariable::new("caller_d", bounds);
+        let first = destination
+            .intern_callee_instantiation(&callee, &[array_type(caller_a), array_type(caller_b)])
+            .unwrap();
+        let second = destination
+            .intern_callee_instantiation(&callee, &[array_type(caller_c), array_type(caller_d)])
+            .unwrap();
+        assert_eq!(first, second);
+
+        // Overlapping live identities in a different order are a real permutation and must not alias.
+        let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
+        let direct = destination
+            .intern_callee_instantiation(
+                &callee,
+                &[array_type(formal_first.clone()), array_type(formal_second.clone())],
+            )
+            .unwrap();
+        let permuted = destination
+            .intern_callee_instantiation(&callee, &[array_type(formal_second), array_type(formal_first)])
+            .unwrap();
+        assert_ne!(direct, permuted);
     }
 
     #[test]

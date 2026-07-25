@@ -11,11 +11,11 @@ use crate::macros::{
     impl_nullary_transposable_operation,
 };
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -23,16 +23,16 @@ use crate::types::ArrayType;
 pub const CONSTANT_OPERATION_NAME: &str = "constant";
 
 /// [`Operation`] that has no inputs and produces a single output equal to a captured typed value. [`ConstantOperation`]
-/// is a true literal constant. It carries a `V` value that is [`Typed`], and so its output type is exactly the value's
+/// is a true literal constant. It carries a `V` [`Value`], and so its output type is exactly the value's
 /// type, and interpreting it simply clones the captured value. Unlike [`FillOperation`](crate::FillOperation), it does
 /// not synthesize a value from a scalar. It instead returns the value the caller already provided when constructing it.
 #[derive(Copy, Clone)]
-pub struct ConstantOperation<V: Clone + Typed> {
+pub struct ConstantOperation<V: Value> {
     /// Captured value produced by this [`Operation`] when interpreted.
     value: V,
 }
 
-impl<V: Clone + Typed> ConstantOperation<V> {
+impl<V: Value> ConstantOperation<V> {
     /// Creates a new [`ConstantOperation`] capturing the provided typed value.
     #[inline]
     pub fn new(value: V) -> Self {
@@ -52,21 +52,21 @@ impl<V: Clone + Typed> ConstantOperation<V> {
     }
 }
 
-impl<V: Clone + Debug + Typed> Debug for ConstantOperation<V> {
+impl<V: Value> Debug for ConstantOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
     }
 }
 
-impl<V: Clone + Display + Typed> Display for ConstantOperation<V> {
+impl<V: Value> Display for ConstantOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<V: Clone + Display + Typed> Operation<V::Type> for ConstantOperation<V> {
+impl<V: Value> Operation<V::Type> for ConstantOperation<V> {
     #[inline]
     fn name(&self) -> &'static str {
         CONSTANT_OPERATION_NAME
@@ -83,14 +83,22 @@ impl<V: Clone + Display + Typed> Operation<V::Type> for ConstantOperation<V> {
     }
 
     #[inline]
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<V::Type as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self::new(self.value.rename_type_identities(renaming)?))
+    }
+
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, CONSTANT_OPERATION_NAME)?
             .bracketed(|operation| operation.field("value", &self.value))
     }
 }
 
-impl<Stored: Clone + Display + Typed, C: Domain<Type = Stored::Type> + Constant<C::Value, Stored>>
-    InterpretableOperation<C> for ConstantOperation<Stored>
+impl<Stored: Value, C: Domain<Type = Stored::Type> + Constant<C::Value, Stored>> InterpretableOperation<C>
+    for ConstantOperation<Stored>
 {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -104,14 +112,14 @@ impl<Stored: Clone + Display + Typed, C: Domain<Type = Stored::Type> + Constant<
     }
 }
 
-impl<V: Clone + Typed, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>>
-    PartiallyEvaluatableOperation<C> for ConstantOperation<V>
+impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>> PartiallyEvaluatableOperation<C>
+    for ConstantOperation<V>
 {
 }
 
 impl_non_differentiable_operation!(ConstantOperation<C::Constant>);
-impl_nullary_transposable_operation!(<F> ConstantOperation<F> where F: Clone + Typed);
-impl_nullary_batchable_operation!(@replicated <Stored> ConstantOperation<Stored> where Stored: Clone + Typed);
+impl_nullary_transposable_operation!(<F> ConstantOperation<F> where F: Value);
+impl_nullary_batchable_operation!(@replicated <Stored> ConstantOperation<Stored> where Stored: Value);
 
 /// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented by
 /// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and

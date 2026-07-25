@@ -12,12 +12,12 @@ use crate::operations::math::{Add, Cos, Div, Log, Mul, Neg, Sqrt, Sub};
 use crate::operations::sort::ArgMax;
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
 // TODO(eaplatanios): Review this module.
@@ -167,6 +167,13 @@ impl Operation<ArrayType> for RngBitGeneratorOperation {
             ));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { algorithm: self.algorithm, output_type: self.output_type.rename_identities(renaming)? })
     }
 }
 

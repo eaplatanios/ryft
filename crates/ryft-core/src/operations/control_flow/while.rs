@@ -278,6 +278,23 @@ impl<T: WhileTypeSemantics> Operation<T> for WhileOperation {
         Ok(state_types.to_vec())
     }
 
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 2 {
+            return Err(TypeError::invalid(format!(
+                "while expects 2 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        if region_interfaces.iter().all(|interface| interface.input_types() == input_types) {
+            return Ok(vec![None, None]);
+        }
+        Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec())])
+    }
+
     #[inline]
     fn region_names(&self) -> &'static [&'static str] {
         &["condition", "body"]

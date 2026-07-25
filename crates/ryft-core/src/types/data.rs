@@ -1525,6 +1525,9 @@ impl Display for DataType {
 }
 
 impl Type for DataType {
+    type Identity = crate::NoIdentity;
+    type Refinements = ();
+
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is not quite a subtyping relationship in that certain type

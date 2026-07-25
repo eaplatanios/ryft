@@ -9,10 +9,11 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::Value;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::identities::{IdentityPosition, TypeIdentityRenaming};
+use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
 use crate::types::data::DataType;
-use crate::types::dimensions::{Dimension, Shape, StaticShape};
+use crate::types::dimensions::{Dimension, DimensionError, DimensionVariable, Shape, StaticShape};
 use crate::types::layouts::Layout;
 use crate::types::memories::Memory;
 
@@ -79,6 +80,66 @@ pub struct ArrayType {
     /// [`Memory`] in which the array resides. For sharded arrays, the memory applies uniformly to every shard,
     /// each residing in its own device's memory of this kind.
     pub(crate) memory: Memory,
+}
+
+/// Concrete extents established while refining one complete array-type signature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArrayTypeRefinements {
+    /// Dynamic-variable-to-extent bindings in first-observation order.
+    bindings: Vec<(DimensionVariable, usize)>,
+}
+
+impl ArrayTypeRefinements {
+    /// Records one concrete extent for `variable`, rejecting a conflicting observation.
+    fn bind(&mut self, variable: &DimensionVariable, extent: usize) -> Result<(), TypeError> {
+        if let Some((_, expected)) = self.bindings.iter().find(|(candidate, _)| candidate == variable) {
+            if *expected != extent {
+                return Err(DimensionError::InputDimensionMismatch {
+                    dimension: variable.to_string(),
+                    expected: *expected,
+                    actual: extent,
+                }
+                .into());
+            }
+        } else {
+            self.bindings.push((variable.clone(), extent));
+        }
+        Ok(())
+    }
+
+    /// Validates one type while visiting each dynamic-to-static refinement.
+    fn visit(
+        declared: &ArrayType,
+        actual: &ArrayType,
+        mut visitor: impl FnMut(&DimensionVariable, usize) -> Result<(), TypeError>,
+    ) -> Result<(), TypeError> {
+        if !declared.metadata_is_refined_by(actual) || declared.rank() != actual.rank() {
+            return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}",)));
+        }
+        for (declared, actual) in declared.shape().dimensions().iter().zip(actual.shape().dimensions()) {
+            match (declared, actual) {
+                (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => {}
+                (Dimension::Dynamic(declared), Dimension::Dynamic(actual)) if declared == actual => {}
+                (Dimension::Dynamic(declared), Dimension::Static(actual)) if declared.bounds().contains(*actual) => {
+                    visitor(declared, *actual)?;
+                }
+                (Dimension::Dynamic(declared), Dimension::Static(actual)) => {
+                    return Err(DimensionError::BindingOutOfBounds {
+                        variable: declared.to_string(),
+                        value: *actual,
+                        bounds: declared.bounds(),
+                    }
+                    .into());
+                }
+                _ => {
+                    return Err(TypeError::invalid(format!(
+                        "dimension {actual} does not refine declared dimension {declared}",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
@@ -277,6 +338,21 @@ impl ArrayType {
         self.memory
     }
 
+    /// Returns whether every non-shape component of `other` refines the corresponding component of this type.
+    fn metadata_is_refined_by(&self, other: &Self) -> bool {
+        let layout_is_refined = match (&self.layout, &other.layout) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
+        let sharding_is_refined = match (&self.sharding, &other.sharding) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
+        self.data_type == other.data_type && layout_is_refined && sharding_is_refined && self.memory == other.memory
+    }
+
     /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
     /// clear explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct
     /// stride or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a
@@ -374,6 +450,79 @@ impl Display for ArrayType {
 }
 
 impl Type for ArrayType {
+    type Identity = DimensionVariable;
+    type Refinements = ArrayTypeRefinements;
+
+    fn visit_identities(&self, visitor: &mut impl FnMut(IdentityPosition, &Self::Identity)) {
+        for dimension in self.shape.dimensions() {
+            if let Dimension::Dynamic(variable) = dimension {
+                visitor(IdentityPosition::Reference, variable);
+            }
+        }
+    }
+
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+        Ok(Self { shape: self.shape.rename_identities(renaming), ..self.clone() })
+    }
+
+    fn instantiation_identity_renaming(
+        declared: &[Self],
+        actual: &[Self],
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        let mut renaming = TypeIdentityRenaming::new();
+        let mut static_bindings = Vec::<(DimensionVariable, usize)>::new();
+        for (declared_type, actual_type) in declared.iter().zip(actual) {
+            if !declared_type.metadata_is_refined_by(actual_type) || declared_type.rank() != actual_type.rank() {
+                return Err(TypeError::invalid(format!(
+                    "type {actual_type} cannot instantiate declared type {declared_type}",
+                )));
+            }
+            for (declared_dimension, actual_dimension) in
+                declared_type.shape.dimensions().iter().zip(actual_type.shape.dimensions())
+            {
+                match (declared_dimension, actual_dimension) {
+                    (Dimension::Static(declared), Dimension::Static(actual)) if declared == actual => {}
+                    (Dimension::Dynamic(declared), Dimension::Dynamic(actual))
+                        if declared.bounds().contains_bounds(actual.bounds()) =>
+                    {
+                        renaming.insert(declared.clone(), actual.clone())?;
+                    }
+                    (Dimension::Dynamic(declared), Dimension::Static(actual))
+                        if declared.bounds().contains(*actual) =>
+                    {
+                        if let Some((_, expected)) = static_bindings.iter().find(|(candidate, _)| candidate == declared)
+                            && expected != actual
+                        {
+                            return Err(DimensionError::InputDimensionMismatch {
+                                dimension: declared.to_string(),
+                                expected: *expected,
+                                actual: *actual,
+                            }
+                            .into());
+                        }
+                        if !static_bindings.iter().any(|(candidate, _)| candidate == declared) {
+                            static_bindings.push((declared.clone(), *actual));
+                        }
+                    }
+                    _ => {
+                        return Err(TypeError::invalid(format!(
+                            "dimension {actual_dimension} does not instantiate declared dimension \
+                             {declared_dimension}",
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(renaming)
+    }
+
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
@@ -388,21 +537,7 @@ impl Type for ArrayType {
         // one that carries the component), while a declared `Some` requires the actual type to carry the exact same
         // component. This is what lets declared types staged without placement information (e.g., program input types
         // traced from metadata-free exemplars) accept concrete runtime values whose types carry normalized shardings.
-        let is_layout_refined_by_other = match (&self.layout, &other.layout) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(declared), Some(actual)) => declared == actual,
-        };
-        let is_sharding_refined_by_other = match (&self.sharding, &other.sharding) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(declared), Some(actual)) => declared == actual,
-        };
-        self.data_type == other.data_type
-            && self.shape.is_refined_by(&other.shape)
-            && is_layout_refined_by_other
-            && is_sharding_refined_by_other
-            && self.memory == other.memory
+        self.metadata_is_refined_by(other) && self.shape.is_refined_by(&other.shape)
     }
 
     #[inline]
@@ -413,6 +548,63 @@ impl Type for ArrayType {
     #[inline]
     fn is_complex(&self) -> bool {
         self.data_type.is_complex()
+    }
+}
+
+impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
+    fn establish(declared: &[ArrayType], actual: &[ArrayType]) -> Result<Self, TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        let mut refinements = Self::default();
+        for (declared, actual) in declared.iter().zip(actual) {
+            Self::visit(declared, actual, |variable, extent| refinements.bind(variable, extent))?;
+        }
+        Ok(refinements)
+    }
+
+    fn validate(
+        &self,
+        declared: &[ArrayType],
+        actual: &[ArrayType],
+        internal_identities: &[DimensionVariable],
+    ) -> Result<(), TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        let mut refinements = self.clone();
+        for (declared, actual) in declared.iter().zip(actual) {
+            Self::visit(declared, actual, |variable, extent| {
+                let expected = refinements
+                    .bindings
+                    .iter()
+                    .find_map(|(candidate, value)| (candidate == variable).then_some(*value));
+                let Some(expected) = expected else {
+                    if internal_identities.contains(variable) {
+                        return refinements.bind(variable, extent);
+                    }
+                    return Err(TypeError::invalid(format!("dimension identity {variable} has no input refinement",)));
+                };
+                if expected != extent {
+                    return Err(DimensionError::InputDimensionMismatch {
+                        dimension: variable.to_string(),
+                        expected,
+                        actual: extent,
+                    }
+                    .into());
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -451,6 +643,14 @@ impl Value for ArrayType {
     #[inline]
     fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        self.rename_identities(renaming)
     }
 }
 
@@ -825,6 +1025,45 @@ mod tests {
         assert!(!declared.is_refined_by(&pinned));
         assert!(pinned.is_refined_by(&pinned));
         assert!(!pinned.is_refined_by(&actual));
+    }
+
+    #[test]
+    fn test_array_type_refinements_bind_repeated_dimensions_across_complete_signatures() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
+        let declared = ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
+        let actual_two = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]));
+        let actual_three = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
+
+        let refinements = ArrayTypeRefinements::establish(
+            &[declared.clone(), declared.clone()],
+            &[actual_two.clone(), actual_two.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            refinements.validate(std::slice::from_ref(&declared), std::slice::from_ref(&actual_two), &[]),
+            Ok(()),
+        );
+        let error = ArrayTypeRefinements::establish(&[declared.clone(), declared.clone()], &[actual_two, actual_three])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
+
+        let error = ArrayTypeRefinements::default()
+            .validate(
+                &[declared.clone(), declared],
+                &[
+                    ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)])),
+                    ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)])),
+                ],
+                std::slice::from_ref(&batch),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
     }
 
     #[test]

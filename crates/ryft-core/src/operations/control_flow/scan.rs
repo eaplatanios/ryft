@@ -35,7 +35,7 @@ use crate::programs::programs::Program;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRef};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{MaybeZero, ProgramError, TypeIdentityRenaming};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
@@ -332,6 +332,14 @@ pub trait ScanTypeSemantics: Type {
     /// Returns this scan's declared output types from its body output types.
     fn scan_declared_output_types(body_output_types: &[Self], carry_count: usize, length: usize) -> Vec<Self>;
 
+    /// Derives the instantiated body input types from this scan's boundary input types.
+    fn scan_body_input_types(
+        input_types: &[Self],
+        body_input_count: usize,
+        carry_count: usize,
+        length: usize,
+    ) -> Result<Vec<Self>, TypeError>;
+
     /// Infers this scan's output types from concrete input types.
     fn infer_scan_output_types(
         body_input_types: &[Self],
@@ -391,6 +399,38 @@ impl ScanTypeSemantics for ArrayType {
         output_types
     }
 
+    fn scan_body_input_types(
+        input_types: &[Self],
+        body_input_count: usize,
+        carry_count: usize,
+        length: usize,
+    ) -> Result<Vec<Self>, TypeError> {
+        check_count!("input", input_types, body_input_count, TypeError);
+        if carry_count > body_input_count {
+            return Err(TypeError::invalid(format!(
+                "scan carry count {carry_count} exceeds the body input count {body_input_count}",
+            )));
+        }
+        let mut body_input_types = input_types[..carry_count].to_vec();
+        for (index, input_type) in input_types[carry_count..].iter().enumerate() {
+            if input_type.rank() == 0 {
+                return Err(TypeError::invalid(format!(
+                    "scan stacked input {} must have rank at least 1",
+                    carry_count + index,
+                )));
+            }
+            let (slice_type, leading_dimension) = input_type.without_dimension(0)?;
+            if leading_dimension != Dimension::Static(length) {
+                return Err(TypeError::invalid(format!(
+                    "scan stacked input {} must have leading dimension {length} but has type {input_type}",
+                    carry_count + index,
+                )));
+            }
+            body_input_types.push(slice_type);
+        }
+        Ok(body_input_types)
+    }
+
     fn infer_scan_output_types(
         body_input_types: &[Self],
         body_output_types: &[Self],
@@ -430,6 +470,22 @@ impl ScanTypeSemantics for DataType {
 
     fn scan_declared_output_types(body_output_types: &[Self], _carry_count: usize, _length: usize) -> Vec<Self> {
         body_output_types.to_vec()
+    }
+
+    fn scan_body_input_types(
+        input_types: &[Self],
+        body_input_count: usize,
+        carry_count: usize,
+        _length: usize,
+    ) -> Result<Vec<Self>, TypeError> {
+        if carry_count != body_input_count {
+            return Err(TypeError::invalid(format!(
+                "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
+                 than the body input count {body_input_count}",
+            )));
+        }
+        check_count!("input", input_types, body_input_count, TypeError);
+        Ok(input_types.to_vec())
     }
 
     fn infer_scan_output_types(
@@ -495,6 +551,55 @@ where
             T::validate_scan_capture(capture, index, self.length)?;
         }
         Ok(output_types)
+    }
+
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError::invalid(format!(
+                "scan expects 1 attached region but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let body_input_types = T::scan_body_input_types(
+            input_types,
+            region_interfaces[0].input_types().len(),
+            self.carry_count,
+            self.length,
+        )?;
+        let mut declared_identities = Vec::new();
+        for r#type in region_interfaces[0].input_types() {
+            r#type.visit_identities(&mut |position, identity| {
+                declared_identities.push((position, identity.clone()));
+            });
+        }
+        let mut instantiated_identities = Vec::new();
+        for r#type in &body_input_types {
+            r#type.visit_identities(&mut |position, identity| {
+                instantiated_identities.push((position, identity.clone()));
+            });
+        }
+        if declared_identities == instantiated_identities {
+            return Ok(vec![None]);
+        }
+        Ok(vec![Some(body_input_types)])
+    }
+
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self {
+            captures: self
+                .captures
+                .iter()
+                .map(|capture| capture.rename_type_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            carry_count: self.carry_count,
+            length: self.length,
+            reverse: self.reverse,
+            unroll: self.unroll,
+        })
     }
 
     #[inline]

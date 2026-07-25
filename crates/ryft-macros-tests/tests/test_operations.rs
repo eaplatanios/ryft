@@ -12,8 +12,31 @@ use std::marker::PhantomData;
 
 use self::partial::PartialValue;
 
+/// Stand-in for `ryft_core::TypeIdentity`.
+trait TypeIdentity: Clone {}
+
+/// Identity used by stand-in types that carry no nominal metadata.
+#[derive(Clone)]
+struct NoIdentity;
+
+impl TypeIdentity for NoIdentity {}
+
+/// Stand-in for `ryft_core::TypeIdentityRenaming`.
+struct TypeIdentityRenaming<I: TypeIdentity> {
+    marker: PhantomData<I>,
+}
+
+impl<I: TypeIdentity> TypeIdentityRenaming<I> {
+    /// Creates an empty stand-in identity renaming.
+    fn new() -> Self {
+        Self { marker: PhantomData }
+    }
+}
+
 /// Stand-in for `ryft_core::Type`.
-trait Type: Clone {}
+trait Type: Clone {
+    type Identity: TypeIdentity;
+}
 
 /// Stand-in for `ryft_core::DifferentiableType`.
 trait DifferentiableType: Type {}
@@ -179,6 +202,18 @@ trait Operation<T: Type>: Clone {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError>;
+
+    fn rename_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(self.clone())
+    }
+
+    fn instantiated_region_input_types(
+        &self,
+        _input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        Ok(vec![None; region_interfaces.len()])
+    }
 
     fn region_names(&self) -> &'static [&'static str] {
         &[]
@@ -506,13 +541,17 @@ fn transposed<T: Type, V: Value<Type = T>, O: Operation<T>>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DataType;
 
-impl Type for DataType {}
+impl Type for DataType {
+    type Identity = NoIdentity;
+}
 impl DifferentiableType for DataType {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArrayType;
 
-impl Type for ArrayType {}
+impl Type for ArrayType {
+    type Identity = NoIdentity;
+}
 impl DifferentiableType for ArrayType {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -696,6 +735,21 @@ impl Operation<DataType> for PrintOperation {
         _region_interfaces: &[RegionInterface<DataType>],
     ) -> Result<Vec<DataType>, TypeError> {
         Ok(input_types.to_vec())
+    }
+
+    fn rename_identities(
+        &self,
+        _renaming: &TypeIdentityRenaming<<DataType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self)
+    }
+
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<Option<Vec<DataType>>>, TypeError> {
+        Ok(vec![Some(input_types.to_vec())])
     }
 
     fn effects(&self) -> Effects {
@@ -950,6 +1004,8 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(add.effects(), Effects::Pure);
     assert_eq!(print.effects(), Effects::Ordered);
     assert_eq!(print.region_names(), &["body"]);
+    assert_eq!(print.rename_identities(&TypeIdentityRenaming::new()), Ok(print.clone()));
+    assert_eq!(print.instantiated_region_input_types(&[DataType], &[]), Ok(vec![Some(vec![DataType])]));
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));

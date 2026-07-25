@@ -11,10 +11,10 @@ use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Fill, Iota, One, Zero};
 use crate::operations::control_flow::Select;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError};
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::types::{ArrayType, DataType, Dimension};
 
 // TODO(eaplatanios): Review this.
@@ -137,6 +137,17 @@ impl Operation<ArrayType> for CoordinateBasisOperation<ArrayType> {
             )));
         }
         Ok(vec![self.leaf_type.with_inserted_dimension(0, Dimension::Static(self.basis_size))?])
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            leaf_type: self.leaf_type.rename_identities(renaming)?,
+            coordinate_offset: self.coordinate_offset,
+            basis_size: self.basis_size,
+        })
     }
 
     #[inline]

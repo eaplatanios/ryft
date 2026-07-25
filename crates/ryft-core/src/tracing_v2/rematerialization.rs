@@ -129,6 +129,16 @@ impl Display for RematerializeOperation {
     }
 }
 
+/// Applies the identity instantiation induced by `actual_inputs` to related types in the formal input scope.
+fn instantiate_rematerialize_boundary_types<T: Type>(
+    formal_inputs: &[T],
+    actual_inputs: &[T],
+    types: &[T],
+) -> Result<Vec<T>, TypeError> {
+    let renaming = T::instantiation_identity_renaming(formal_inputs, actual_inputs)?;
+    types.iter().map(|r#type| r#type.rename_identities(&renaming)).collect()
+}
+
 /// Validates the rematerialization contract over the four attached region interfaces
 /// (`["primal", "forward", "backward", "tangent"]` region order) and returns the primal interface; refer to the
 /// documentation of [`RematerializeOperation::new`] for the contract.
@@ -190,6 +200,47 @@ impl<T: Type> Operation<T> for RematerializeOperation {
         let primal_interface = validated_rematerialize_interfaces(region_interfaces)?;
         check_types!(@same, "rematerialize input", [primal_interface.input_types(), input_types]);
         Ok(primal_interface.output_types().to_vec())
+    }
+
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        if region_interfaces.len() != 4 {
+            return Err(TypeError::invalid(format!(
+                "rematerialize expects 4 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let primal_interface = &region_interfaces[0];
+        let forward_interface = &region_interfaces[1];
+        let primal_output_types = instantiate_rematerialize_boundary_types(
+            primal_interface.input_types(),
+            input_types,
+            primal_interface.output_types(),
+        )?;
+        let forward_output_types = instantiate_rematerialize_boundary_types(
+            forward_interface.input_types(),
+            input_types,
+            forward_interface.output_types(),
+        )?;
+        if forward_output_types.len() < primal_output_types.len() {
+            return Err(TypeError::invalid(format!(
+                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                primal_output_types.len(),
+                forward_output_types.len(),
+            )));
+        }
+        let residual_types = &forward_output_types[primal_output_types.len()..];
+        let backward_input_types = residual_types.iter().chain(primal_output_types.iter()).cloned().collect::<Vec<_>>();
+        let tangent_input_types = residual_types.iter().chain(input_types.iter()).cloned().collect::<Vec<_>>();
+        Ok(vec![
+            Some(input_types.to_vec()),
+            Some(input_types.to_vec()),
+            Some(backward_input_types),
+            Some(tangent_input_types),
+        ])
     }
 
     #[inline]
@@ -1917,13 +1968,8 @@ where
             let mut regions = source.regions().to_vec();
             regions[source.entry().index()] =
                 Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions };
-            let forward = Program {
-                input_structure: vec![Placeholder; input_count],
-                output_structure,
-                regions,
-                entry: source.entry(),
-                marker: PhantomData,
-            };
+            let forward =
+                Program::from_regions(vec![Placeholder; input_count], output_structure, regions, source.entry())?;
             (forward.into_simplified()?, saved_types)
         };
 

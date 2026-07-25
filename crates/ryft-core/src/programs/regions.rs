@@ -20,6 +20,7 @@
 //! borrowed views of the regions attached to the current instruction. [`EmptyRegionDriver`] supplies the same contract
 //! for applications with no attached regions.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -30,10 +31,11 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::effects::Effects;
+use crate::programs::identities::{IdentityPosition, IdentitySignature, TypeIdentityRenaming};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
 
 /// Unique identifier for a [`Region`] within a [`Program`]. [`RegionId`]s are stable indexes into a [`Program`]'s
@@ -158,6 +160,154 @@ impl<V: Typed, O> Region<V, O> {
     }
 }
 
+impl<V: Value, O: Operation<V::Type>> Region<V, O> {
+    /// Returns this region after simultaneously renaming type identities in its atoms, constants, and operations.
+    pub fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<Self, ProgramError> {
+        let atoms = self
+            .atoms
+            .iter()
+            .map(|atom| match atom {
+                Atom::Variable(r#type) => Ok(Atom::Variable(r#type.rename_identities(renaming)?)),
+                Atom::Constant(value) => Ok(Atom::Constant(value.rename_type_identities(renaming)?)),
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let instructions = self
+            .instructions
+            .iter()
+            .map(|instruction| {
+                Ok(Instruction::new(
+                    instruction.operation().rename_identities(renaming)?,
+                    instruction.inputs().to_vec(),
+                    instruction.outputs().to_vec(),
+                    instruction.regions().to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Ok(Self { atoms, input_ids: self.input_ids.clone(), output_ids: self.output_ids.clone(), instructions })
+    }
+
+    /// Derives closed identity signatures for `regions` in arena order.
+    ///
+    /// Producer-versus-forwarder status is structural. A result definition whose identity occurs on an operand
+    /// forwards that available identity. Any other result definition establishes one fresh internal identity. During
+    /// the staged migration to explicit dimension operands, a fresh identity whose first occurrence is a result
+    /// reference also establishes an internal identity. That fallback keeps existing shape-producing array operations
+    /// closed until their first-class dimension producer operands make the reference available before the result.
+    pub(crate) fn identity_signatures(
+        regions: &[Self],
+    ) -> Result<Vec<IdentitySignature<<V::Type as Type>::Identity>>, TypeError> {
+        let mut signatures = Vec::with_capacity(regions.len());
+        for region in regions {
+            let mut input_identities = Vec::new();
+            for input in &region.input_ids {
+                let r#type = region.atoms[input.index()].r#type();
+                r#type.visit_identities(&mut |_, identity| {
+                    if !input_identities.contains(identity) {
+                        input_identities.push(identity.clone());
+                    }
+                });
+            }
+            let mut available_identities = input_identities.clone();
+            let mut internal_identities = Vec::new();
+
+            for atom in &region.atoms {
+                if let Atom::Constant(value) = atom {
+                    let r#type = value.r#type();
+                    let mut error = None;
+                    r#type.visit_identities(&mut |_, identity| {
+                        if error.is_none() && !available_identities.contains(identity) {
+                            error = Some(TypeError::invalid(format!(
+                                "constant type references identity {identity} which is not established by a region \
+                                 input",
+                            )));
+                        }
+                    });
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+            }
+
+            for instruction in &region.instructions {
+                let mut operand_identities = Vec::new();
+                for input in instruction.inputs() {
+                    let r#type = region.atoms[input.index()].r#type();
+                    let mut error = None;
+                    r#type.visit_identities(&mut |_, identity| {
+                        if error.is_none() && !available_identities.contains(identity) {
+                            error = Some(TypeError::invalid(format!(
+                                "operation `{}` input type references identity {identity} before its definition",
+                                instruction.operation().name(),
+                            )));
+                        }
+                        if !operand_identities.contains(identity) {
+                            operand_identities.push(identity.clone());
+                        }
+                    });
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+
+                let mut defined_identities = Vec::new();
+                for output in instruction.outputs() {
+                    let mut error = None;
+                    region.atoms[output.index()].r#type().visit_identities(&mut |position, identity| {
+                        if position != IdentityPosition::Definition || error.is_some() {
+                            return;
+                        }
+                        if operand_identities.contains(identity) {
+                            return;
+                        }
+                        if available_identities.contains(identity) || defined_identities.contains(identity) {
+                            error = Some(TypeError::invalid(format!(
+                                "operation `{}` output defines identity {identity} more than once in this region",
+                                instruction.operation().name(),
+                            )));
+                            return;
+                        }
+                        available_identities.push(identity.clone());
+                        internal_identities.push(identity.clone());
+                        defined_identities.push(identity.clone());
+                    });
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+
+                for output in instruction.outputs() {
+                    let mut error = None;
+                    region.atoms[output.index()].r#type().visit_identities(&mut |position, identity| {
+                        if position != IdentityPosition::Reference || error.is_some() {
+                            return;
+                        }
+                        if !available_identities.contains(identity) {
+                            available_identities.push(identity.clone());
+                            internal_identities.push(identity.clone());
+                            defined_identities.push(identity.clone());
+                        } else if !operand_identities.contains(identity) && !defined_identities.contains(identity) {
+                            error = Some(TypeError::invalid(format!(
+                                "operation `{}` output type references identity {identity} without consuming or \
+                                 defining it",
+                                instruction.operation().name(),
+                            )));
+                        }
+                    });
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+            }
+
+            signatures.push(IdentitySignature::from_parts(input_identities, internal_identities));
+        }
+        Ok(signatures)
+    }
+}
+
 /// Borrowed view of a [`Region`]. [`RegionRef`] provides [`Program`]-like access to a rooted, nested computation
 /// without cloning the owning [`Program`]'s region arena. The intended usage is to store [`RegionId`]s in long-lived
 /// Intermediate Representation (IR) objects and recreate [`RegionRef`]s only while inspecting, replaying, importing,
@@ -168,6 +318,9 @@ pub struct RegionRef<'r, V: Typed, O> {
     /// Arena containing the referenced [`Region`] and its reachable descendants.
     regions: &'r [Region<V, O>],
 
+    /// Retained identity signatures when this view borrows an immutable program arena.
+    identity_signatures: Option<&'r [IdentitySignature<<V::Type as Type>::Identity>]>,
+
     /// Identifier of the rooted [`Region`] within `regions`.
     id: RegionId,
 }
@@ -177,7 +330,26 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
     pub fn new(regions: &'r [Region<V, O>], id: RegionId) -> Result<Self, ProgramError> {
         regions
             .get(id.index())
-            .map(|_| Self { regions, id })
+            .map(|_| Self { regions, identity_signatures: None, id })
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("region {id} is out of range")))
+    }
+
+    /// Creates a region view backed by a validated program's retained identity signatures.
+    pub(crate) fn with_identity_signatures(
+        regions: &'r [Region<V, O>],
+        identity_signatures: &'r [IdentitySignature<<V::Type as Type>::Identity>],
+        id: RegionId,
+    ) -> Result<Self, ProgramError> {
+        if regions.len() != identity_signatures.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region arena contains {} regions but {} retained identity signatures",
+                regions.len(),
+                identity_signatures.len(),
+            )));
+        }
+        regions
+            .get(id.index())
+            .map(|_| Self { regions, identity_signatures: Some(identity_signatures), id })
             .ok_or_else(|| ProgramError::MalformedProgram(format!("region {id} is out of range")))
     }
 
@@ -263,7 +435,17 @@ impl<'r, V: Typed, O> RegionRef<'r, V, O> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
+impl<'r, V: Value, O: Operation<V::Type>> RegionRef<'r, V, O> {
+    /// Returns this region's closed identity signature, borrowing retained program metadata when available.
+    pub(crate) fn identity_signature(
+        self,
+    ) -> Result<Cow<'r, IdentitySignature<<V::Type as Type>::Identity>>, TypeError> {
+        match self.identity_signatures {
+            Some(signatures) => Ok(Cow::Borrowed(&signatures[self.id.index()])),
+            None => Ok(Cow::Owned(Region::identity_signatures(std::slice::from_ref(self.region()))?.pop().unwrap())),
+        }
+    }
+
     /// Materializes this borrowed [`Region`] and its complete reachable region closure as a [`Program`]. Descendant
     /// sharing is preserved within the resulting [`Program`], meaning that if several [`Instruction`]s in the reachable
     /// closure point at the same source [`RegionId`], the resulting program contains one copied descendant and all
@@ -421,6 +603,13 @@ pub trait BindingRegionDriver<V: Value, O: Operation<V::Type>>: RegionDriver<V, 
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order
     /// and returns their [`RegionId`]s in the same order.
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError>;
+
+    /// Imports attached regions after instantiating the region inputs supplied by each non-`None` entry.
+    fn import_instantiation_into(
+        self,
+        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+        region_input_types: &[Option<Vec<V::Type>>],
+    ) -> Result<Vec<RegionId>, ProgramError>;
 }
 
 impl<
@@ -433,6 +622,32 @@ impl<
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         let mut builder = builder.borrow_mut();
         Ok(self.into_iter().map(|region| builder.import_program(region)).collect())
+    }
+
+    fn import_instantiation_into(
+        self,
+        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+        region_input_types: &[Option<Vec<V::Type>>],
+    ) -> Result<Vec<RegionId>, ProgramError> {
+        let programs = self.into_iter().collect::<Vec<_>>();
+        if programs.len() != region_input_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region identity instantiation count {} does not match attached region count {}",
+                region_input_types.len(),
+                programs.len(),
+            )));
+        }
+        let mut builder = builder.borrow_mut();
+        programs
+            .into_iter()
+            .zip(region_input_types)
+            .map(|(program, input_types)| {
+                Ok(builder.import_program(match input_types {
+                    Some(input_types) => program.instantiate_input_identities(input_types)?.into_owned(),
+                    None => program,
+                }))
+            })
+            .collect()
     }
 }
 
@@ -469,6 +684,29 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for CalleeRegion
     fn import_into(self, builder: &Rc<RefCell<ProgramBuilder<V, O>>>) -> Result<Vec<RegionId>, ProgramError> {
         let mut builder = builder.borrow_mut();
         Ok(self.callees.iter().map(|callee| builder.intern_callee(callee)).collect())
+    }
+
+    fn import_instantiation_into(
+        self,
+        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+        region_input_types: &[Option<Vec<V::Type>>],
+    ) -> Result<Vec<RegionId>, ProgramError> {
+        if self.callees.len() != region_input_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region identity instantiation count {} does not match attached region count {}",
+                region_input_types.len(),
+                self.callees.len(),
+            )));
+        }
+        let mut builder = builder.borrow_mut();
+        self.callees
+            .iter()
+            .zip(region_input_types)
+            .map(|(callee, input_types)| match input_types {
+                Some(input_types) => builder.intern_callee_instantiation(callee, input_types),
+                None => Ok(builder.intern_callee(callee)),
+            })
+            .collect()
     }
 }
 
@@ -552,7 +790,11 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
             .iter()
             .position(|mapping| Weak::ptr_eq(&mapping.builder, &builder_identity))
             .unwrap_or_else(|| {
-                destinations.push(DestinationRegionMapping { builder: builder_identity, remapping: HashMap::new() });
+                destinations.push(DestinationRegionMapping {
+                    builder: builder_identity,
+                    remapping: HashMap::new(),
+                    identity_instantiations: Vec::new(),
+                });
                 destinations.len() - 1
             });
         let remapping = &mut destinations[destination_index].remapping;
@@ -562,6 +804,68 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
             .map(|root| {
                 let region = self.source.with_id(*root)?;
                 Ok(builder.import_region_with_remapping(region, remapping))
+            })
+            .collect()
+    }
+
+    fn import_instantiation_into(
+        self,
+        builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+        region_input_types: &[Option<Vec<V::Type>>],
+    ) -> Result<Vec<RegionId>, ProgramError> {
+        if self.roots.len() != region_input_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region identity instantiation count {} does not match attached region count {}",
+                region_input_types.len(),
+                self.roots.len(),
+            )));
+        }
+        if region_input_types.iter().all(Option::is_none) {
+            return self.import_into(builder);
+        }
+        let builder_identity = Rc::downgrade(builder);
+        let mut destinations = self.mappings.destinations.borrow_mut();
+        destinations.retain(|mapping| mapping.builder.strong_count() > 0);
+        let destination_index = destinations
+            .iter()
+            .position(|mapping| Weak::ptr_eq(&mapping.builder, &builder_identity))
+            .unwrap_or_else(|| {
+                destinations.push(DestinationRegionMapping {
+                    builder: builder_identity,
+                    remapping: HashMap::new(),
+                    identity_instantiations: Vec::new(),
+                });
+                destinations.len() - 1
+            });
+        let destination = &mut destinations[destination_index];
+        let mut builder = builder.borrow_mut();
+        self.roots
+            .iter()
+            .zip(region_input_types)
+            .map(|(root, input_types)| {
+                let region = self.source.with_id(*root)?;
+                let Some(input_types) = input_types else {
+                    return Ok(builder.import_region_with_remapping(region, &mut destination.remapping));
+                };
+                let renaming = V::Type::instantiation_identity_renaming(region.input_types().as_slice(), input_types)?;
+                if let Some((_, _, imported)) =
+                    destination.identity_instantiations.iter().find(|(candidate_root, candidate_input_types, _)| {
+                        candidate_root == root
+                            && Program::<V, O, Vec<V>, Vec<V>>::same_identity_instantiation(
+                                candidate_input_types,
+                                input_types,
+                            )
+                    })
+                {
+                    return Ok(*imported);
+                }
+                let imported = if renaming.is_identity() {
+                    builder.import_region_with_remapping(region, &mut destination.remapping)
+                } else {
+                    builder.import_program(region.to_program().rename_identities(&renaming)?)
+                };
+                destination.identity_instantiations.push((*root, input_types.clone(), imported));
+                Ok(imported)
             })
             .collect()
     }
@@ -597,6 +901,9 @@ pub(crate) struct DestinationRegionMapping<V: Value, O: Operation<V::Type>> {
 
     /// Source-to-destination [`RegionId`] remapping for the destination [`ProgramBuilder`].
     remapping: HashMap<RegionId, RegionId>,
+
+    /// Instantiated source roots imported into this destination.
+    identity_instantiations: Vec<(RegionId, Vec<V::Type>, RegionId)>,
 }
 
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
@@ -614,17 +921,192 @@ pub struct OutputRegionProvenance {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::fmt::Display;
+
     use pretty_assertions::assert_eq;
+    use ryft_macros::Parameter;
 
     use crate::backends::scalars::Scalar;
-    use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder, ProgramError};
+    use crate::contexts::EagerContext;
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, TypeIdentity};
     use crate::tests::TestRegionOperation;
     use crate::types::DataType;
 
     use super::*;
 
     type TestProgram = Program<Scalar, TestRegionOperation, Vec<Scalar>, Vec<Scalar>>;
+
+    /// Nominal identity used by the structural closure prototype.
+    #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
+    struct StructuralIdentity(&'static str);
+
+    impl StructuralIdentity {
+        /// Creates a structural test identity.
+        fn new(name: &'static str) -> Self {
+            Self(name)
+        }
+    }
+
+    impl Display for StructuralIdentity {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl TypeIdentity for StructuralIdentity {}
+
+    /// Test type that exposes definition and reference occurrences independently.
+    #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
+    struct StructuralType {
+        /// Identity definitions in positional order.
+        definitions: Vec<StructuralIdentity>,
+
+        /// Identity references in positional order.
+        references: Vec<StructuralIdentity>,
+    }
+
+    impl StructuralType {
+        /// Creates a type containing the provided identity occurrences.
+        fn new(definitions: Vec<StructuralIdentity>, references: Vec<StructuralIdentity>) -> Self {
+            Self { definitions, references }
+        }
+
+        /// Creates a type that defines one identity.
+        fn definition(identity: StructuralIdentity) -> Self {
+            Self::new(vec![identity], Vec::new())
+        }
+
+        /// Creates a type that references one identity.
+        fn reference(identity: StructuralIdentity) -> Self {
+            Self::new(Vec::new(), vec![identity])
+        }
+    }
+
+    impl Display for StructuralType {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "definitions={:?}, references={:?}",
+                self.definitions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                self.references.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    impl Type for StructuralType {
+        type Identity = StructuralIdentity;
+        type Refinements = ();
+
+        fn visit_identities(&self, visitor: &mut impl FnMut(IdentityPosition, &Self::Identity)) {
+            for identity in &self.definitions {
+                visitor(IdentityPosition::Definition, identity);
+            }
+            for identity in &self.references {
+                visitor(IdentityPosition::Reference, identity);
+            }
+        }
+
+        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+            Ok(Self {
+                definitions: self.definitions.iter().map(|identity| renaming.rename(identity)).collect(),
+                references: self.references.iter().map(|identity| renaming.rename(identity)).collect(),
+            })
+        }
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            false
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
+    impl Typed for StructuralType {
+        type Type = Self;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            Cow::Borrowed(self)
+        }
+    }
+
+    impl Value for StructuralType {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            EagerContext::new()
+        }
+
+        fn rename_type_identities(
+            &self,
+            renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+        ) -> Result<Self, TypeError> {
+            self.rename_identities(renaming)
+        }
+    }
+
+    /// Minimal operation used by manually assembled structural closure fixtures.
+    #[derive(Clone)]
+    struct StructuralOperation;
+
+    impl Operation<StructuralType> for StructuralOperation {
+        fn name(&self) -> &'static str {
+            "structural"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[StructuralType],
+            _region_interfaces: &[RegionInterface<StructuralType>],
+        ) -> Result<Vec<StructuralType>, TypeError> {
+            Ok(input_types.to_vec())
+        }
+    }
+
+    /// Builds one structurally valid-enough region arena for direct closure testing.
+    fn structural_region(
+        input_types: Vec<StructuralType>,
+        loose_types: Vec<StructuralType>,
+        applications: Vec<(Vec<usize>, Vec<StructuralType>)>,
+    ) -> Region<StructuralType, StructuralOperation> {
+        let input_count = input_types.len();
+        let mut atoms = input_types.into_iter().chain(loose_types).map(Atom::Variable).collect::<Vec<_>>();
+        let input_ids = (0..input_count).map(AtomId::new).collect();
+        let mut instructions = Vec::with_capacity(applications.len());
+        let mut output_ids = Vec::new();
+        for (inputs, output_types) in applications {
+            output_ids = output_types
+                .into_iter()
+                .map(|r#type| {
+                    let output = AtomId::new(atoms.len());
+                    atoms.push(Atom::Variable(r#type));
+                    output
+                })
+                .collect();
+            instructions.push(Instruction::new(
+                StructuralOperation,
+                inputs.into_iter().map(AtomId::new).collect(),
+                output_ids.clone(),
+                Vec::new(),
+            ));
+        }
+        Region { atoms, input_ids, output_ids, instructions }
+    }
 
     /// Test fixture containing two distinct root regions that share one descendant.
     struct SharedDescendantFixture {
@@ -688,6 +1170,103 @@ mod tests {
             .unwrap()[0];
         let program = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         SharedDescendantFixture { program, first_root, second_root }
+    }
+
+    #[test]
+    fn test_structural_identity_closure_classifies_forwarded_and_fresh_definitions() {
+        let boundary = StructuralIdentity::new("boundary");
+        let fresh = StructuralIdentity::new("fresh");
+
+        // Repeated definition-position readers forward an identity because each result consumes that identity.
+        let repeated_readers = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            Vec::new(),
+            vec![
+                (vec![0], vec![StructuralType::definition(boundary.clone())]),
+                (vec![1], vec![StructuralType::definition(boundary.clone())]),
+            ],
+        );
+        let signatures = Region::identity_signatures(&[repeated_readers]).unwrap();
+        assert_eq!(signatures[0].input_identities(), &[boundary.clone()]);
+        assert_eq!(signatures[0].internal_identities(), &[]);
+
+        // A result definition absent from the operands establishes one fresh internal identity.
+        let arithmetic = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            Vec::new(),
+            vec![(vec![0], vec![StructuralType::definition(fresh.clone())])],
+        );
+        let signatures = Region::identity_signatures(&[arithmetic]).unwrap();
+        assert_eq!(signatures[0].input_identities(), &[boundary]);
+        assert_eq!(signatures[0].internal_identities(), &[fresh]);
+    }
+
+    #[test]
+    fn test_structural_identity_closure_supports_shared_instruction_outputs() {
+        let boundary = StructuralIdentity::new("boundary");
+        let fresh = StructuralIdentity::new("fresh");
+        let region = structural_region(
+            vec![StructuralType::reference(boundary)],
+            Vec::new(),
+            vec![(vec![0], vec![StructuralType::definition(fresh.clone()), StructuralType::reference(fresh.clone())])],
+        );
+        let signatures = Region::identity_signatures(&[region]).unwrap();
+        assert_eq!(signatures[0].internal_identities(), &[fresh]);
+    }
+
+    #[test]
+    fn test_structural_identity_closure_rejects_invalid_dominance_and_ownership() {
+        let boundary = StructuralIdentity::new("boundary");
+        let fresh = StructuralIdentity::new("fresh");
+
+        let duplicate_definition = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            Vec::new(),
+            vec![(vec![0], vec![StructuralType::definition(fresh.clone()), StructuralType::definition(fresh.clone())])],
+        );
+        assert!(matches!(
+            Region::identity_signatures(&[duplicate_definition]),
+            Err(TypeError::Invalid { message })
+                if message == "operation `structural` output defines identity fresh more than once in this region",
+        ));
+
+        let reference_before_definition = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            vec![StructuralType::reference(fresh.clone())],
+            vec![(vec![1], Vec::new())],
+        );
+        assert!(matches!(
+            Region::identity_signatures(&[reference_before_definition]),
+            Err(TypeError::Invalid { message })
+                if message == "operation `structural` input type references identity fresh before its definition",
+        ));
+
+        let unrelated_reference = structural_region(
+            vec![StructuralType::reference(boundary.clone())],
+            Vec::new(),
+            vec![(Vec::new(), vec![StructuralType::reference(boundary.clone())])],
+        );
+        assert!(matches!(
+            Region::identity_signatures(&[unrelated_reference]),
+            Err(TypeError::Invalid { message })
+                if message
+                    == "operation `structural` output type references identity boundary without consuming or defining it",
+        ));
+
+        let constant_reference = Region {
+            atoms: vec![
+                Atom::Variable(StructuralType::reference(boundary)),
+                Atom::Constant(StructuralType::reference(fresh)),
+            ],
+            input_ids: vec![AtomId::new(0)],
+            output_ids: Vec::new(),
+            instructions: Vec::new(),
+        };
+        assert!(matches!(
+            Region::<StructuralType, StructuralOperation>::identity_signatures(&[constant_reference]),
+            Err(TypeError::Invalid { message })
+                if message == "constant type references identity fresh which is not established by a region input",
+        ));
     }
 
     #[test]

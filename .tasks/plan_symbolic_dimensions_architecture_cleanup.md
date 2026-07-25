@@ -510,7 +510,7 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 - existing StableHLO dynamic-shape operands and assertion lowering;
 - behavioral JAX parity tests;
 - exact diagnostics;
-- identity alpha-renaming, canonical signatures, and cache behavior; and
+- identity alpha-renaming and cache behavior; and
 - public `RuntimeDimension`/`RuntimeShape` ergonomics, after decoupling them from backend-specific projection names.
 
 ### Deletes
@@ -531,6 +531,7 @@ wrap `TypeError` in `ProgramError` only at outward program boundaries.
 - independent `runtime_dimension_variables` contracts and copied dimension identity/bounds/order validation loops;
 - redundant operation-family variant lists and manual outer `From` boilerplate;
 - `OutputIdentityRole` and its operation-specific implementations, subject to the structural prototype gate;
+- P1c's temporary result-reference producer fallback after P3 supplies explicit result-dimension operands;
 - duplicated transform rules whose only purpose is storage-kind projection/lifting;
 - direct `TypeError::Invalid { message: ... }` construction after the canonical `TypeError::invalid(...)` migration;
   named-field destructuring remains supported; and
@@ -690,7 +691,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `S4`   | Structured `TypeError` core, then mechanical `invalid(...)` call sites       | Core plus sampled sites  |
 | `S5a`  | Pure `Size` to `Dimension` rename and `Shape` module move, semantics intact | Pattern, residual, sample |
 | `P0`   | Behavioral/evidence freeze and archive implementation disposition          | Evidence review           |
-| `P1`   | Leaf identity, bounds, refinements, structural closure, canonical identity | Line by line              |
+| `P1`   | Leaf identity, bounds, refinements, structural closure, alpha-equivalent cache identity | Line by line     |
 | `P2`   | Dimension SSA/value operations, storage sum, and projection vertical slice | Line by line              |
 | `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
 | `P4`   | Control flow, partial evaluation, import, and higher-order composition       | Line by line              |
@@ -959,7 +960,7 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
 - `P1b` changes `Dimension::Dynamic` from `Option<usize>` to one `DimensionVariable` leaf and migrates shape/type
   consumers directly, without a compatibility variant or expression representation.
 - `P1c` adds the minimal generic `Type::Identity`/`Type::Refinements` contract, implements structural closure,
-  instantiation, renaming, and canonical identity, then deletes `OutputIdentityRole`.
+  instantiation, renaming, and alpha-equivalent cache matching, then deletes `OutputIdentityRole`.
 
 - [x] `P1a`: add validated inclusive-lower/exclusive-upper bounds with exact diagnostics.
 - [x] `P1a`: add fresh identity semantics whose clone preserves identity and whose name is diagnostic-only.
@@ -971,22 +972,22 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
       one `DimensionVariable` identity plus authoritative bounds, with no arithmetic expression in types.
 - [x] Establish one source of truth for bounds. Types carry the authoritative bounds used for checking and compilation;
       public declaration helpers construct those types rather than maintaining an independently mutable copy.
-- [ ] Add only the generic `Type::Identity` and `Type::Refinements` hooks needed for program closure, alpha-renaming,
-      instantiation, and canonical signatures. Do not put batching, differentiation, or dimension-specific behavior on
-      `Type`.
-- [ ] Capture exact current identity closure, dominance, forwarding, import, and cache diagnostics.
-- [ ] Implement the structural producer/forwarder algorithm behind a focused internal prototype.
-- [ ] Cover repeated `dimension_size` readers, fresh dimension arithmetic results, shared outputs, condition forwarding,
+- [x] Add only the generic `Type::Identity` and `Type::Refinements` hooks needed for program closure, alpha-renaming,
+      instantiation, and alpha-equivalent cache matching. Do not put batching, differentiation, or dimension-specific
+      behavior on `Type`.
+- [x] Capture exact current identity closure, dominance, forwarding, import, and cache diagnostics.
+- [x] Implement the structural producer/forwarder algorithm behind a focused internal prototype.
+- [x] Cover repeated `dimension_size` readers, fresh dimension arithmetic results, shared outputs, condition forwarding,
       while carries, scan stacked outputs, captures, shared regions, and alpha-equivalent imports.
-- [ ] Delete `OutputIdentityRole` from the operation trait, derive macro, box delegation, builders, and operation
+- [x] Delete `OutputIdentityRole` from the operation trait, derive macro, box delegation, builders, and operation
       payloads if all valid cases pass.
-- [ ] Ensure definition/reference positions remain owned by type families and boundary/internal classification remains
+- [x] Ensure definition/reference positions remain owned by type families and boundary/internal classification remains
       owned by region closure.
-- [ ] Replace repeated linear membership scans only if profiling shows closure cost is material; do not require `Hash`
+- [x] Replace repeated linear membership scans only if profiling shows closure cost is material; do not require `Hash`
       on identities without a real consumer.
-- [ ] Remove avoidable temporary array/dimension refinement vectors with one-pass validation where it reduces
+- [x] Remove avoidable temporary array/dimension refinement vectors with one-pass validation where it reduces
       allocations without obscuring diagnostics.
-- [ ] Gate: cache identity, permutation behavior, and exact diagnostics match or exceed the baseline with no
+- [x] Gate: cache identity, permutation behavior, and exact diagnostics match or exceed the baseline with no
       operation-specific identity-source hook.
 
 ### Phase 2: introduce generic member projection and direct binding
@@ -1023,6 +1024,9 @@ P1 is split at compile-safe semantic boundaries so each increment remains review
 - [ ] Make `DimensionSizeOperation` exclusively `array -> dimension`.
 - [ ] Keep `DimensionToScalarOperation` as the only `dimension -> scalar-array` conversion.
 - [ ] Migrate reshape and broadcast first as the canonical mixed vertical slice.
+- [ ] Delete P1c's temporary result-reference producer fallback once every shape-producing operation carries its
+      first-class result-dimension operands. After this point, a fresh output reference without an available operand or
+      a definition-position occurrence is a closure error.
 - [ ] Delete their homogeneous operation implementations and every transform rule that depends on those contracts.
 - [ ] Migrate the remaining dual-contract operations:
       concatenate, custom call, dynamic slice, gather, pad, reduce, RNG bit generation, slice, and slice scatter.
@@ -1618,8 +1622,8 @@ P1b makes the P1a identity foundation the sole dynamic-axis representation:
   relationships; executable metadata retains names and reconstructs each shared variable once.
 
 No compatibility variant, expression representation, dimension witness, generic `Type` hook, or operation-specific
-identity-source mechanism was added. Cross-type closure, boundary-wide refinement, alpha-renaming, canonical program
-signatures, and `OutputIdentityRole` deletion remain P1c work.
+identity-source mechanism was added. Cross-type closure, boundary-wide refinement, alpha-renaming, cache identity,
+and `OutputIdentityRole` deletion remain P1c work.
 
 Verification completed:
 
@@ -1636,3 +1640,36 @@ Targeted residual searches found no old `Dimension::Dynamic(None)`/`Dimension::D
 XLA version-2 type-schema identifier, invalid zero-bound lowering variant, or non-static `Dimension` `.copied()` use
 under `crates`. The sole non-test/non-doc `DimensionVariable::new` outside `types::dimensions` is the version-3 XLA
 signature decoder, which recreates validated shared variables from persistent metadata.
+
+### Execution: P1c structural dimension identities
+
+P1c adds the generic program-boundary machinery required by leaf identities without introducing dimension arithmetic
+or an operation-specific producer classification:
+
+- `Type::Identity` and `Type::Refinements` keep type-family identity occurrences and complete-boundary refinement facts
+  generic; `DataType` uses zero-state implementations and `ArrayType` supplies dimension-variable behavior;
+- structural region closure classifies formal-input and instruction-produced identities from definition/reference
+  positions and graph dataflow, retaining the live input/internal partition needed by interpretation;
+- simultaneous alpha-renaming covers swaps and permutations across atom types, constant and capture metadata, operation
+  payloads, nested regions, and shared callees;
+- region-carrying operations declare only their ordinary operand-to-region input mapping, allowing condition, while,
+  scan, custom-derivative, and rematerialization regions to reuse the same generic instantiation path;
+- complete-signature refinement establishes one concrete extent per shared input identity and validates related output
+  occurrences, including identities structurally produced inside a region; and
+- instantiation caches share disjoint alpha-equivalent calls but keep overlapping live-identity permutations distinct,
+  using bidirectional structural instantiation rather than redundant canonical-signature fields on caches already keyed
+  by one exact source callee or region root.
+
+The prototype also showed that a separate generic canonical-identity-signature object had no production consumer:
+core interning is restricted to one exact source callee or region root, while persistent XLA compilation keys already
+own their typed canonical signature. P1c therefore does not add a dead canonical representation or
+`TypeIdentity::CanonicalProperties` hook. Alpha-equivalent calls are compared structurally in both directions, which
+retains bounds and repeated-identity relationships without storing parallel metadata.
+
+The current array-only graph has no definition-position dimension values until P2 introduces `DimensionType`. P1c
+therefore includes one explicit temporary closure rule: the first fresh result-reference occurrence may establish an
+internal identity for a legacy shape-producing operation. P3 must delete that fallback after those operations consume
+their result extents as first-class dimension operands; the rule is recorded in both the Phase 3 checklist and the
+deletion ledger.
+
+Verification and residual-audit results are recorded in the P1c cleanup-ledger entry at handoff.

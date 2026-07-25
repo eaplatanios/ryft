@@ -22,13 +22,13 @@ use crate::operations::constants::ZeroOperation;
 use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::ArrayType;
 
@@ -101,6 +101,11 @@ impl<T: Type> Value for CaptureReference<T> {
     #[inline]
     fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
+    }
+
+    #[inline]
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self::new(self.index, self.r#type.rename_identities(renaming)?))
     }
 }
 
@@ -461,12 +466,32 @@ mod tests {
     use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::programs::regions::{EmptyRegionDriver, RegionId};
-    use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::programs::{ProgramBuilder, ProgramError, TypeIdentityRenaming};
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
 
     use super::*;
+
+    #[test]
+    fn test_capture_reference_identity_renaming_preserves_capture_index() {
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let capture = CaptureReference::new(
+            3,
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])),
+        );
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source, target.clone()).unwrap();
+
+        let renamed = capture.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed.index(), 3);
+        assert_eq!(
+            renamed.r#type().as_ref(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target)])),
+        );
+    }
 
     #[test]
     fn test_closed_program_without_unused_captures() {

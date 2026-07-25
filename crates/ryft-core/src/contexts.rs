@@ -269,13 +269,7 @@ pub trait Context: Domain + Clone {
         let flat_program = flat_program.into_simplified()?;
         let output_values = flat_program.interpret_in_context(self, input_values)?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
-        let program = Program {
-            input_structure,
-            output_structure,
-            regions: flat_program.regions,
-            entry: flat_program.entry,
-            marker: PhantomData,
-        };
+        let program = flat_program.into_restructured(input_structure, output_structure);
         Ok((output, program))
     }
 }
@@ -446,9 +440,27 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         let operation = operation.into();
         check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
             .map_err(|error| self.error(error))?;
+        let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
+        let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+        let region_input_types =
+            operation.instantiated_region_input_types(input_types.as_slice(), region_interfaces.as_slice())?;
+        if region_input_types.len() != region_interfaces.len() {
+            return Err(self.error(ProgramError::MalformedProgram(format!(
+                "operation `{}` returned {} region instantiation entries for {} attached regions",
+                operation.name(),
+                region_input_types.len(),
+                region_interfaces.len(),
+            ))));
+        }
         if self.builder().borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
-            let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
+            let region_interfaces = driver
+                .regions()
+                .zip(&region_input_types)
+                .map(|(region, input_types)| match input_types {
+                    Some(input_types) => Ok(region.to_program().instantiate_input_identities(input_types)?.interface()),
+                    None => Ok(region.interface()),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
             let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
             Ok(output_types
                 .into_iter()
@@ -459,7 +471,9 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 Ok(input_atom_ids) => input_atom_ids,
                 Err(error) => return Err(self.error(error)),
             };
-            let region_ids = driver.import_into(self.builder()).map_err(|error| self.error(error))?;
+            let region_ids = driver
+                .import_instantiation_into(self.builder(), &region_input_types)
+                .map_err(|error| self.error(error))?;
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
                 match builder.add_instruction(operation, region_ids, inputs) {

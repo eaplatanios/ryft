@@ -5,12 +5,12 @@ use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::impl_differentiable_operation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::TypeError;
+use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
@@ -199,6 +199,22 @@ impl Operation<ArrayType> for CustomCallOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         Ok(self.output_types.clone())
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            target_name: self.target_name.clone(),
+            output_types: self
+                .output_types
+                .iter()
+                .map(|r#type| r#type.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            attributes: self.attributes.clone(),
+            has_side_effect: self.has_side_effect,
+        })
     }
 
     #[inline]

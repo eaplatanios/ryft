@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::contexts::Domain;
 use crate::macros::check_count;
@@ -8,10 +10,11 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::Effects;
+use crate::programs::identities::{IdentitySignature, TypeIdentityRenaming};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::regions::{Region, RegionId, RegionInterface, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
@@ -35,12 +38,42 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
     /// [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
     pub(crate) entry: RegionId,
 
+    /// Structurally closed identity signatures retained for every region in `regions`.
+    pub(crate) identity_signatures: Arc<[IdentitySignature<<V::Type as Type>::Identity>]>,
+
     /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types
     /// without making it own either value family.
     pub(crate) marker: PhantomData<(Input, Output)>,
 }
 
 impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
+    /// Constructs a program from an already structurally validated region arena and closes its type identities.
+    pub(crate) fn from_regions(
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
+        regions: Vec<Region<V, O>>,
+        entry: RegionId,
+    ) -> Result<Self, ProgramError> {
+        let identity_signatures = Region::identity_signatures(regions.as_slice())?.into();
+        Ok(Self { input_structure, output_structure, regions, entry, identity_signatures, marker: PhantomData })
+    }
+
+    /// Replaces only this program's structured boundary metadata.
+    pub(crate) fn into_restructured<NewInput: Parameterized<V>, NewOutput: Parameterized<V>>(
+        self,
+        input_structure: NewInput::ParameterStructure,
+        output_structure: NewOutput::ParameterStructure,
+    ) -> Program<V, O, NewInput, NewOutput> {
+        Program {
+            input_structure,
+            output_structure,
+            regions: self.regions,
+            entry: self.entry,
+            identity_signatures: self.identity_signatures,
+            marker: PhantomData,
+        }
+    }
+
     /// Returns the [`Atom`]s contained in this [`Program`]'s entry [`Region`],
     /// in the order in which they will be evaluated.
     #[inline]
@@ -153,7 +186,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns a borrowed view of the [`Region`] that corresponds to the provided [`RegionId`].
     #[inline]
     pub fn region_ref(&self, id: RegionId) -> Result<RegionRef<'_, V, O>, ProgramError> {
-        RegionRef::new(self.regions.as_slice(), id)
+        RegionRef::with_identity_signatures(self.regions.as_slice(), self.identity_signatures.as_ref(), id)
     }
 
     /// Returns the [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
@@ -171,13 +204,74 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns a borrowed view of this [`Program`]'s entry [`Region`].
     #[inline]
     pub fn entry_region_ref(&self) -> RegionRef<'_, V, O> {
-        RegionRef::new(self.regions.as_slice(), self.entry).unwrap()
+        RegionRef::with_identity_signatures(self.regions.as_slice(), self.identity_signatures.as_ref(), self.entry)
+            .unwrap()
     }
 
     /// Returns the operation-inference [`RegionInterface`] of this [`Program`]'s entry [`Region`].
     #[inline]
     pub fn interface(&self) -> RegionInterface<V::Type> {
         self.entry_region_ref().interface()
+    }
+
+    /// Returns this program entry point's closed identity signature.
+    #[inline]
+    pub(crate) fn identity_signature(&self) -> &IdentitySignature<<V::Type as Type>::Identity> {
+        &self.identity_signatures[self.entry.index()]
+    }
+
+    /// Returns whether two calls represent the same alpha-equivalent input-identity instantiation.
+    ///
+    /// Exact live types match immediately. Otherwise, callers with overlapping live identities remain distinct so an
+    /// identity permutation cannot alias a cache entry. Disjoint callers may match when they instantiate each other
+    /// bidirectionally.
+    pub(crate) fn same_identity_instantiation(candidate_input_types: &[V::Type], input_types: &[V::Type]) -> bool {
+        if candidate_input_types == input_types {
+            return true;
+        }
+        let mut identities_overlap = false;
+        for candidate_type in candidate_input_types {
+            candidate_type.visit_identities(&mut |_, candidate| {
+                for r#type in input_types {
+                    r#type.visit_identities(&mut |_, identity| {
+                        identities_overlap |= candidate == identity;
+                    });
+                }
+            });
+        }
+        if identities_overlap {
+            return false;
+        }
+        V::Type::instantiation_identity_renaming(candidate_input_types, input_types).is_ok()
+            && V::Type::instantiation_identity_renaming(input_types, candidate_input_types).is_ok()
+    }
+
+    /// Returns this program with `renaming` applied to every region atom, constant, and operation payload.
+    pub fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    ) -> Result<Self, ProgramError> {
+        Self::from_regions(
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+            self.regions
+                .iter()
+                .map(|region| region.rename_identities(renaming))
+                .collect::<Result<Vec<_>, _>>()?,
+            self.entry,
+        )
+    }
+
+    /// Instantiates this program's formal input identities at `input_types`.
+    ///
+    /// The validated identity-free path borrows this program. A nonempty renaming rebuilds and structurally recloses
+    /// the complete region arena.
+    pub fn instantiate_input_identities<'a>(&'a self, input_types: &[V::Type]) -> Result<Cow<'a, Self>, ProgramError> {
+        let renaming = V::Type::instantiation_identity_renaming(self.input_types().as_slice(), input_types)?;
+        if renaming.is_identity() {
+            return Ok(Cow::Borrowed(self));
+        }
+        Ok(Cow::Owned(self.rename_identities(&renaming)?))
     }
 
     /// Returns the [`InstructionId`] of the instruction producing the provided value, or [`None`] when the value is
@@ -358,11 +452,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self,
         mut map_fn: F,
     ) -> Result<Program<V, P, Input, Output>, ProgramError> {
-        Ok(Program {
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            regions: self
-                .regions
+        Program::from_regions(
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+            self.regions
                 .iter()
                 .map(|region| {
                     Ok(Region {
@@ -384,9 +477,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                     })
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?,
-            entry: self.entry,
-            marker: PhantomData,
-        })
+            self.entry,
+        )
     }
 
     /// Returns a cloned view of this [`Program`] whose public input and output types are flat vectors. The atom table,
@@ -404,6 +496,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             output_structure: vec![Placeholder; self.output_count()],
             regions: self.regions.clone(),
             entry: self.entry,
+            identity_signatures: self.identity_signatures.clone(),
             marker: PhantomData,
         }
     }
@@ -415,7 +508,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn into_flat_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         let input_structure = vec![Placeholder; self.input_count()];
         let output_structure = vec![Placeholder; self.output_count()];
-        Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData }
+        self.into_restructured(input_structure, output_structure)
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -522,13 +615,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (regions, entry) = compact_regions(regions, self.entry);
-        Ok(Self {
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            regions,
-            entry,
-            marker: PhantomData,
-        })
+        Self::from_regions(self.input_structure.clone(), self.output_structure.clone(), regions, entry)
     }
 
     /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
@@ -653,7 +740,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (regions, entry) = compact_regions(regions, entry);
-        Ok(Self { input_structure, output_structure, regions, entry, marker: PhantomData })
+        Self::from_regions(input_structure, output_structure, regions, entry)
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
@@ -746,13 +833,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         let mut regions = self.regions[..self.entry.index()].to_vec();
         regions.push(Region { atoms: new_atoms, input_ids: new_input_ids, output_ids, instructions: new_instructions });
         let (regions, entry) = compact_regions(regions, self.entry);
-        let program = Program {
-            input_structure: vec![Placeholder; live_input_indices.len()],
-            output_structure: vec![Placeholder; outputs.len()],
+        let program = Program::from_regions(
+            vec![Placeholder; live_input_indices.len()],
+            vec![Placeholder; outputs.len()],
             regions,
             entry,
-            marker: PhantomData,
-        };
+        )?;
         Ok((program, live_input_indices))
     }
 
@@ -842,7 +928,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         });
 
         let (regions, entry) = compact_regions(nested_regions, entry);
-        Ok((Program { input_structure, output_structure, regions, entry, marker: PhantomData }, live_input_indices))
+        Ok((
+            Program::<V, O, Vec<V>, Vec<V>>::from_regions(input_structure, output_structure, regions, entry)?,
+            live_input_indices,
+        ))
     }
 
     /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability from
@@ -1063,6 +1152,7 @@ impl<V: Value, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clon
             output_structure: self.output_structure.clone(),
             regions: self.regions.clone(),
             entry: self.entry,
+            identity_signatures: self.identity_signatures.clone(),
             marker: PhantomData,
         }
     }

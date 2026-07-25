@@ -143,6 +143,27 @@ where
         Ok(true_interface.output_types().to_vec())
     }
 
+    fn instantiated_region_input_types(
+        &self,
+        input_types: &[F::Type],
+        region_interfaces: &[RegionInterface<F::Type>],
+    ) -> Result<Vec<Option<Vec<F::Type>>>, TypeError> {
+        if region_interfaces.len() != 2 {
+            return Err(TypeError::invalid(format!(
+                "condition expects 2 attached regions but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        if input_types.is_empty() {
+            return Err(TypeError::invalid("condition expects at least one input but got 0"));
+        }
+        if region_interfaces.iter().all(|interface| interface.input_types() == &input_types[1..]) {
+            return Ok(vec![None, None]);
+        }
+        let branch_input_types = input_types[1..].to_vec();
+        Ok(vec![Some(branch_input_types.clone()), Some(branch_input_types)])
+    }
+
     #[inline]
     fn region_names(&self) -> &'static [&'static str] {
         &["true", "false"]

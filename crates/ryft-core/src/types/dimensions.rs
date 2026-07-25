@@ -9,6 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::axes::Axis;
 use crate::parameters::Parameter;
+use crate::programs::identities::{TypeIdentity, TypeIdentityRenaming};
 use crate::programs::types::TypeError;
 
 /// Errors produced while constructing or validating [`Dimension`]s.
@@ -22,6 +23,32 @@ pub enum DimensionError {
 
         /// Exclusive upper bound.
         upper: usize,
+    },
+
+    /// A concrete extent violates a variable's declared bounds.
+    #[error("input dimension `{variable}` = {value} is outside its declared bounds {bounds}")]
+    BindingOutOfBounds {
+        /// Diagnostic name of the dynamic dimension variable.
+        variable: String,
+
+        /// Concrete extent that violated the bounds.
+        value: usize,
+
+        /// Declared bounds of the variable.
+        bounds: DimensionBounds,
+    },
+
+    /// Corresponding occurrences of one declared variable observed different concrete extents.
+    #[error("input dimension `{dimension}` expected {expected} but got {actual}")]
+    InputDimensionMismatch {
+        /// Diagnostic name of the shared dynamic dimension variable.
+        dimension: String,
+
+        /// Extent established by an earlier occurrence.
+        expected: usize,
+
+        /// Conflicting extent observed at this occurrence.
+        actual: usize,
     },
 }
 
@@ -197,6 +224,8 @@ impl Hash for DimensionVariable {
     }
 }
 
+impl TypeIdentity for DimensionVariable {}
+
 /// Represents the extent of one array axis as either a static value or one symbolic [`DimensionVariable`]. Reusing the
 /// same variable in multiple dimensions declares that their runtime extents are equal. Arithmetic relationships between
 /// dynamic extents are deliberately not represented in this type and instead belong in the ordinary program graph.
@@ -225,6 +254,15 @@ impl Dimension {
         match self {
             Self::Static(_) => None,
             Self::Dynamic(variable) => Some(variable),
+        }
+    }
+
+    /// Returns this dimension after applying `renaming` to its dynamic variable.
+    #[inline]
+    pub fn rename_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Self {
+        match self {
+            Self::Static(value) => Self::Static(*value),
+            Self::Dynamic(variable) => Self::Dynamic(renaming.rename(variable)),
         }
     }
 
@@ -316,6 +354,11 @@ impl Shape {
     #[inline]
     pub fn dimensions(&self) -> &[Dimension] {
         self.dimensions.as_slice()
+    }
+
+    /// Returns this shape after simultaneously renaming every dynamic dimension variable.
+    pub fn rename_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Self {
+        Self::new(self.dimensions.iter().map(|dimension| dimension.rename_identities(renaming)).collect())
     }
 
     /// Returns the rank (i.e., the number of [`Dimension`]s) of this [`Shape`].

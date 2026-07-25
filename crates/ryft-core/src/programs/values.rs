@@ -8,8 +8,9 @@ use crate::parameters::Parameter;
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
+use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::regions::RegionId;
-use crate::programs::types::{Type, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -85,6 +86,26 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// Returns the [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the
     /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
     fn execution_domain(&self) -> Self::ExecutionDomain;
+
+    /// Reconstructs this value after renaming identities in its [`Type`](Self::Type).
+    ///
+    /// This compiler-managed operation may replace only type metadata. The default supports values whose type is
+    /// unchanged by `renaming`; values that store safely reconstructible identity-bearing metadata override it.
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        let current_type = self.r#type();
+        let renamed_type = current_type.rename_identities(renaming)?;
+        if current_type.as_ref() != &renamed_type {
+            return Err(TypeError::invalid(format!(
+                "cannot rename identity metadata in value of type {} without a value-specific reconstruction \
+                 implementation",
+                current_type.as_ref(),
+            )));
+        }
+        Ok(self.clone())
+    }
 }
 
 /// Supports extracting this value as a concrete host-side value of type `V`. Concretization is distinct from a staged

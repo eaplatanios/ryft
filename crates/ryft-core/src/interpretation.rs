@@ -53,8 +53,73 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use crate::programs::values::Value;
+
+/// Preserves the established pairwise program/region diagnostics while leaving cross-leaf refinement failures intact.
+fn contextualize_boundary_refinement_error<'a, T: Type + 'a, V: Typed<Type = T>>(
+    error: TypeError,
+    declared_count: usize,
+    declared_type: impl Fn(usize) -> std::borrow::Cow<'a, T>,
+    actual: &[V],
+    position: &str,
+    owner: &str,
+) -> ProgramError {
+    if matches!(error, TypeError::Invalid { .. }) && declared_count == actual.len() {
+        for (index, actual) in actual.iter().enumerate() {
+            let declared = declared_type(index);
+            let actual = actual.r#type();
+            if !declared.is_refined_by(actual.as_ref()) {
+                return TypeError::invalid(format!(
+                    "encountered {position} type {actual} which is incompatible with the {owner}'s declared type \
+                     {declared}",
+                ))
+                .into();
+            }
+        }
+    }
+    error.into()
+}
+
+/// Establishes complete-signature refinement facts without allocating when every boundary type matches exactly.
+fn establish_boundary_refinements<'a, T: Type + 'a, V: Typed<Type = T>>(
+    declared_count: usize,
+    declared_type: impl Fn(usize) -> std::borrow::Cow<'a, T>,
+    actual: &[V],
+) -> Result<T::Refinements, TypeError> {
+    if declared_count == actual.len()
+        && actual
+            .iter()
+            .enumerate()
+            .all(|(index, actual)| declared_type(index).as_ref() == actual.r#type().as_ref())
+    {
+        return Ok(T::Refinements::default());
+    }
+    let declared = (0..declared_count).map(|index| declared_type(index).into_owned()).collect::<Vec<_>>();
+    let actual = actual.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    T::Refinements::establish(&declared, &actual)
+}
+
+/// Validates a complete output signature without allocating when every boundary type matches exactly.
+fn validate_boundary_refinements<'a, T: Type + 'a, V: Typed<Type = T>>(
+    declared_count: usize,
+    declared_type: impl Fn(usize) -> std::borrow::Cow<'a, T>,
+    actual: &[V],
+    refinements: &T::Refinements,
+    internal_identities: &[T::Identity],
+) -> Result<(), TypeError> {
+    if declared_count == actual.len()
+        && actual
+            .iter()
+            .enumerate()
+            .all(|(index, actual)| declared_type(index).as_ref() == actual.r#type().as_ref())
+    {
+        return Ok(());
+    }
+    let declared = (0..declared_count).map(|index| declared_type(index).into_owned()).collect::<Vec<_>>();
+    let actual = actual.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    refinements.validate(&declared, &actual, internal_identities)
+}
 
 /// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]
 /// application. During [`Program`] replay that application is exactly one [`Instruction`]. Direct rule invocation
@@ -205,21 +270,29 @@ impl<
             .into());
         }
 
-        // Flatten the structured input and validate each input value's type.
+        // Flatten the structured input and validate the complete input type signature.
         let inputs = input.into_parameters().collect::<Vec<_>>();
-        for (input, input_id) in inputs.iter().zip(self.input_ids().iter()) {
-            let Some(declared) = self.atoms().get(input_id.index()) else {
+        let input_ids = self.input_ids();
+        for input_id in input_ids {
+            if input_id.index() >= self.atoms().len() {
                 return Err(ProgramError::UnboundAtomId { id: *input_id });
-            };
-            let declared = declared.r#type();
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError::invalid(format!(
-                    "encountered input type {actual} which is incompatible with the program's declared type {declared}",
-                ))
-                .into());
             }
         }
+        let refinements = establish_boundary_refinements(
+            input_ids.len(),
+            |index| self.atoms()[input_ids[index].index()].r#type(),
+            &inputs,
+        )
+        .map_err(|error| {
+            contextualize_boundary_refinement_error(
+                error,
+                input_ids.len(),
+                |index| self.atoms()[input_ids[index].index()].r#type(),
+                &inputs,
+                "input",
+                "program",
+            )
+        })?;
 
         // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
         // structured output form of this program, reparameterized at the context's value type. All instructions
@@ -237,6 +310,25 @@ impl<
                 )
             },
         )?;
+
+        let output_ids = self.output_ids();
+        validate_boundary_refinements(
+            output_ids.len(),
+            |index| self.atoms()[output_ids[index].index()].r#type(),
+            &outputs,
+            &refinements,
+            self.identity_signature().internal_identities(),
+        )
+        .map_err(|error| {
+            contextualize_boundary_refinement_error(
+                error,
+                output_ids.len(),
+                |index| self.atoms()[output_ids[index].index()].r#type(),
+                &outputs,
+                "output",
+                "program",
+            )
+        })?;
 
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
@@ -296,19 +388,29 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, self.input_ids().len(), ProgramError);
-        for (input, input_id) in inputs.iter().zip(self.input_ids()) {
-            let declared =
-                self.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: *input_id })?.r#type();
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError::invalid(format!(
-                    "encountered input type {actual} which is incompatible with the region's declared type {declared}",
-                ))
-                .into());
+        let input_ids = self.input_ids();
+        for input_id in input_ids {
+            if input_id.index() >= self.atoms().len() {
+                return Err(ProgramError::UnboundAtomId { id: *input_id });
             }
         }
+        let refinements = establish_boundary_refinements(
+            input_ids.len(),
+            |index| self.atoms()[input_ids[index].index()].r#type(),
+            &inputs,
+        )
+        .map_err(|error| {
+            contextualize_boundary_refinement_error(
+                error,
+                input_ids.len(),
+                |index| self.atoms()[input_ids[index].index()].r#type(),
+                &inputs,
+                "input",
+                "region",
+            )
+        })?;
         let region_mappings = RegionReplayMappings::new();
-        self.interpret_with(
+        let outputs = self.interpret_with(
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
@@ -318,7 +420,27 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
                     inputs,
                 )
             },
+        )?;
+        let output_ids = self.output_ids();
+        let identity_signature = self.identity_signature()?;
+        validate_boundary_refinements(
+            output_ids.len(),
+            |index| self.atoms()[output_ids[index].index()].r#type(),
+            &outputs,
+            &refinements,
+            identity_signature.internal_identities(),
         )
+        .map_err(|error| {
+            contextualize_boundary_refinement_error(
+                error,
+                output_ids.len(),
+                |index| self.atoms()[output_ids[index].index()].r#type(),
+                &outputs,
+                "output",
+                "region",
+            )
+        })?;
+        Ok(outputs)
     }
 
     /// Interprets/executes this borrowed [`RegionRef`]'s [`Instruction`]s using the caller-supplied value and error
@@ -440,7 +562,7 @@ mod tests {
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
 
     use super::*;
 
@@ -596,8 +718,13 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[dynamic]",
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>()
+                    == Some(&DimensionError::BindingOutOfBounds {
+                        variable: "dynamic".to_string(),
+                        value: 3,
+                        bounds: DimensionBounds::non_negative(Some(3)).unwrap(),
+                    }),
         ));
     }
 

@@ -20,7 +20,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{MaybeZero, ProgramError, TypeIdentityRenaming};
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::custom_derivatives::CustomVjpResidual;
@@ -614,6 +614,13 @@ impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearScatterAddOperat
             &[input_types[0].clone(), self.indices.r#type().into_owned(), input_types[1].clone()],
             &[],
         )
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { operation: self.operation.clone(), indices: self.indices.rename_type_identities(renaming)? })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {

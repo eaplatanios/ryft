@@ -767,14 +767,7 @@ where
         let flat = self
             .entry_region_ref()
             .transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
-        let Program { regions, entry, .. } = flat;
-        Ok(Program {
-            input_structure: self.output_structure().clone(),
-            output_structure: self.input_structure().clone(),
-            regions,
-            entry,
-            marker: PhantomData,
-        })
+        Ok(flat.into_restructured(self.output_structure().clone(), self.input_structure().clone()))
     }
 
     /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ with respect to selected
@@ -1424,6 +1417,7 @@ where
 mod tests {
     use std::cell::Cell;
     use std::marker::PhantomData;
+    use std::sync::Arc;
 
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
@@ -1443,6 +1437,7 @@ mod tests {
     use crate::programs::atoms::{Atom, AtomId, MaybeZero};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
+    use crate::programs::identities::IdentitySignature;
     use crate::programs::instructions::Instruction;
     use crate::programs::operations::Operation;
     use crate::programs::programs::Program;
@@ -1912,6 +1907,7 @@ mod tests {
                 instructions: Vec::new(),
             }],
             entry: RegionId::new(0),
+            identity_signatures: Arc::from([IdentitySignature::from_parts(Vec::new(), Vec::new())]),
             marker: PhantomData,
         };
         assert!(matches!(
@@ -1937,6 +1933,7 @@ mod tests {
                 )],
             }],
             entry: RegionId::new(0),
+            identity_signatures: Arc::from([IdentitySignature::from_parts(Vec::new(), Vec::new())]),
             marker: PhantomData,
         };
         assert!(matches!(

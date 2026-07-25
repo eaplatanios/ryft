@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::errors::CustomError;
 use crate::parameters::Parameter;
+use crate::programs::identities::{IdentityPosition, TypeIdentity, TypeIdentityRenaming};
 
 /// Represents errors produced while inferring or validating [`Type`]s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -59,6 +60,43 @@ impl TypeError {
 /// requires [`Parameter`] so that types can be used as leaves in [`Parameterized`](crate::Parameterized) data
 /// structures.
 pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
+    /// Nominal identity carried by this type family's metadata.
+    ///
+    /// An identity represents a declared equality relationship between otherwise dynamic parts of types, rather than
+    /// a runtime value or an SSA atom. Repeating the same identity means those occurrences denote the same runtime
+    /// quantity. Type families without such relationships use [`NoIdentity`](crate::NoIdentity).
+    type Identity: TypeIdentity;
+
+    /// Facts accumulated while checking concrete values against a complete program boundary.
+    ///
+    /// Refinements make boundary validation consistent across multiple values and repeated identity occurrences. For
+    /// example, an array refinement environment remembers the concrete extent first observed for a dynamic dimension
+    /// and rejects a conflicting extent elsewhere in the same signature. Type families that need no cross-value facts
+    /// use `()`.
+    type Refinements: TypeRefinements<Self>;
+
+    /// Visits the identities carried by this type in deterministic positional order.
+    #[inline]
+    fn visit_identities(&self, visitor: &mut impl FnMut(IdentityPosition, &Self::Identity)) {
+        let _ = visitor;
+    }
+
+    /// Returns this type after simultaneously renaming all of its live identities.
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+        let _ = renaming;
+        Ok(self.clone())
+    }
+
+    /// Derives the live-identity renaming that instantiates `declared` with the complete `actual` signature.
+    fn instantiation_identity_renaming(
+        declared: &[Self],
+        actual: &[Self],
+    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+        Self::Refinements::establish(declared, actual)?;
+        Ok(TypeIdentityRenaming::new())
+    }
+
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
     /// while array-like types may account for broadcasting and nested structure.
@@ -108,6 +146,43 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// `*_holomorphic` variants. The plain entry points reject output types for which this returns `true`, and the
     /// holomorphic ones reject output types for which it returns `false`.
     fn is_complex(&self) -> bool;
+}
+
+/// Facts established while validating one complete signature of [`Type`]s.
+///
+/// [`Type::is_refined_by`] checks one type pair. This companion contract checks a complete boundary so relationships
+/// repeated across several inputs or outputs remain consistent. Establishment is transactional across the complete
+/// input signature, and the resulting environment validates outputs against those same facts. Identities produced
+/// inside the region may establish additional output facts; unrelated, unbound output identities are rejected.
+pub trait TypeRefinements<T: Type>: Clone + Debug + Default {
+    /// Establishes refinement facts from `actual` relative to `declared`.
+    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError>;
+
+    /// Validates `actual` against `declared` using the already-established facts. Identities in
+    /// `internal_identities` may establish new facts at this boundary; all other identities must already be bound.
+    fn validate(&self, declared: &[T], actual: &[T], internal_identities: &[T::Identity]) -> Result<(), TypeError>;
+}
+
+impl<T: Type> TypeRefinements<T> for () {
+    fn establish(declared: &[T], actual: &[T]) -> Result<Self, TypeError> {
+        Self::validate(&(), declared, actual, &[])
+    }
+
+    fn validate(&self, declared: &[T], actual: &[T], _internal_identities: &[T::Identity]) -> Result<(), TypeError> {
+        if declared.len() != actual.len() {
+            return Err(TypeError::invalid(format!(
+                "declared type count {} does not match actual type count {}",
+                declared.len(),
+                actual.len(),
+            )));
+        }
+        for (declared, actual) in declared.iter().zip(actual) {
+            if !declared.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}",)));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Associates a runtime value with the abstract [`Type`] that Ryft should use to reason about it. [`Typed`] is the

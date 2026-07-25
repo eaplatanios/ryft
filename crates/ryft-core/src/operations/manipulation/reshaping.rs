@@ -16,7 +16,7 @@ use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{TypeError, Typed};
 use crate::programs::values::Value;
-use crate::programs::{MaybeZero, ProgramError};
+use crate::programs::{MaybeZero, ProgramError, TypeIdentityRenaming};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Dimension, Shape};
@@ -432,6 +432,22 @@ impl Operation<ArrayType> for ReshapeOperation {
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError::invalid(error.to_string())),
         }
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            target: match &self.target {
+                ReshapeTarget::Shape(shape) => ReshapeTarget::Shape(shape.rename_identities(renaming)),
+                ReshapeTarget::DimensionExpressions(expressions) => {
+                    ReshapeTarget::DimensionExpressions(expressions.clone())
+                }
+            },
+            dimensions: self.dimensions.clone(),
+            output_sharding: self.output_sharding.clone(),
+        })
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {

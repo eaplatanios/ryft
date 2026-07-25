@@ -16,12 +16,12 @@ use crate::operations::manipulation::transposition::TransposeOperation;
 use crate::operations::math::ReduceOperation;
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{TypeError, Typed};
+use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::sharding::{Sharding, ShardingDimension};
 use crate::types::{ArrayType, DataType, Dimension, Shape};
 
@@ -85,6 +85,13 @@ impl Operation<ArrayType> for BroadcastOperation {
             Err(ProgramError::Type(error)) => Err(error),
             Err(error) => Err(TypeError::invalid(error.to_string())),
         }
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { output_type: self.output_type.rename_identities(renaming)?, output_axes: self.output_axes.clone() })
     }
 
     #[inline]
@@ -336,6 +343,13 @@ impl Operation<ArrayType> for DynamicBroadcastOperation {
         }
 
         Ok(vec![self.output_type.clone()])
+    }
+
+    fn rename_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self { output_type: self.output_type.rename_identities(renaming)?, output_axes: self.output_axes.clone() })
     }
 
     #[inline]

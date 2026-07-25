@@ -10,10 +10,10 @@ use crate::macros::{
     impl_nullary_transposable_operation,
 };
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::{ProgramError, TypeIdentityRenaming};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::ArrayType;
 
@@ -64,6 +64,11 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         Ok(vec![self.r#type.clone()])
+    }
+
+    #[inline]
+    fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        Ok(Self { r#type: self.r#type.rename_identities(renaming)? })
     }
 
     #[inline]
