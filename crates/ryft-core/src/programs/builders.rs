@@ -302,14 +302,13 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         RegionId::new(entry.index() + offset)
     }
 
-    // TODO(eaplatanios): The "alpha-equivalent" term below will be unknown to readers.
-    // TODO(eaplatanios): Can we clean up this function's implementation somehow.
     /// Interns `callee`, optionally after instantiating its formal [`TypeIdentity`](crate::TypeIdentity)s for
     /// `input_types`. Without `input_types`, callees are identified by [`Rc`] identity, not structural equality, so
     /// structurally equal but independently built [`Program`]s remain distinct. With `input_types`, repeated exact
-    /// instantiations share one imported root. Alpha-equivalent types with different live identities remain distinct
-    /// because those identities are retained by the imported region's boundary and no per-attachment renaming is stored
-    /// on an [`Instruction`]. An instantiation requiring no renaming reuses the uninstantiated callee root.
+    /// instantiations share one imported root. Semantically identical types carrying separately created live identities
+    /// remain distinct because those identities are retained by the imported region's boundary and no per-attachment
+    /// renaming is stored on an [`Instruction`]. An instantiation requiring no renaming reuses the uninstantiated
+    /// callee root.
     pub fn intern_callee(
         &mut self,
         callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>,
@@ -318,30 +317,28 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
-        let renaming = if let Some(input_types) = input_types {
-            if let Some(instantiation) = self.callee_instantiations.iter().find(|instantiation| {
+        if let Some(input_types) = input_types
+            && let Some(instantiation) = self.callee_instantiations.iter().find(|instantiation| {
                 Rc::ptr_eq(&instantiation.callee, callee) && instantiation.input_types == input_types
-            }) {
-                return Ok(instantiation.region);
-            }
-            Some(V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types)?)
-        } else {
-            None
-        };
+            })
+        {
+            return Ok(instantiation.region);
+        }
 
-        let region = match renaming {
-            Some(ref renaming) if !renaming.is_identity() => {
-                self.import_program(callee.rename_type_identities(renaming)?)
-            }
-            _ => {
-                if let Some((_, region)) = self.callees.iter().find(|(interned, _)| Rc::ptr_eq(interned, callee)) {
-                    *region
-                } else {
-                    let region = self.import_region(callee.entry_region_ref());
-                    self.callees.push((callee.clone(), region));
-                    region
-                }
-            }
+        let renaming = input_types
+            .map(|input_types| V::Type::derive_identity_renaming(callee.input_types().as_slice(), input_types))
+            .transpose()?;
+
+        let region = if let Some(renaming) = renaming.as_ref().filter(|renaming| !renaming.is_identity()) {
+            self.import_program(callee.rename_type_identities(renaming)?)
+        } else if let Some(region) =
+            self.callees.iter().find_map(|(interned, region)| Rc::ptr_eq(interned, callee).then_some(*region))
+        {
+            region
+        } else {
+            let region = self.import_region(callee.entry_region_ref());
+            self.callees.push((callee.clone(), region));
+            region
         };
 
         if let Some(input_types) = input_types {
@@ -739,8 +736,8 @@ mod tests {
                 .unwrap(),
         );
 
-        // Repeated exact instantiations share, but fresh alpha-equivalent callers remain distinct because each
-        // imported region retains the live identities in its boundary.
+        // Repeated exact instantiations share, but otherwise-identical callers with separately created identities
+        // remain distinct because each imported region retains those live identities in its boundary.
         let mut destination = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
         let caller_a = DimensionVariable::new("caller_a", bounds);
         let caller_b = DimensionVariable::new("caller_b", bounds);

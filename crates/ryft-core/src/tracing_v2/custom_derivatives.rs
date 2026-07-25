@@ -26,16 +26,6 @@ use crate::programs::{MaybeZero, Program, ProgramError, TypeIdentityRenaming, Va
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::types::ArrayType;
 
-/// Applies the type-identity instantiation induced by `actual_inputs` to related types in the formal input scope.
-fn instantiate_boundary_types<T: Type>(
-    formal_inputs: &[T],
-    actual_inputs: &[T],
-    types: &[T],
-) -> Result<Vec<T>, TypeError> {
-    let renaming = T::derive_identity_renaming(formal_inputs, actual_inputs)?;
-    types.iter().map(|r#type| r#type.rename_identities(&renaming)).collect()
-}
-
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
 /// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
 ///
@@ -420,10 +410,22 @@ impl<T: DifferentiableType> Operation<T> for CustomVjpOperation {
         }
         let primal_interface = &region_interfaces[0];
         let forward_interface = &region_interfaces[1];
-        let primal_output_types =
-            instantiate_boundary_types(primal_interface.input_types(), input_types, primal_interface.output_types())?;
-        let forward_output_types =
-            instantiate_boundary_types(forward_interface.input_types(), input_types, forward_interface.output_types())?;
+
+        // The primal and forward regions were traced independently, so each boundary owns its own formal identities.
+        // Derive each region's caller-specific renaming from its input boundary before using its outputs to construct
+        // the backward region's input signature.
+        let primal_renaming = T::derive_identity_renaming(primal_interface.input_types(), input_types)?;
+        let primal_output_types = primal_interface
+            .output_types()
+            .iter()
+            .map(|r#type| r#type.rename_identities(&primal_renaming))
+            .collect::<Result<Vec<_>, _>>()?;
+        let forward_renaming = T::derive_identity_renaming(forward_interface.input_types(), input_types)?;
+        let forward_output_types = forward_interface
+            .output_types()
+            .iter()
+            .map(|r#type| r#type.rename_identities(&forward_renaming))
+            .collect::<Result<Vec<_>, _>>()?;
         if forward_output_types.len() < primal_output_types.len() {
             return Err(TypeError::invalid(format!(
                 "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",

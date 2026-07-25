@@ -53,7 +53,7 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use crate::programs::values::Value;
 
 /// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]
@@ -205,21 +205,56 @@ impl<
             .into());
         }
 
-        // Flatten the structured input and validate each input value's type.
+        // Flatten the structured input and validate the complete input type signature. Program construction normally
+        // guarantees these identifiers, but every check below indexes the atom table directly. Validate the boundary
+        // first so malformed internal state remains a structured error rather than a panic during diagnostic or
+        // refinement handling.
         let inputs = input.into_parameters().collect::<Vec<_>>();
-        for (input, input_id) in inputs.iter().zip(self.input_ids().iter()) {
-            let Some(declared) = self.atoms().get(input_id.index()) else {
+        let input_ids = self.input_ids();
+        for input_id in input_ids {
+            if input_id.index() >= self.atoms().len() {
                 return Err(ProgramError::UnboundAtomId { id: *input_id });
-            };
-            let declared = declared.r#type();
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError::invalid(format!(
-                    "encountered input type {actual} which is incompatible with the program's declared type {declared}",
-                ))
-                .into());
             }
         }
+
+        // Refinement errors that already carry structured cross-leaf or dimension details pass through unchanged.
+        // For an ordinary pairwise incompatibility, retain the established program-boundary diagnostic naming the
+        // first mismatched leaf and whether it occurred at the input or output boundary.
+        let contextualize_refinement_error =
+            |error: TypeError, ids: &[AtomId], actual: &[C::Value], position: &str| -> ProgramError {
+                if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
+                    for (id, actual) in ids.iter().zip(actual) {
+                        let declared = self.atoms()[id.index()].r#type();
+                        let actual = actual.r#type();
+                        if !declared.is_refined_by(actual.as_ref()) {
+                            return TypeError::invalid(format!(
+                                "encountered {position} type {actual} which is incompatible with the program's \
+                                 declared type {declared}",
+                            ))
+                            .into();
+                        }
+                    }
+                }
+                error.into()
+            };
+
+        // Equal boundary types carry no additional refinement facts, so avoid constructing a refinement environment
+        // in the common staging/replay case. More precise actual types (for example, a static extent supplied for a
+        // dynamic dimension) must be checked as one complete signature so repeated identities agree across inputs.
+        let refinements = if input_ids.len() == inputs.len()
+            && input_ids
+                .iter()
+                .zip(&inputs)
+                .all(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
+        {
+            T::Refinements::default()
+        } else {
+            T::Refinements::establish(
+                input_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                inputs.iter().map(Typed::r#type),
+            )
+            .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
+        };
 
         // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
         // structured output form of this program, reparameterized at the context's value type. All instructions
@@ -237,6 +272,26 @@ impl<
                 )
             },
         )?;
+
+        // Replayed values commonly retain the program's exact declared output types. Only a count difference or a
+        // more precise output type requires validation. That validation reuses facts established from the inputs and
+        // permits a previously unbound output identity only when the region metadata proves an instruction inside this
+        // program defines it.
+        let output_ids = self.output_ids();
+        if output_ids.len() != outputs.len()
+            || output_ids
+                .iter()
+                .zip(&outputs)
+                .any(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
+        {
+            refinements
+                .validate(
+                    output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                    outputs.iter().map(Typed::r#type),
+                    self.type_identity_signature().internal_identities(),
+                )
+                .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+        }
 
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
@@ -296,19 +351,55 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, self.input_ids().len(), ProgramError);
-        for (input, input_id) in inputs.iter().zip(self.input_ids()) {
-            let declared =
-                self.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: *input_id })?.r#type();
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError::invalid(format!(
-                    "encountered input type {actual} which is incompatible with the region's declared type {declared}",
-                ))
-                .into());
+        let input_ids = self.input_ids();
+        for input_id in input_ids {
+            if input_id.index() >= self.atoms().len() {
+                return Err(ProgramError::UnboundAtomId { id: *input_id });
             }
         }
+
+        // Preserve structured refinement errors while keeping the established pairwise region-boundary diagnostic for
+        // ordinary incompatibilities. This closure is local because the owner wording and atom lookup are properties
+        // of this specific borrowed region, not a separate boundary-refinement abstraction.
+        let contextualize_refinement_error =
+            |error: TypeError, ids: &[AtomId], actual: &[C::Value], position: &str| -> ProgramError {
+                if matches!(&error, TypeError::Invalid { .. }) && ids.len() == actual.len() {
+                    for (id, actual) in ids.iter().zip(actual) {
+                        let declared = self.atoms()[id.index()].r#type();
+                        let actual = actual.r#type();
+                        if !declared.is_refined_by(actual.as_ref()) {
+                            return TypeError::invalid(format!(
+                                "encountered {position} type {actual} which is incompatible with the region's declared \
+                                 type {declared}",
+                            ))
+                            .into();
+                        }
+                    }
+                }
+                error.into()
+            };
+
+        // Exact input types introduce no new boundary facts. Otherwise, establish one environment across the entire
+        // region signature so repeated dynamic identities cannot acquire conflicting concrete refinements.
+        let refinements = if input_ids.len() == inputs.len()
+            && input_ids
+                .iter()
+                .zip(&inputs)
+                .all(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
+        {
+            <V::Type as Type>::Refinements::default()
+        } else {
+            <V::Type as Type>::Refinements::establish(
+                input_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                inputs.iter().map(Typed::r#type),
+            )
+            .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
+        };
+
+        // Share one source-to-destination mapping across every instruction in this replay. If several instructions
+        // attach the same nested source region, a staging context imports it only once and preserves that sharing.
         let region_mappings = RegionReplayMappings::new();
-        self.interpret_with(
+        let outputs = self.interpret_with(
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
@@ -318,7 +409,28 @@ impl<V: Value, O: Operation<V::Type>> RegionRef<'_, V, O> {
                     inputs,
                 )
             },
-        )
+        )?;
+
+        // Skip output validation when replay preserved every declared type exactly. Refined outputs are checked
+        // against the input environment. Only identities structurally defined inside this region may establish new
+        // facts at the output boundary.
+        let output_ids = self.output_ids();
+        if output_ids.len() != outputs.len()
+            || output_ids
+                .iter()
+                .zip(&outputs)
+                .any(|(id, actual)| self.atoms()[id.index()].r#type().as_ref() != actual.r#type().as_ref())
+        {
+            refinements
+                .validate(
+                    output_ids.iter().map(|id| self.atoms()[id.index()].r#type()),
+                    outputs.iter().map(Typed::r#type),
+                    self.type_identity_signature().internal_identities(),
+                )
+                .map_err(|error| contextualize_refinement_error(error, output_ids, &outputs, "output"))?;
+        }
+
+        Ok(outputs)
     }
 
     /// Interprets/executes this borrowed [`RegionRef`]'s [`Instruction`]s using the caller-supplied value and error
@@ -436,11 +548,14 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::AtomId;
+    use crate::programs::builders::ProgramBuilder;
+    use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
-    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::types::{ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape};
 
     use super::*;
 
@@ -481,10 +596,18 @@ mod tests {
         let shared = source_builder.import_program(nested);
         let source_input = source_builder.add_input(DataType::F64);
         let first = source_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![shared], vec![source_input])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![shared],
+                vec![source_input],
+            )
             .unwrap()[0];
         let second = source_builder
-            .add_instruction(TestRegionOperation::WithRegions(&["body"]), vec![shared], vec![first])
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![shared],
+                vec![first],
+            )
             .unwrap()[0];
         let source = source_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
@@ -596,8 +719,105 @@ mod tests {
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError::Invalid { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[dynamic]",
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>()
+                    == Some(&DimensionError::BindingOutOfBounds {
+                        variable: "dynamic".to_string(),
+                        value: 3,
+                        bounds: DimensionBounds::non_negative(Some(3)).unwrap(),
+                    }),
+        ));
+    }
+
+    #[test]
+    fn test_program_interpret_boundary_refinements() {
+        #[derive(Clone)]
+        struct WrongShapeOperation;
+
+        impl Operation<ArrayType> for WrongShapeOperation {
+            fn name(&self) -> &'static str {
+                "wrong_shape"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                let [input_type] = input_types else {
+                    return Err(TypeError::invalid(format!(
+                        "wrong shape expects 1 input but got {}",
+                        input_types.len(),
+                    )));
+                };
+                Ok(vec![input_type.clone()])
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<Array, WrongShapeOperation>> for WrongShapeOperation {
+            fn interpret<D: InterpretationDriver<EagerContext<Array, WrongShapeOperation>>>(
+                &self,
+                _context: &EagerContext<Array, WrongShapeOperation>,
+                _driver: &D,
+                _inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
+                Ok(vec![Array::vector(vec![1.0, 2.0, 3.0])])
+            }
+        }
+
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let batch = DimensionVariable::new("batch", bounds);
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
+
+        // Repeated occurrences of one input identity must refine to the same concrete extent across the complete
+        // boundary, rather than being checked independently.
+        let mut builder = ProgramBuilder::<Array, WrongShapeOperation>::new();
+        let first = builder.add_input(dynamic_type.clone());
+        builder.add_input(dynamic_type.clone());
+        let program = builder
+            .build::<(Array, Array), Array>(vec![first], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert!(matches!(
+            program.interpret((Array::vector(vec![1.0, 2.0]), Array::vector(vec![1.0, 2.0, 3.0]))),
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>()
+                    == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "batch".to_string(),
+                        expected: 2,
+                        actual: 3,
+                    }),
+        ));
+
+        // Output validation reuses the input refinement environment, so an operation that violates its declared
+        // identity relationship is rejected even though its output independently refines the dynamic array type.
+        let mut builder = ProgramBuilder::<Array, WrongShapeOperation>::new();
+        let input = builder.add_input(dynamic_type);
+        let output = builder.add_instruction(WrongShapeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        assert!(matches!(
+            program.interpret(Array::vector(vec![1.0, 2.0])),
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>()
+                    == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "batch".to_string(),
+                        expected: 2,
+                        actual: 3,
+                    }),
+        ));
+        assert!(matches!(
+            program
+                .entry_region_ref()
+                .interpret_in_context(
+                    &EagerContext::<Array, WrongShapeOperation>::new(),
+                    vec![Array::vector(vec![1.0, 2.0])],
+                ),
+            Err(ProgramError::Type(error))
+                if error.downcast_custom::<DimensionError>()
+                    == Some(&DimensionError::InputDimensionMismatch {
+                        dimension: "batch".to_string(),
+                        expected: 2,
+                        actual: 3,
+                    }),
         ));
     }
 
