@@ -951,6 +951,22 @@ semantics; the P0 release build is its regression gate.
 
 ### Phase 1: introduce leaf identity and derive ownership structurally
 
+P1 is split at compile-safe semantic boundaries so each increment remains reviewable:
+
+- `P1a` introduces the local `DimensionBounds` and `DimensionVariable` foundations, including fresh identity,
+  authoritative immutable bounds, diagnostics, equality, hashing, and focused tests. It does not change
+  `Dimension::Dynamic` yet.
+- `P1b` changes `Dimension::Dynamic` from `Option<usize>` to one `DimensionVariable` leaf and migrates shape/type
+  consumers directly, without a compatibility variant or expression representation.
+- `P1c` adds the minimal generic `Type::Identity`/`Type::Refinements` contract, implements structural closure,
+  instantiation, renaming, and canonical identity, then deletes `OutputIdentityRole`.
+
+- [x] `P1a`: add validated inclusive-lower/exclusive-upper bounds with exact diagnostics.
+- [x] `P1a`: add fresh identity semantics whose clone preserves identity and whose name is diagnostic-only.
+- [x] `P1a`: keep bounds owned only by the identity and immutable after construction.
+- [x] `P1a` gate: focused tests cover bounds, display, clone/fresh equality, hashing, and typed error recovery without
+      changing existing `Dimension` behavior.
+
 - [ ] Replace the mechanically renamed `Dimension::Dynamic(Option<usize>)` with the reviewed leaf-only dynamic form:
       one `DimensionVariable` identity plus authoritative bounds, with no arithmetic expression in types.
 - [ ] Establish one source of truth for bounds. Types carry the authoritative bounds used for checking and compilation;
@@ -1559,3 +1575,29 @@ Verification completed:
   gap.
 
 The existing ambiguous `arrays` glob-re-export warning remains assigned to P9. P0 changes no dimension semantics.
+
+### Execution: P1a dimension identity foundations
+
+P1a adds only the compile-safe local foundations in `types::dimensions`:
+
+- `DimensionBounds` validates inclusive-lower/exclusive-upper ranges and provides containment without duplicating
+  identity metadata;
+- `DimensionVariable` uses one shared immutable core, clone-preserving identity, pointer identity for equality and
+  hashing, and a diagnostic-only name; and
+- `DimensionError::InvalidBounds` travels through the generic `TypeError::Custom` path established in S4, so generic
+  type machinery remains independent of dimensions.
+
+`Dimension::Dynamic(Option<usize>)` remains unchanged until P1b. No compatibility variant, expression representation,
+program hook, or backend behavior is introduced. Adding the typed `DimensionError -> TypeError` conversion exposed one
+pre-existing unconstrained `Result<_, _>` in symbolic reshape inversion; P1a adds only the explicit
+`Ok::<ReshapeDimensionExpression, TypeError>` annotation needed to select the intended conversion.
+
+Verification completed:
+
+- all 16 focused `types::dimensions` tests passed;
+- `cargo check -p ryft-core` passed;
+- `cargo test -p ryft-core --lib` passed all 915 tests;
+- `cargo test -p ryft-core --doc` passed 43 tests with 13 ignored; and
+- scoped formatting and `git diff --check` passed.
+
+The known ambiguous `arrays` glob-re-export warning remains assigned to P9.
