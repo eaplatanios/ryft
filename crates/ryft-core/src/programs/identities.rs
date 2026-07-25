@@ -123,11 +123,21 @@ impl<I: TypeIdentity> TypeIdentitySignature<I> {
     }
 }
 
-/// Returns `true` if a cache entry imported for `cached_input_types` can safely serve `requested_input_types`. Exact
-/// signatures can always share an entry. Non-exact signatures that contain any of the same live [`TypeIdentity`]s
-/// cannot share because a permutation of those identities would alias a differently instantiated region. Signatures
-/// with disjoint live identities can share when each signature can instantiate the other, proving that they differ
-/// only by a safe alpha-renaming.
+/// Determines whether an already imported [`Program`](crate::Program) [`Region`](crate::Region) can be reused for
+/// another invocation of the same source region. Importing a region specializes its input [`Type`]s by replacing the
+/// source region's [`TypeIdentity`]s with those used by the caller. `cached_input_types` are the caller input types
+/// used when creating an existing imported region, while `requested_input_types` are the caller input types for a new
+/// invocation. Reusing the existing region avoids importing another copy.
+///
+/// Reuse is safe when the two input-type lists are equal. It is also safe when they have the same structure and
+/// identity relationships but use completely separate identities (e.g., `[f32[n], f32[n]]` and `[f32[m], f32[m]]`).
+/// In that case, each list can be consistently renamed to the other without changing what its repeated identity
+/// occurrences mean.
+///
+/// Reuse is rejected when unequal input-type lists share an identity. Partial overlap or reordering could otherwise
+/// cause the imported region to associate an input with the wrong runtime quantity. Requiring successful renaming
+/// in both directions additionally ensures that the two lists have the same identity structure rather than merely
+/// allowing a one-way substitution.
 pub(crate) fn can_reuse_type_identity_instantiation<T: Type>(
     cached_input_types: &[T],
     requested_input_types: &[T],
@@ -135,7 +145,7 @@ pub(crate) fn can_reuse_type_identity_instantiation<T: Type>(
     if cached_input_types == requested_input_types {
         return true;
     }
-    
+
     let mut identities_overlap = false;
     for cached_type in cached_input_types {
         cached_type.visit_identities(&mut |_, cached_identity| {
@@ -146,11 +156,11 @@ pub(crate) fn can_reuse_type_identity_instantiation<T: Type>(
             }
         });
     }
-    
+
     if identities_overlap {
         return false;
     }
-    
+
     T::derive_identity_renaming(cached_input_types, requested_input_types).is_ok()
         && T::derive_identity_renaming(requested_input_types, cached_input_types).is_ok()
 }

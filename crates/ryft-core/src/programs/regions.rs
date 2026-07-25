@@ -31,7 +31,9 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
 use crate::programs::effects::Effects;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
+use crate::programs::identities::{
+    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, can_reuse_type_identity_instantiation,
+};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -969,10 +971,7 @@ impl<V: Value, O: Operation<V::Type>> BindingRegionDriver<V, O> for ReplayRegion
                 let renaming = V::Type::derive_identity_renaming(region.input_types().as_slice(), input_types)?;
                 if let Some(mapping) = destination.instantiated_region_mappings.iter().find(|mapping| {
                     &mapping.source_region == root
-                        && Program::<V, O, Vec<V>, Vec<V>>::same_type_identity_instantiation(
-                            &mapping.input_types,
-                            input_types,
-                        )
+                        && can_reuse_type_identity_instantiation(&mapping.input_types, input_types)
                 }) {
                     return Ok(mapping.destination_region);
                 }

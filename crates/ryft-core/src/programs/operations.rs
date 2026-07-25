@@ -387,180 +387,68 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
-    use crate::contexts::{Domain, EagerContext};
-    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::macros::check_count;
+    use crate::operations::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
-    use crate::programs::programs::Program;
-    use crate::programs::regions::EmptyRegionDriver;
     use crate::types::DataType;
 
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct IdentityOperation;
-
-    impl Operation<DataType> for IdentityOperation {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "identity"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[DataType],
-            _region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(vec![input_types[0]])
-        }
-    }
-
-    impl<C: Domain<Type = DataType, Value = Scalar>> InterpretableOperation<C> for IdentityOperation {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            _context: &C,
-            _driver: &D,
-            inputs: &[Scalar],
-        ) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            Ok(inputs.to_vec())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct InlineMetadataOperation;
-
-    impl Operation<DataType> for InlineMetadataOperation {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "metadata"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
-            IdentityOperation.infer_output_types(input_types, region_interfaces)
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-                operation.field("mode", "test")?;
-                operation.field("count", 2)
-            })
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct LongMetadataOperation;
-
-    impl LongMetadataOperation {
-        const VALUE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
-    }
-
-    impl Operation<DataType> for LongMetadataOperation {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "metadata"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
-            IdentityOperation.infer_output_types(input_types, region_interfaces)
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            OperationFormatter::new(formatter, indentation, self.name())?
-                .bracketed(|operation| operation.field("value", Self::VALUE))
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct NestedProgramOperation {
-        program: Program<Scalar, IdentityOperation, Scalar, Scalar>,
-    }
-
-    impl Operation<DataType> for NestedProgramOperation {
-        #[inline]
-        fn name(&self) -> &'static str {
-            "nested"
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[DataType],
-            region_interfaces: &[RegionInterface<DataType>],
-        ) -> Result<Vec<DataType>, TypeError> {
-            IdentityOperation.infer_output_types(input_types, region_interfaces)
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-                operation.field("tag", "before")?;
-                operation.program("body", &self.program)?;
-                operation.field("tag", "after")
-            })
-        }
-    }
-
-    struct RenderedOperation<'a, O> {
-        operation: &'a O,
-        indentation: usize,
-    }
-
-    impl<O: Operation<DataType>> std::fmt::Display for RenderedOperation<'_, O> {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            self.operation.render(formatter, self.indentation)
-        }
-    }
-
-    fn render_operation(operation: &impl Operation<DataType>) -> String {
-        RenderedOperation { operation, indentation: 0 }.to_string()
-    }
-
-    fn identity_program() -> Program<Scalar, IdentityOperation, Scalar, Scalar> {
-        let mut builder = ProgramBuilder::<Scalar, IdentityOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(IdentityOperation, Vec::new(), vec![input]).unwrap()[0];
-        builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap()
-    }
-
     #[test]
     fn test_operation_formatter() {
         // Check that short fields are rendered inline.
-        assert_eq!(render_operation(&InlineMetadataOperation), "metadata [mode=test, count=2]");
-        
-        // Check that long fields are wrapped over multiple lines.
         assert_eq!(
-            render_operation(&LongMetadataOperation),
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "metadata")?.bracketed(|operation| {
+                    operation.field("mode", "test")?;
+                    operation.field("count", 2)
+                })
+            })
+            .to_string(),
+            "metadata [mode=test, count=2]",
+        );
+
+        // Check that long fields are wrapped over multiple lines.
+        const LONG_VALUE: &str =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "metadata")?
+                    .bracketed(|operation| operation.field("value", LONG_VALUE))
+            })
+            .to_string(),
             format!(
                 indoc! {"
                     metadata [
                         value={value},
                     ]
                 "},
-                value = LongMetadataOperation::VALUE,
+                value = LONG_VALUE,
             )
             .trim_end()
         );
-        
+
         // Check that program fields are rendered over multiple lines.
+        let mut builder = ProgramBuilder::<Scalar, StopGradientOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(StopGradientOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
-            render_operation(&NestedProgramOperation { program: identity_program() }),
+            std::fmt::from_fn(|formatter| {
+                OperationFormatter::new(formatter, 0, "nested")?.bracketed(|operation| {
+                    operation.field("tag", "before")?;
+                    operation.program("body", &program)?;
+                    operation.field("tag", "after")
+                })
+            })
+            .to_string(),
             indoc! {"
                 nested [
                     tag=before,
                     body={
                         lambda %0:f64 .
-                        let %1:f64 = identity %0
+                        let %1:f64 = stop_gradient %0
                         in (%1)
                     },
                     tag=after,
@@ -570,18 +458,16 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    
     #[test]
     fn test_operation() {
-        let operation = IdentityOperation;
+        let operation = StopGradientOperation;
+
+        // Check required inference and the default operation contract.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            operation.infer_output_types(&[], &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),
         );
-        assert_eq!(render_operation(&operation), "identity");
-
         let region_interfaces = [
             RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE),
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
@@ -592,24 +478,16 @@ mod tests {
         assert_eq!(Operation::<DataType>::output_region_provenance(&operation, 0), Vec::new());
         assert!(!Operation::<DataType>::is_zero(&operation, 0));
         assert_eq!(Operation::<DataType>::effects(&operation), Effects::PURE);
-        assert_eq!(
+        assert!(matches!(
             Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
-            Ok(operation.clone()),
+            Ok(StopGradientOperation),
+        ));
+        assert_eq!(
+            std::fmt::from_fn(|formatter| Operation::<DataType>::render(&operation, formatter, 0)).to_string(),
+            "stop_gradient",
         );
 
-        // Test interpretation.
-        assert_eq!(
-            operation.interpret(&EagerContext::<Scalar>::new(), &EmptyRegionDriver, &[Scalar::from(3.0)],),
-            Ok(vec![Scalar::from(3.0)]),
-        );
-        assert_eq!(
-            operation.interpret(&EagerContext::<Scalar>::new(), &EmptyRegionDriver, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-    }
-
-    #[test]
-    fn test_boxed_operation_forwards_complete_contract() {
+        /// Test operation that makes every [`Operation`] method's forwarding observable.
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct ForwardingOperation {
             renamed: bool,
@@ -664,6 +542,7 @@ mod tests {
             }
         }
 
+        // Check that `Box<O>` forwards every method rather than silently falling back to a trait default.
         let operation = Box::new(ForwardingOperation { renamed: false });
         let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
 
@@ -685,6 +564,9 @@ mod tests {
             Operation::<DataType>::rename_type_identities(&operation, &TypeIdentityRenaming::new()),
             Ok(Box::new(ForwardingOperation { renamed: true })),
         );
-        assert_eq!(render_operation(&operation), "forwarded");
+        assert_eq!(
+            std::fmt::from_fn(|formatter| Operation::<DataType>::render(&operation, formatter, 0)).to_string(),
+            "forwarded",
+        );
     }
 }
