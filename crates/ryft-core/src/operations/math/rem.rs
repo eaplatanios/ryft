@@ -92,9 +92,9 @@ define_elementwise_capability!(
 );
 
 define_tracer_operator!(
-    @binary_provider std::ops::Rem,
+    @binary std::ops::Rem,
     rem,
-    RemOperationFor,
+    provider = RemOperationFor,
     "`rem` operation failed",
 );
 

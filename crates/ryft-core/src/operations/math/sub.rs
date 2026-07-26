@@ -70,7 +70,7 @@ define_elementwise_capability!(
     SubOperation,
 );
 
-define_tracer_operator!(@binary_provider std::ops::Sub, sub, SubOperationFor, "`sub` operation failed");
+define_tracer_operator!(@binary std::ops::Sub, sub, provider = SubOperationFor, "`sub` operation failed");
 
 #[cfg(test)]
 mod tests {

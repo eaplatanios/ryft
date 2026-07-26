@@ -166,7 +166,7 @@ define_elementwise_capability!(
     MulOperation,
 );
 
-define_tracer_operator!(@binary_provider std::ops::Mul, mul, MulOperationFor, "`mul` operation failed");
+define_tracer_operator!(@binary std::ops::Mul, mul, provider = MulOperationFor, "`mul` operation failed");
 
 #[cfg(test)]
 mod tests {

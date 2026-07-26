@@ -2478,8 +2478,6 @@ macro_rules! impl_nullary_batchable_operation {
     };
 }
 
-// TODO(eaplatanios): Should `@binary_provider` just be inferred from the existence of the `$provider` argument?
-//  Also, does it really need to be an entirely separate branch? Is it really so different from `@binary`?
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
 /// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
@@ -2496,18 +2494,22 @@ macro_rules! impl_nullary_batchable_operation {
 /// directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal (e.g.,
 /// no `Type = ArrayType` pin is needed on the batching arm).
 ///
+/// Binary invocations may provide a unit-struct operation directly or use `provider = ProviderTrait` when the operation
+/// type depends on the program's [`Type`](crate::Type) family. A provider constructs its associated operation from both
+/// operand types. Provider-construction failures poison ordinary staged tracers and fail immediately for direct-binding
+/// transform tracers, preserving each tracer family's established error behavior.
+///
 /// # Parameters
 ///
-///   - `@unary` / `@binary` / `@binary_provider`: Selects the operator shape to stamp out.
+///   - `@unary` / `@binary`: Selects the operator shape to stamp out.
 ///     `@unary` produces `fn(self) -> Self` operators and `@binary` produces `fn(self, Self) -> Self` operators.
-///     `@binary_provider` produces binary operators whose operation is selected and constructed by a type-level
-///     provider trait. This form supports one operator across program type families that use distinct operation types.
 ///   - `$trait`: Path to the foreign `std::ops` operator trait to implement (e.g., `std::ops::Add`).
 ///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
 ///   - `$operation`: Path to the unit-struct operation, used both as the `From` bound target and as the value bound
-///     through each tracer's context (e.g., `AddOperation`).
-///   - `$provider`: Path to a type-level provider trait with an associated `Operation` type and a fallible
-///     `operation(left_type, right_type)` constructor.
+///     through each tracer's context (e.g., `AndOperation`).
+///   - `provider = $provider`: Selects and constructs a binary operation through a type-level provider trait with an
+///     associated `Operation` type and a fallible `operation(left_type, right_type)` constructor. This form supports
+///     one operator across program type families that use distinct operation types.
 ///   - `$message`: Panic message used when an eager tracer's bind fails.
 #[macro_export]
 macro_rules! define_tracer_operator {
@@ -2568,8 +2570,8 @@ macro_rules! define_tracer_operator {
         }
     };
 
-    // This branch statically selects and constructs a type-family-specific binary operation for every tracer family.
-    (@binary_provider $trait:path, $method:ident, $provider:path, $message:literal $(,)?) => {
+    // This binary form statically selects and constructs a type-family-specific operation through a provider.
+    (@binary $trait:path, $method:ident, provider = $provider:path, $message:literal $(,)?) => {
         impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
         where
             C::Type: $provider,
@@ -4523,9 +4525,9 @@ mod tests {
     );
 
     define_tracer_operator!(
-        @binary_provider TestProvidedBinaryOperator,
+        @binary TestProvidedBinaryOperator,
         apply_provided_binary,
-        TestOperationFor,
+        provider = TestOperationFor,
         "test provided binary operation failed",
     );
 
@@ -6111,7 +6113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_define_tracer_operator_binary_provider() {
+    fn test_define_tracer_operator_binary_with_provider() {
         // The scalar universe selects the ordinary elementwise test operation.
         let context = TracingContext::<Scalar, TestBinaryOperation>::new();
         let left = context.input(DataType::F32);

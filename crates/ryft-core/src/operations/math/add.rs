@@ -71,7 +71,7 @@ define_elementwise_capability!(
     AddOperation,
 );
 
-define_tracer_operator!(@binary_provider std::ops::Add, add, AddOperationFor, "`add` operation failed");
+define_tracer_operator!(@binary std::ops::Add, add, provider = AddOperationFor, "`add` operation failed");
 
 #[cfg(test)]
 mod tests {

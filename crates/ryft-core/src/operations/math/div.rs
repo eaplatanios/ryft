@@ -94,7 +94,7 @@ define_elementwise_capability!(
     DivOperation,
 );
 
-define_tracer_operator!(@binary_provider std::ops::Div, div, DivOperationFor, "`div` operation failed");
+define_tracer_operator!(@binary std::ops::Div, div, provider = DivOperationFor, "`div` operation failed");
 
 #[cfg(test)]
 mod tests {
