@@ -289,11 +289,12 @@ ledger disagrees with Git.
 
 ## P2a: dimension SSA foundations
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2a-dimension-ssa-foundations`
 - Source commit: `e73dde1d4cebf560d5abfead1ce44132e0bd3124`
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Integration commit: `1693157b44d3b44cdee962c8574dbedf3f80314e`, followed by owner review correction
+  `bede731d2968a5deb3d5013c8bfb8d4ac62f9cce`
+- Remainder reconciliation commit: `e3e4df58eaadba0d20cf3204aa3022650b5e62da`
 - Immutable archive unchanged: yes
 - Scope: introduce the homogeneous `DimensionType`/`DimensionValue` SSA foundation and checked dimension arithmetic
   operation family without yet introducing assertions, the heterogeneous array/dimension storage sum, or projected
@@ -326,5 +327,40 @@ ledger disagrees with Git.
   arithmetic error name, projection wrapper, replay hook, or expression representation was introduced; comparisons,
   gateways, `dimension_size`, requirements, the storage sum, and direct projected binding remain assigned to their
   explicit later increments
+- Review method: line by line
+- Next action: none
+
+## P2b: ordered dimension requirements
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p2b-ordered-dimension-requirements`
+- Source commit: `b5f38959b3cdba68b96a0c84b387224fabf32cda`
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Scope: add homogeneous equality, less-than-or-equal, positive-divisibility, and explicit-bounds requirements;
+  classify them from local exact/identity/interval facts; and integrate inconclusive checks with ordered effects and
+  ordinary partial-evaluation placement
+- Deferred: comparisons, gateways, `dimension_size`, and the storage sum remain in later P2/P3 increments;
+  graph-wide entailment over producer arithmetic, preceding requirements, and nested regions remains in P4; backend
+  assertion lowering remains in P7
+- Implemented: adds one `DimensionRequirementOperation` payload parameterized by equality, less-than-or-equal,
+  positive-divisibility, and explicit-bounds predicates. The private operand representation and public constructors
+  enforce unary/binary arity without four nominal operation types. The same exact/shared-variable/interval fact lattice
+  drives inference effects and partial evaluation, while refined literal operands keep the operation's declared names
+  in diagnostics.
+- Effects and placement: proven requirements are pure and disappear under ordinary simplification; statically
+  impossible requirements return typed `DimensionError`s; inconclusive requirements carry the restored
+  `Effect::OrderedAssertion`, survive zero-result DCE in source order, execute eagerly with observed-value diagnostics,
+  and either fold on the known side or residualize exactly once according to ordinary partial-evaluation placement.
+- Verification: `cargo check -p ryft-core` and `cargo check -p ryft-xla` passed; all 936 core library tests passed; core
+  doctests passed 43 tests with 13 ignored; `cargo test -p ryft-xla --lib` passed 396 tests with one documented ignored
+  benchmark; focused requirement and effect tests passed; `cargo fmt --all -- --check` and `git diff --check` passed.
+- Lint audit: strict core Clippy remains blocked by the inherited repository-wide warning backlog; its diagnostic list
+  contains no warning in the P2b dimension or effect files.
+- Residual search: the production tree contains one requirement payload and one outer operation-family variant; there
+  is no nominal per-predicate operation type, expression/witness representation, requirement-specific program path, or
+  backend assertion lowering. `OrderedAssertion` appears only in the generic effect definition/tests and the
+  requirement effect/test sites.
 - Review method: line by line
 - Next action: stage the no-commit integration merge for owner review

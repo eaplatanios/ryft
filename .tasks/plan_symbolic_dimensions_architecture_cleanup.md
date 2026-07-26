@@ -1003,10 +1003,23 @@ vertical and third-member extensibility gates.
 
 - [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
       arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
+- [x] P2b: introduce equality, less-than-or-equal, positive-divisibility, and explicit-bounds requirements as one
+      homogeneous dimension-operation payload. Keep the payload tagged because every predicate has the same semantic
+      contract and transformation behavior; distinct nominal operation types would only multiply dispatch and trait
+      implementations.
+- [x] P2b: classify each requirement from exact, shared-identity, and interval facts as proven, disproven, or
+      inconclusive. Proven requirements are pure and erasable, disproven requirements return the owning
+      `DimensionError`, and inconclusive requirements carry `Effect::OrderedAssertion`.
+- [x] P2b: preserve source order and DCE survival for inconclusive requirements, fold all-known requirements on the
+      known side, retain any unknown-side requirement exactly once in the residual program, and include named observed
+      values in eager/known-side failures.
+- [x] P2b gate: focused tests pin all proof outcomes, exact diagnostics, rendering, eager interpretation, simplification,
+      partial-evaluation placement, and deterministic first-failure order. Graph-wide entailment across preceding
+      requirements and nested regions remains assigned to P4.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
 - [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
-- [ ] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
+- [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
       lowering.
 - [ ] Complete the Phase 0 projection-ownership decision before writing the generic projection trait.
