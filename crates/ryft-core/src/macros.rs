@@ -676,6 +676,177 @@ macro_rules! define_elementwise_capability {
     };
 }
 
+/// Defines one nominal binary first-class-dimension arithmetic operation and its value-level capability.
+///
+/// The caller supplies only the operation-specific documentation, names, result metadata derivation, and checked
+/// extent calculation. Shared operand storage, type inference, identity renaming, interpretation-independent
+/// capability dispatch, rendering, and partial-evaluation behavior come from
+/// [`ArithmeticDimensionOperation`](crate::operations::dimensions::ArithmeticDimensionOperation).
+macro_rules! define_arithmetic_dimension_operation {
+    // This branch defines one nominal binary dimension primitive and its matching value capability.
+    (
+        $(#[$capability_documentation:meta])*
+        capability $capability:ident {
+            $(#[$method_documentation:meta])*
+            fn $method:ident;
+        }
+        $(#[$operation_documentation:meta])*
+        operation $operation:ident {
+            name = $operation_name:expr,
+            result_name = $result_name:expr,
+            infer_bounds = $infer_bounds:expr,
+            evaluate = $evaluate:expr $(,)?
+        }
+    ) => {
+        $(#[$operation_documentation])*
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
+        pub struct $operation {
+            /// Shared operand and result metadata for this arithmetic dimension operation.
+            metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata,
+        }
+
+        impl $operation {
+            /// Creates a new operation and derives its fresh bounded result dimension.
+            pub fn new(
+                left: &$crate::types::DimensionType,
+                right: &$crate::types::DimensionType,
+            ) -> Result<Self, $crate::types::DimensionError> {
+                let result_name = ($result_name)(left, right);
+                let result_bounds = ($infer_bounds)(left, right)?;
+                Ok(Self {
+                    metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata::new(
+                        left,
+                        right,
+                        result_name,
+                        result_bounds,
+                    ),
+                })
+            }
+
+            /// Returns the expected left operand type.
+            #[inline]
+            pub fn left_type(&self) -> &$crate::types::DimensionType {
+                self.metadata.left_type()
+            }
+
+            /// Returns the expected right operand type.
+            #[inline]
+            pub fn right_type(&self) -> &$crate::types::DimensionType {
+                self.metadata.right_type()
+            }
+
+            /// Returns this operation's fresh result type.
+            #[inline]
+            pub fn result_type(&self) -> $crate::types::DimensionType {
+                self.metadata.result_type()
+            }
+        }
+
+        impl ::std::fmt::Display for $operation {
+            #[inline]
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                <$operation as $crate::programs::operations::Operation<$crate::types::DimensionType>>::render(
+                    self,
+                    formatter,
+                    0,
+                )
+            }
+        }
+
+        impl $crate::programs::operations::Operation<$crate::types::DimensionType> for $operation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                $operation_name
+            }
+
+            #[inline]
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::types::DimensionType],
+                _region_interfaces: &[$crate::programs::regions::RegionInterface<$crate::types::DimensionType>],
+            ) -> Result<Vec<$crate::types::DimensionType>, $crate::programs::types::TypeError> {
+                $crate::operations::dimensions::ArithmeticDimensionOperation::infer_output_types(self, input_types)
+            }
+
+            #[inline]
+            fn rename_type_identities(
+                &self,
+                renaming: &$crate::programs::identities::TypeIdentityRenaming<$crate::types::DimensionVariable>,
+            ) -> Result<Self, $crate::programs::types::TypeError> {
+                Ok(Self { metadata: self.metadata.rename_type_identities(renaming)? })
+            }
+        }
+
+        impl $crate::operations::dimensions::ArithmeticDimensionOperation for $operation {
+            #[inline]
+            fn left_type(&self) -> &$crate::types::DimensionType {
+                $operation::left_type(self)
+            }
+
+            #[inline]
+            fn right_type(&self) -> &$crate::types::DimensionType {
+                $operation::right_type(self)
+            }
+
+            #[inline]
+            fn result_type(&self) -> $crate::types::DimensionType {
+                $operation::result_type(self)
+            }
+
+            #[inline]
+            fn evaluate_extents(
+                &self,
+                left: usize,
+                right: usize,
+            ) -> Result<usize, $crate::types::DimensionError> {
+                ($evaluate)(self.left_type(), left, self.right_type(), right)
+            }
+        }
+
+        impl<
+            C: $crate::contexts::Context<
+                Type = $crate::types::DimensionType,
+                Operation: ::std::convert::From<Self>,
+            >,
+        > $crate::partial::PartiallyEvaluatableOperation<C> for $operation
+        {
+        }
+
+        $(#[$capability_documentation])*
+        pub trait $capability: Sized {
+            $(#[$method_documentation])*
+            fn $method(&self, right: &Self) -> Result<Self, $crate::programs::ProgramError>;
+        }
+
+        impl<
+            V: $crate::programs::values::Value<
+                Type = $crate::types::DimensionType,
+                DispatchDomain: $crate::contexts::Context<Operation: ::std::convert::From<$operation>>,
+            >,
+        > $capability for V
+        {
+            #[inline]
+            fn $method(&self, right: &Self) -> Result<Self, $crate::programs::ProgramError> {
+                let left_type = $crate::programs::types::Typed::r#type(self);
+                let right_type = $crate::programs::types::Typed::r#type(right);
+                let operation = $operation::new(
+                    left_type.as_ref(),
+                    right_type.as_ref(),
+                )?;
+                Ok($crate::contexts::Context::bind(
+                    &$crate::programs::values::Value::dispatch_domain(self),
+                    operation,
+                    Vec::new(),
+                    &[self.clone(), right.clone()],
+                )?
+                .remove(0))
+            }
+        }
+    };
+}
+
+pub(crate) use define_arithmetic_dimension_operation;
+
 /// Implements complete forward-mode differentiation (i.e., the Jacobian-Vector Product, or JVP, tranform) and primitive
 /// transposition rules for an [`Operation`](crate::Operation). The caller supplies the operation-specific algorithms
 /// while this macro generates the common [`DifferentiableOperation`](crate::DifferentiableOperation) and

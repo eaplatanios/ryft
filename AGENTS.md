@@ -91,6 +91,10 @@ update this file so that they do not need to remind you again in the future.
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
 - When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
   inherent methods and trait methods, to the extent possible.
+- Model first-class dimension arithmetic as one nominal operation type per primitive and centralize only the genuinely
+  shared contract in `ArithmeticDimensionOperation`, following `ElementwiseOperation`. Do not encode arithmetic
+  selection as a tag inside one payload or reuse stateless array/scalar arithmetic payloads that cannot retain a fresh
+  dimension result identity and bounds.
 - For simple capability/provider impls, keep bounds to the minimum needed for the impl target to be well-formed and for
   the method body to type-check. Do not copy broader bounds from neighboring trait impls unless the provider method
   itself uses the capability.

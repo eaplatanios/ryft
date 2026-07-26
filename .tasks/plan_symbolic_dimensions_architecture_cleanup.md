@@ -1003,9 +1003,12 @@ and generic borrowed/consuming member projection. `P2d` adds direct zero-state p
 vertical and third-member extensibility gates.
 
 At the owner's request, `P2b.1` moves the now-stable arithmetic and requirement primitives into canonical
-`operations::dimensions` submodules and introduces their user-facing capability traits before P2c. This advances only
-the primitive-operation ownership portion of Phase 9: concrete host values and the reference backend's closed
-operation family remain under `backends`, while neutral `RuntimeDimension`/`RuntimeShape` API placement remains in P9.
+`operations::dimensions` submodules and introduces their user-facing capability traits before P2c. Arithmetic uses
+one nominal payload and capability per primitive, with shared behavior centralized by
+`ArithmeticDimensionOperation`; this flattens stored-program dispatch to the outer operation-family selection without
+duplicating inference or identity plumbing. This advances only the primitive-operation ownership portion of Phase 9:
+concrete host values and the reference backend's closed operation family remain under `backends`, while neutral
+`RuntimeDimension`/`RuntimeShape` API placement remains in P9.
 
 - [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
       arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
@@ -1022,6 +1025,8 @@ operation family remain under `backends`, while neutral `RuntimeDimension`/`Runt
 - [x] P2b gate: focused tests pin all proof outcomes, exact diagnostics, rendering, eager interpretation, simplification,
       partial-evaluation placement, and deterministic first-failure order. Graph-wide entailment across preceding
       requirements and nested regions remains assigned to P4.
+- [x] P2b.1: move dimension primitives into canonical operation modules, replace tagged arithmetic with nine nominal
+      payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
 - [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.

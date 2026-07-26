@@ -367,21 +367,24 @@ ledger disagrees with Git.
 
 ## P2b.1: canonical dimension operation modules
 
-- Status: in progress (plan ready for owner review)
+- Status: implementation ready for owner review
 - Branch: `u/eaplatanios/increment/p2b1-dimension-operation-modules`
 - Source commit: pending implementation
 - Integration commit: pending owner review
 - Remainder reconciliation commit: pending integration
 - Immutable archive unchanged: yes
-- Scope: move the stable dimension arithmetic and requirement primitive payloads into one canonical
-  `operations::dimensions` submodule per payload; add documented user-facing capability traits; and leave only concrete
-  host values, eager adapters, and the reference operation family under backend ownership
+- Scope: replace tagged dimension arithmetic with one nominal type and capability per primitive, share their common
+  operation contract through `ArithmeticDimensionOperation`, move arithmetic and requirement primitives into one
+  canonical `operations::dimensions` submodule per payload, and leave concrete host values, eager adapters, and the
+  reference operation family under backend ownership
 - Deferred: the heterogeneous storage sum and generic projection remain P2c; projected binding remains P2d; mixed
   shape operations remain P3; neutral runtime-dimension API placement and final public-path audit remain P9
 - Plan: `.tasks/plan_dimension_operation_modules.md`
-- Verification: plan structure, ownership inventory, API names, documentation contract, unit-test placement, residual
-  searches, and full implementation gates are specified; no production code has changed at this review gate
-- Residual search: deferred to implementation; the plan names exact searches for old backend ownership, selector
-  names, production backend dependencies, duplicate semantics, and duplicated tests
-- Review method: line by line, with the plan reviewed before production implementation begins
-- Next action: owner reviews or edits `.tasks/plan_dimension_operation_modules.md`
+- Verification: formatting and diff hygiene, 943 `ryft-core` library tests, 53 executable `ryft-core` doctests, 396
+  `ryft-xla` library tests, focused operation/requirement tests, and changed-file clippy diagnostics
+- Residual search: no `DimensionArithmetic` or `DimensionArithmeticOperation`; exactly nine nominal arithmetic
+  payload modules and backend-family variants; no arithmetic selector enum; no production operation-to-backend
+  dependency; no duplicate backend arithmetic semantics
+- Review method: line by line, with the plan reviewed before production implementation and a final minimality and
+  dispatch-boundary audit after verification
+- Next action: stage the implementation on `u/eaplatanios/dynamic-shapes` for owner review

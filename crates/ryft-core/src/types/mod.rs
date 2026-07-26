@@ -7,7 +7,8 @@ pub mod memories;
 pub use arrays::{ArrayType, ArrayTypeRefinements};
 pub use data::{DataType, DataTypeError};
 pub use dimensions::{
-    Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, Shape, StaticShape,
+    Dimension, DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape,
+    StaticShape,
 };
 pub use layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 pub use memories::Memory;

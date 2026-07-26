@@ -13,6 +13,12 @@ use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError};
 
+/// Largest runtime dimension extent that every supported backend representation can carry.
+///
+/// Host values use [`usize`], while compiled dimension SSA uses a signed 64-bit scalar. On narrower hosts every
+/// [`usize`] fits; on 64-bit hosts this excludes values that cannot be lowered without changing their meaning.
+pub const MAX_DIMENSION_EXTENT: usize = if usize::BITS < i64::BITS { usize::MAX } else { i64::MAX as usize };
+
 /// Errors produced while constructing or validating [`Dimension`]s.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum DimensionError {
