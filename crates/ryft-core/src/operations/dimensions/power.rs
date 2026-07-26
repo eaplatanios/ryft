@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
-use super::{bounds_overflow, checked_power, evaluation_overflow, representable_extent_range};
+use super::{bounds_overflow, checked_power, representable_extent_range};
 
 /// Canonical operation name for [`DimensionPowerOperation`].
 pub const DIMENSION_POWER_OPERATION_NAME: &str = "dimension_power";
@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionPower`] for semantic details and an example.
     DimensionPowerOperation, DIMENSION_POWER_OPERATION_NAME,
+    DimensionPower, raise_dimension_to_power_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} ^ {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -35,6 +35,7 @@ define_arithmetic_dimension_capability!(
     DimensionPower,
     /// Returns `self` raised to the nonnegative integer power `right`.
     raise_dimension_to_power(right),
+    raise_dimension_to_power_with(right, operation),
     DimensionPowerOperation,
 );
 
@@ -62,18 +63,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     DimensionBounds::new(lower, maximum.checked_add(1))
 }
 
-/// Evaluates checked dimension exponentiation.
-fn evaluate(
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    checked_power(left, right).ok_or_else(|| {
-        evaluation_overflow("raising a runtime dimension to a dimension power", left_type, left, right_type, right)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -91,8 +80,6 @@ mod tests {
         let operation = DimensionPowerOperation::new(&base, &exponent).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_POWER_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(0, Some(5)).unwrap());
-        assert_eq!(evaluate(&base, 2, &exponent, 2), Ok(4));
-        assert_eq!(evaluate(&base, 0, &exponent, 0), Ok(1));
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()

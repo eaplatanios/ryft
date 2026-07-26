@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, ValueResolution};
+use crate::contexts::{Context, Domain, ValueResolution};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -65,59 +66,68 @@ pub enum DimensionRequirementPredicate {
 /// # }
 /// ```
 pub trait DimensionRequirement: Sized {
+    /// Applies `operation` to `self` and its optional right operand.
+    fn require_with(&self, right: Option<&Self>, operation: &DimensionRequirementOperation)
+    -> Result<(), ProgramError>;
+
     /// Requires `self == right`.
-    fn require_equal(&self, right: &Self) -> Result<(), ProgramError>;
+    #[inline]
+    fn require_equal(&self, right: &Self) -> Result<(), ProgramError>
+    where
+        Self: Typed<Type = DimensionType>,
+    {
+        self.require_with(Some(right), &DimensionRequirementOperation::equal(&self.r#type(), &right.r#type()))
+    }
 
     /// Requires `self <= right`.
-    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError>;
+    #[inline]
+    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError>
+    where
+        Self: Typed<Type = DimensionType>,
+    {
+        self.require_with(
+            Some(right),
+            &DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type()),
+        )
+    }
 
     /// Requires `right` to be positive and to divide `self` exactly.
-    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError>;
+    #[inline]
+    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError>
+    where
+        Self: Typed<Type = DimensionType>,
+    {
+        self.require_with(Some(right), &DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type()))
+    }
 
     /// Requires `self` to lie within `bounds`.
-    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError>;
+    #[inline]
+    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError>
+    where
+        Self: Typed<Type = DimensionType>,
+    {
+        self.require_with(None, &DimensionRequirementOperation::bounds(&self.r#type(), bounds))
+    }
 }
 
-impl<V: Value<Type = DimensionType, DispatchDomain: Context<Operation: From<DimensionRequirementOperation>>>>
-    DimensionRequirement for V
+impl<V: Value<Type = DimensionType>> DimensionRequirement for V
+where
+    V::DispatchDomain: Context<Type = DimensionType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionRequirementOperation>,
 {
-    #[inline]
-    fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::equal(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::bounds(&self.r#type(), bounds),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+    fn require_with(
+        &self,
+        right: Option<&Self>,
+        operation: &DimensionRequirementOperation,
+    ) -> Result<(), ProgramError> {
+        match right {
+            Some(right) => {
+                self.dispatch_domain().bind(operation.clone(), Vec::new(), &[self.clone(), right.clone()])?;
+            }
+            None => {
+                self.dispatch_domain().bind(operation.clone(), Vec::new(), std::slice::from_ref(self))?;
+            }
+        }
         Ok(())
     }
 }
@@ -511,6 +521,21 @@ impl Operation<DimensionType> for DimensionRequirementOperation {
             }
             _ => formatter.write_str(self.name()),
         }
+    }
+}
+
+impl<C: Domain<Type = DimensionType, Value: DimensionRequirement>> InterpretableOperation<C>
+    for DimensionRequirementOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, self.input_count(), ProgramError);
+        inputs[0].require_with(inputs.get(1), self)?;
+        Ok(Vec::new())
     }
 }
 

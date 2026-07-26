@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionSubtractClamped`] for semantic details and an example.
     DimensionSubtractClampedOperation, DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME,
+    DimensionSubtractClamped, subtract_dimension_clamped_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -36,6 +36,7 @@ define_arithmetic_dimension_capability!(
     DimensionSubtractClamped,
     /// Returns `max(0, self - right)`.
     subtract_dimension_clamped(right),
+    subtract_dimension_clamped_with(right, operation),
     DimensionSubtractClampedOperation,
 );
 
@@ -47,16 +48,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
         left_lower.saturating_sub(right_maximum),
         left_maximum.saturating_sub(right_lower).checked_add(1),
     )
-}
-
-/// Evaluates clamped dimension subtraction.
-fn evaluate(
-    _left_type: &DimensionType,
-    left: usize,
-    _right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    Ok(left.saturating_sub(right))
 }
 
 #[cfg(test)]
@@ -76,8 +67,6 @@ mod tests {
         let operation = DimensionSubtractClampedOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(0, Some(3)).unwrap());
-        assert_eq!(evaluate(&left, 3, &right, 7), Ok(0));
-        assert_eq!(evaluate(&left, 4, &right, 2), Ok(2));
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()

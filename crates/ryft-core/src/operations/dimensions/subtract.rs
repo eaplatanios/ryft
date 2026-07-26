@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
-use super::{representable_extent_range, requirement_violation};
+use super::representable_extent_range;
 
 /// Canonical operation name for [`DimensionSubtractOperation`].
 pub const DIMENSION_SUBTRACT_OPERATION_NAME: &str = "dimension_subtract";
@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionSubtract`] for semantic details and an example.
     DimensionSubtractOperation, DIMENSION_SUBTRACT_OPERATION_NAME,
+    DimensionSubtract, subtract_dimension_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} - {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -36,6 +36,7 @@ define_arithmetic_dimension_capability!(
     DimensionSubtract,
     /// Returns `self - right`, failing if `right` is greater than `self`.
     subtract_dimension(right),
+    subtract_dimension_with(right, operation),
     DimensionSubtractOperation,
 );
 
@@ -51,30 +52,12 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     DimensionBounds::new(left_lower.saturating_sub(right_maximum), (left_maximum - right_lower).checked_add(1))
 }
 
-/// Evaluates checked dimension subtraction.
-fn evaluate(
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    left.checked_sub(right).ok_or_else(|| {
-        requirement_violation(
-            format!("{} >= {}", left_type.variable(), right_type.variable()),
-            left_type,
-            left,
-            right_type,
-            right,
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::dimensions::DimensionValue;
-    use crate::types::{DimensionBounds, DimensionError};
+    use crate::types::DimensionBounds;
 
     use super::super::test_dimension_type;
     use super::*;
@@ -86,7 +69,6 @@ mod tests {
         let operation = DimensionSubtractOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_SUBTRACT_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(0, Some(8)).unwrap());
-        assert_eq!(evaluate(&left, 7, &right, 3), Ok(4));
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()
@@ -94,12 +76,6 @@ mod tests {
                 .unwrap()
                 .extent(),
             4,
-        );
-        assert_eq!(
-            evaluate(&left, 1, &right, 3),
-            Err(DimensionError::RequirementViolation {
-                message: "left >= right; observed left=1, right=3".to_string(),
-            }),
         );
     }
 }

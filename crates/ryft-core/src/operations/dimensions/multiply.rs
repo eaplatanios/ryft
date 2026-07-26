@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
-use super::{bounds_overflow, evaluation_overflow, representable_extent_range};
+use super::{bounds_overflow, representable_extent_range};
 
 /// Canonical operation name for [`DimensionMultiplyOperation`].
 pub const DIMENSION_MULTIPLY_OPERATION_NAME: &str = "dimension_multiply";
@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionMultiply`] for semantic details and an example.
     DimensionMultiplyOperation, DIMENSION_MULTIPLY_OPERATION_NAME,
+    DimensionMultiply, multiply_dimension_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} * {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -35,6 +35,7 @@ define_arithmetic_dimension_capability!(
     DimensionMultiply,
     /// Returns the checked product of `self` and `right`.
     multiply_dimension(right),
+    multiply_dimension_with(right, operation),
     DimensionMultiplyOperation,
 );
 
@@ -46,17 +47,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     let lower = left_lower.checked_mul(right_lower).ok_or_else(overflow)?;
     let maximum = left_maximum.saturating_mul(right_maximum).min(MAX_DIMENSION_EXTENT);
     DimensionBounds::new(lower, maximum.checked_add(1))
-}
-
-/// Evaluates checked dimension multiplication.
-fn evaluate(
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    left.checked_mul(right)
-        .ok_or_else(|| evaluation_overflow("multiplying runtime dimensions", left_type, left, right_type, right))
 }
 
 #[cfg(test)]
@@ -76,7 +66,6 @@ mod tests {
         let operation = DimensionMultiplyOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MULTIPLY_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(2, Some(33)).unwrap());
-        assert_eq!(evaluate(&left, 7, &right, 3), Ok(21));
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()

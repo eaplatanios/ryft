@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 
-use super::{bounds_overflow, evaluation_overflow, representable_extent_range};
+use super::{bounds_overflow, representable_extent_range};
 
 /// Canonical operation name for [`DimensionAddOperation`].
 pub const DIMENSION_ADD_OPERATION_NAME: &str = "dimension_add";
@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionAdd`] for semantic details and an example.
     DimensionAddOperation, DIMENSION_ADD_OPERATION_NAME,
+    DimensionAdd, add_dimension_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} + {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -39,6 +39,7 @@ define_arithmetic_dimension_capability!(
     DimensionAdd,
     /// Returns the checked sum of `self` and `right`.
     add_dimension(right),
+    add_dimension_with(right, operation),
     DimensionAddOperation,
 );
 
@@ -50,17 +51,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     let lower = left_lower.checked_add(right_lower).ok_or_else(overflow)?;
     let maximum = left_maximum.saturating_add(right_maximum).min(MAX_DIMENSION_EXTENT);
     DimensionBounds::new(lower, maximum.checked_add(1))
-}
-
-/// Evaluates checked dimension addition.
-fn evaluate(
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    left.checked_add(right)
-        .ok_or_else(|| evaluation_overflow("adding runtime dimensions", left_type, left, right_type, right))
 }
 
 #[cfg(test)]
@@ -90,7 +80,6 @@ mod tests {
         assert_ne!(operation.result_type().variable(), left.variable());
         assert_ne!(operation.result_type().variable(), right.variable());
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(3, Some(13)).unwrap());
-        assert_eq!(evaluate(&left, 7, &right, 3), Ok(10));
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()

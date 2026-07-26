@@ -2,7 +2,7 @@ use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_di
 use crate::parameters::Parameter;
 use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
-use super::{positive_divisor_lower_bound, representable_extent_range, requirement_violation};
+use super::{positive_divisor_lower_bound, representable_extent_range};
 
 /// Canonical operation name for [`DimensionRemainderOperation`].
 pub const DIMENSION_REMAINDER_OPERATION_NAME: &str = "dimension_remainder";
@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionRemainder`] for semantic details and an example.
     DimensionRemainderOperation, DIMENSION_REMAINDER_OPERATION_NAME,
+    DimensionRemainder, remainder_dimension_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("{} % {}", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -35,6 +35,7 @@ define_arithmetic_dimension_capability!(
     DimensionRemainder,
     /// Returns `self % right`, failing when `right` is zero.
     remainder_dimension(right),
+    remainder_dimension_with(right, operation),
     DimensionRemainderOperation,
 );
 
@@ -46,26 +47,12 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     DimensionBounds::new(0, left_maximum.min(right_maximum - 1).checked_add(1))
 }
 
-/// Evaluates checked dimension remainder.
-fn evaluate(
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    if right == 0 {
-        Err(requirement_violation(format!("{} > 0", right_type.variable()), left_type, left, right_type, right))
-    } else {
-        Ok(left % right)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::dimensions::DimensionValue;
-    use crate::types::{DimensionBounds, DimensionError};
+    use crate::types::DimensionBounds;
 
     use super::super::test_dimension_type;
     use super::*;
@@ -77,7 +64,6 @@ mod tests {
         let operation = DimensionRemainderOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_REMAINDER_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(0, Some(4)).unwrap());
-        assert_eq!(evaluate(&left, 7, &right, 3), Ok(1));
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()
@@ -85,10 +71,6 @@ mod tests {
                 .unwrap()
                 .extent(),
             1,
-        );
-        assert_eq!(
-            evaluate(&left, 7, &right, 0),
-            Err(DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
         );
     }
 }

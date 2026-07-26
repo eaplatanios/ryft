@@ -399,15 +399,15 @@ ledger disagrees with Git.
 - Integration commit: pending owner review
 - Remainder reconciliation commit: `fa34b4ffe` (reconciles reviewed P2b.1 into the mutable remainder)
 - Immutable archive unchanged: yes
-- Scope: remove the concrete `DimensionValue` dependency from generic arithmetic operation generation, restore
-  backend-owned eager adapters, and expose only the smallest checked concrete-extent semantic hook needed by those
-  adapters
+- Scope: remove the concrete `DimensionValue` dependency from generic arithmetic operation generation, make each
+  operation own generic capability-constrained interpretation, and make the reference backend own concrete dimension
+  capability implementations
 - Deferred: the heterogeneous storage sum and generic projection remain P2c; projected binding remains P2d; no
   operation, capability, bounds, or diagnostic semantics change in this correction
-- Verification: formatting and diff hygiene, `cargo check -p ryft-core -p ryft-xla`, 946 `ryft-core` library tests,
-  53 executable `ryft-core` doctests, and 396 `ryft-xla` library tests
-- Residual search: `rg -n 'backends::dimensions' crates/ryft-core/src/macros.rs
-  crates/ryft-core/src/operations/dimensions` reports only test imports of the reference eager value; generic operation
-  generation and production dimension-operation modules no longer depend on the backend
+- Verification: formatting and diff hygiene, `cargo check -p ryft-core -p ryft-xla`, focused dimension/backend/macro
+  tests, 946 `ryft-core` library tests, 53 executable `ryft-core` doctests, and 396 `ryft-xla` library tests
+- Residual search: no arithmetic `evaluate` hook, backend-owned arithmetic/requirement `InterpretableOperation`, rich
+  `DimensionValue::DispatchDomain`, or production operation-to-backend dependency remains; the requirement predicate's
+  shared `evaluate_extents` is intentionally retained for eager enforcement and known-side reasoning
 - Review method: line by line
-- Next action: stage the no-commit integration merge for owner review
+- Next action: refresh the existing no-commit integration merge for owner review

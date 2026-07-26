@@ -41,9 +41,9 @@ pub use subtract_clamped::{
 
 /// Shared contract implemented by binary first-class-dimension arithmetic operations.
 ///
-/// Concrete operations own their bounds formula and checked calculation. This trait centralizes the common two-input
-/// type validation and fresh-result contract, allowing operation families and eager backends to dispatch once to a
-/// nominal operation type and then invoke its statically selected implementation.
+/// Each nominal operation owns its bounds formula and is paired with a value capability. This trait centralizes the
+/// common two-input type validation and fresh-result contract without imposing a concrete backend value
+/// representation.
 pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
     /// Returns the declared left operand type.
     fn left_type(&self) -> &DimensionType;
@@ -53,13 +53,6 @@ pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
 
     /// Returns the fresh result type defined by this operation.
     fn result_type(&self) -> DimensionType;
-
-    /// Evaluates this operation's checked semantics for two concrete nonnegative extents.
-    ///
-    /// Reference backends use this hook to materialize their concrete value type without making operation semantics
-    /// depend on that backend. Each nominal operation implements it through its statically selected calculation, so
-    /// calling it introduces no arithmetic selector or dynamic dispatch.
-    fn evaluate(&self, left_extent: usize, right_extent: usize) -> Result<usize, DimensionError>;
 
     /// Infers this operation's one fresh dimension result after validating both operand types.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
@@ -177,23 +170,6 @@ pub(crate) fn bounds_overflow(operation_name: &str, left: &DimensionType, right:
         message: format!(
             "dimension arithmetic overflow while deriving '{operation_name}' result bounds with operands {left}, \
              {right}",
-        ),
-    }
-}
-
-/// Constructs a checked-evaluation overflow diagnostic.
-pub(crate) fn evaluation_overflow(
-    action: &str,
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> DimensionError {
-    DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while {action} with operands {}={left}, {}={right}",
-            left_type.variable(),
-            right_type.variable(),
         ),
     }
 }

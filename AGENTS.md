@@ -83,6 +83,11 @@ update this file so that they do not need to remind you again in the future.
   user explicitly asks for a different abstraction. If an experimental staging hook or lowering path is removed or
   superseded, delete its public trait methods, helper functions, and test-only scaffolding instead of leaving unused
   compatibility layers behind.
+- In `ryft-core`, operations own generic `InterpretableOperation` implementations constrained by value capability
+  traits, while concrete backends own the corresponding capability implementations. When an operation carries result
+  identities or other semantic metadata, pass the operation to an operation-aware capability method (following
+  `reshape_with`) so concrete values preserve that metadata. Do not replace this pattern with operation-level concrete
+  evaluation hooks or backend-owned `InterpretableOperation` adapters.
 - Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
   `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as
   `crate::Operation::name(self)` or `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is

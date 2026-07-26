@@ -12,11 +12,11 @@ define_arithmetic_dimension_operation!(
     ///
     /// Refer to [`DimensionMinimum`] for semantic details and an example.
     DimensionMinimumOperation, DIMENSION_MINIMUM_OPERATION_NAME,
+    DimensionMinimum, minimum_dimension_with,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("min({}, {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
@@ -35,6 +35,7 @@ define_arithmetic_dimension_capability!(
     DimensionMinimum,
     /// Returns `min(self, right)`.
     minimum_dimension(right),
+    minimum_dimension_with(right, operation),
     DimensionMinimumOperation,
 );
 
@@ -43,16 +44,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
     let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
     let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
     DimensionBounds::new(left_lower.min(right_lower), left_maximum.min(right_maximum).checked_add(1))
-}
-
-/// Evaluates dimension minimum.
-fn evaluate(
-    _left_type: &DimensionType,
-    left: usize,
-    _right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    Ok(left.min(right))
 }
 
 #[cfg(test)]
@@ -72,7 +63,6 @@ mod tests {
         let operation = DimensionMinimumOperation::new(&left, &right).unwrap();
         assert_eq!(operation.to_string(), DIMENSION_MINIMUM_OPERATION_NAME);
         assert_eq!(operation.result_type().bounds(), DimensionBounds::new(1, Some(5)).unwrap());
-        assert_eq!(evaluate(&left, 7, &right, 3), Ok(3));
         assert_eq!(
             DimensionValue::constant(7)
                 .unwrap()

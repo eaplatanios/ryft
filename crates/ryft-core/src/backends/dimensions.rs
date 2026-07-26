@@ -10,13 +10,14 @@ use std::fmt::Display;
 use ryft_macros::{Operation, Parameter};
 
 use crate::contexts::EagerContext;
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::{
-    ArithmeticDimensionOperation, DimensionAddOperation, DimensionFloorDivideOperation, DimensionMaximumOperation,
-    DimensionMinimumOperation, DimensionMultiplyOperation, DimensionPowerOperation, DimensionRemainderOperation,
-    DimensionRequirementOperation, DimensionSubtractClampedOperation, DimensionSubtractOperation,
+    DimensionAdd, DimensionAddOperation, DimensionFloorDivide, DimensionFloorDivideOperation, DimensionMaximum,
+    DimensionMaximumOperation, DimensionMinimum, DimensionMinimumOperation, DimensionMultiply,
+    DimensionMultiplyOperation, DimensionPower, DimensionPowerOperation, DimensionRemainder,
+    DimensionRemainderOperation, DimensionRequirement, DimensionRequirementOperation, DimensionSubtract,
+    DimensionSubtractClamped, DimensionSubtractClampedOperation, DimensionSubtractOperation, checked_power,
+    requirement_violation,
 };
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
@@ -98,7 +99,7 @@ impl Typed for DimensionValue {
 }
 
 impl Value for DimensionValue {
-    type DispatchDomain = EagerContext<Self, DimensionOperation<Self>>;
+    type DispatchDomain = EagerContext<Self>;
     type ExecutionDomain = EagerContext<Self, DimensionOperation<Self>>;
 
     #[inline]
@@ -126,50 +127,141 @@ impl Concretizable<usize> for DimensionValue {
     }
 }
 
-/// Implements eager host interpretation for one nominal binary dimension-arithmetic primitive.
-macro_rules! impl_arithmetic_dimension_interpretation {
-    // This branch validates two concrete inputs and invokes the statically selected checked operation semantics.
-    ($operation:ty) => {
-        impl<O: Operation<DimensionType>> InterpretableOperation<EagerContext<DimensionValue, O>> for $operation {
-            fn interpret<D: InterpretationDriver<EagerContext<DimensionValue, O>>>(
-                &self,
-                _context: &EagerContext<DimensionValue, O>,
-                _driver: &D,
-                inputs: &[DimensionValue],
-            ) -> Result<Vec<DimensionValue>, ProgramError> {
-                check_count!("input", inputs, 2, ProgramError);
-                Operation::infer_output_types(self, &[inputs[0].r#type().clone(), inputs[1].r#type().clone()], &[])?;
-                let extent = self.evaluate(inputs[0].extent(), inputs[1].extent())?;
-                Ok(vec![DimensionValue::new(self.result_type(), extent)?])
+/// Implements one concrete checked-arithmetic capability for [`DimensionValue`].
+macro_rules! impl_arithmetic_dimension_capability {
+    // This branch validates the supplied operation metadata, computes one host extent, and preserves its result type.
+    (
+        $capability:ident, $method:ident, $operation:ty,
+        |$left:ident, $right:ident, $operation_argument:ident| $evaluate:expr $(,)?
+    ) => {
+        impl $capability for DimensionValue {
+            fn $method(&self, right: &Self, $operation_argument: &$operation) -> Result<Self, ProgramError> {
+                Operation::infer_output_types($operation_argument, &[self.r#type.clone(), right.r#type.clone()], &[])?;
+                let $left = self.extent;
+                let $right = right.extent;
+                let extent: Result<usize, DimensionError> = $evaluate;
+                Ok(Self::new($operation_argument.result_type(), extent?)?)
             }
         }
     };
 }
 
-impl_arithmetic_dimension_interpretation!(DimensionAddOperation);
-impl_arithmetic_dimension_interpretation!(DimensionSubtractOperation);
-impl_arithmetic_dimension_interpretation!(DimensionSubtractClampedOperation);
-impl_arithmetic_dimension_interpretation!(DimensionMultiplyOperation);
-impl_arithmetic_dimension_interpretation!(DimensionPowerOperation);
-impl_arithmetic_dimension_interpretation!(DimensionFloorDivideOperation);
-impl_arithmetic_dimension_interpretation!(DimensionRemainderOperation);
-impl_arithmetic_dimension_interpretation!(DimensionMinimumOperation);
-impl_arithmetic_dimension_interpretation!(DimensionMaximumOperation);
+impl_arithmetic_dimension_capability!(
+    DimensionAdd,
+    add_dimension_with,
+    DimensionAddOperation,
+    |left, right, operation| left.checked_add(right).ok_or_else(|| DimensionError::ArithmeticOverflow {
+        message: format!(
+            "dimension arithmetic overflow while adding runtime dimensions with operands {}={left}, {}={right}",
+            operation.left_type().variable(),
+            operation.right_type().variable(),
+        ),
+    }),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionSubtract,
+    subtract_dimension_with,
+    DimensionSubtractOperation,
+    |left, right, operation| left.checked_sub(right).ok_or_else(|| requirement_violation(
+        format!("{} >= {}", operation.left_type().variable(), operation.right_type().variable()),
+        operation.left_type(),
+        left,
+        operation.right_type(),
+        right,
+    )),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionSubtractClamped,
+    subtract_dimension_clamped_with,
+    DimensionSubtractClampedOperation,
+    |left, right, _operation| Ok(left.saturating_sub(right)),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionMultiply,
+    multiply_dimension_with,
+    DimensionMultiplyOperation,
+    |left, right, operation| left.checked_mul(right).ok_or_else(|| DimensionError::ArithmeticOverflow {
+        message: format!(
+            "dimension arithmetic overflow while multiplying runtime dimensions with operands {}={left}, {}={right}",
+            operation.left_type().variable(),
+            operation.right_type().variable(),
+        ),
+    }),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionPower,
+    raise_dimension_to_power_with,
+    DimensionPowerOperation,
+    |left, right, operation| checked_power(left, right).ok_or_else(|| DimensionError::ArithmeticOverflow {
+        message: format!(
+            "dimension arithmetic overflow while raising a runtime dimension to a dimension power with operands \
+             {}={left}, {}={right}",
+            operation.left_type().variable(),
+            operation.right_type().variable(),
+        ),
+    }),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionFloorDivide,
+    floor_divide_dimension_with,
+    DimensionFloorDivideOperation,
+    |left, right, operation| if right == 0 {
+        Err(requirement_violation(
+            format!("{} > 0", operation.right_type().variable()),
+            operation.left_type(),
+            left,
+            operation.right_type(),
+            right,
+        ))
+    } else {
+        Ok(left / right)
+    },
+);
+impl_arithmetic_dimension_capability!(
+    DimensionRemainder,
+    remainder_dimension_with,
+    DimensionRemainderOperation,
+    |left, right, operation| if right == 0 {
+        Err(requirement_violation(
+            format!("{} > 0", operation.right_type().variable()),
+            operation.left_type(),
+            left,
+            operation.right_type(),
+            right,
+        ))
+    } else {
+        Ok(left % right)
+    },
+);
+impl_arithmetic_dimension_capability!(
+    DimensionMinimum,
+    minimum_dimension_with,
+    DimensionMinimumOperation,
+    |left, right, _operation| Ok(left.min(right)),
+);
+impl_arithmetic_dimension_capability!(
+    DimensionMaximum,
+    maximum_dimension_with,
+    DimensionMaximumOperation,
+    |left, right, _operation| Ok(left.max(right)),
+);
 
-impl<O: Operation<DimensionType>> InterpretableOperation<EagerContext<DimensionValue, O>>
-    for DimensionRequirementOperation
-{
-    fn interpret<D: InterpretationDriver<EagerContext<DimensionValue, O>>>(
+impl DimensionRequirement for DimensionValue {
+    fn require_with(
         &self,
-        _context: &EagerContext<DimensionValue, O>,
-        _driver: &D,
-        inputs: &[DimensionValue],
-    ) -> Result<Vec<DimensionValue>, ProgramError> {
-        check_count!("input", inputs, self.input_count(), ProgramError);
-        let input_types = inputs.iter().map(|input| input.r#type().clone()).collect::<Vec<_>>();
-        self.infer_output_types(&input_types, &[])?;
-        self.evaluate_extents(inputs[0].extent(), inputs.get(1).map(DimensionValue::extent))?;
-        Ok(Vec::new())
+        right: Option<&Self>,
+        operation: &DimensionRequirementOperation,
+    ) -> Result<(), ProgramError> {
+        match right {
+            Some(right) => {
+                operation.infer_output_types(&[self.r#type.clone(), right.r#type.clone()], &[])?;
+            }
+            None => {
+                operation.infer_output_types(std::slice::from_ref(&self.r#type), &[])?;
+            }
+        }
+        operation.evaluate_extents(self.extent, right.map(|right| right.extent))?;
+        Ok(())
     }
 }
 
@@ -218,7 +310,10 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::operations::dimensions::{DimensionAdd, DimensionRequirement};
+    use crate::operations::dimensions::{
+        DimensionAdd, DimensionAddOperation, DimensionFloorDivide, DimensionFloorDivideOperation, DimensionRemainder,
+        DimensionRemainderOperation, DimensionRequirement, DimensionSubtract, DimensionSubtractOperation,
+    };
 
     use super::*;
 
@@ -253,5 +348,44 @@ mod tests {
         let right = DimensionValue::constant(3).unwrap();
         assert_eq!(left.add_dimension(&right).unwrap().extent(), 10);
         left.require_less_than_or_equal(&DimensionValue::constant(8).unwrap()).unwrap();
+
+        // Operation-aware capability methods preserve the operation's fresh result identity instead of constructing a
+        // second eager-only result type.
+        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(10)).unwrap()));
+        let right_type =
+            DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
+        let left = DimensionValue::new(left_type.clone(), 7).unwrap();
+        let right = DimensionValue::new(right_type.clone(), 3).unwrap();
+        let add = DimensionAddOperation::new(&left_type, &right_type).unwrap();
+        let sum = left.add_dimension_with(&right, &add).unwrap();
+        assert_eq!(sum.r#type(), &add.result_type());
+        assert_eq!(sum.extent(), 10);
+
+        // Concrete backend capability implementations retain the operation-owned diagnostics for invalid observed
+        // extents admitted by otherwise valid operand bounds.
+        let subtract = DimensionSubtractOperation::new(&left_type, &right_type).unwrap();
+        let error = DimensionValue::new(left_type.clone(), 1)
+            .unwrap()
+            .subtract_dimension_with(&right, &subtract)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "left >= right; observed left=1, right=3".to_string(),
+            }),
+        );
+        let zero = DimensionValue::new(right_type.clone(), 0).unwrap();
+        let floor_divide = DimensionFloorDivideOperation::new(&left_type, &right_type).unwrap();
+        let error = left.floor_divide_dimension_with(&zero, &floor_divide).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
+        );
+        let remainder = DimensionRemainderOperation::new(&left_type, &right_type).unwrap();
+        let error = left.remainder_dimension_with(&zero, &remainder).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
+        );
     }
 }
