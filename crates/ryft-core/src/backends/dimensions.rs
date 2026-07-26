@@ -127,21 +127,18 @@ impl Concretizable<usize> for DimensionValue {
 // TODO(eaplatanios): Review from here onwards.
 
 /// Implements one concrete checked-arithmetic capability for [`DimensionValue`].
+///
+/// The evaluator receives both complete operand values so it can use their extents and type metadata without exposing
+/// macro-internal local names in the invocation syntax.
 macro_rules! impl_arithmetic_dimension_capability {
-    // This branch derives the semantic output type from the operands and computes one checked host extent.
-    (
-        $capability:ident, $method:ident, $operation:ty,
-        |$left:ident, $right:ident, $left_type:ident, $right_type:ident| $evaluate:expr $(,)?
-    ) => {
+    ($capability:ident, $method:ident, $operation:ty, |$left:ident, $right:ident| $evaluate:expr $(,)?) => {
         impl $capability for DimensionValue {
             fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let $left_type = &self.r#type;
-                let $right_type = &right.r#type;
-                let operation = <$operation>::new($left_type, $right_type)?;
-                let result_type =
-                    operation.infer_output_types(&[self.r#type.clone(), right.r#type.clone()], &[])?.remove(0);
-                let $left = self.extent;
-                let $right = right.extent;
+                let operation = <$operation>::new(&self.r#type, &right.r#type)?;
+                let inputs = &[self.r#type.clone(), right.r#type.clone()];
+                let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+                let $left: &DimensionValue = self;
+                let $right: &DimensionValue = right;
                 let extent: Result<usize, DimensionError> = $evaluate;
                 Ok(Self::new(result_type, extent?)?)
             }
@@ -149,101 +146,133 @@ macro_rules! impl_arithmetic_dimension_capability {
     };
 }
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionAdd,
     add,
     DimensionAddOperation,
-    |left, right, left_type, right_type| left.checked_add(right).ok_or_else(|| DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while adding runtime dimensions with operands {}={left}, {}={right}",
-            left_type.variable(),
-            right_type.variable(),
-        ),
-    }),
-);
+    |left, right| {
+        left.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while adding runtime dimensions with operands {}={}, {}={}",
+                left.r#type().variable(),
+                left.extent(),
+                right.r#type().variable(),
+                right.extent(),
+            ),
+        })
+    },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionSubtract,
     sub,
     DimensionSubtractOperation,
-    |left, right, left_type, right_type| left.checked_sub(right).ok_or_else(|| requirement_violation(
-        format!("{} >= {}", left_type.variable(), right_type.variable()),
-        left_type,
-        left,
-        right_type,
-        right,
-    )),
-);
+    |left, right| {
+        left.extent().checked_sub(right.extent()).ok_or_else(|| {
+            requirement_violation(
+                format!("{} >= {}", left.r#type().variable(), right.r#type().variable()),
+                left.r#type(),
+                left.extent(),
+                right.r#type(),
+                right.extent(),
+            )
+        })
+    },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionSubtractClamped,
     sub_clamped,
     DimensionSubtractClampedOperation,
-    |left, right, _left_type, _right_type| Ok(left.saturating_sub(right)),
-);
+    |left, right| { Ok(left.extent().saturating_sub(right.extent())) },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionMultiply,
     mul,
     DimensionMultiplyOperation,
-    |left, right, left_type, right_type| left.checked_mul(right).ok_or_else(|| DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while multiplying runtime dimensions with operands {}={left}, {}={right}",
-            left_type.variable(),
-            right_type.variable(),
-        ),
-    }),
-);
+    |left, right| {
+        left.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while multiplying runtime dimensions with operands {}={}, {}={}",
+                left.r#type().variable(),
+                left.extent(),
+                right.r#type().variable(),
+                right.extent(),
+            ),
+        })
+    },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionPower,
     pow,
     DimensionPowerOperation,
-    |left, right, left_type, right_type| checked_power(left, right).ok_or_else(|| DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while raising a runtime dimension to a dimension power with operands \
-             {}={left}, {}={right}",
-            left_type.variable(),
-            right_type.variable(),
-        ),
-    }),
-);
+    |left, right| {
+        checked_power(left.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while raising a runtime dimension to a dimension power with operands \
+                 {}={}, {}={}",
+                left.r#type().variable(),
+                left.extent(),
+                right.r#type().variable(),
+                right.extent(),
+            ),
+        })
+    },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionFloorDivide,
     floor_divide,
     DimensionFloorDivideOperation,
-    |left, right, left_type, right_type| if right == 0 {
-        Err(requirement_violation(format!("{} > 0", right_type.variable()), left_type, left, right_type, right))
-    } else {
-        Ok(left / right)
+    |left, right| {
+        if right.extent() == 0 {
+            Err(requirement_violation(
+                format!("{} > 0", right.r#type().variable()),
+                left.r#type(),
+                left.extent(),
+                right.r#type(),
+                right.extent(),
+            ))
+        } else {
+            Ok(left.extent() / right.extent())
+        }
     },
-);
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionRemainder,
     remainder,
     DimensionRemainderOperation,
-    |left, right, left_type, right_type| if right == 0 {
-        Err(requirement_violation(format!("{} > 0", right_type.variable()), left_type, left, right_type, right))
-    } else {
-        Ok(left % right)
+    |left, right| {
+        if right.extent() == 0 {
+            Err(requirement_violation(
+                format!("{} > 0", right.r#type().variable()),
+                left.r#type(),
+                left.extent(),
+                right.r#type(),
+                right.extent(),
+            ))
+        } else {
+            Ok(left.extent() % right.extent())
+        }
     },
-);
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionMinimum,
     minimum,
     DimensionMinimumOperation,
-    |left, right, _left_type, _right_type| Ok(left.min(right)),
-);
+    |left, right| { Ok(left.extent().min(right.extent())) },
+}
 
-impl_arithmetic_dimension_capability!(
+impl_arithmetic_dimension_capability! {
     DimensionMaximum,
     maximum,
     DimensionMaximumOperation,
-    |left, right, _left_type, _right_type| Ok(left.max(right)),
-);
+    |left, right| { Ok(left.extent().max(right.extent())) },
+}
 
 /// Implements one panicking standard operator as sugar for a fallible [`DimensionValue`] capability.
 macro_rules! impl_dimension_operator {
