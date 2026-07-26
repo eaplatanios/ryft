@@ -332,11 +332,11 @@ ledger disagrees with Git.
 
 ## P2b: ordered dimension requirements
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2b-ordered-dimension-requirements`
 - Source commit: `b5f38959b3cdba68b96a0c84b387224fabf32cda`
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Integration commit: `b671b123acbde965ab8d0ea738482a22a825a9cb`
+- Remainder reconciliation commit: `982333afccc46c04884db3d3fcd6cef44ac9d46a`
 - Immutable archive unchanged: yes
 - Scope: add homogeneous equality, less-than-or-equal, positive-divisibility, and explicit-bounds requirements;
   classify them from local exact/identity/interval facts; and integrate inconclusive checks with ordered effects and
@@ -363,4 +363,25 @@ ledger disagrees with Git.
   backend assertion lowering. `OrderedAssertion` appears only in the generic effect definition/tests and the
   requirement effect/test sites.
 - Review method: line by line
-- Next action: stage the no-commit integration merge for owner review
+- Next action: none
+
+## P2b.1: canonical dimension operation modules
+
+- Status: in progress (plan ready for owner review)
+- Branch: `u/eaplatanios/increment/p2b1-dimension-operation-modules`
+- Source commit: pending implementation
+- Integration commit: pending owner review
+- Remainder reconciliation commit: pending integration
+- Immutable archive unchanged: yes
+- Scope: move the stable dimension arithmetic and requirement primitive payloads into one canonical
+  `operations::dimensions` submodule per payload; add documented user-facing capability traits; and leave only concrete
+  host values, eager adapters, and the reference operation family under backend ownership
+- Deferred: the heterogeneous storage sum and generic projection remain P2c; projected binding remains P2d; mixed
+  shape operations remain P3; neutral runtime-dimension API placement and final public-path audit remain P9
+- Plan: `.tasks/plan_dimension_operation_modules.md`
+- Verification: plan structure, ownership inventory, API names, documentation contract, unit-test placement, residual
+  searches, and full implementation gates are specified; no production code has changed at this review gate
+- Residual search: deferred to implementation; the plan names exact searches for old backend ownership, selector
+  names, production backend dependencies, duplicate semantics, and duplicated tests
+- Review method: line by line, with the plan reviewed before production implementation begins
+- Next action: owner reviews or edits `.tasks/plan_dimension_operation_modules.md`

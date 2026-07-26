@@ -694,6 +694,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `P1`   | Leaf identity, bounds, refinements, structural closure, alpha-equivalent cache identity | Line by line     |
 | `P2a`  | Homogeneous dimension SSA values and checked arithmetic                     | Line by line              |
 | `P2b`  | Ordered dimension requirements and partial-evaluation behavior              | Line by line              |
+| `P2b.1` | Canonical dimension operation modules and capability APIs                  | Line by line              |
 | `P2c`  | Generic storage-sum type/value projection                                  | Line by line              |
 | `P2d`  | Zero-state projected binding and third-member extensibility gate           | Line by line              |
 | `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
@@ -1000,6 +1001,11 @@ homogeneous dimension SSA values and checked arithmetic without depending on the
 adds ordered requirements, static proof behavior, and partial-evaluation placement. `P2c` introduces the storage sum
 and generic borrowed/consuming member projection. `P2d` adds direct zero-state projected binding and completes the
 vertical and third-member extensibility gates.
+
+At the owner's request, `P2b.1` moves the now-stable arithmetic and requirement primitives into canonical
+`operations::dimensions` submodules and introduces their user-facing capability traits before P2c. This advances only
+the primitive-operation ownership portion of Phase 9: concrete host values and the reference backend's closed
+operation family remain under `backends`, while neutral `RuntimeDimension`/`RuntimeShape` API placement remains in P9.
 
 - [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
       arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
