@@ -32,7 +32,19 @@ pub use constants::*;
 pub use control_flow::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::*;
-pub use dimensions::*;
+pub use dimensions::{
+    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_FLOOR_DIVIDE_OPERATION_NAME,
+    DIMENSION_MAXIMUM_OPERATION_NAME, DIMENSION_MINIMUM_OPERATION_NAME, DIMENSION_MULTIPLY_OPERATION_NAME,
+    DIMENSION_POWER_OPERATION_NAME, DIMENSION_REMAINDER_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
+    DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
+    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME,
+    DIMENSION_SUBTRACT_OPERATION_NAME, DimensionAdd, DimensionAddOperation, DimensionFloorDivide,
+    DimensionFloorDivideOperation, DimensionMaximum, DimensionMaximumOperation, DimensionMinimum,
+    DimensionMinimumOperation, DimensionMultiply, DimensionMultiplyOperation, DimensionPower, DimensionPowerOperation,
+    DimensionRemainder, DimensionRemainderOperation, DimensionRequirement, DimensionRequirementOperation,
+    DimensionRequirementPredicate, DimensionSubtract, DimensionSubtractClamped, DimensionSubtractClampedOperation,
+    DimensionSubtractOperation,
+};
 pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
