@@ -54,6 +54,13 @@ pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
     /// Returns the fresh result type defined by this operation.
     fn result_type(&self) -> DimensionType;
 
+    /// Evaluates this operation's checked semantics for two concrete nonnegative extents.
+    ///
+    /// Reference backends use this hook to materialize their concrete value type without making operation semantics
+    /// depend on that backend. Each nominal operation implements it through its statically selected calculation, so
+    /// calling it introduces no arithmetic selector or dynamic dispatch.
+    fn evaluate(&self, left_extent: usize, right_extent: usize) -> Result<usize, DimensionError>;
+
     /// Infers this operation's one fresh dimension result after validating both operand types.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);

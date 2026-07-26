@@ -14,9 +14,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::{
-    DimensionAddOperation, DimensionFloorDivideOperation, DimensionMaximumOperation, DimensionMinimumOperation,
-    DimensionMultiplyOperation, DimensionPowerOperation, DimensionRemainderOperation, DimensionRequirementOperation,
-    DimensionSubtractClampedOperation, DimensionSubtractOperation,
+    ArithmeticDimensionOperation, DimensionAddOperation, DimensionFloorDivideOperation, DimensionMaximumOperation,
+    DimensionMinimumOperation, DimensionMultiplyOperation, DimensionPowerOperation, DimensionRemainderOperation,
+    DimensionRequirementOperation, DimensionSubtractClampedOperation, DimensionSubtractOperation,
 };
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
@@ -125,6 +125,36 @@ impl Concretizable<usize> for DimensionValue {
         Ok(self.extent)
     }
 }
+
+/// Implements eager host interpretation for one nominal binary dimension-arithmetic primitive.
+macro_rules! impl_arithmetic_dimension_interpretation {
+    // This branch validates two concrete inputs and invokes the statically selected checked operation semantics.
+    ($operation:ty) => {
+        impl<O: Operation<DimensionType>> InterpretableOperation<EagerContext<DimensionValue, O>> for $operation {
+            fn interpret<D: InterpretationDriver<EagerContext<DimensionValue, O>>>(
+                &self,
+                _context: &EagerContext<DimensionValue, O>,
+                _driver: &D,
+                inputs: &[DimensionValue],
+            ) -> Result<Vec<DimensionValue>, ProgramError> {
+                check_count!("input", inputs, 2, ProgramError);
+                Operation::infer_output_types(self, &[inputs[0].r#type().clone(), inputs[1].r#type().clone()], &[])?;
+                let extent = self.evaluate(inputs[0].extent(), inputs[1].extent())?;
+                Ok(vec![DimensionValue::new(self.result_type(), extent)?])
+            }
+        }
+    };
+}
+
+impl_arithmetic_dimension_interpretation!(DimensionAddOperation);
+impl_arithmetic_dimension_interpretation!(DimensionSubtractOperation);
+impl_arithmetic_dimension_interpretation!(DimensionSubtractClampedOperation);
+impl_arithmetic_dimension_interpretation!(DimensionMultiplyOperation);
+impl_arithmetic_dimension_interpretation!(DimensionPowerOperation);
+impl_arithmetic_dimension_interpretation!(DimensionFloorDivideOperation);
+impl_arithmetic_dimension_interpretation!(DimensionRemainderOperation);
+impl_arithmetic_dimension_interpretation!(DimensionMinimumOperation);
+impl_arithmetic_dimension_interpretation!(DimensionMaximumOperation);
 
 impl<O: Operation<DimensionType>> InterpretableOperation<EagerContext<DimensionValue, O>>
     for DimensionRequirementOperation

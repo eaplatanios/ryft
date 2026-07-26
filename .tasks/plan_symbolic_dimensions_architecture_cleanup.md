@@ -695,6 +695,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `P2a`  | Homogeneous dimension SSA values and checked arithmetic                     | Line by line              |
 | `P2b`  | Ordered dimension requirements and partial-evaluation behavior              | Line by line              |
 | `P2b.1` | Canonical dimension operation modules and capability APIs                  | Line by line              |
+| `P2b.2` | Restore backend-neutral eager dimension interpretation                    | Line by line              |
 | `P2c`  | Generic storage-sum type/value projection                                  | Line by line              |
 | `P2d`  | Zero-state projected binding and third-member extensibility gate           | Line by line              |
 | `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
@@ -1010,6 +1011,11 @@ duplicating inference or identity plumbing. This advances only the primitive-ope
 concrete host values and the reference backend's closed operation family remain under `backends`, while neutral
 `RuntimeDimension`/`RuntimeShape` API placement remains in P9.
 
+`P2b.2` is a narrow ownership correction to the final P2b.1 macro follow-up. Generic operation generation must not
+name the reference backend's concrete `DimensionValue`; the backend owns eager materialization and calls a small
+backend-neutral checked-evaluation hook on each nominal arithmetic operation. The improved separate operation and
+capability macro syntax, inlined bounds construction, nominal payloads, and all public semantics remain unchanged.
+
 - [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
       arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
 - [x] P2b: introduce equality, less-than-or-equal, positive-divisibility, and explicit-bounds requirements as one
@@ -1027,6 +1033,8 @@ concrete host values and the reference backend's closed operation family remain 
       requirements and nested regions remains assigned to P4.
 - [x] P2b.1: move dimension primitives into canonical operation modules, replace tagged arithmetic with nine nominal
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
+- [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation and restore
+      backend-owned eager adapters through the smallest checked concrete-extent hook.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
 - [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
@@ -1730,3 +1738,31 @@ projection wrappers, or special program machinery.
 Ordered requirements, comparisons, gateways, `dimension_size`, heterogeneous storage, and projected binding remain
 separate P2b–P2d/P3 increments. Verification and residual-audit results are recorded in the P2a cleanup-ledger entry at
 handoff.
+
+### Execution: P2b.2 backend-neutral dimension interpretation
+
+P2b.2 restores the dependency boundary inadvertently crossed by P2b.1's final macro cleanup:
+
+- `ArithmeticDimensionOperation::evaluate` is the backend-neutral checked concrete-extent contract shared by the nine
+  nominal arithmetic operations;
+- `define_arithmetic_dimension_operation!` generates that statically selected semantic hook but no longer names
+  `DimensionValue`, `EagerContext`, or another reference-backend type; and
+- `backends::dimensions` owns one small adapter macro that validates eager inputs, invokes the operation's checked
+  semantics, and materializes the backend's concrete `DimensionValue`.
+
+The hook does not reintroduce an arithmetic selector or dynamic dispatch. Its low call-site count is intentional: one
+backend adapter centralizes the conversion from operation semantics to the reference backend's value representation.
+The nominal operation/capability split, bounds inference, diagnostics, rendering, and partial-evaluation behavior are
+unchanged.
+
+Verification completed:
+
+- `cargo fmt -p ryft-core -- --check` and `git diff --check` passed;
+- `cargo check -p ryft-core -p ryft-xla` passed;
+- `cargo test -p ryft-core --lib` passed all 946 tests;
+- `cargo test -p ryft-core --doc` passed 53 tests with 15 ignored; and
+- `cargo test -p ryft-xla --lib` passed 396 tests with one ignored.
+
+The targeted production dependency search reports no reference from generic operation generation or dimension
+operation modules to `backends::dimensions`; all remaining matches are test-only imports of the reference eager value.
+The four pre-existing ambiguous dimension/math module glob-re-export warnings remain outside this correction's scope.

@@ -224,8 +224,7 @@ macro_rules! check_builders {
 ///
 /// The generated operation stores the two declared operand types and one fresh bounded result identity through shared
 /// internal metadata. It implements [`Operation`](crate::Operation), [`ArithmeticDimensionOperation`],
-/// [`Display`](std::fmt::Display), identity renaming, checked eager host interpretation, and ordinary partial
-/// evaluation.
+/// [`Display`](std::fmt::Display), identity renaming, checked concrete evaluation, and ordinary partial evaluation.
 ///
 /// The caller supplies the operation's public documentation and name, a diagnostic result-name expression, a
 /// bounds-transfer expression, and a checked concrete-extent calculation. This keeps the shared operation contract
@@ -362,43 +361,14 @@ macro_rules! define_arithmetic_dimension_operation {
             fn result_type(&self) -> $crate::types::DimensionType {
                 $operation::result_type(self)
             }
-        }
 
-        impl<O: $crate::programs::operations::Operation<$crate::types::DimensionType>>
-            $crate::interpretation::InterpretableOperation<
-                $crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
-            > for $operation
-        {
             #[inline]
-            fn interpret<
-                D: $crate::interpretation::InterpretationDriver<
-                    $crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
-                >,
-            >(
+            fn evaluate(
                 &self,
-                _context: &$crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
-                _driver: &D,
-                inputs: &[$crate::backends::dimensions::DimensionValue],
-            ) -> Result<Vec<$crate::backends::dimensions::DimensionValue>, $crate::programs::ProgramError> {
-                $crate::check_count!("input", inputs, 2, ProgramError);
-                $crate::programs::operations::Operation::infer_output_types(
-                    self,
-                    &[
-                        inputs[0].r#type().clone(),
-                        inputs[1].r#type().clone(),
-                    ],
-                    &[],
-                )?;
-                let extent = ($evaluate)(
-                    self.left_type(),
-                    inputs[0].extent(),
-                    self.right_type(),
-                    inputs[1].extent(),
-                )?;
-                Ok(vec![$crate::backends::dimensions::DimensionValue::new(
-                    self.result_type(),
-                    extent,
-                )?])
+                left_extent: usize,
+                right_extent: usize,
+            ) -> Result<usize, $crate::types::DimensionError> {
+                ($evaluate)(self.left_type(), left_extent, self.right_type(), right_extent)
             }
         }
 
@@ -4788,7 +4758,7 @@ mod tests {
             Err(ProgramError::MismatchedProgramBuilders),
         );
     }
-    
+
     // TODO(eaplatanios): Generally about this `tests` module, the tests are not defined in the same order as the
     //  corresponding macros. Re-order them accordingly.
     // TODO(eaplatanios): Review this.
@@ -4817,6 +4787,7 @@ mod tests {
         );
         fn assert_arithmetic_dimension_operation<O: ArithmeticDimensionOperation>() {}
         assert_arithmetic_dimension_operation::<TestArithmeticDimensionOperation>();
+        assert_eq!(operation.evaluate(3, 4), Ok(7));
 
         // The generated identity-renaming implementation rewrites both declared operand identities while preserving
         // the operation's fresh result identity.
