@@ -222,14 +222,14 @@ macro_rules! check_builders {
 // TODO(eaplatanios): Review this.
 /// Defines a nominal binary dimension-arithmetic operation.
 ///
-/// The generated operation stores the two declared operand types and one fresh bounded result identity through shared
-/// internal metadata. It implements [`Operation`](crate::Operation), [`ArithmeticDimensionOperation`],
-/// [`Display`](std::fmt::Display), identity renaming, checked eager host interpretation, and ordinary partial
-/// evaluation.
+/// The generated operation stores the two declared operand types and the name and bounds needed to infer one fresh
+/// result identity. The resulting program atom owns that inferred identity; the operation does not duplicate it. The
+/// generated type implements [`Operation`](crate::Operation), [`ArithmeticDimensionOperation`],
+/// [`Display`](std::fmt::Display), identity renaming, capability-based interpretation, and ordinary partial evaluation.
 ///
-/// The caller supplies the operation's public documentation and name, a diagnostic result-name expression, a
-/// bounds-transfer expression, and a checked concrete-extent calculation. This keeps the shared operation contract
-/// centralized while leaving each arithmetic primitive's semantics in its owning module.
+/// The caller supplies the operation's public documentation and name, its value-level capability and semantic method,
+/// a diagnostic result-name expression, and a bounds-transfer expression. This keeps operation structure and
+/// interpretation centralized while leaving concrete value semantics in backend capability implementations.
 ///
 /// # Examples
 ///
@@ -237,11 +237,11 @@ macro_rules! check_builders {
 /// define_arithmetic_dimension_operation!(
 ///     /// Checked dimension-addition operation used by [`DimensionAdd`].
 ///     DimensionAddOperation, DIMENSION_ADD_OPERATION_NAME,
+///     DimensionAdd, add_dimension,
 ///     result_name = |left: &DimensionType, right: &DimensionType| {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
 ///     infer_bounds = infer_add_bounds,
-///     evaluate = evaluate_add,
 /// );
 /// ```
 ///
@@ -250,26 +250,27 @@ macro_rules! check_builders {
 ///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation type.
 ///   - `$operation`: Identifier of the generated nominal operation type (e.g., `DimensionAddOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `DIMENSION_ADD_OPERATION_NAME`).
+///   - `$capability`: Value-level capability required by the generated
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `DimensionAdd`).
+///   - `$method`: Semantic capability method used for interpretation (e.g., `add_dimension`).
 ///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the result [`DimensionBounds`](crate::DimensionBounds) or a [`DimensionError`](crate::DimensionError).
-///   - `$evaluate`: Expression accepting both operand types and concrete extents and returning the checked result
-///     extent or a [`DimensionError`](crate::DimensionError).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_operation {
     // This public branch defines one nominal binary dimension primitive and its shared operation machinery.
     (
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
+        $capability:ident, $method:ident,
         result_name = $result_name:expr,
-        infer_bounds = $infer_bounds:expr,
-        evaluate = $evaluate:expr $(,)?
+        infer_bounds = $infer_bounds:expr $(,)?
     ) => {
         $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
         pub struct $operation {
-            /// Shared operand and result metadata for this arithmetic dimension operation.
+            /// Shared operand contract and result-inference metadata for this arithmetic dimension operation.
             metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata,
         }
 
@@ -303,13 +304,17 @@ macro_rules! define_arithmetic_dimension_operation {
                 self.metadata.right_type()
             }
 
-            /// Returns this [`Operation`](crate::Operation)'s fresh result
-            /// [`DimensionType`](crate::types::DimensionType).
+            /// Returns the diagnostic name used for a freshly inferred result variable.
             #[inline]
-            pub fn result_type(&self) -> $crate::types::DimensionType {
-                self.metadata.result_type()
+            pub fn result_name(&self) -> &str {
+                self.metadata.result_name()
             }
 
+            /// Returns the bounds of a freshly inferred result variable.
+            #[inline]
+            pub fn result_bounds(&self) -> $crate::types::DimensionBounds {
+                self.metadata.result_bounds()
+            }
         }
 
         impl ::std::fmt::Display for $operation {
@@ -359,46 +364,40 @@ macro_rules! define_arithmetic_dimension_operation {
             }
 
             #[inline]
-            fn result_type(&self) -> $crate::types::DimensionType {
-                $operation::result_type(self)
+            fn result_name(&self) -> &str {
+                $operation::result_name(self)
+            }
+
+            #[inline]
+            fn result_bounds(&self) -> $crate::types::DimensionBounds {
+                $operation::result_bounds(self)
             }
         }
 
-        impl<O: $crate::programs::operations::Operation<$crate::types::DimensionType>>
-            $crate::interpretation::InterpretableOperation<
-                $crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
-            > for $operation
+        impl<
+            C: $crate::contexts::Domain<
+                Type = $crate::types::DimensionType,
+                Value: $capability,
+            >,
+        > $crate::interpretation::InterpretableOperation<C> for $operation
         {
             #[inline]
-            fn interpret<
-                D: $crate::interpretation::InterpretationDriver<
-                    $crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
-                >,
-            >(
+            fn interpret<D: $crate::interpretation::InterpretationDriver<C>>(
                 &self,
-                _context: &$crate::contexts::EagerContext<$crate::backends::dimensions::DimensionValue, O>,
+                _context: &C,
                 _driver: &D,
-                inputs: &[$crate::backends::dimensions::DimensionValue],
-            ) -> Result<Vec<$crate::backends::dimensions::DimensionValue>, $crate::programs::ProgramError> {
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, $crate::programs::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::programs::operations::Operation::infer_output_types(
                     self,
                     &[
-                        inputs[0].r#type().clone(),
-                        inputs[1].r#type().clone(),
+                        $crate::programs::types::Typed::r#type(&inputs[0]).into_owned(),
+                        $crate::programs::types::Typed::r#type(&inputs[1]).into_owned(),
                     ],
                     &[],
                 )?;
-                let extent = ($evaluate)(
-                    self.left_type(),
-                    inputs[0].extent(),
-                    self.right_type(),
-                    inputs[1].extent(),
-                )?;
-                Ok(vec![$crate::backends::dimensions::DimensionValue::new(
-                    self.result_type(),
-                    extent,
-                )?])
+                Ok(vec![inputs[0].$method(&inputs[1])?])
             }
         }
 
@@ -416,8 +415,9 @@ macro_rules! define_arithmetic_dimension_operation {
 // TODO(eaplatanios): Review this.
 /// Defines a value-level capability for a binary dimension-arithmetic operation.
 ///
-/// The generated trait exposes one fallible receiver method. Its blanket implementation constructs the concrete
-/// operation from the borrowed operand types and binds it through the value's dispatch domain.
+/// The generated trait exposes one semantic binary method. Its blanket implementation constructs and stages the
+/// corresponding operation through a context-carrying value's dispatch domain; concrete eager values provide
+/// backend-owned implementations.
 ///
 /// # Examples
 ///
@@ -442,7 +442,7 @@ macro_rules! define_arithmetic_dimension_operation {
 ///     `DimensionAddOperation`).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_capability {
-    // This branch defines a two-operand capability that constructs its typed dimension operation before binding it.
+    // This branch defines one semantic binary method plus its generic staging implementation.
     (
         $(#[$capability_documentation:meta])*
         $capability:ident,
@@ -451,17 +451,15 @@ macro_rules! define_arithmetic_dimension_capability {
         $operation:ident $(,)?
     ) => {
         $(#[$capability_documentation])*
-        pub trait $capability: Sized {
+        pub trait $capability: $crate::programs::types::Typed<Type = $crate::types::DimensionType> + Sized {
             $(#[$method_documentation])*
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError>;
         }
 
-        impl<
-            V: $crate::programs::values::Value<
-                Type = $crate::types::DimensionType,
-                DispatchDomain: $crate::contexts::Context<Operation: ::std::convert::From<$operation>>,
-            >,
-        > $capability for V
+        impl<V: $crate::programs::values::Value<Type = $crate::types::DimensionType>> $capability for V
+        where
+            V::DispatchDomain: $crate::contexts::Context<Type = $crate::types::DimensionType>,
+            <V::DispatchDomain as $crate::contexts::Domain>::Operation: ::std::convert::From<$operation>,
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::programs::ProgramError> {
@@ -4203,7 +4201,10 @@ mod tests {
 
     define_arithmetic_dimension_operation!(
         /// Dimension-arithmetic operation used to test [`define_arithmetic_dimension_operation!`].
-        TestArithmeticDimensionOperation, TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,
+        TestArithmeticDimensionOperation,
+        TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,
+        TestArithmeticDimension,
+        test_arithmetic_dimension,
         result_name = |left: &DimensionType, right: &DimensionType| {
             format!("{} + {}", left.variable(), right.variable())
         },
@@ -4221,12 +4222,6 @@ mod tests {
             };
             DimensionBounds::new(lower, upper)
         },
-        evaluate =
-            |_left_type: &DimensionType, left: usize, _right_type: &DimensionType, right: usize| {
-                left.checked_add(right).ok_or_else(|| DimensionError::ArithmeticOverflow {
-                    message: "test dimension arithmetic overflow".to_string(),
-                })
-            },
     );
 
     define_arithmetic_dimension_capability!(
@@ -4788,7 +4783,7 @@ mod tests {
             Err(ProgramError::MismatchedProgramBuilders),
         );
     }
-    
+
     // TODO(eaplatanios): Generally about this `tests` module, the tests are not defined in the same order as the
     //  corresponding macros. Re-order them accordingly.
     // TODO(eaplatanios): Review this.
@@ -4798,19 +4793,19 @@ mod tests {
         let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
         let operation = TestArithmeticDimensionOperation::new(&left_type, &right_type).unwrap();
 
-        // The generated operation owns stable operand and fresh result metadata, participates in the shared arithmetic
-        // type contract, and evaluates its concrete primitive without dynamic dispatch.
+        // The generated operation owns stable operand metadata and the result name and bounds needed to infer a fresh
+        // program-atom identity.
         assert_eq!(format!("{operation}"), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME);
         assert_eq!(Operation::<DimensionType>::name(&operation), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
         assert_eq!(operation.left_type(), &left_type);
         assert_eq!(operation.right_type(), &right_type);
-        assert_ne!(operation.result_type().variable(), left_type.variable());
-        assert_ne!(operation.result_type().variable(), right_type.variable());
-        assert_eq!(operation.result_type().bounds(), DimensionBounds::new(3, Some(9)).unwrap());
-        assert_eq!(
-            Operation::<DimensionType>::infer_output_types(&operation, &[left_type.clone(), right_type.clone()], &[],),
-            Ok(vec![operation.result_type()]),
-        );
+        assert_eq!(operation.result_bounds(), DimensionBounds::new(3, Some(9)).unwrap());
+        let result =
+            Operation::<DimensionType>::infer_output_types(&operation, &[left_type.clone(), right_type.clone()], &[])
+                .unwrap();
+        assert_ne!(result[0].variable(), left_type.variable());
+        assert_ne!(result[0].variable(), right_type.variable());
+        assert_eq!(result[0].bounds(), operation.result_bounds());
         assert_eq!(
             Operation::<DimensionType>::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
@@ -4819,7 +4814,7 @@ mod tests {
         assert_arithmetic_dimension_operation::<TestArithmeticDimensionOperation>();
 
         // The generated identity-renaming implementation rewrites both declared operand identities while preserving
-        // the operation's fresh result identity.
+        // the result metadata from which the output atom's identity will be inferred.
         let renamed_left = DimensionType::new(DimensionVariable::new("renamed_left", left_type.bounds()));
         let renamed_right = DimensionType::new(DimensionVariable::new("renamed_right", right_type.bounds()));
         let mut renaming = TypeIdentityRenaming::new();
@@ -4828,7 +4823,8 @@ mod tests {
         let renamed = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.left_type(), &renamed_left);
         assert_eq!(renamed.right_type(), &renamed_right);
-        assert_eq!(renamed.result_type(), operation.result_type());
+        assert_eq!(renamed.result_name(), operation.result_name());
+        assert_eq!(renamed.result_bounds(), operation.result_bounds());
 
         // The macro supplies the ordinary partial-evaluation marker implementation for any compatible context.
         fn assert_partially_evaluatable<

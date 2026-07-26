@@ -21,10 +21,12 @@ use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOpe
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
+#[cfg(test)]
+use ryft_core::operations::manipulation::ReshapeParameters;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, PadOperation, Reshape, ReshapeDimensionExpression, ReshapeOperation, ReshapeParameters,
-    ScatterOperation, ScatterReductionKind, Slice, SliceOperation, TransposeOperation, UpdateSlice,
+    GatherScatterMode, PadOperation, Reshape, ReshapeDimensionExpression, ReshapeOperation, ScatterOperation,
+    ScatterReductionKind, Slice, SliceOperation, TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
