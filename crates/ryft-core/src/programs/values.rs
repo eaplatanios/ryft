@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::batching::{ArrayBatch, BatchingTracer};
@@ -10,7 +11,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::regions::RegionId;
-use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::types::{Type, TypeError, TypeProjection, Typed};
 use crate::tracing::Tracer;
 use crate::types::ArrayType;
 
@@ -42,6 +43,60 @@ impl ValueId {
     #[inline]
     pub fn atom(self) -> AtomId {
         self.atom
+    }
+}
+
+/// Checked view of a value projected from a heterogeneous storage universe to one homogeneous member type.
+///
+/// The wrapper preserves `value` itself—including any Single Static Assignment (SSA), capture, partial-evaluation, or
+/// transform identity—and stores only the member type obtained through [`TypeProjection`]. Concrete eager storage sums
+/// project directly to borrowed or owned payloads instead and therefore do not need this wrapper. Projection alone does
+/// not define how operations dispatch; a context adapter can add the appropriate [`Value`] implementation when binding
+/// homogeneous operations through an outer heterogeneous graph.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectedValue<T: Type, V> {
+    /// Original heterogeneous value whose identity this projection preserves.
+    value: V,
+
+    /// Homogeneous member type validated against `value` at construction.
+    r#type: T,
+}
+
+impl<T: Type, V> ProjectedValue<T, V> {
+    /// Constructs a projected value after the caller has validated `type` against `value`.
+    #[inline]
+    pub(crate) fn new(value: V, r#type: T) -> Self {
+        Self { value, r#type }
+    }
+
+    /// Borrows the original heterogeneous value.
+    #[inline]
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    /// Consumes this projection and returns the original heterogeneous value.
+    #[inline]
+    pub fn into_value(self) -> V {
+        self.value
+    }
+}
+
+impl<T: Type, V: Display> Display for ProjectedValue<T, V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.value, formatter)
+    }
+}
+
+impl<T: Type, V> Parameter for ProjectedValue<T, V> {}
+
+impl<T: Type, V> Typed for ProjectedValue<T, V> {
+    type Type = T;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        Cow::Borrowed(&self.r#type)
     }
 }
 
@@ -114,6 +169,38 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         }
         Ok(self.clone())
     }
+}
+
+/// Projects one homogeneous member value from a heterogeneous [`Value`] storage universe.
+///
+/// Read-only consumers use [`Self::project_ref`] so concrete eager payloads remain borrowed and are never cloned.
+/// Consumers that already own the storage value use [`Self::into_projected`] to transfer the member payload without
+/// copying it. [`Self::lift`] embeds an owned projected member back into the heterogeneous universe.
+///
+/// Symbolic values whose storage representation cannot be changed without losing SSA or transform identity use
+/// [`ProjectedValue`] for one or both associated representations. The wrapper keeps the original value intact while
+/// exposing its checked homogeneous type.
+pub trait ValueProjection<T: Type>: Value<Type: TypeProjection<T>> {
+    /// Owned representation of the projected member.
+    type Projected: Typed<Type = T>;
+
+    /// Read-only representation of the projected member.
+    type ProjectedRef<'a>: Typed<Type = T>
+    where
+        Self: 'a;
+
+    /// Borrows this value as the requested homogeneous member without cloning an eager payload.
+    ///
+    /// Returns a [`TypeError`] when this value contains a different member kind.
+    fn project_ref(&self) -> Result<Self::ProjectedRef<'_>, TypeError>;
+
+    /// Consumes this value and transfers or preserves its requested homogeneous member representation.
+    ///
+    /// Returns a [`TypeError`] when this value contains a different member kind.
+    fn into_projected(self) -> Result<Self::Projected, TypeError>;
+
+    /// Lifts an owned projected member back into this heterogeneous value universe.
+    fn lift(value: Self::Projected) -> Self;
 }
 
 /// Supports extracting this value as a concrete host-side value of type `V`. Concretization is distinct from a staged

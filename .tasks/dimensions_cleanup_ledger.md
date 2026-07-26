@@ -393,10 +393,10 @@ ledger disagrees with Git.
 
 ## P2b.2: restore backend-neutral dimension interpretation
 
-- Status: ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2b2-backend-neutral-dimension-interpretation`
-- Source commit: pending next-increment bookkeeping
-- Integration commit: pending owner review
+- Source commit: `dc89ecfaa`
+- Integration commit: `fb8ba7812`
 - Remainder reconciliation commit: `fa34b4ffe` (reconciles reviewed P2b.1 into the mutable remainder)
 - Immutable archive unchanged: yes
 - Scope: remove the concrete `DimensionValue` dependency from generic arithmetic operation generation, make each
@@ -410,4 +410,32 @@ ledger disagrees with Git.
   `DimensionValue::DispatchDomain`, or production operation-to-backend dependency remains; the requirement predicate's
   shared `evaluate_extents` is intentionally retained for eager enforcement and known-side reasoning
 - Review method: line by line
-- Next action: refresh the existing no-commit integration merge for owner review
+- Next action: none
+
+## P2c: generic storage-sum projection
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p2c-generic-storage-projection`
+- Source commit: pending
+- Integration commit: pending owner review
+- Immutable archive unchanged: yes
+- Scope: introduce the array/dimension storage type and value sums plus generic borrowed and consuming projection
+  contracts, preserving concrete eager payload ownership and symbolic SSA identity without introducing projected
+  contexts or mixed operation contracts
+- Deferred: direct projected binding and the third-member extensibility gate remain P2d; mixed operations, gateways,
+  comparisons, and `dimension_size` remain P3; composite batching projection remains P5 because its current carrier is
+  array-only and adding a heterogeneous batch representation would prematurely encode batching policy
+- Implemented: adds the sole `ArrayProgramType`/`ArrayProgramValue<A>` storage sums, generic type/value projection
+  contracts with borrowed and consuming paths, one checked `ProjectedValue<T, V>` for symbolic identity preservation,
+  and projection implementations for eager values, captures, tracers, partial tracers, and differentiation tracers
+- Ownership and performance: eager array projection returns `&A` or transfers `A`; a 4,096-element reference array
+  retains the same `Scalar` payload pointer through both paths, and isolated allocator tests measure zero allocations
+  for 1,000 borrowed projections and for consuming projection
+- Verification: formatting and diff hygiene, 958 `ryft-core` library tests, 53 executable `ryft-core` doctests with 15
+  ignored, two zero-allocation integration tests, and 396 `ryft-xla` library tests with one ignored benchmark
+- Lint audit: scoped Clippy remains nonzero because of the inherited warning backlog; no warning names a P2c-owned
+  storage, projection, type, value, or allocation-test implementation
+- Residual search: no archived `ArrayProgramProjection`, array/dimension-specific context view, projected context,
+  `.cloned()` eager projection, mixed operation family, gateway, or `dimension_size` implementation was introduced
+- Review method: line by line
+- Next action: commit and push the increment branch, then stage its no-commit merge for owner review

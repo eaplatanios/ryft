@@ -140,8 +140,8 @@ pub use regions::{
     Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
     RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
-pub use types::{Type, TypeError, TypeRefinements, Typed};
-pub use values::{Concretizable, Value, ValueId};
+pub use types::{Type, TypeError, TypeProjection, TypeRefinements, Typed};
+pub use values::{Concretizable, ProjectedValue, Value, ValueId, ValueProjection};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]

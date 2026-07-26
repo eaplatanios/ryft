@@ -94,8 +94,8 @@ use crate::programs::programs::{FlatProgram, Program};
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
-use crate::programs::types::Typed;
-use crate::programs::values::Value;
+use crate::programs::types::{Type, TypeError, TypeProjection, Typed};
+use crate::programs::values::{ProjectedValue, Value, ValueProjection};
 use crate::tracing::TracingContext;
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
@@ -1488,6 +1488,30 @@ impl<C: Context> Value for PartialTracer<C> {
     #[inline]
     fn execution_domain(&self) -> PartialEvaluationContext<C> {
         self.context().clone()
+    }
+}
+
+impl<C: Context<Type: TypeProjection<T>>, T: Type> ValueProjection<T> for PartialTracer<C> {
+    type Projected = ProjectedValue<T, Self>;
+    type ProjectedRef<'a>
+        = ProjectedValue<T, &'a Self>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn project_ref(&self) -> Result<Self::ProjectedRef<'_>, TypeError> {
+        Ok(ProjectedValue::new(self, self.r#type().project()?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let r#type = self.r#type().project()?.clone();
+        Ok(ProjectedValue::new(self, r#type))
+    }
+
+    #[inline]
+    fn lift(value: Self::Projected) -> Self {
+        value.into_value()
     }
 }
 

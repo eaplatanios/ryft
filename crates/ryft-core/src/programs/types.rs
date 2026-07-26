@@ -178,6 +178,21 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     fn is_complex(&self) -> bool;
 }
 
+/// Projects one member [`Type`] from a heterogeneous storage type without changing its semantics.
+///
+/// Implementations belong to storage sums such as [`ArrayProgramType`](crate::ArrayProgramType), while ordinary
+/// operation rules continue to use their homogeneous member types. [`Self::project`] borrows the member already stored
+/// by the sum, and [`Self::lift`] embeds an owned member back into that sum.
+pub trait TypeProjection<T: Type>: Type {
+    /// Borrows the projected member type.
+    ///
+    /// Returns a [`TypeError`] when this storage type contains a different member kind.
+    fn project(&self) -> Result<&T, TypeError>;
+
+    /// Lifts `type` into this heterogeneous storage type.
+    fn lift(r#type: T) -> Self;
+}
+
 /// Cross-occurrence established while validating one complete type signature at a [`Program`](crate::Program) or
 /// [`Region`](crate::Region) boundary. These facts relate declared [`TypeIdentity`]s to refinements observed in
 /// corresponding actual types, ensuring that repeated identity occurrences remain consistent across boundary leaves
@@ -287,12 +302,21 @@ pub trait Typed {
     fn r#type(&self) -> Cow<'_, Self::Type>;
 }
 
+impl<V: Typed + ?Sized> Typed for &V {
+    type Type = V::Type;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Self::Type> {
+        (*self).r#type()
+    }
+}
+
 #[allow(clippy::let_unit_value)]
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use crate::types::DataType;
+    use crate::types::{ArrayType, DataType};
 
     use super::*;
 
@@ -356,5 +380,12 @@ mod tests {
             ),
             Err(TypeError::invalid("type f64 does not refine declared type f32")),
         );
+    }
+
+    #[test]
+    fn test_typed_reference_delegates_to_referent() {
+        let value = ArrayType::scalar(DataType::F32);
+        let reference = &value;
+        assert_eq!(reference.r#type(), value.r#type());
     }
 }

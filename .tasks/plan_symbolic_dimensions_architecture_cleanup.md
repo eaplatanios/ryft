@@ -1041,26 +1041,29 @@ checked-evaluation hook or backend-owned interpretation adapter is introduced.
       capability-constrained interpretation, and make backends own concrete capability implementations.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
-- [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
+- [x] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
 - [x] Integrate inconclusive requirements with the existing effects model as `Effect::OrderedAssertion`; specify
       ordering, DCE survival, known-side PE folding, runtime observation values, and diagnostic ownership before
       lowering.
-- [ ] Complete the Phase 0 projection-ownership decision before writing the generic projection trait.
-- [ ] Prototype `TypeProjection<T>` and `ValueProjection<T>` for `ArrayType` and `DimensionType` members of the storage
+- [x] Complete the Phase 0 projection-ownership decision before writing the generic projection trait.
+- [x] Prototype `TypeProjection<T>` and `ValueProjection<T>` for `ArrayType` and `DimensionType` members of the storage
       sum.
-- [ ] Provide distinct borrowed projection and consuming ownership-transfer paths; do not implement eager projection
+- [x] Provide distinct borrowed projection and consuming ownership-transfer paths; do not implement eager projection
       as `.cloned()` from a borrowed storage-sum value.
-- [ ] Implement eager, capture, tracer, partial-tracer, batching-tracer, and differentiation-tracer projections.
-- [ ] Replace duplicated projected-value wrappers with one generic checked projected value where the concrete eager
+- [x] Implement eager, capture, tracer, partial-tracer, and differentiation-tracer projections. Composite batching
+      projection remains assigned to P5 because the current `BatchingTracer` is intentionally array-only; introducing
+      its heterogeneous batch representation here would prematurely encode P5's replicated-dimension policy.
+- [x] Replace duplicated projected-value wrappers with one generic checked projected value where the concrete eager
       value cannot be returned directly.
 - [ ] Introduce a zero-state `ProjectedContext<C, T>` that binds homogeneous inner operations directly into the outer
       graph.
 - [ ] Add one generic inner-operation lift contract implemented by the outer operation family.
-- [ ] Preserve SSA atom identity exactly through staged projections.
-- [ ] Preserve concrete eager values without boxing or heap allocation.
-- [ ] Add allocation and payload-size tests proving that projecting a large reference-backend array neither allocates
+- [x] Preserve SSA atom identity exactly through staged projections.
+- [x] Preserve concrete eager values without boxing or heap allocation.
+- [x] Add allocation and payload-size tests proving that projecting a large reference-backend array neither allocates
       nor copies its `Scalar` payload.
-- [ ] Pin canonical wrong-kind and wrong-count diagnostics as compile/runtime goldens.
+- [x] Pin canonical wrong-kind diagnostics as compile/runtime goldens. Wrong-count diagnostics belong to P3's mixed
+      operand schemas because P2c introduces no operand-count projection.
 - [ ] Add a compile-only toy third member kind to prove that another kind needs projection and policy
       implementations, not changes to generic `Program`, `Context`, capture, tracer, or projected-context machinery.
 - [ ] Gate: the projected context contains no semantic state other than its parent, and the vertical slice creates no
@@ -1781,3 +1784,26 @@ rich `DimensionValue::DispatchDomain`, and no production operation-to-backend de
 predicate-specific `evaluate_extents` remains intentionally shared by eager enforcement and known-side reasoning; it
 is not an arithmetic value-materialization side channel. The four pre-existing ambiguous dimension/math glob-re-export
 warnings remain assigned to P9.
+
+### Execution: P2c generic storage-sum projection
+
+P2c introduces only the heterogeneous storage and projection seam:
+
+- `ArrayProgramType` and `ArrayProgramValue<A>` are the sole array/dimension storage sums;
+- generic `TypeProjection<T>` and `ValueProjection<T>` contracts provide distinct borrowed and consuming paths;
+- eager array and dimension projection returns direct references or transfers the stored payload, with no clone,
+  allocation, boxing, or type-erased dispatch;
+- one `ProjectedValue<T, V>` preserves the original capture, tracer, partial-tracer, or differentiation-tracer value
+  while exposing its checked homogeneous member type;
+- reference `Typed` delegation makes `&A` a zero-state typed projection instead of requiring a borrowing wrapper;
+- storage-sum identity renaming and boundary refinements delegate to the existing array/dimension contracts while
+  enforcing canonical wrong-kind diagnostics; and
+- no projected context, operation-family lift, mixed operation, gateway, `dimension_size`, or batching policy is
+  introduced.
+
+Composite batching projection remains P5 work because the current batching carrier is structurally array-only.
+Defining a heterogeneous batch enum in P2c would make the storage increment choose the replicated-dimension and mapped
+authority policies assigned to P5. P2d can therefore prototype direct projected binding and a third storage member
+without pulling transformation policy forward.
+
+Verification and residual-audit results are recorded in the P2c cleanup-ledger entry at handoff.
