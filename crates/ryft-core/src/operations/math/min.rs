@@ -7,8 +7,8 @@ use crate::operations::control_flow::Select;
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`MinimumOperation`].
-pub const MINIMUM_OPERATION_NAME: &str = "minimum";
+/// Canonical operation name for [`MinOperation`].
+pub const MIN_OPERATION_NAME: &str = "min";
 
 define_elementwise_operation!(
     @binary
@@ -17,17 +17,17 @@ define_elementwise_operation!(
     /// [StableHLO's `minimum`](https://openxla.org/stablehlo/spec#minimum), only real (non-complex) numeric operands
     /// are supported because complex numbers are unordered (Boolean minima are spelled [`And`](crate::And)). For
     /// floating-point operands, NaNs propagate (the minimum is NaN when either operand is NaN) and `-0.0` orders
-    /// below `+0.0` (so `minimum(-0.0, +0.0)` is `-0.0`). Array operands that still carry partial sums are rejected,
+    /// below `+0.0` (so `min(-0.0, +0.0)` is `-0.0`). Array operands that still carry partial sums are rejected,
     /// and their reduced-axis markers must agree.
-    MinimumOperation, MINIMUM_OPERATION_NAME,
-    Minimum, minimum,
+    MinOperation, MIN_OPERATION_NAME,
+    Min, min,
     check_data_types = [@numeric @real],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
     @binary
-    MinimumOperation,
+    MinOperation,
     jvp<C>
     where
         C::Value: Compare<Output = C::Value> + Select + ZeroLike,
@@ -49,13 +49,13 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value-level elementwise minimum capability. [`Minimum`] fills the same role for
-    /// [`MinimumOperation`] that [`Atan2`](crate::Atan2) fills for [`Atan2Operation`](crate::Atan2Operation).
-    Minimum,
+    /// Value-level elementwise minimum capability. [`Min`] fills the same role for
+    /// [`MinOperation`] that [`Atan2`](crate::Atan2) fills for [`Atan2Operation`](crate::Atan2Operation).
+    Min,
     /// Computes the elementwise minimum of this value and `right`, promoting both operands to a common numeric
     /// element type and returning a [`ProgramError`](crate::ProgramError) if something goes wrong.
-    minimum(right),
-    MinimumOperation,
+    min(right),
+    MinOperation,
 );
 
 #[cfg(test)]
@@ -76,45 +76,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_minimum() {
-        assert_eq!(Scalar::from(2i32).minimum(&Scalar::from(5i32)).unwrap(), Scalar::from(2i32));
-        assert_eq!(Scalar::from(-2i64).minimum(&Scalar::from(-5i64)).unwrap(), Scalar::from(-5i64));
-        assert_eq!(Scalar::from(3u32).minimum(&Scalar::from(7u32)).unwrap(), Scalar::from(3u32));
-        assert_eq!(Scalar::from(2.5f32).minimum(&Scalar::from(1.5f32)).unwrap(), Scalar::from(1.5f32));
+    fn test_min() {
+        assert_eq!(Scalar::from(2i32).min(&Scalar::from(5i32)).unwrap(), Scalar::from(2i32));
+        assert_eq!(Scalar::from(-2i64).min(&Scalar::from(-5i64)).unwrap(), Scalar::from(-5i64));
+        assert_eq!(Scalar::from(3u32).min(&Scalar::from(7u32)).unwrap(), Scalar::from(3u32));
+        assert_eq!(Scalar::from(2.5f32).min(&Scalar::from(1.5f32)).unwrap(), Scalar::from(1.5f32));
         // Mixed-precision operands promote before comparing.
-        assert_eq!(Scalar::from(2.5f32).minimum(&Scalar::from(3.5f64)).unwrap(), Scalar::from(2.5f64));
+        assert_eq!(Scalar::from(2.5f32).min(&Scalar::from(3.5f64)).unwrap(), Scalar::from(2.5f64));
         assert_eq!(
-            Scalar::from(bf16::from_f32(2.0)).minimum(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
+            Scalar::from(bf16::from_f32(2.0)).min(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
             Scalar::from(bf16::from_f32(2.0)),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(2.0)).minimum(&Scalar::from(f16::from_f32(3.0))).unwrap(),
+            Scalar::from(f16::from_f32(2.0)).min(&Scalar::from(f16::from_f32(3.0))).unwrap(),
             Scalar::from(f16::from_f32(2.0)),
         );
         // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(match Scalar::from(f64::NAN).minimum(&Scalar::from(1.0f64)).unwrap() {
+        assert!(match Scalar::from(f64::NAN).min(&Scalar::from(1.0f64)).unwrap() {
             Scalar::F64(value) => value.is_nan(),
             _ => false,
         });
-        assert!(match Scalar::from(1.0f64).minimum(&Scalar::from(f64::NAN)).unwrap() {
+        assert!(match Scalar::from(1.0f64).min(&Scalar::from(f64::NAN)).unwrap() {
             Scalar::F64(value) => value.is_nan(),
             _ => false,
         });
-        assert!(match Scalar::from(-0.0f64).minimum(&Scalar::from(0.0f64)).unwrap() {
+        assert!(match Scalar::from(-0.0f64).min(&Scalar::from(0.0f64)).unwrap() {
             Scalar::F64(value) => value == 0.0 && value.is_sign_negative(),
             _ => false,
         });
         assert_eq!(
-            Array::vector(vec![0.7, -1.0]).minimum(&Array::vector(vec![0.3, 2.0])).unwrap(),
+            Array::vector(vec![0.7, -1.0]).min(&Array::vector(vec![0.3, 2.0])).unwrap(),
             Array::vector(vec![0.3, -1.0]),
         );
     }
 
     #[test]
-    fn test_minimum_type_inference() {
+    fn test_min_type_inference() {
         check_operation_type_inference!(
             @elementwise @binary,
-            operation = MinimumOperation,
+            operation = MinOperation,
             cases = [
                 {
                     input_data_types = [DataType::I32, DataType::I32],
@@ -122,26 +122,26 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "'minimum' does not support input data type c64",
+                    error = "'min' does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'minimum' does not support input data type bool",
+                    error = "'min' does not support input data type bool",
                 },
             ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = MinimumOperation,
+            operation = MinOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
-    fn test_minimum_batching() {
+    fn test_min_batching() {
         check_operation_batching!(
             @exact,
-            operation = MinimumOperation,
+            operation = MinOperation,
             axis_size = 2,
             cases = [
                 {
@@ -163,10 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_differentiation() {
+    fn test_min_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = MinimumOperation,
+            operation = MinOperation,
             cases = [
                 {
                     primals = [Array::scalar(2.0), Array::scalar(1.0)],
@@ -185,13 +185,13 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_differentiation_at_ties() {
+    fn test_min_differentiation_at_ties() {
         // Ties route the tangent to the left operand. The finite-difference oracle cannot check the
         // non-differentiable tie point, so the tie policy is asserted on the staged jvp program directly.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(MinimumOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(MinOperation, Vec::new(), vec![left, right]).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
@@ -204,19 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn test_minimum_partial_evaluation() {
+    fn test_min_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = MinimumOperation,
+            operation = MinOperation,
             inputs = [Scalar::from(0.7), Scalar::from(0.3)],
             expected = Scalar::from(0.3),
         );
     }
 
     #[test]
-    fn test_minimum_transposition() {
+    fn test_min_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = MinimumOperation,
+            operation = MinOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

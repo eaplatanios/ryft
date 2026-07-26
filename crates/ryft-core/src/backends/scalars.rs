@@ -36,9 +36,9 @@ use crate::operations::manipulation::{ConvertElementType, ConvertElementTypeOper
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
     DivOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Log, LogOperation, Logistic,
-    LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul, MulOperation, Neg, NegOperation, Pow,
-    PowOperation, Remainder, RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign, SignOperation,
-    Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
+    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Pow, PowOperation,
+    Rem, RemOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, Sign, SignOperation, Sin, SinOperation, Sqrt,
+    SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
 };
 use crate::operations::tag::{Tag, TagOperation};
 use crate::parameters::Parameter;
@@ -84,9 +84,9 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Floor(FloorOperation),
     Ceil(CeilOperation),
     Round(RoundOperation),
-    Maximum(MaximumOperation),
-    Minimum(MinimumOperation),
-    Remainder(RemainderOperation),
+    Max(MaxOperation),
+    Min(MinOperation),
+    Rem(RemOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
@@ -1763,13 +1763,13 @@ fn minimum_float(left: f64, right: f64) -> f64 {
     }
 }
 
-impl Maximum for Scalar {
+impl Max for Scalar {
     /// Computes the elementwise maximum of two [`Scalar`]s, promoting them to a common data type. Only the real
     /// (non-complex) numeric variants are supported. For floating-point operands, NaNs propagate and `-0.0` orders
     /// below `+0.0`; any other combination returns a [`TypeError`].
-    fn maximum(&self, right: &Self) -> Result<Self, ProgramError> {
-        check_types!(@numeric @real, "maximum", [self.r#type().into_owned(), right.r#type().into_owned()]);
-        let (left, right) = promote_scalar_arithmetic_operands(self, right, "maximum")?;
+    fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "max", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "max")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (left.low_precision_float_parts(), right.low_precision_float_parts())
         {
@@ -1812,13 +1812,13 @@ impl Maximum for Scalar {
     }
 }
 
-impl Minimum for Scalar {
+impl Min for Scalar {
     /// Computes the elementwise minimum of two [`Scalar`]s, promoting them to a common data type. Only the real
     /// (non-complex) numeric variants are supported. For floating-point operands, NaNs propagate and `-0.0` orders
     /// below `+0.0`; any other combination returns a [`TypeError`].
-    fn minimum(&self, right: &Self) -> Result<Self, ProgramError> {
-        check_types!(@numeric @real, "minimum", [self.r#type().into_owned(), right.r#type().into_owned()]);
-        let (left, right) = promote_scalar_arithmetic_operands(self, right, "minimum")?;
+    fn min(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "min", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "min")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (left.low_precision_float_parts(), right.low_precision_float_parts())
         {
@@ -1861,14 +1861,14 @@ impl Minimum for Scalar {
     }
 }
 
-impl Remainder for Scalar {
+impl Rem for Scalar {
     /// Computes the elementwise remainder of this [`Scalar`] (the dividend) and `right` (the divisor), with the
     /// result taking the sign of the dividend (truncation semantics). Integer and floating-point operands are
     /// promoted to a common data type; integer remainders with a zero divisor return a [`TypeError`], the minimum
     /// signed-integer dividend with a `-1` divisor wraps to `0`, and any other combination returns a [`TypeError`].
-    fn remainder(&self, right: &Self) -> Result<Self, ProgramError> {
-        check_types!(@numeric @real, "remainder", [self.r#type().into_owned(), right.r#type().into_owned()]);
-        let (left, right) = promote_scalar_arithmetic_operands(self, right, "remainder")?;
+    fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+        check_types!(@numeric @real, "rem", [self.r#type().into_owned(), right.r#type().into_owned()]);
+        let (left, right) = promote_scalar_arithmetic_operands(self, right, "rem")?;
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (left.low_precision_float_parts(), right.low_precision_float_parts())
         {

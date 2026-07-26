@@ -30,8 +30,8 @@ use ryft_core::operations::manipulation::{
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
-    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation,
-    NegOperation, PowOperation, ReductionKind, RemainderOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
+    NegOperation, PowOperation, ReductionKind, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
     SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
@@ -1028,7 +1028,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RoundOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaximumOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaxOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1049,7 +1049,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MaximumOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinimumOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -1070,7 +1070,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinimumOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemainderOperation {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -2221,7 +2221,7 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Maximum(operation) => <MaximumOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Max(operation) => <MaxOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -2229,7 +2229,7 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Minimum(operation) => <MinimumOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Min(operation) => <MinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -2237,7 +2237,7 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Remainder(operation) => <RemainderOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Rem(operation) => <RemOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -4428,7 +4428,7 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Maximum(operation) => <MaximumOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Max(operation) => <MaxOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -4436,7 +4436,7 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Minimum(operation) => <MinimumOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Min(operation) => <MinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -4444,7 +4444,7 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Remainder(operation) => <RemainderOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Rem(operation) => <RemOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 regions,
@@ -7860,7 +7860,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 .append_operation(stable_hlo::round_with_nearest_even_tie_break(input_values[0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.round_nearest_even should return one result").as_ref()])
         }
-        XlaOperation::Maximum(_) => {
+        XlaOperation::Max(_) => {
             let [left, right] = normalize_binary_elementwise_operands(
                 input_values,
                 output_types,
@@ -7871,7 +7871,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             let result = lowerer.block.append_operation(stable_hlo::maximum(left, right, lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.maximum should return one result").as_ref()])
         }
-        XlaOperation::Minimum(_) => {
+        XlaOperation::Min(_) => {
             let [left, right] = normalize_binary_elementwise_operands(
                 input_values,
                 output_types,
@@ -7882,7 +7882,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             let result = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()])
         }
-        XlaOperation::Remainder(_) => {
+        XlaOperation::Rem(_) => {
             let [left, right] = normalize_binary_elementwise_operands(
                 input_values,
                 output_types,

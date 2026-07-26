@@ -228,8 +228,8 @@ mod tests {
         Concatenate, ConvertElementType, Pad, Reshape, Slice, Transpose, UpdateSlice,
     };
     use ryft_core::operations::math::{
-        Abs, Atan2, Ceil, Cos, Dot, Erf, Exp, Floor, Log, Logistic, Maximum, Minimum, Pow, Reduce, ReductionKind,
-        Remainder, Round, Rsqrt, Sign, Sin, Sqrt, Tanh,
+        Abs, Atan2, Ceil, Cos, Dot, Erf, Exp, Floor, Log, Logistic, Max, Min, Pow, Reduce, ReductionKind, Rem, Round,
+        Rsqrt, Sign, Sin, Sqrt, Tanh,
     };
     use ryft_core::operations::tag::Tag;
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
@@ -462,9 +462,9 @@ mod tests {
         // The `right` vector contains the exact ties `-1.5` and `2.5`, checking the round-to-nearest-even policy
         // against the reference backend.
         assert_parity(&right.round().unwrap(), &reference_right.round().unwrap());
-        assert_parity(&left.maximum(&right).unwrap(), &reference_left.maximum(&reference_right).unwrap());
-        assert_parity(&left.minimum(&right).unwrap(), &reference_left.minimum(&reference_right).unwrap());
-        assert_parity(&left.remainder(&right).unwrap(), &reference_left.remainder(&reference_right).unwrap());
+        assert_parity(&left.max(&right).unwrap(), &reference_left.max(&reference_right).unwrap());
+        assert_parity(&left.min(&right).unwrap(), &reference_left.min(&reference_right).unwrap());
+        assert_parity(&left.rem(&right).unwrap(), &reference_left.rem(&reference_right).unwrap());
 
         // Element-type conversion agrees, including the exact `f8e4m3fn` encodings: the device payload bytes match
         // the reference backend's encoded bits bit for bit.

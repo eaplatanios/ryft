@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, ValueResolution};
+use crate::contexts::{Context, Domain, ValueResolution};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::partial::{
@@ -16,8 +17,6 @@ use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
-
-use super::requirement_violation;
 
 /// Canonical operation name for an equality [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";
@@ -64,7 +63,7 @@ pub enum DimensionRequirementPredicate {
 /// # Ok(())
 /// # }
 /// ```
-pub trait DimensionRequirement: Sized {
+pub trait DimensionRequirement: Typed<Type = DimensionType> + Sized {
     /// Requires `self == right`.
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError>;
 
@@ -78,46 +77,36 @@ pub trait DimensionRequirement: Sized {
     fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError>;
 }
 
-impl<V: Value<Type = DimensionType, DispatchDomain: Context<Operation: From<DimensionRequirementOperation>>>>
-    DimensionRequirement for V
+impl<V: Value<Type = DimensionType>> DimensionRequirement for V
+where
+    V::DispatchDomain: Context<Type = DimensionType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionRequirementOperation>,
 {
     #[inline]
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::equal(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
+        let operation = DimensionRequirementOperation::equal(&self.r#type(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }
 
     #[inline]
     fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
+        let operation = DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }
 
     #[inline]
     fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type()),
-            Vec::new(),
-            &[self.clone(), right.clone()],
-        )?;
+        let operation = DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }
 
     #[inline]
     fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            DimensionRequirementOperation::bounds(&self.r#type(), bounds),
-            Vec::new(),
-            std::slice::from_ref(self),
-        )?;
+        let operation = DimensionRequirementOperation::bounds(&self.r#type(), bounds);
+        self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         Ok(())
     }
 }
@@ -396,13 +385,14 @@ impl DimensionRequirementOperation {
         if left == right {
             Ok(())
         } else {
-            Err(requirement_violation(
-                format!("{} == {}", left_type.variable(), right_type.variable()),
-                left_type,
-                left,
-                right_type,
-                right,
-            ))
+            let left_variable = left_type.variable();
+            let right_variable = right_type.variable();
+            Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{left_variable} == {right_variable}; observed {left_variable}={left}, \
+                     {right_variable}={right}",
+                ),
+            })
         }
     }
 
@@ -416,13 +406,14 @@ impl DimensionRequirementOperation {
         if left <= right {
             Ok(())
         } else {
-            Err(requirement_violation(
-                format!("{} <= {}", left_type.variable(), right_type.variable()),
-                left_type,
-                left,
-                right_type,
-                right,
-            ))
+            let left_variable = left_type.variable();
+            let right_variable = right_type.variable();
+            Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{left_variable} <= {right_variable}; observed {left_variable}={left}, \
+                     {right_variable}={right}",
+                ),
+            })
         }
     }
 
@@ -434,23 +425,25 @@ impl DimensionRequirementOperation {
         divisor: usize,
     ) -> Result<(), DimensionError> {
         if divisor == 0 {
-            Err(requirement_violation(
-                format!("{} > 0 for divisibility", divisor_type.variable()),
-                dividend_type,
-                dividend,
-                divisor_type,
-                divisor,
-            ))
+            let dividend_variable = dividend_type.variable();
+            let divisor_variable = divisor_type.variable();
+            Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{divisor_variable} > 0 for divisibility; observed {dividend_variable}={dividend}, \
+                     {divisor_variable}={divisor}",
+                ),
+            })
         } else if dividend.is_multiple_of(divisor) {
             Ok(())
         } else {
-            Err(requirement_violation(
-                format!("{} % {} == 0", dividend_type.variable(), divisor_type.variable()),
-                dividend_type,
-                dividend,
-                divisor_type,
-                divisor,
-            ))
+            let dividend_variable = dividend_type.variable();
+            let divisor_variable = divisor_type.variable();
+            Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{dividend_variable} % {divisor_variable} == 0; observed {dividend_variable}={dividend}, \
+                     {divisor_variable}={divisor}",
+                ),
+            })
         }
     }
 
@@ -511,6 +504,34 @@ impl Operation<DimensionType> for DimensionRequirementOperation {
             }
             _ => formatter.write_str(self.name()),
         }
+    }
+}
+
+impl<C: Domain<Type = DimensionType, Value: DimensionRequirement>> InterpretableOperation<C>
+    for DimensionRequirementOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, self.input_count(), ProgramError);
+        let left_type = inputs[0].r#type().into_owned();
+        if let Some(right) = inputs.get(1) {
+            self.validate_input_types(&[left_type, right.r#type().into_owned()])?;
+        } else {
+            self.validate_input_types(std::slice::from_ref(&left_type))?;
+        }
+        match self.predicate {
+            DimensionRequirementPredicate::Equal => inputs[0].require_equal(&inputs[1])?,
+            DimensionRequirementPredicate::LessThanOrEqual => {
+                inputs[0].require_less_than_or_equal(&inputs[1])?;
+            }
+            DimensionRequirementPredicate::DivisibleBy => inputs[0].require_divisible_by(&inputs[1])?,
+            DimensionRequirementPredicate::Bounds(bounds) => inputs[0].require_bounds(bounds)?,
+        }
+        Ok(Vec::new())
     }
 }
 

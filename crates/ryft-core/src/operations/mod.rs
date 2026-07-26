@@ -33,17 +33,16 @@ pub use control_flow::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::*;
 pub use dimensions::{
-    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_FLOOR_DIVIDE_OPERATION_NAME,
-    DIMENSION_MAXIMUM_OPERATION_NAME, DIMENSION_MINIMUM_OPERATION_NAME, DIMENSION_MULTIPLY_OPERATION_NAME,
-    DIMENSION_POWER_OPERATION_NAME, DIMENSION_REMAINDER_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
+    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,
+    DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME,
+    DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
     DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
-    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME,
-    DIMENSION_SUBTRACT_OPERATION_NAME, DimensionAdd, DimensionAddOperation, DimensionFloorDivide,
-    DimensionFloorDivideOperation, DimensionMaximum, DimensionMaximumOperation, DimensionMinimum,
-    DimensionMinimumOperation, DimensionMultiply, DimensionMultiplyOperation, DimensionPower, DimensionPowerOperation,
-    DimensionRemainder, DimensionRemainderOperation, DimensionRequirement, DimensionRequirementOperation,
-    DimensionRequirementPredicate, DimensionSubtract, DimensionSubtractClamped, DimensionSubtractClampedOperation,
-    DimensionSubtractOperation,
+    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME,
+    DIMENSION_SUB_OPERATION_NAME, DimensionAdd, DimensionAddOperation, DimensionDivFloor, DimensionDivFloorOperation,
+    DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMul, DimensionMulOperation,
+    DimensionPow, DimensionPowOperation, DimensionRem, DimensionRemOperation, DimensionRequirement,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
+    DimensionSaturatingSubOperation, DimensionSub, DimensionSubOperation,
 };
 pub use logical::*;
 pub use manipulation::*;

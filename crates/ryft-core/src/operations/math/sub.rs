@@ -2,6 +2,10 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::types::Type;
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -27,6 +31,33 @@ impl_differentiable_elementwise_operation! {
     rule = [@positive, @negative]
 }
 
+/// Selects the operation used to implement traced [`std::ops::Sub`] for a program type family.
+pub trait SubOperationFor: Type {
+    /// Concrete subtraction operation staged for this type family.
+    type Operation: Operation<Self>;
+
+    /// Constructs the subtraction operation for `left_type` and `right_type`.
+    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+}
+
+impl SubOperationFor for DataType {
+    type Operation = SubOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(SubOperation)
+    }
+}
+
+impl SubOperationFor for ArrayType {
+    type Operation = SubOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(SubOperation)
+    }
+}
+
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise subtraction capability. [`Sub`] is the fallible Ryft counterpart to [`std::ops::Sub`]
@@ -39,7 +70,7 @@ define_elementwise_capability!(
     SubOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");
+define_tracer_operator!(@binary_provider std::ops::Sub, sub, SubOperationFor, "`sub` operation failed");
 
 #[cfg(test)]
 mod tests {

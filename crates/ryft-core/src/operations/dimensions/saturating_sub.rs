@@ -4,42 +4,42 @@ use crate::types::{DimensionBounds, DimensionError, DimensionType};
 
 use super::representable_extent_range;
 
-/// Canonical operation name for [`DimensionSubtractClampedOperation`].
-pub const DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME: &str = "dimension_subtract_clamped";
+/// Canonical operation name for [`DimensionSaturatingSubOperation`].
+pub const DIMENSION_SATURATING_SUB_OPERATION_NAME: &str = "dimension_saturating_sub";
 
 define_arithmetic_dimension_operation!(
-    /// Clamped dimension-subtraction operation used by [`DimensionSubtractClamped`].
+    /// Saturating dimension-subtraction operation used by [`DimensionSaturatingSub`].
     ///
-    /// Refer to [`DimensionSubtractClamped`] for semantic details and an example.
-    DimensionSubtractClampedOperation, DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME,
+    /// Refer to [`DimensionSaturatingSub`] for semantic details and an example.
+    DimensionSaturatingSubOperation, DIMENSION_SATURATING_SUB_OPERATION_NAME,
+    DimensionSaturatingSub, saturating_sub,
     result_name = |left: &DimensionType, right: &DimensionType| {
         format!("max(0, {} - {})", left.variable(), right.variable())
     },
     infer_bounds = infer_bounds,
-    evaluate = evaluate,
 );
 
 define_arithmetic_dimension_capability!(
-    /// Subtracts one runtime dimension from another and clamps negative results to zero.
+    /// Subtracts one runtime dimension from another, saturating at zero instead of producing a negative result.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use ryft_core::{DimensionSubtractClamped, DimensionValue, ProgramError};
+    /// # use ryft_core::{DimensionSaturatingSub, DimensionValue, ProgramError};
     /// # fn main() -> Result<(), ProgramError> {
     /// let result = DimensionValue::constant(3)?
-    ///     .subtract_dimension_clamped(&DimensionValue::constant(7)?)?;
+    ///     .saturating_sub(&DimensionValue::constant(7)?)?;
     /// assert_eq!(result.extent(), 0);
     /// # Ok(())
     /// # }
     /// ```
-    DimensionSubtractClamped,
+    DimensionSaturatingSub,
     /// Returns `max(0, self - right)`.
-    subtract_dimension_clamped(right),
-    DimensionSubtractClampedOperation,
+    saturating_sub(right),
+    DimensionSaturatingSubOperation,
 );
 
-/// Derives sound bounds for clamped dimension subtraction.
+/// Derives sound bounds for saturating dimension subtraction.
 fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<DimensionBounds, DimensionError> {
     let (left_lower, left_maximum) = representable_extent_range(left.bounds())?;
     let (right_lower, right_maximum) = representable_extent_range(right.bounds())?;
@@ -47,16 +47,6 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<Dimension
         left_lower.saturating_sub(right_maximum),
         left_maximum.saturating_sub(right_lower).checked_add(1),
     )
-}
-
-/// Evaluates clamped dimension subtraction.
-fn evaluate(
-    _left_type: &DimensionType,
-    left: usize,
-    _right_type: &DimensionType,
-    right: usize,
-) -> Result<usize, DimensionError> {
-    Ok(left.saturating_sub(right))
 }
 
 #[cfg(test)]
@@ -70,18 +60,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dimension_subtract_clamped_operation() {
+    fn test_dimension_saturating_sub_operation() {
         let left = test_dimension_type("left", 1, 5);
         let right = test_dimension_type("right", 2, 9);
-        let operation = DimensionSubtractClampedOperation::new(&left, &right).unwrap();
-        assert_eq!(operation.to_string(), DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME);
-        assert_eq!(operation.result_type().bounds(), DimensionBounds::new(0, Some(3)).unwrap());
-        assert_eq!(evaluate(&left, 3, &right, 7), Ok(0));
-        assert_eq!(evaluate(&left, 4, &right, 2), Ok(2));
+        let operation = DimensionSaturatingSubOperation::new(&left, &right).unwrap();
+        assert_eq!(operation.to_string(), DIMENSION_SATURATING_SUB_OPERATION_NAME);
+        assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(3)).unwrap());
         assert_eq!(
             DimensionValue::constant(3)
                 .unwrap()
-                .subtract_dimension_clamped(&DimensionValue::constant(7).unwrap())
+                .saturating_sub(&DimensionValue::constant(7).unwrap())
                 .unwrap()
                 .extent(),
             0,

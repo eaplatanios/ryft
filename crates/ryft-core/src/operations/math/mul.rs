@@ -8,9 +8,11 @@ use crate::macros::{
     impl_differentiable_elementwise_operation,
 };
 use crate::operations::ElementwiseOperation;
-use crate::programs::types::TypeError;
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::types::{Type, TypeError};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -125,6 +127,33 @@ impl_differentiable_elementwise_operation! {
     },
 }
 
+/// Selects the operation used to implement traced [`std::ops::Mul`] for a program type family.
+pub trait MulOperationFor: Type {
+    /// Concrete multiplication operation staged for this type family.
+    type Operation: Operation<Self>;
+
+    /// Constructs the multiplication operation for `left_type` and `right_type`.
+    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+}
+
+impl MulOperationFor for DataType {
+    type Operation = MulOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(MulOperation)
+    }
+}
+
+impl MulOperationFor for ArrayType {
+    type Operation = MulOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(MulOperation)
+    }
+}
+
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to
@@ -137,7 +166,7 @@ define_elementwise_capability!(
     MulOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operation failed");
+define_tracer_operator!(@binary_provider std::ops::Mul, mul, MulOperationFor, "`mul` operation failed");
 
 #[cfg(test)]
 mod tests {

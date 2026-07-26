@@ -32,9 +32,9 @@ use ryft_core::operations::manipulation::{
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
-    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaximumOperation, MinimumOperation, MulOperation,
-    NegOperation, PowOperation, ReduceOperation, RemainderOperation, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
+    ExpOperation, FloorOperation, LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation,
+    NegOperation, PowOperation, ReduceOperation, RemOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    SignOperation, SinOperation, SqrtOperation, SubOperation, TanhOperation,
 };
 use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
@@ -107,9 +107,9 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Floor(FloorOperation),
     Ceil(CeilOperation),
     Round(RoundOperation),
-    Maximum(MaximumOperation),
-    Minimum(MinimumOperation),
-    Remainder(RemainderOperation),
+    Max(MaxOperation),
+    Min(MinOperation),
+    Rem(RemOperation),
     Abs(AbsOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),
@@ -217,9 +217,9 @@ where
             ArrayOperation::Floor(operation) => Self::Floor(operation),
             ArrayOperation::Ceil(operation) => Self::Ceil(operation),
             ArrayOperation::Round(operation) => Self::Round(operation),
-            ArrayOperation::Maximum(operation) => Self::Maximum(operation),
-            ArrayOperation::Minimum(operation) => Self::Minimum(operation),
-            ArrayOperation::Remainder(operation) => Self::Remainder(operation),
+            ArrayOperation::Max(operation) => Self::Max(operation),
+            ArrayOperation::Min(operation) => Self::Min(operation),
+            ArrayOperation::Rem(operation) => Self::Rem(operation),
             ArrayOperation::Abs(operation) => Self::Abs(operation),
             ArrayOperation::Complex(operation) => Self::Complex(operation),
             ArrayOperation::Conjugate(operation) => Self::Conjugate(operation),

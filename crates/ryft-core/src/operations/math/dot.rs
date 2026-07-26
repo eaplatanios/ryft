@@ -18,7 +18,7 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, Reshape, ReshapeOperation,
     Transpose,
 };
-use crate::operations::math::{Abs, Div, Exp, Floor, Log, Maximum, Mul, MulOperation, Reduce, ReductionKind, Sub};
+use crate::operations::math::{Abs, Div, Exp, Floor, Log, Max, Mul, MulOperation, Reduce, ReductionKind, Sub};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::operations::{Operation, OperationFormatter};
 use crate::programs::regions::RegionInterface;
@@ -1635,7 +1635,7 @@ where
         + Exp
         + Floor
         + Log
-        + Maximum
+        + Max
         + Mul
         + Reduce
         + Reshape
@@ -1648,7 +1648,7 @@ where
         element_type: DataType,
         scale_type: DataType,
     ) -> Result<(Self, Self), ProgramError> {
-        // Maximum finite magnitude and maximum exponent of the supported microscaling element types.
+        // Max finite magnitude and maximum exponent of the supported microscaling element types.
         let (element_max, element_max_exponent) = match element_type {
             DataType::F4E2M1FN => (6.0, 2.0),
             DataType::F8E4M3FN => (448.0, 8.0),
@@ -1728,7 +1728,7 @@ where
                 .into());
             }
         };
-        let scales = scale.maximum(&fill(smallest_scale)?)?.convert_element_type(scale_type)?;
+        let scales = scale.max(&fill(smallest_scale)?)?.convert_element_type(scale_type)?;
 
         // Divide by the *stored* scale — exactly the value `scaled_dot` dequantizes with — and narrow the elements.
         let stored_scales = scales.convert_element_type(compute_type)?;

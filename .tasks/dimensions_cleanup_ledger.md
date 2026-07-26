@@ -367,11 +367,12 @@ ledger disagrees with Git.
 
 ## P2b.1: canonical dimension operation modules
 
-- Status: implementation ready for owner review
+- Status: landed
 - Branch: `u/eaplatanios/increment/p2b1-dimension-operation-modules`
-- Source commit: pending implementation
-- Integration commit: pending owner review
-- Remainder reconciliation commit: pending integration
+- Source commit: `d95dcc9214cc26afeffe7d6c9ca0f419f26b1ba3`
+- Integration commit: `4d4342009b8e45ac2998e25608fafc568b4db798` (review merge
+  `8dd7be61ab75d5949adffc1675f3933ab6681303` plus reviewed follow-up commits)
+- Remainder reconciliation commit: `fa34b4ffe`
 - Immutable archive unchanged: yes
 - Scope: replace tagged dimension arithmetic with one nominal type and capability per primitive, share their common
   operation contract through `ArithmeticDimensionOperation`, move arithmetic and requirement primitives into one
@@ -383,8 +384,30 @@ ledger disagrees with Git.
 - Verification: formatting and diff hygiene, 943 `ryft-core` library tests, 53 executable `ryft-core` doctests, 396
   `ryft-xla` library tests, focused operation/requirement tests, and changed-file clippy diagnostics
 - Residual search: no `DimensionArithmetic` or `DimensionArithmeticOperation`; exactly nine nominal arithmetic
-  payload modules and backend-family variants; no arithmetic selector enum; no production operation-to-backend
-  dependency; no duplicate backend arithmetic semantics
+  payload modules and backend-family variants; no arithmetic selector enum or duplicate backend arithmetic semantics.
+  The final macro follow-up moved eager interpretation into generic operation generation and thereby introduced a
+  direct `macros -> backends::dimensions::DimensionValue` dependency; P2b.2 owns its removal before P2c.
 - Review method: line by line, with the plan reviewed before production implementation and a final minimality and
   dispatch-boundary audit after verification
-- Next action: stage the implementation on `u/eaplatanios/dynamic-shapes` for owner review
+- Next action: land P2b.2's narrow backend-neutral interpretation correction
+
+## P2b.2: restore backend-neutral dimension interpretation
+
+- Status: ready for owner review
+- Branch: `u/eaplatanios/increment/p2b2-backend-neutral-dimension-interpretation`
+- Source commit: pending next-increment bookkeeping
+- Integration commit: pending owner review
+- Remainder reconciliation commit: `fa34b4ffe` (reconciles reviewed P2b.1 into the mutable remainder)
+- Immutable archive unchanged: yes
+- Scope: remove the concrete `DimensionValue` dependency from generic arithmetic operation generation, make each
+  operation own generic capability-constrained interpretation, and make the reference backend own concrete dimension
+  capability implementations
+- Deferred: the heterogeneous storage sum and generic projection remain P2c; projected binding remains P2d; no
+  operation, capability, bounds, or diagnostic semantics change in this correction
+- Verification: formatting and diff hygiene, `cargo check -p ryft-core -p ryft-xla`, focused dimension/backend/macro
+  tests, 946 `ryft-core` library tests, 53 executable `ryft-core` doctests, and 396 `ryft-xla` library tests
+- Residual search: no arithmetic `evaluate` hook, backend-owned arithmetic/requirement `InterpretableOperation`, rich
+  `DimensionValue::DispatchDomain`, or production operation-to-backend dependency remains; the requirement predicate's
+  shared `evaluate_extents` is intentionally retained for eager enforcement and known-side reasoning
+- Review method: line by line
+- Next action: refresh the existing no-commit integration merge for owner review

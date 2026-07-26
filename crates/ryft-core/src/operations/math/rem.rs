@@ -4,11 +4,15 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::types::Type;
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`RemainderOperation`].
-pub const REMAINDER_OPERATION_NAME: &str = "remainder";
+/// Canonical operation name for [`RemOperation`].
+pub const REM_OPERATION_NAME: &str = "rem";
 
 define_elementwise_operation!(
     @binary
@@ -18,18 +22,18 @@ define_elementwise_operation!(
     /// [StableHLO's `remainder`](https://openxla.org/stablehlo/spec#remainder) and Rust's `%`). Only integer and
     /// floating-point operands are supported. Array operands that still carry partial sums are rejected, and their
     /// reduced-axis markers must agree.
-    RemainderOperation, REMAINDER_OPERATION_NAME,
-    Remainder, remainder,
+    RemOperation, REM_OPERATION_NAME,
+    Rem, rem,
     check_data_types = [@numeric @real],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
     @binary
-    RemainderOperation,
+    RemOperation,
     jvp<C>
     where
-        C::Value: Remainder
+        C::Value: Rem
             + StandardDiv<Output = C::Value>
             + StandardMul<Output = C::Value>
             + StandardNeg<Output = C::Value>
@@ -39,28 +43,60 @@ impl_differentiable_elementwise_operation! {
         // recovered exactly as (x - rem(x, y)) / y.
         |(_, left_tangent), (_, _)| left_tangent;
         |(left, _), (right, right_tangent)| {
-            let truncated_quotient = (left.clone() - left.remainder(&right)?) / right;
+            let truncated_quotient = (left.clone() - left.rem(&right)?) / right;
             -(truncated_quotient * right_tangent)
         };
     },
     transpose = @nonlinear,
 }
 
+/// Selects the operation used to implement traced [`std::ops::Rem`] for a program type family.
+pub trait RemOperationFor: Type {
+    /// Concrete remainder operation staged for this type family.
+    type Operation: Operation<Self>;
+
+    /// Constructs the remainder operation for `left_type` and `right_type`.
+    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+}
+
+impl RemOperationFor for DataType {
+    type Operation = RemOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(RemOperation)
+    }
+}
+
+impl RemOperationFor for ArrayType {
+    type Operation = RemOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(RemOperation)
+    }
+}
+
 define_elementwise_capability!(
     @binary
-    /// Value-level elementwise remainder capability. [`Remainder`] is the fallible Ryft counterpart to
-    /// [`std::ops::Rem`] that [`RemainderOperation`] interprets through, surfacing a
+    /// Value-level elementwise remainder capability. [`Rem`] is the fallible Ryft counterpart to
+    /// [`std::ops::Rem`] that [`RemOperation`] interprets through, surfacing a
     /// [`ProgramError`](crate::ProgramError) when something goes wrong, instead of panicking. Value types
     /// additionally provide [`std::ops::Rem`] as ergonomic (albeit panicking) sugar layered on top of this
     /// capability.
-    Remainder,
+    Rem,
     /// Computes the remainder of dividing this value (the dividend) by `right` (the divisor), with the result taking
     /// the sign of the dividend, and returning a [`ProgramError`](crate::ProgramError) if something goes wrong.
-    remainder(right),
-    RemainderOperation,
+    rem(right),
+    RemOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Rem, rem, RemainderOperation, "`remainder` operation failed");
+define_tracer_operator!(
+    @binary_provider std::ops::Rem,
+    rem,
+    RemOperationFor,
+    "`rem` operation failed",
+);
 
 #[cfg(test)]
 mod tests {
@@ -78,36 +114,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_remainder() {
-        assert_eq!(Scalar::from(7i32).remainder(&Scalar::from(3i32)).unwrap(), Scalar::from(1i32));
+    fn test_rem() {
+        assert_eq!(Scalar::from(7i32).rem(&Scalar::from(3i32)).unwrap(), Scalar::from(1i32));
         // The result takes the sign of the dividend.
-        assert_eq!(Scalar::from(-7i32).remainder(&Scalar::from(3i32)).unwrap(), Scalar::from(-1i32));
-        assert_eq!(Scalar::from(7i64).remainder(&Scalar::from(-3i64)).unwrap(), Scalar::from(1i64));
-        assert_eq!(Scalar::from(7u32).remainder(&Scalar::from(3u32)).unwrap(), Scalar::from(1u32));
-        assert_eq!(Scalar::from(7.5f64).remainder(&Scalar::from(2.0f64)).unwrap(), Scalar::from(1.5f64));
-        assert_eq!(Scalar::from(-7.5f32).remainder(&Scalar::from(2.0f32)).unwrap(), Scalar::from(-1.5f32));
+        assert_eq!(Scalar::from(-7i32).rem(&Scalar::from(3i32)).unwrap(), Scalar::from(-1i32));
+        assert_eq!(Scalar::from(7i64).rem(&Scalar::from(-3i64)).unwrap(), Scalar::from(1i64));
+        assert_eq!(Scalar::from(7u32).rem(&Scalar::from(3u32)).unwrap(), Scalar::from(1u32));
+        assert_eq!(Scalar::from(7.5f64).rem(&Scalar::from(2.0f64)).unwrap(), Scalar::from(1.5f64));
+        assert_eq!(Scalar::from(-7.5f32).rem(&Scalar::from(2.0f32)).unwrap(), Scalar::from(-1.5f32));
         assert_eq!(
-            Scalar::from(bf16::from_f32(7.5)).remainder(&Scalar::from(bf16::from_f32(2.0))).unwrap(),
+            Scalar::from(bf16::from_f32(7.5)).rem(&Scalar::from(bf16::from_f32(2.0))).unwrap(),
             Scalar::from(bf16::from_f32(7.5f32 % 2.0f32)),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(7.5)).remainder(&Scalar::from(f16::from_f32(2.0))).unwrap(),
+            Scalar::from(f16::from_f32(7.5)).rem(&Scalar::from(f16::from_f32(2.0))).unwrap(),
             Scalar::from(f16::from_f32(7.5f32 % 2.0f32)),
         );
         // Division by an integer zero reports an error instead of panicking.
-        assert!(matches!(Scalar::from(7i32).remainder(&Scalar::from(0i32)), Err(_)));
+        assert!(matches!(Scalar::from(7i32).rem(&Scalar::from(0i32)), Err(_)));
 
         assert_eq!(
-            Array::vector(vec![7.5, -7.5]).remainder(&Array::vector(vec![2.0, 2.0])).unwrap(),
+            Array::vector(vec![7.5, -7.5]).rem(&Array::vector(vec![2.0, 2.0])).unwrap(),
             Array::vector(vec![1.5, -1.5]),
         );
     }
 
     #[test]
-    fn test_remainder_type_inference() {
+    fn test_rem_type_inference() {
         check_operation_type_inference!(
             @elementwise @binary,
-            operation = RemainderOperation,
+            operation = RemOperation,
             cases = [
                 {
                     input_data_types = [DataType::I32, DataType::I32],
@@ -115,26 +151,26 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "'remainder' does not support input data type c64",
+                    error = "'rem' does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'remainder' does not support input data type bool",
+                    error = "'rem' does not support input data type bool",
                 },
             ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = RemainderOperation,
+            operation = RemOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
-    fn test_remainder_batching() {
+    fn test_rem_batching() {
         check_operation_batching!(
             @exact,
-            operation = RemainderOperation,
+            operation = RemOperation,
             axis_size = 2,
             cases = [{
                 inputs = [
@@ -147,10 +183,10 @@ mod tests {
     }
 
     #[test]
-    fn test_remainder_differentiation() {
+    fn test_rem_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = RemainderOperation,
+            operation = RemOperation,
             cases = [{
                 primals = [Array::scalar(7.5), Array::scalar(2.0)],
                 tangents = [Array::scalar(3.0), Array::scalar(5.0)],
@@ -162,15 +198,15 @@ mod tests {
     }
 
     #[test]
-    fn test_remainder_partial_evaluation() {
-        check_operation_partial_evaluation!(operation = RemainderOperation, inputs = [7.5, 2.0], expected = 1.5,);
+    fn test_rem_partial_evaluation() {
+        check_operation_partial_evaluation!(operation = RemOperation, inputs = [7.5, 2.0], expected = 1.5,);
     }
 
     #[test]
-    fn test_remainder_transposition() {
+    fn test_rem_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = RemainderOperation,
+            operation = RemOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

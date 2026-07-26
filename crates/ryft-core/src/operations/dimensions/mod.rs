@@ -12,38 +12,38 @@ use crate::programs::types::{Type, TypeError};
 use crate::types::{DimensionBounds, DimensionError, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT};
 
 pub mod add;
-pub mod floor_divide;
-pub mod maximum;
-pub mod minimum;
-pub mod multiply;
-pub mod power;
-pub mod remainder;
+pub mod div_floor;
+pub mod max;
+pub mod min;
+pub mod mul;
+pub mod pow;
+pub mod rem;
 pub mod requirement;
-pub mod subtract;
-pub mod subtract_clamped;
+pub mod saturating_sub;
+pub mod sub;
 
 pub use add::{DIMENSION_ADD_OPERATION_NAME, DimensionAdd, DimensionAddOperation};
-pub use floor_divide::{DIMENSION_FLOOR_DIVIDE_OPERATION_NAME, DimensionFloorDivide, DimensionFloorDivideOperation};
-pub use maximum::{DIMENSION_MAXIMUM_OPERATION_NAME, DimensionMaximum, DimensionMaximumOperation};
-pub use minimum::{DIMENSION_MINIMUM_OPERATION_NAME, DimensionMinimum, DimensionMinimumOperation};
-pub use multiply::{DIMENSION_MULTIPLY_OPERATION_NAME, DimensionMultiply, DimensionMultiplyOperation};
-pub use power::{DIMENSION_POWER_OPERATION_NAME, DimensionPower, DimensionPowerOperation};
-pub use remainder::{DIMENSION_REMAINDER_OPERATION_NAME, DimensionRemainder, DimensionRemainderOperation};
+pub use div_floor::{DIMENSION_DIV_FLOOR_OPERATION_NAME, DimensionDivFloor, DimensionDivFloorOperation};
+pub use max::{DIMENSION_MAX_OPERATION_NAME, DimensionMax, DimensionMaxOperation};
+pub use min::{DIMENSION_MIN_OPERATION_NAME, DimensionMin, DimensionMinOperation};
+pub use mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMul, DimensionMulOperation};
+pub use pow::{DIMENSION_POW_OPERATION_NAME, DimensionPow, DimensionPowOperation};
+pub use rem::{DIMENSION_REM_OPERATION_NAME, DimensionRem, DimensionRemOperation};
 pub use requirement::{
     DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
     DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DimensionRequirement,
     DimensionRequirementOperation, DimensionRequirementPredicate,
 };
-pub use subtract::{DIMENSION_SUBTRACT_OPERATION_NAME, DimensionSubtract, DimensionSubtractOperation};
-pub use subtract_clamped::{
-    DIMENSION_SUBTRACT_CLAMPED_OPERATION_NAME, DimensionSubtractClamped, DimensionSubtractClampedOperation,
+pub use saturating_sub::{
+    DIMENSION_SATURATING_SUB_OPERATION_NAME, DimensionSaturatingSub, DimensionSaturatingSubOperation,
 };
+pub use sub::{DIMENSION_SUB_OPERATION_NAME, DimensionSub, DimensionSubOperation};
 
 /// Shared contract implemented by binary first-class-dimension arithmetic operations.
 ///
-/// Concrete operations own their bounds formula and checked calculation. This trait centralizes the common two-input
-/// type validation and fresh-result contract, allowing operation families and eager backends to dispatch once to a
-/// nominal operation type and then invoke its statically selected implementation.
+/// Each nominal operation owns its bounds formula and is paired with a value capability. This trait centralizes the
+/// common two-input type validation and fresh-result contract without imposing a concrete backend value
+/// representation.
 pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
     /// Returns the declared left operand type.
     fn left_type(&self) -> &DimensionType;
@@ -51,8 +51,11 @@ pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
     /// Returns the declared right operand type.
     fn right_type(&self) -> &DimensionType;
 
-    /// Returns the fresh result type defined by this operation.
-    fn result_type(&self) -> DimensionType;
+    /// Returns the diagnostic name used for a freshly inferred result variable.
+    fn result_name(&self) -> &str;
+
+    /// Returns the bounds of a freshly inferred result variable.
+    fn result_bounds(&self) -> DimensionBounds;
 
     /// Infers this operation's one fresh dimension result after validating both operand types.
     fn infer_output_types(&self, input_types: &[DimensionType]) -> Result<Vec<DimensionType>, TypeError> {
@@ -69,7 +72,7 @@ pub trait ArithmeticDimensionOperation: Operation<DimensionType> {
                 }
             },
         )?;
-        Ok(vec![self.result_type()])
+        Ok(vec![DimensionType::new(DimensionVariable::new(self.result_name(), self.result_bounds()))])
     }
 }
 
@@ -82,19 +85,22 @@ pub(crate) struct ArithmeticDimensionOperationMetadata {
     /// Expected right operand type.
     right: DimensionType,
 
-    /// Fresh variable defined by the operation's result.
-    result: DimensionVariable,
+    /// Diagnostic name assigned to the result variable when output inference creates it.
+    result_name: String,
+
+    /// Authoritative bounds assigned to the result variable when output inference creates it.
+    result_bounds: DimensionBounds,
 }
 
 impl ArithmeticDimensionOperationMetadata {
-    /// Constructs shared arithmetic metadata with one fresh result variable.
+    /// Constructs shared arithmetic metadata used to infer one fresh result variable.
     pub(crate) fn new(
         left: &DimensionType,
         right: &DimensionType,
         result_name: String,
         result_bounds: DimensionBounds,
     ) -> Self {
-        Self { left: left.clone(), right: right.clone(), result: DimensionVariable::new(result_name, result_bounds) }
+        Self { left: left.clone(), right: right.clone(), result_name, result_bounds }
     }
 
     /// Returns the expected left operand type.
@@ -109,22 +115,28 @@ impl ArithmeticDimensionOperationMetadata {
         &self.right
     }
 
-    /// Returns the fresh result type.
+    /// Returns the diagnostic name used for a freshly inferred result variable.
     #[inline]
-    pub(crate) fn result_type(&self) -> DimensionType {
-        DimensionType::new(self.result.clone())
+    pub(crate) fn result_name(&self) -> &str {
+        &self.result_name
     }
 
-    /// Applies one simultaneous identity renaming to both operands and the result.
+    /// Returns the bounds of a freshly inferred result variable.
+    #[inline]
+    pub(crate) fn result_bounds(&self) -> DimensionBounds {
+        self.result_bounds
+    }
+
+    /// Applies one simultaneous identity renaming to both operands.
     pub(crate) fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<DimensionVariable>,
     ) -> Result<Self, TypeError> {
-        let result = self.result_type().rename_identities(renaming)?;
         Ok(Self {
             left: self.left.rename_identities(renaming)?,
             right: self.right.rename_identities(renaming)?,
-            result: result.variable().clone(),
+            result_name: self.result_name.clone(),
+            result_bounds: self.result_bounds,
         })
     }
 }
@@ -174,36 +186,6 @@ pub(crate) fn bounds_overflow(operation_name: &str, left: &DimensionType, right:
     }
 }
 
-/// Constructs a checked-evaluation overflow diagnostic.
-pub(crate) fn evaluation_overflow(
-    action: &str,
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> DimensionError {
-    DimensionError::ArithmeticOverflow {
-        message: format!(
-            "dimension arithmetic overflow while {action} with operands {}={left}, {}={right}",
-            left_type.variable(),
-            right_type.variable(),
-        ),
-    }
-}
-
-/// Constructs an observed binary requirement failure.
-pub(crate) fn requirement_violation(
-    requirement: String,
-    left_type: &DimensionType,
-    left: usize,
-    right_type: &DimensionType,
-    right: usize,
-) -> DimensionError {
-    DimensionError::RequirementViolation {
-        message: format!("{requirement}; observed {}={left}, {}={right}", left_type.variable(), right_type.variable()),
-    }
-}
-
 #[cfg(test)]
 fn test_dimension_type(name: &'static str, lower: usize, upper: usize) -> DimensionType {
     DimensionType::new(DimensionVariable::new(name, DimensionBounds::new(lower, Some(upper)).unwrap()))
@@ -224,10 +206,10 @@ mod tests {
         let left = test_dimension_type("left", 2, 9);
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionAddOperation::new(&left, &right).unwrap();
-        assert_eq!(
-            Operation::infer_output_types(&operation, &[left.clone(), right.clone()], &[]),
-            Ok(vec![operation.result_type()]),
-        );
+        let result = Operation::infer_output_types(&operation, &[left.clone(), right.clone()], &[]).unwrap();
+        assert_eq!(result[0].bounds(), operation.result_bounds());
+        assert_ne!(result[0].variable(), left.variable());
+        assert_ne!(result[0].variable(), right.variable());
 
         let unexpected = test_dimension_type("unexpected", 0, 6);
         assert_eq!(

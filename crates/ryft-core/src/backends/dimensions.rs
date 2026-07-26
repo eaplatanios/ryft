@@ -6,12 +6,10 @@ use ryft_macros::{Operation, Parameter};
 use crate::contexts::EagerContext;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::dimensions::{
-    DimensionAdd, DimensionAddOperation, DimensionFloorDivide, DimensionFloorDivideOperation, DimensionMaximum,
-    DimensionMaximumOperation, DimensionMinimum, DimensionMinimumOperation, DimensionMultiply,
-    DimensionMultiplyOperation, DimensionPower, DimensionPowerOperation, DimensionRemainder,
-    DimensionRemainderOperation, DimensionRequirement, DimensionRequirementOperation, DimensionSubtract,
-    DimensionSubtractClamped, DimensionSubtractClampedOperation, DimensionSubtractOperation, checked_power,
-    requirement_violation,
+    DimensionAdd, DimensionAddOperation, DimensionDivFloor, DimensionDivFloorOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMul, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRem, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
+    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSub, DimensionSubOperation, checked_power,
 };
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
@@ -126,152 +124,145 @@ impl Concretizable<usize> for DimensionValue {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Implements one concrete checked-arithmetic capability for [`DimensionValue`].
-///
-/// The evaluator receives both complete operand values so it can use their extents and type metadata without exposing
-/// macro-internal local names in the invocation syntax.
-macro_rules! impl_arithmetic_dimension_capability {
-    ($capability:ident, $method:ident, $operation:ty, |$left:ident, $right:ident| $evaluate:expr $(,)?) => {
-        impl $capability for DimensionValue {
-            fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let operation = <$operation>::new(&self.r#type, &right.r#type)?;
-                let inputs = &[self.r#type.clone(), right.r#type.clone()];
-                let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
-                let $left: &DimensionValue = self;
-                let $right: &DimensionValue = right;
-                let extent: Result<usize, DimensionError> = $evaluate;
-                Ok(Self::new(result_type, extent?)?)
+impl DimensionAdd for DimensionValue {
+    fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionAddOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent.checked_add(right.extent).ok_or_else(|| DimensionError::ArithmeticOverflow {
+            message: format!(
+                "dimension arithmetic overflow while adding dimensions with operands {}={}, {}={}",
+                self.r#type.variable(),
+                self.extent,
+                right.r#type.variable(),
+                right.extent,
+            ),
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
+}
+
+impl DimensionSub for DimensionValue {
+    fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionSubOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent.checked_sub(right.extent).ok_or_else(|| {
+            let left_variable = self.r#type.variable();
+            let right_variable = right.r#type.variable();
+            DimensionError::RequirementViolation {
+                message: format!(
+                    "{left_variable} >= {right_variable}; observed {left_variable}={}, {right_variable}={}",
+                    self.extent, right.extent,
+                ),
             }
-        }
-    };
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionAdd,
-    add,
-    DimensionAddOperation,
-    |left, right| {
-        left.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+impl DimensionSaturatingSub for DimensionValue {
+    fn saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionSaturatingSubOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(result_type, self.extent.saturating_sub(right.extent))?)
+    }
+}
+
+impl DimensionMul for DimensionValue {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionMulOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = self.extent.checked_mul(right.extent).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while adding runtime dimensions with operands {}={}, {}={}",
-                left.r#type().variable(),
-                left.extent(),
-                right.r#type().variable(),
-                right.extent(),
+                "dimension arithmetic overflow while multiplying dimensions with operands {}={}, {}={}",
+                self.r#type.variable(),
+                self.extent,
+                right.r#type.variable(),
+                right.extent,
             ),
-        })
-    },
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionSubtract,
-    sub,
-    DimensionSubtractOperation,
-    |left, right| {
-        left.extent().checked_sub(right.extent()).ok_or_else(|| {
-            requirement_violation(
-                format!("{} >= {}", left.r#type().variable(), right.r#type().variable()),
-                left.r#type(),
-                left.extent(),
-                right.r#type(),
-                right.extent(),
-            )
-        })
-    },
-}
-
-impl_arithmetic_dimension_capability! {
-    DimensionSubtractClamped,
-    sub_clamped,
-    DimensionSubtractClampedOperation,
-    |left, right| { Ok(left.extent().saturating_sub(right.extent())) },
-}
-
-impl_arithmetic_dimension_capability! {
-    DimensionMultiply,
-    mul,
-    DimensionMultiplyOperation,
-    |left, right| {
-        left.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
+impl DimensionPow for DimensionValue {
+    fn pow(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionPowOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        let extent = checked_power(self.extent, right.extent).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while multiplying runtime dimensions with operands {}={}, {}={}",
-                left.r#type().variable(),
-                left.extent(),
-                right.r#type().variable(),
-                right.extent(),
-            ),
-        })
-    },
-}
-
-impl_arithmetic_dimension_capability! {
-    DimensionPower,
-    pow,
-    DimensionPowerOperation,
-    |left, right| {
-        checked_power(left.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
-            message: format!(
-                "dimension arithmetic overflow while raising a runtime dimension to a dimension power with operands \
+                "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
                  {}={}, {}={}",
-                left.r#type().variable(),
-                left.extent(),
-                right.r#type().variable(),
-                right.extent(),
+                self.r#type.variable(),
+                self.extent,
+                right.r#type.variable(),
+                right.extent,
             ),
-        })
-    },
+        })?;
+        Ok(Self::new(result_type, extent)?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionFloorDivide,
-    floor_divide,
-    DimensionFloorDivideOperation,
-    |left, right| {
+impl DimensionDivFloor for DimensionValue {
+    fn div_floor(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionDivFloorOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
-            Err(requirement_violation(
-                format!("{} > 0", right.r#type().variable()),
-                left.r#type(),
-                left.extent(),
-                right.r#type(),
-                right.extent(),
-            ))
-        } else {
-            Ok(left.extent() / right.extent())
+            let left_variable = self.r#type.variable();
+            let right_variable = right.r#type.variable();
+            return Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
+                    self.extent, right.extent,
+                ),
+            }
+            .into());
         }
-    },
+        Ok(Self::new(result_type, self.extent / right.extent)?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionRemainder,
-    remainder,
-    DimensionRemainderOperation,
-    |left, right| {
+impl DimensionRem for DimensionValue {
+    fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionRemOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
-            Err(requirement_violation(
-                format!("{} > 0", right.r#type().variable()),
-                left.r#type(),
-                left.extent(),
-                right.r#type(),
-                right.extent(),
-            ))
-        } else {
-            Ok(left.extent() % right.extent())
+            let left_variable = self.r#type.variable();
+            let right_variable = right.r#type.variable();
+            return Err(DimensionError::RequirementViolation {
+                message: format!(
+                    "{right_variable} > 0; observed {left_variable}={}, {right_variable}={}",
+                    self.extent, right.extent,
+                ),
+            }
+            .into());
         }
-    },
+        Ok(Self::new(result_type, self.extent % right.extent)?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionMinimum,
-    minimum,
-    DimensionMinimumOperation,
-    |left, right| { Ok(left.extent().min(right.extent())) },
+impl DimensionMin for DimensionValue {
+    fn min(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionMinOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(result_type, self.extent.min(right.extent))?)
+    }
 }
 
-impl_arithmetic_dimension_capability! {
-    DimensionMaximum,
-    maximum,
-    DimensionMaximumOperation,
-    |left, right| { Ok(left.extent().max(right.extent())) },
+impl DimensionMax for DimensionValue {
+    fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+        let operation = DimensionMaxOperation::new(&self.r#type, &right.r#type)?;
+        let inputs = &[self.r#type.clone(), right.r#type.clone()];
+        let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
+        Ok(Self::new(result_type, self.extent.max(right.extent))?)
+    }
 }
 
 /// Implements one panicking standard operator as sugar for a fallible [`DimensionValue`] capability.
@@ -317,10 +308,10 @@ macro_rules! impl_dimension_operator {
 }
 
 impl_dimension_operator!(Add, add, DimensionAdd, add);
-impl_dimension_operator!(Sub, sub, DimensionSubtract, sub);
-impl_dimension_operator!(Mul, mul, DimensionMultiply, mul);
-impl_dimension_operator!(Div, div, DimensionFloorDivide, floor_divide);
-impl_dimension_operator!(Rem, rem, DimensionRemainder, remainder);
+impl_dimension_operator!(Sub, sub, DimensionSub, sub);
+impl_dimension_operator!(Mul, mul, DimensionMul, mul);
+impl_dimension_operator!(Div, div, DimensionDivFloor, div_floor);
+impl_dimension_operator!(Rem, rem, DimensionRem, rem);
 
 impl DimensionRequirement for DimensionValue {
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
@@ -348,7 +339,7 @@ impl DimensionRequirement for DimensionValue {
     }
 }
 
-/// Closed operation family stored by programs over first-class runtime dimensions.
+/// Closed operation family stored by programs over first-class dimensions.
 ///
 /// Each arithmetic variant contains a distinct nominal operation type. This enum is the single dynamic dispatch
 /// boundary needed to store heterogeneous instructions in a homogeneous [`crate::Program`]; the operation itself
@@ -362,30 +353,30 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Add(DimensionAddOperation),
 
     /// Checked dimension subtraction.
-    Subtract(DimensionSubtractOperation),
+    Sub(DimensionSubOperation),
 
-    /// Clamped dimension subtraction.
-    SubtractClamped(DimensionSubtractClampedOperation),
+    /// Saturating dimension subtraction.
+    SaturatingSub(DimensionSaturatingSubOperation),
 
     /// Checked dimension multiplication.
-    Multiply(DimensionMultiplyOperation),
+    Mul(DimensionMulOperation),
 
     /// Checked dimension exponentiation.
-    Power(DimensionPowerOperation),
+    Pow(DimensionPowOperation),
 
     /// Checked dimension floor division.
-    FloorDivide(DimensionFloorDivideOperation),
+    DivFloor(DimensionDivFloorOperation),
 
     /// Checked dimension remainder.
-    Remainder(DimensionRemainderOperation),
+    Rem(DimensionRemOperation),
 
     /// Dimension minimum.
-    Minimum(DimensionMinimumOperation),
+    Min(DimensionMinOperation),
 
     /// Dimension maximum.
-    Maximum(DimensionMaximumOperation),
+    Max(DimensionMaxOperation),
 
-    /// Ordered runtime dimension requirement.
+    /// Ordered dimension requirement.
     Requirement(DimensionRequirementOperation),
 }
 
@@ -394,7 +385,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::dimensions::{
-        DimensionAdd, DimensionFloorDivide, DimensionRemainder, DimensionRequirement, DimensionSubtract,
+        DimensionAdd, DimensionDivFloor, DimensionRem, DimensionRequirement, DimensionSub,
     };
     use crate::tracing::Trace;
 
@@ -453,12 +444,12 @@ mod tests {
             }),
         );
         let zero = DimensionValue::new(right_type.clone(), 0).unwrap();
-        let error = left.floor_divide(&zero).unwrap_err();
+        let error = left.div_floor(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
         );
-        let error = left.remainder(&zero).unwrap_err();
+        let error = left.rem(&zero).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
             Some(&DimensionError::RequirementViolation { message: "right > 0; observed left=7, right=0".to_string() }),
@@ -508,10 +499,10 @@ mod tests {
             0,
         );
         assert!(matches!(program.instructions()[0].operation(), DimensionOperation::Add(_)));
-        assert!(matches!(program.instructions()[1].operation(), DimensionOperation::Multiply(_)));
-        assert!(matches!(program.instructions()[2].operation(), DimensionOperation::Subtract(_)));
-        assert!(matches!(program.instructions()[3].operation(), DimensionOperation::FloorDivide(_)));
-        assert!(matches!(program.instructions()[4].operation(), DimensionOperation::Remainder(_)));
+        assert!(matches!(program.instructions()[1].operation(), DimensionOperation::Mul(_)));
+        assert!(matches!(program.instructions()[2].operation(), DimensionOperation::Sub(_)));
+        assert!(matches!(program.instructions()[3].operation(), DimensionOperation::DivFloor(_)));
+        assert!(matches!(program.instructions()[4].operation(), DimensionOperation::Rem(_)));
     }
 
     #[test]

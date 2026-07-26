@@ -52,8 +52,8 @@ macro_rules! check_count {
 /// so both invocations below accept real numeric data types and reject Boolean, token, zero-space, and complex types:
 ///
 /// ```rust,ignore
-/// check_types!(@numeric @real, "maximum", input_types);
-/// check_types!(@real @numeric, "maximum", input_types);
+/// check_types!(@numeric @real, "max", input_types);
+/// check_types!(@real @numeric, "max", input_types);
 /// ```
 ///
 /// # Parameters
@@ -237,7 +237,7 @@ macro_rules! check_builders {
 /// define_arithmetic_dimension_operation!(
 ///     /// Checked dimension-addition operation used by [`DimensionAdd`].
 ///     DimensionAddOperation, DIMENSION_ADD_OPERATION_NAME,
-///     DimensionAdd, add_dimension,
+///     DimensionAdd, add,
 ///     result_name = |left: &DimensionType, right: &DimensionType| {
 ///         format!("{} + {}", left.variable(), right.variable())
 ///     },
@@ -252,7 +252,7 @@ macro_rules! check_builders {
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `DIMENSION_ADD_OPERATION_NAME`).
 ///   - `$capability`: Value-level capability required by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `DimensionAdd`).
-///   - `$method`: Semantic capability method used for interpretation (e.g., `add_dimension`).
+///   - `$method`: Semantic capability method used for interpretation (e.g., `add`).
 ///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
 ///     the fresh result identity's diagnostic name.
 ///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
@@ -426,7 +426,7 @@ macro_rules! define_arithmetic_dimension_operation {
 ///     /// Adds two first-class runtime dimensions.
 ///     DimensionAdd,
 ///     /// Returns the checked sum of `self` and `right`.
-///     add_dimension(right),
+///     add(right),
 ///     DimensionAddOperation,
 /// );
 /// ```
@@ -436,7 +436,7 @@ macro_rules! define_arithmetic_dimension_operation {
 ///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `DimensionAdd`).
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
-///   - `$method`: Identifier of the generated binary capability method (e.g., `add_dimension`).
+///   - `$method`: Identifier of the generated binary capability method (e.g., `add`).
 ///   - `$argument`: Name of the capability method's non-receiver argument (e.g., `right`).
 ///   - `$operation`: Dimension-arithmetic operation constructed and bound by the generated implementation (e.g.,
 ///     `DimensionAddOperation`).
@@ -2478,6 +2478,8 @@ macro_rules! impl_nullary_batchable_operation {
     };
 }
 
+// TODO(eaplatanios): Should `@binary_provider` just be inferred from the existence of the `$provider` argument?
+//  Also, does it really need to be an entirely separate branch? Is it really so different from `@binary`?
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
 /// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
@@ -2496,12 +2498,16 @@ macro_rules! impl_nullary_batchable_operation {
 ///
 /// # Parameters
 ///
-///   - `@unary` / `@binary`: Selects the operator shape to stamp out. `@unary` produces `fn(self) -> Self` operators
-///     and `@binary` produces `fn(self, Self) -> Self` operators.
+///   - `@unary` / `@binary` / `@binary_provider`: Selects the operator shape to stamp out.
+///     `@unary` produces `fn(self) -> Self` operators and `@binary` produces `fn(self, Self) -> Self` operators.
+///     `@binary_provider` produces binary operators whose operation is selected and constructed by a type-level
+///     provider trait. This form supports one operator across program type families that use distinct operation types.
 ///   - `$trait`: Path to the foreign `std::ops` operator trait to implement (e.g., `std::ops::Add`).
 ///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
 ///   - `$operation`: Path to the unit-struct operation, used both as the `From` bound target and as the value bound
 ///     through each tracer's context (e.g., `AddOperation`).
+///   - `$provider`: Path to a type-level provider trait with an associated `Operation` type and a fallible
+///     `operation(left_type, right_type)` constructor.
 ///   - `$message`: Panic message used when an eager tracer's bind fails.
 #[macro_export]
 macro_rules! define_tracer_operator {
@@ -2556,6 +2562,96 @@ macro_rules! define_tracer_operator {
             #[inline]
             fn $method(self) -> Self {
                 $crate::Context::bind(self.context(), $operation, Vec::new(), ::std::slice::from_ref(&self))
+                    .expect($message)
+                    .remove(0)
+            }
+        }
+    };
+
+    // This branch statically selects and constructs a type-family-specific binary operation for every tracer family.
+    (@binary_provider $trait:path, $method:ident, $provider:path, $message:literal $(,)?) => {
+        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
+        where
+            C::Type: $provider,
+            C::Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let left_type = $crate::Typed::r#type(&self);
+                let right_type = $crate::Typed::r#type(&right);
+                match <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref()) {
+                    Ok(operation) => self.binary(&right, operation),
+                    Err(error) => {
+                        $crate::StagingContext::error(self.context(), error);
+                        $crate::Tracer::new(self.context().clone(), $crate::TracerState::Poison, left_type.into_owned())
+                    }
+                }
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        where
+            C::Type: $provider,
+            $crate::PartialEvaluationContext<C>: $crate::Context<
+                    Value = $crate::PartialTracer<C>,
+                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let left_type = $crate::Typed::r#type(&self);
+                let right_type = $crate::Typed::r#type(&right);
+                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                    .unwrap_or_else(|error| panic!("{error}"));
+                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
+                    .expect($message)
+                    .remove(0)
+            }
+        }
+
+        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        where
+            C::Type: $provider,
+            $crate::BatchingContext<C>: $crate::Context<
+                    Value = $crate::BatchingTracer<C>,
+                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let left_type = $crate::Typed::r#type(&self);
+                let right_type = $crate::Typed::r#type(&right);
+                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                    .unwrap_or_else(|error| panic!("{error}"));
+                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
+                    .expect($message)
+                    .remove(0)
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
+        where
+            C::Type: $provider,
+            $crate::DifferentiationContext<C>: $crate::Context<
+                    Value = $crate::DifferentiationTracer<C>,
+                    Operation: ::std::convert::From<<C::Type as $provider>::Operation>,
+                >,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, right: Self) -> Self {
+                let left_type = $crate::Typed::r#type(&self);
+                let right_type = $crate::Typed::r#type(&right);
+                let operation = <C::Type as $provider>::operation(left_type.as_ref(), right_type.as_ref())
+                    .unwrap_or_else(|error| panic!("{error}"));
+                $crate::Context::bind(self.context(), operation, Vec::new(), &[self.clone(), right.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -4370,6 +4466,48 @@ mod tests {
         fn apply_binary(self, right: Self) -> Self::Output;
     }
 
+    /// Binary operator used to test type-directed operation selection in [`define_tracer_operator!`].
+    trait TestProvidedBinaryOperator {
+        /// Result of applying this operator.
+        type Output;
+
+        /// Applies the operator selected for this tracer's program type.
+        fn apply_provided_binary(self, right: Self) -> Self::Output;
+    }
+
+    /// Selects the test operation used for each supported program type.
+    trait TestOperationFor: Type {
+        /// Operation selected for this program type.
+        type Operation: Operation<Self>;
+
+        /// Constructs the operation for the two operand types.
+        fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+    }
+
+    impl TestOperationFor for DataType {
+        type Operation = TestBinaryOperation;
+
+        fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+            Ok(TestBinaryOperation)
+        }
+    }
+
+    impl TestOperationFor for ArrayType {
+        type Operation = TestBinaryOperation;
+
+        fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+            Ok(TestBinaryOperation)
+        }
+    }
+
+    impl TestOperationFor for DimensionType {
+        type Operation = TestArithmeticDimensionOperation;
+
+        fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError> {
+            Ok(TestArithmeticDimensionOperation::new(left_type, right_type)?)
+        }
+    }
+
     define_tracer_operator!(
         @unary TestUnaryOperator,
         apply_unary,
@@ -4382,6 +4520,13 @@ mod tests {
         apply_binary,
         TestBinaryOperation,
         "test binary operation failed",
+    );
+
+    define_tracer_operator!(
+        @binary_provider TestProvidedBinaryOperator,
+        apply_provided_binary,
+        TestOperationFor,
+        "test provided binary operation failed",
     );
 
     /// Nullary operation used to execute generated transposition and batching rules.
@@ -5963,6 +6108,33 @@ mod tests {
         let output = left.apply_binary(right).into_dual();
         assert_eq!(output.primal(), &Scalar::from(5.0f32));
         assert!(matches!(output.tangent(), MaybeZero::Zero(DataType::F32)));
+    }
+
+    #[test]
+    fn test_define_tracer_operator_binary_provider() {
+        // The scalar universe selects the ordinary elementwise test operation.
+        let context = TracingContext::<Scalar, TestBinaryOperation>::new();
+        let left = context.input(DataType::F32);
+        let right = context.input(DataType::F32);
+        let input_ids = [left.atom_id().unwrap(), right.atom_id().unwrap()];
+        let output = left.apply_provided_binary(right);
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(Operation::<DataType>::name(builder.instructions()[0].operation()), TEST_BINARY_OPERATION_NAME,);
+        assert_eq!(builder.instructions()[0].inputs(), &input_ids);
+        drop(builder);
+
+        // The same operator implementation selects the nominal dimension operation in the dimension universe.
+        let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
+        let right_type = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(2, Some(6)).unwrap()));
+        let context = TracingContext::<DimensionValue, TestArithmeticDimensionOperation>::new();
+        let left = context.input(left_type);
+        let right = context.input(right_type);
+        let output = left.apply_provided_binary(right);
+        assert_eq!(output.r#type().bounds(), DimensionBounds::new(3, Some(9)).unwrap());
+        let builder = output.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(builder.instructions()[0].operation().name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME);
     }
 
     #[test]

@@ -1,11 +1,11 @@
-use crate::operations::math::{Maximum, Minimum};
+use crate::operations::math::{Max, Min};
 use crate::programs::ProgramError;
 
 // TODO(eaplatanios): Review this module.
 
 /// Value-level elementwise clamp capability, restricting each element of a value to the inclusive `[lower, upper]`
-/// interval. [`Clamp`] is not a primitive operation: it is provided for every value that supports [`Maximum`] and
-/// [`Minimum`] as the composition `maximum(lower, minimum(x, upper))`, which is exactly how
+/// interval. [`Clamp`] is not a primitive operation: it is provided for every value that supports [`Max`] and
+/// [`Min`] as the composition `max(lower, min(x, upper))`, which is exactly how
 /// [StableHLO defines `clamp`](https://openxla.org/stablehlo/spec#clamp). The composition inherits the primitives'
 /// semantics: operands promote to a common real numeric element type and broadcast, NaNs propagate, and the tangent
 /// follows the clamped value (so gradients are `1` strictly inside the interval and `0` outside it).
@@ -20,10 +20,10 @@ pub trait Clamp: Sized {
     fn clamp(&self, lower: &Self, upper: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Maximum + Minimum> Clamp for V {
+impl<V: Max + Min> Clamp for V {
     #[inline]
     fn clamp(&self, lower: &Self, upper: &Self) -> Result<Self, ProgramError> {
-        self.minimum(upper)?.maximum(lower)
+        self.min(upper)?.max(lower)
     }
 }
 

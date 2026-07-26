@@ -7,8 +7,8 @@ use crate::operations::control_flow::Select;
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`MaximumOperation`].
-pub const MAXIMUM_OPERATION_NAME: &str = "maximum";
+/// Canonical operation name for [`MaxOperation`].
+pub const MAX_OPERATION_NAME: &str = "max";
 
 define_elementwise_operation!(
     @binary
@@ -19,15 +19,15 @@ define_elementwise_operation!(
     /// floating-point operands, NaNs propagate (the maximum is NaN when either operand is NaN) and `-0.0` orders
     /// below `+0.0`. Array operands that still carry partial sums are rejected, and their reduced-axis markers must
     /// agree.
-    MaximumOperation, MAXIMUM_OPERATION_NAME,
-    Maximum, maximum,
+    MaxOperation, MAX_OPERATION_NAME,
+    Max, max,
     check_data_types = [@numeric @real],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
     @binary
-    MaximumOperation,
+    MaxOperation,
     jvp<C>
     where
         C::Value: Compare<Output = C::Value> + Select + ZeroLike,
@@ -49,13 +49,13 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value-level elementwise maximum capability. [`Maximum`] fills the same role for
-    /// [`MaximumOperation`] that [`Atan2`](crate::Atan2) fills for [`Atan2Operation`](crate::Atan2Operation).
-    Maximum,
+    /// Value-level elementwise maximum capability. [`Max`] fills the same role for
+    /// [`MaxOperation`] that [`Atan2`](crate::Atan2) fills for [`Atan2Operation`](crate::Atan2Operation).
+    Max,
     /// Computes the elementwise maximum of this value and `right`, promoting both operands to a common numeric
     /// element type and returning a [`ProgramError`](crate::ProgramError) if something goes wrong.
-    maximum(right),
-    MaximumOperation,
+    max(right),
+    MaxOperation,
 );
 
 #[cfg(test)]
@@ -77,45 +77,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_maximum() {
-        assert_eq!(Scalar::from(2i32).maximum(&Scalar::from(5i32)).unwrap(), Scalar::from(5i32));
-        assert_eq!(Scalar::from(-2i64).maximum(&Scalar::from(-5i64)).unwrap(), Scalar::from(-2i64));
-        assert_eq!(Scalar::from(3u32).maximum(&Scalar::from(7u32)).unwrap(), Scalar::from(7u32));
-        assert_eq!(Scalar::from(2.5f32).maximum(&Scalar::from(1.5f32)).unwrap(), Scalar::from(2.5f32));
+    fn test_max() {
+        assert_eq!(Scalar::from(2i32).max(&Scalar::from(5i32)).unwrap(), Scalar::from(5i32));
+        assert_eq!(Scalar::from(-2i64).max(&Scalar::from(-5i64)).unwrap(), Scalar::from(-2i64));
+        assert_eq!(Scalar::from(3u32).max(&Scalar::from(7u32)).unwrap(), Scalar::from(7u32));
+        assert_eq!(Scalar::from(2.5f32).max(&Scalar::from(1.5f32)).unwrap(), Scalar::from(2.5f32));
         // Mixed-precision operands promote before comparing.
-        assert_eq!(Scalar::from(2.5f32).maximum(&Scalar::from(3.5f64)).unwrap(), Scalar::from(3.5f64));
+        assert_eq!(Scalar::from(2.5f32).max(&Scalar::from(3.5f64)).unwrap(), Scalar::from(3.5f64));
         assert_eq!(
-            Scalar::from(bf16::from_f32(2.0)).maximum(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
+            Scalar::from(bf16::from_f32(2.0)).max(&Scalar::from(bf16::from_f32(3.0))).unwrap(),
             Scalar::from(bf16::from_f32(3.0)),
         );
         assert_eq!(
-            Scalar::from(f16::from_f32(2.0)).maximum(&Scalar::from(f16::from_f32(3.0))).unwrap(),
+            Scalar::from(f16::from_f32(2.0)).max(&Scalar::from(f16::from_f32(3.0))).unwrap(),
             Scalar::from(f16::from_f32(3.0)),
         );
         // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(match Scalar::from(f64::NAN).maximum(&Scalar::from(1.0f64)).unwrap() {
+        assert!(match Scalar::from(f64::NAN).max(&Scalar::from(1.0f64)).unwrap() {
             Scalar::F64(value) => value.is_nan(),
             _ => false,
         });
-        assert!(match Scalar::from(1.0f64).maximum(&Scalar::from(f64::NAN)).unwrap() {
+        assert!(match Scalar::from(1.0f64).max(&Scalar::from(f64::NAN)).unwrap() {
             Scalar::F64(value) => value.is_nan(),
             _ => false,
         });
-        assert!(match Scalar::from(-0.0f64).maximum(&Scalar::from(0.0f64)).unwrap() {
+        assert!(match Scalar::from(-0.0f64).max(&Scalar::from(0.0f64)).unwrap() {
             Scalar::F64(value) => value == 0.0 && value.is_sign_positive(),
             _ => false,
         });
         assert_eq!(
-            Array::vector(vec![0.7, -1.0]).maximum(&Array::vector(vec![0.3, 2.0])).unwrap(),
+            Array::vector(vec![0.7, -1.0]).max(&Array::vector(vec![0.3, 2.0])).unwrap(),
             Array::vector(vec![0.7, 2.0]),
         );
     }
 
     #[test]
-    fn test_maximum_type_inference() {
+    fn test_max_type_inference() {
         check_operation_type_inference!(
             @elementwise @binary,
-            operation = MaximumOperation,
+            operation = MaxOperation,
             cases = [
                 {
                     input_data_types = [DataType::I32, DataType::I32],
@@ -123,26 +123,26 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "'maximum' does not support input data type c64",
+                    error = "'max' does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'maximum' does not support input data type bool",
+                    error = "'max' does not support input data type bool",
                 },
             ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = MaximumOperation,
+            operation = MaxOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
-    fn test_maximum_batching() {
+    fn test_max_batching() {
         check_operation_batching!(
             @exact,
-            operation = MaximumOperation,
+            operation = MaxOperation,
             axis_size = 2,
             cases = [
                 {
@@ -164,10 +164,10 @@ mod tests {
     }
 
     #[test]
-    fn test_maximum_differentiation() {
+    fn test_max_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = MaximumOperation,
+            operation = MaxOperation,
             cases = [
                 {
                     primals = [Array::scalar(2.0), Array::scalar(1.0)],
@@ -176,7 +176,7 @@ mod tests {
                     tangent_outputs = [Array::scalar(3.0)],
                     jvp = indoc! {"
                         lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                        let %4:f64[] = maximum %0 %1
+                        let %4:f64[] = max %0 %1
                             %5:bool[] = compare [direction=GreaterThanOrEqual] %0 %1
                             %6:f64[] = zero_like %2
                             %7:f64[] = select %5 %2 %6
@@ -198,13 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn test_maximum_differentiation_at_ties() {
+    fn test_max_differentiation_at_ties() {
         // Ties route the tangent to the left operand. The finite-difference oracle cannot check the
         // non-differentiable tie point, so the tie policy is asserted on the staged jvp program directly.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(MaximumOperation, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(MaxOperation, Vec::new(), vec![left, right]).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
@@ -217,19 +217,19 @@ mod tests {
     }
 
     #[test]
-    fn test_maximum_partial_evaluation() {
+    fn test_max_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = MaximumOperation,
+            operation = MaxOperation,
             inputs = [Scalar::from(0.7), Scalar::from(0.3)],
             expected = Scalar::from(0.7),
         );
     }
 
     #[test]
-    fn test_maximum_transposition() {
+    fn test_max_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = MaximumOperation,
+            operation = MaxOperation,
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         );
     }

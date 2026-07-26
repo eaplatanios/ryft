@@ -6,7 +6,11 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::types::Type;
 use crate::tracing::{Tracer, TracingContext};
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -51,6 +55,33 @@ impl_differentiable_elementwise_operation! {
     },
 }
 
+/// Selects the operation used to implement traced [`std::ops::Div`] for a program type family.
+pub trait DivOperationFor: Type {
+    /// Concrete division operation staged for this type family.
+    type Operation: Operation<Self>;
+
+    /// Constructs the division operation for `left_type` and `right_type`.
+    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+}
+
+impl DivOperationFor for DataType {
+    type Operation = DivOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(DivOperation)
+    }
+}
+
+impl DivOperationFor for ArrayType {
+    type Operation = DivOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(DivOperation)
+    }
+}
+
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
@@ -63,7 +94,7 @@ define_elementwise_capability!(
     DivOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operation failed");
+define_tracer_operator!(@binary_provider std::ops::Div, div, DivOperationFor, "`div` operation failed");
 
 #[cfg(test)]
 mod tests {

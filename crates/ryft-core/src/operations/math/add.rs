@@ -2,6 +2,10 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation,
 };
+use crate::programs::ProgramError;
+use crate::programs::operations::Operation;
+use crate::programs::types::Type;
+use crate::types::{ArrayType, DataType};
 
 // TODO(eaplatanios): Review this module.
 
@@ -28,6 +32,33 @@ impl_differentiable_elementwise_operation! {
     rule = [@positive, @positive],
 }
 
+/// Selects the operation used to implement traced [`std::ops::Add`] for a program type family.
+pub trait AddOperationFor: Type {
+    /// Concrete addition operation staged for this type family.
+    type Operation: Operation<Self>;
+
+    /// Constructs the addition operation for `left_type` and `right_type`.
+    fn operation(left_type: &Self, right_type: &Self) -> Result<Self::Operation, ProgramError>;
+}
+
+impl AddOperationFor for DataType {
+    type Operation = AddOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(AddOperation)
+    }
+}
+
+impl AddOperationFor for ArrayType {
+    type Operation = AddOperation;
+
+    #[inline]
+    fn operation(_left_type: &Self, _right_type: &Self) -> Result<Self::Operation, ProgramError> {
+        Ok(AddOperation)
+    }
+}
+
 define_elementwise_capability!(
     @binary
     /// Value-level elementwise addition capability. [`Add`] is the fallible Ryft counterpart to [`std::ops::Add`]
@@ -40,7 +71,7 @@ define_elementwise_capability!(
     AddOperation,
 );
 
-define_tracer_operator!(@binary std::ops::Add, add, AddOperation, "`add` operation failed");
+define_tracer_operator!(@binary_provider std::ops::Add, add, AddOperationFor, "`add` operation failed");
 
 #[cfg(test)]
 mod tests {

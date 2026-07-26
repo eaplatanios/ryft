@@ -62,11 +62,10 @@ use crate::operations::math::reduce::{reduce_abstract, reduce_evaluate};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Ceil, CeilOperation, Cos, CosOperation, Div,
     DivOperation, Dot, DotDimensionNumbers, DotOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation,
-    Log, LogOperation, Logistic, LogisticOperation, Maximum, MaximumOperation, Minimum, MinimumOperation, Mul,
-    MulOperation, Neg, NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Remainder,
-    RemainderOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign,
-    SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation, Tanh, TanhOperation,
-    scaled_dot_composition,
+    Log, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
+    NegOperation, Pow, PowOperation, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Round, RoundOperation,
+    Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, Sign, SignOperation, Sin, SinOperation, Sqrt, SqrtOperation,
+    Sub, SubOperation, Tanh, TanhOperation, scaled_dot_composition,
 };
 use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::random::{
@@ -131,9 +130,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Floor(FloorOperation),
     Ceil(CeilOperation),
     Round(RoundOperation),
-    Maximum(MaximumOperation),
-    Minimum(MinimumOperation),
-    Remainder(RemainderOperation),
+    Max(MaxOperation),
+    Min(MinOperation),
+    Rem(RemOperation),
     Not(NotOperation),
     And(AndOperation),
     Or(OrOperation),
@@ -724,21 +723,21 @@ impl Round for Array {
     }
 }
 
-impl Maximum for Array {
-    fn maximum(&self, right: &Self) -> Result<Self, ProgramError> {
-        self.binary(right, |left, right| left.maximum(right))
+impl Max for Array {
+    fn max(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.max(right))
     }
 }
 
-impl Minimum for Array {
-    fn minimum(&self, right: &Self) -> Result<Self, ProgramError> {
-        self.binary(right, |left, right| left.minimum(right))
+impl Min for Array {
+    fn min(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.min(right))
     }
 }
 
-impl Remainder for Array {
-    fn remainder(&self, right: &Self) -> Result<Self, ProgramError> {
-        self.binary(right, |left, right| left.remainder(right))
+impl Rem for Array {
+    fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
+        self.binary(right, |left, right| left.rem(right))
     }
 }
 

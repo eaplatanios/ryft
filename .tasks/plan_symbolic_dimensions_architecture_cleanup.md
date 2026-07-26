@@ -695,6 +695,7 @@ never landed as `S6`; it is a reference and source of tests, not the architectur
 | `P2a`  | Homogeneous dimension SSA values and checked arithmetic                     | Line by line              |
 | `P2b`  | Ordered dimension requirements and partial-evaluation behavior              | Line by line              |
 | `P2b.1` | Canonical dimension operation modules and capability APIs                  | Line by line              |
+| `P2b.2` | Restore backend-neutral eager dimension interpretation                    | Line by line              |
 | `P2c`  | Generic storage-sum type/value projection                                  | Line by line              |
 | `P2d`  | Zero-state projected binding and third-member extensibility gate           | Line by line              |
 | `P3.*` | Central schemas, constructors, and one increment per mixed shape operation  | Line by line              |
@@ -1010,6 +1011,15 @@ duplicating inference or identity plumbing. This advances only the primitive-ope
 concrete host values and the reference backend's closed operation family remain under `backends`, while neutral
 `RuntimeDimension`/`RuntimeShape` API placement remains in P9.
 
+`P2b.2` is a narrow ownership correction to the final P2b.1 macro follow-up. Dimension operations follow the same
+capability-based interpretation architecture as scalar and array operations: each operation owns a generic
+`InterpretableOperation` implementation constrained by its value capability, while concrete backends own the
+capability implementations. Operation-aware capability methods receive the nominal operation so eager values preserve
+its fresh result identity. `DimensionValue` uses the same constant-only dispatch/rich execution-domain split as
+`Scalar` and `Array`, keeping generic context-carrying implementations disjoint from its concrete eager
+implementations. No generic operation generation names the reference backend's `DimensionValue`, and no parallel
+checked-evaluation hook or backend-owned interpretation adapter is introduced.
+
 - [x] P2a: introduce homogeneous `DimensionType`/`DimensionValue` SSA, generic constant reuse, checked bounded
       arithmetic, eager host execution, tracing, and ordinary partial evaluation without projection machinery.
 - [x] P2b: introduce equality, less-than-or-equal, positive-divisibility, and explicit-bounds requirements as one
@@ -1027,6 +1037,8 @@ concrete host values and the reference backend's closed operation family remain 
       requirements and nested regions remains assigned to P4.
 - [x] P2b.1: move dimension primitives into canonical operation modules, replace tagged arithmetic with nine nominal
       payloads, and centralize their shared contract in `ArithmeticDimensionOperation`.
+- [x] P2b.2: remove the concrete backend dependency from generic arithmetic operation generation, make operations own
+      capability-constrained interpretation, and make backends own concrete capability implementations.
 - [ ] Introduce ordinary `DimensionType`/`DimensionValue` scalar SSA and the minimal dimension operation family for
       constants, arithmetic, comparisons, gateways, `dimension_size`, and requirements.
 - [ ] Introduce the array/dimension storage sum only at atom/region interfaces and genuinely mixed operations.
@@ -1730,3 +1742,42 @@ projection wrappers, or special program machinery.
 Ordered requirements, comparisons, gateways, `dimension_size`, heterogeneous storage, and projected binding remain
 separate P2b–P2d/P3 increments. Verification and residual-audit results are recorded in the P2a cleanup-ledger entry at
 handoff.
+
+### Execution: P2b.2 capability-based dimension interpretation
+
+The first P2b.2 implementation corrected the dependency direction but introduced a redundant checked-evaluation hook
+instead of applying Ryft's established scalar/array architecture. It was staged but not committed by the owner and was
+superseded in place:
+
+- each nominal arithmetic operation owns `InterpretableOperation<C>` for domains whose values implement its
+  capability;
+- every arithmetic capability has an operation-aware `*_with` method plus the ergonomic method that constructs the
+  operation from operand types;
+- generic context-carrying values implement `*_with` by staging the supplied operation;
+- `DimensionValue` implements each capability in `backends::dimensions`, validates the supplied operation against the
+  eager operand types, performs checked host arithmetic, and materializes exactly the operation's fresh result type;
+- `DimensionValue::DispatchDomain` becomes constant-only while `ExecutionDomain` retains the closed dimension
+  operation family, matching `Scalar` and `Array`;
+- `ArithmeticDimensionOperation::evaluate` and the backend arithmetic interpretation-adapter macro are deleted; and
+- the requirement operation follows the same ownership rule: the operation owns interpretation, generic values stage
+  its operation-aware capability, and `DimensionValue` owns concrete enforcement.
+
+The concrete capability tests pin preservation of the supplied operation's fresh result identity and the exact
+observed-value diagnostics for subtraction, floor division, and remainder. Generic tracing tests continue to pin
+operation staging, while eager program and requirement tests now reach operation-owned interpretation through the
+backend capability implementations.
+
+Verification completed:
+
+- `cargo fmt -p ryft-core -- --check` and `git diff --check` passed;
+- `cargo check -p ryft-core -p ryft-xla` passed;
+- focused dimension, backend-capability, and declarative-macro tests passed;
+- `cargo test -p ryft-core --lib` passed all 946 tests;
+- `cargo test -p ryft-core --doc` passed 53 tests with 15 ignored; and
+- `cargo test -p ryft-xla --lib` passed 396 tests with one ignored.
+
+Residual searches find no arithmetic `evaluate` hook, no backend-owned `InterpretableOperation` implementation, no
+rich `DimensionValue::DispatchDomain`, and no production operation-to-backend dependency. The requirement operation's
+predicate-specific `evaluate_extents` remains intentionally shared by eager enforcement and known-side reasoning; it
+is not an arithmetic value-materialization side channel. The four pre-existing ambiguous dimension/math glob-re-export
+warnings remain assigned to P9.
