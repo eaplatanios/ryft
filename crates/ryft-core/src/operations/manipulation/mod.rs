@@ -20,7 +20,9 @@ pub use gathering::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
 };
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
-pub use reshaping::{RESHAPE_OPERATION_NAME, Reshape, ReshapeDimensionExpression, ReshapeOperation, ReshapeTarget};
+pub use reshaping::{
+    RESHAPE_OPERATION_NAME, Reshape, ReshapeDimensionExpression, ReshapeOperation, ReshapeParameters, ReshapeTarget,
+};
 pub use scattering::{
     LinearScatterAddOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
     ScatterReductionKind,

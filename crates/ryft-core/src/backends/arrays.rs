@@ -54,8 +54,8 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation,
     DynamicBroadcast, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
     DynamicUpdateSliceOperation, Gather, GatherOperation, GatherScatterMode, Pad, PadOperation, Permutation, Reshape,
-    ReshapeOperation, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    ReshapeOperation, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
+    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::math::dot::dot_general_evaluate;
 use crate::operations::math::reduce::{reduce_abstract, reduce_evaluate};
@@ -1336,12 +1336,12 @@ impl Transpose for Array {
 }
 
 impl Reshape for Array {
-    fn reshape_with(&self, operation: &ReshapeOperation) -> Result<Self, ProgramError> {
+    fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
         // Resolve runtime dimension expressions from the concrete eager input shape, then delegate to the type-level
         // reshape so all element-count and sharding validation remains shared with staged execution.
-        let operation = operation.resolve_target(self.r#type.shape())?;
-        let output_type = self.r#type.reshape_with(&operation)?;
-        let values = match operation.dimensions() {
+        let parameters = parameters.into().resolve_target(self.r#type.shape())?;
+        let output_type = self.r#type.reshape(parameters.clone())?;
+        let values = match parameters.dimensions() {
             Some(dimensions) => self.transpose(dimensions)?.values,
             None => self.values.clone(),
         };

@@ -23,8 +23,8 @@ use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperatio
 use ryft_core::operations::differentiation::CoordinateBasisOperation;
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConvertElementType, ConvertElementTypeOperation, DynamicBroadcastOperation, GatherOperation,
-    GatherScatterMode, PadOperation, Reshape, ReshapeDimensionExpression, ReshapeOperation, ScatterOperation,
-    ScatterReductionKind, Slice, SliceOperation, TransposeOperation, UpdateSlice,
+    GatherScatterMode, PadOperation, Reshape, ReshapeDimensionExpression, ReshapeOperation, ReshapeParameters,
+    ScatterOperation, ScatterReductionKind, Slice, SliceOperation, TransposeOperation, UpdateSlice,
 };
 use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CeilOperation, CosOperation, DivOperation, DotOperation, ErfOperation,
@@ -1340,14 +1340,14 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    let input = if let Some(dimensions) = operation.dimensions() {
+    let input = if let Some(dimensions) = operation.parameters().dimensions() {
         let transpose =
             block.append_operation(stable_hlo::transpose(input_values[0], dimensions.as_slice(), location)?)?;
         transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
     } else {
         input_values[0]
     };
-    let result = if let Some(expressions) = operation.output_dimension_expressions() {
+    let result = if let Some(expressions) = operation.parameters().output_dimension_expressions() {
         let shape = lower_reshape_shape(expressions, input_values[0], block, context, location)?;
         let output_bounds = output_types[0]
             .shape()
@@ -1379,7 +1379,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
         let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
         reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
     };
-    if operation.output_sharding().is_some() {
+    if operation.parameters().output_sharding().is_some() {
         let output_sharding = output_types[0]
             .sharding()
             .expect("reshape type inference should preserve a requested output sharding");
@@ -9756,13 +9756,15 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_reshape_with_dimensions_lowers_transpose_before_reshape() {
+    fn test_plain_reshape_dimensions_lower_transpose_before_reshape() {
         let input_type = test_matrix_type(2, 3);
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
+                ReshapeOperation::new(
+                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
+                ),
                 Vec::new(),
                 vec![input],
             )
@@ -9820,7 +9822,11 @@ mod tests {
         let mut builder = ryft_core::ProgramBuilder::<CpuArray, ReshapeOperation>::new();
         let input = builder.add_input(ArrayType::new(DataType::F32, input_shape));
         let output = builder
-            .add_instruction(ReshapeOperation::new(output_shape).with_dimensions([2, 0, 1]), Vec::new(), vec![input])
+            .add_instruction(
+                ReshapeOperation::new(ReshapeParameters::new(output_shape).with_dimensions([2, 0, 1])),
+                Vec::new(),
+                vec![input],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<CpuArray>, Vec<CpuArray>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -9858,11 +9864,13 @@ mod tests {
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::from_dimension_expressions(vec![
-                    normalized_input_dimension(0, 2),
-                    normalized_input_dimension(1, 3),
-                ])
-                .with_dimensions([1, 0]),
+                ReshapeOperation::new(
+                    ReshapeParameters::from_dimension_expressions(vec![
+                        normalized_input_dimension(0, 2),
+                        normalized_input_dimension(1, 3),
+                    ])
+                    .with_dimensions([1, 0]),
+                ),
                 Vec::new(),
                 vec![input],
             )
@@ -9909,11 +9917,11 @@ mod tests {
         ));
         let output = builder
             .add_instruction(
-                ReshapeOperation::from_dimension_expressions(vec![
+                ReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
                     ReshapeDimensionExpression::InputDimension(0),
                     ReshapeDimensionExpression::Constant(2),
                     ReshapeDimensionExpression::Constant(3),
-                ]),
+                ])),
                 Vec::new(),
                 vec![input],
             )
@@ -9954,13 +9962,13 @@ mod tests {
         ));
         assert_eq!(
             builder.add_instruction(
-                ReshapeOperation::from_dimension_expressions(vec![
+                ReshapeOperation::new(ReshapeParameters::from_dimension_expressions(vec![
                     ReshapeDimensionExpression::Product(vec![
                         ReshapeDimensionExpression::InputDimension(0),
                         ReshapeDimensionExpression::Constant(2),
                     ]),
                     ReshapeDimensionExpression::Constant(2),
-                ]),
+                ])),
                 Vec::new(),
                 vec![input],
             ),
@@ -10078,13 +10086,15 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_operation_reshape_with_dimensions_uses_shared_lowering() {
+    fn test_xla_operation_reshape_dimensions_use_shared_lowering() {
         let input_type = test_matrix_type(2, 3);
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
+                ReshapeOperation::new(
+                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),
+                ),
                 Vec::new(),
                 vec![input],
             )
@@ -10110,7 +10120,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_reshape_with_explicit_output_sharding_lowers_constraint() {
+    fn test_plain_reshape_explicit_output_sharding_lowers_constraint() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
@@ -10118,8 +10128,10 @@ mod tests {
         let input = builder.add_input(test_vector_type(4));
         let output = builder
             .add_instruction(
-                ReshapeOperation::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
-                    .with_output_sharding(output_sharding),
+                ReshapeOperation::new(
+                    ReshapeParameters::new(Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+                        .with_output_sharding(output_sharding),
+                ),
                 Vec::new(),
                 vec![input],
             )
